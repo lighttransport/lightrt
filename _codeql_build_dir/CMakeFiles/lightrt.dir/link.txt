@@ -1,0 +1,2 @@
+/usr/bin/ar qc liblightrt.a CMakeFiles/lightrt.dir/lightrt.cc.o
+/usr/bin/ranlib liblightrt.a
