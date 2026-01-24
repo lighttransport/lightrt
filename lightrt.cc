@@ -53,7 +53,7 @@ bool AABB::intersectSIMD(const Ray& ray, float& tmin_out, float& tmax_out) const
   __m128 ray_inv_dir = _mm_div_ps(_mm_set1_ps(1.0f), ray_dir);
   
   __m128 box_min = _mm_set_ps(0.0f, min.z, min.y, min.x);
-  __m128 box_max = _mm_set_ps(0.0f, max.z, max.y, max.z);
+  __m128 box_max = _mm_set_ps(0.0f, max.z, max.y, max.x);
   
   __m128 t0 = _mm_mul_ps(_mm_sub_ps(box_min, ray_orig), ray_inv_dir);
   __m128 t1 = _mm_mul_ps(_mm_sub_ps(box_max, ray_orig), ray_inv_dir);
@@ -243,7 +243,7 @@ uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t dep
 BVH::SplitResult BVH::findBestSplit(
     const uint32_t* indices,
     uint32_t num_prims,
-    const AABB& centroid_bounds) noexcept {
+    const AABB& /* centroid_bounds */) noexcept {
   
   SplitResult best;
   best.cost = kInfinity;
