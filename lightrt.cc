@@ -173,8 +173,7 @@ uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t dep
     uint32_t offset = static_cast<uint32_t>(prim_indices_.size());
     
     // Move primitives to end of array
-    std::vector<uint32_t> leaf_prims(indices, indices + num_prims);
-    prim_indices_.insert(prim_indices_.end(), leaf_prims.begin(), leaf_prims.end());
+    prim_indices_.insert(prim_indices_.end(), indices, indices + num_prims);
     
     node.setLeaf(offset, num_prims);
     return node_idx;
@@ -224,8 +223,7 @@ uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t dep
   if (config_.use_sah && split.cost >= config_.intersection_cost * num_prims) {
     // Don't split, create leaf
     uint32_t offset = static_cast<uint32_t>(prim_indices_.size());
-    std::vector<uint32_t> leaf_prims(indices, indices + num_prims);
-    prim_indices_.insert(prim_indices_.end(), leaf_prims.begin(), leaf_prims.end());
+    prim_indices_.insert(prim_indices_.end(), indices, indices + num_prims);
     node.setLeaf(offset, num_prims);
     return node_idx;
   }
@@ -423,7 +421,7 @@ uint32_t BVH::traverse(const Ray& ray, float& hit_t) const noexcept {
       }
     } else {
       // Add children to stack
-      if (stack_ptr < 63) {
+      if (stack_ptr < 62) {
         stack[stack_ptr++].node_idx = node.left_child;
         stack[stack_ptr++].node_idx = node.right_child;
       }
@@ -476,7 +474,7 @@ uint32_t BVH::traverseSIMD(const Ray& ray, float& hit_t) const noexcept {
       }
     } else {
       // Add children to stack
-      if (stack_ptr < 63) {
+      if (stack_ptr < 62) {
         stack[stack_ptr++].node_idx = node.left_child;
         stack[stack_ptr++].node_idx = node.right_child;
       }
