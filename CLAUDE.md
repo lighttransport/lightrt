@@ -69,6 +69,18 @@ LightRT is a two-file BVH (Bounding Volume Hierarchy) library: `lightrt.hh` (hea
   - 16-bit quantized position, log-scale
   - 8-bit quantized quaternion, opacity, DC color
 
+### SBVH (Split BVH)
+- `SBVH`: Triangle BVH with spatial splits (Stich et al., HPG 2009)
+- `SBVHGeneric`: Generic AABB-based SBVH
+- Allows primitives to be split/duplicated across nodes
+- Benefits scenes with large triangles spanning multiple spatial regions
+- Uses `PrimRef` (primitive reference) with clipped bounds
+- Configuration via `SBVHBuildConfig`:
+  - `num_spatial_bins`: Bins for spatial split evaluation (default: 256)
+  - `num_object_bins`: Bins for object split evaluation (default: 32)
+  - `alpha`: Overlap threshold for considering spatial splits (default: 1e-5)
+  - `max_split_factor`: Maximum reference count increase (default: 1.5 = 50% more)
+
 ### Build Configuration
 `BVHBuildConfig` controls construction:
 - `use_sah`: Surface Area Heuristic for optimal splits (default: true)

@@ -715,6 +715,29 @@ struct BVHBuildConfig {
 };
 
 // ============================================================================
+// SBVH Build Configuration
+// ============================================================================
+
+struct SBVHBuildConfig {
+  uint32_t max_leaf_size;        // Maximum primitives per leaf
+  float traversal_cost;          // Cost of traversing interior node
+  float intersection_cost;       // Cost of primitive intersection
+  uint32_t num_spatial_bins;     // Number of bins for spatial splits
+  uint32_t num_object_bins;      // Number of bins for object splits
+  float alpha;                   // Spatial split threshold (overlap ratio)
+  float max_split_factor;        // Max reference count increase (e.g., 1.5 = 50% more)
+
+  SBVHBuildConfig() noexcept
+    : max_leaf_size(4)
+    , traversal_cost(1.0f)
+    , intersection_cost(1.0f)
+    , num_spatial_bins(256)
+    , num_object_bins(32)
+    , alpha(1e-5f)
+    , max_split_factor(1.5f) {}
+};
+
+// ============================================================================
 // BVH Builder
 // ============================================================================
 
@@ -885,6 +908,217 @@ public:
 private:
   BVH bvh_;
   std::vector<Triangle> triangles_;
+};
+
+// ============================================================================
+// SBVH (Split BVH) - BVH with Spatial Splits
+// Reference: "Spatial Splits in Bounding Volume Hierarchies" (Stich et al., HPG 2009)
+// ============================================================================
+
+class SBVH {
+public:
+  // Primitive reference with clipped bounds
+  struct PrimRef {
+    uint32_t prim_id;    // Original primitive index
+    AABB bounds;         // Clipped bounding box (may be smaller than original)
+
+    PrimRef() noexcept : prim_id(kInvalidIndex) {}
+    PrimRef(uint32_t id, const AABB& b) noexcept : prim_id(id), bounds(b) {}
+  };
+
+  SBVH() noexcept = default;
+  ~SBVH() noexcept = default;
+
+  // Build SBVH from triangles
+  bool build(const std::vector<Triangle>& triangles,
+             const SBVHBuildConfig& config = SBVHBuildConfig()) noexcept;
+
+  // Traverse and find closest triangle intersection
+  uint32_t traverse(const Ray& ray, float& hit_t, float& hit_u, float& hit_v) const noexcept;
+
+  // Get statistics
+  struct Stats {
+    uint32_t num_nodes;
+    uint32_t num_leaves;
+    uint32_t max_depth;
+    float avg_leaf_size;
+    float sah_cost;
+    uint32_t num_references;     // Total references (>= num_primitives due to splits)
+    uint32_t num_primitives;     // Original primitive count
+    float split_ratio;           // num_references / num_primitives
+  };
+
+  Stats getStats() const noexcept;
+
+  // Access internals
+  const std::vector<BVHNode>& getNodes() const noexcept { return nodes_; }
+  const std::vector<PrimRef>& getReferences() const noexcept { return refs_; }
+  const std::vector<Triangle>& getTriangles() const noexcept { return triangles_; }
+
+private:
+  std::vector<BVHNode> nodes_;
+  std::vector<PrimRef> refs_;          // Leaf references (may have duplicates)
+  std::vector<Triangle> triangles_;    // Original triangles
+  SBVHBuildConfig config_;
+  AABB scene_bounds_;
+
+  // Split result types
+  enum class SplitType { Object, Spatial };
+
+  struct SplitResult {
+    SplitType type;
+    int axis;
+    float pos;
+    float cost;
+    AABB left_bounds;
+    AABB right_bounds;
+    uint32_t left_count;
+    uint32_t right_count;
+  };
+
+  // Spatial bin for binned split finding
+  struct SpatialBin {
+    AABB bounds;
+    uint32_t enter;   // Primitives entering this bin
+    uint32_t exit;    // Primitives exiting this bin
+
+    SpatialBin() noexcept : enter(0), exit(0) {}
+  };
+
+  // Object bin
+  struct ObjectBin {
+    AABB bounds;
+    uint32_t count;
+
+    ObjectBin() noexcept : count(0) {}
+  };
+
+  // Build methods
+  uint32_t buildRecursive(std::vector<PrimRef>& refs, uint32_t depth) noexcept;
+
+  // Split finding
+  SplitResult findObjectSplit(const std::vector<PrimRef>& refs,
+                              const AABB& node_bounds,
+                              const AABB& centroid_bounds) noexcept;
+
+  SplitResult findSpatialSplit(const std::vector<PrimRef>& refs,
+                               const AABB& node_bounds) noexcept;
+
+  // Perform the split
+  void performObjectSplit(std::vector<PrimRef>& refs,
+                          const SplitResult& split,
+                          std::vector<PrimRef>& left_refs,
+                          std::vector<PrimRef>& right_refs) noexcept;
+
+  void performSpatialSplit(std::vector<PrimRef>& refs,
+                           const SplitResult& split,
+                           std::vector<PrimRef>& left_refs,
+                           std::vector<PrimRef>& right_refs) noexcept;
+
+  // Clip triangle AABB to a half-space
+  AABB clipTriangleToPlane(const Triangle& tri, int axis, float pos, bool left) const noexcept;
+
+  // Compute overlap between two AABBs
+  float computeOverlap(const AABB& a, const AABB& b) const noexcept;
+};
+
+// ============================================================================
+// SBVH for generic primitives (AABB-based)
+// ============================================================================
+
+class SBVHGeneric {
+public:
+  // Primitive reference with clipped bounds
+  struct PrimRef {
+    uint32_t prim_id;
+    AABB bounds;
+
+    PrimRef() noexcept : prim_id(kInvalidIndex) {}
+    PrimRef(uint32_t id, const AABB& b) noexcept : prim_id(id), bounds(b) {}
+  };
+
+  SBVHGeneric() noexcept = default;
+  ~SBVHGeneric() noexcept = default;
+
+  // Build SBVH from primitive AABBs
+  // prim_aabbs: Bounding boxes of primitives (used for both bounds and spatial clipping)
+  bool build(const std::vector<AABB>& prim_aabbs,
+             const SBVHBuildConfig& config = SBVHBuildConfig()) noexcept;
+
+  // Traverse and find closest intersection (returns primitive index)
+  uint32_t traverse(const Ray& ray, float& hit_t) const noexcept;
+
+  // Get statistics
+  struct Stats {
+    uint32_t num_nodes;
+    uint32_t num_leaves;
+    uint32_t max_depth;
+    float avg_leaf_size;
+    float sah_cost;
+    uint32_t num_references;
+    uint32_t num_primitives;
+    float split_ratio;
+  };
+
+  Stats getStats() const noexcept;
+
+  const std::vector<BVHNode>& getNodes() const noexcept { return nodes_; }
+  const std::vector<PrimRef>& getReferences() const noexcept { return refs_; }
+
+private:
+  std::vector<BVHNode> nodes_;
+  std::vector<PrimRef> refs_;
+  std::vector<AABB> prim_aabbs_;
+  SBVHBuildConfig config_;
+  AABB scene_bounds_;
+
+  enum class SplitType { Object, Spatial };
+
+  struct SplitResult {
+    SplitType type;
+    int axis;
+    float pos;
+    float cost;
+    AABB left_bounds;
+    AABB right_bounds;
+    uint32_t left_count;
+    uint32_t right_count;
+  };
+
+  struct SpatialBin {
+    AABB bounds;
+    uint32_t enter;
+    uint32_t exit;
+    SpatialBin() noexcept : enter(0), exit(0) {}
+  };
+
+  struct ObjectBin {
+    AABB bounds;
+    uint32_t count;
+    ObjectBin() noexcept : count(0) {}
+  };
+
+  uint32_t buildRecursive(std::vector<PrimRef>& refs, uint32_t depth) noexcept;
+
+  SplitResult findObjectSplit(const std::vector<PrimRef>& refs,
+                              const AABB& node_bounds,
+                              const AABB& centroid_bounds) noexcept;
+
+  SplitResult findSpatialSplit(const std::vector<PrimRef>& refs,
+                               const AABB& node_bounds) noexcept;
+
+  void performObjectSplit(std::vector<PrimRef>& refs,
+                          const SplitResult& split,
+                          std::vector<PrimRef>& left_refs,
+                          std::vector<PrimRef>& right_refs) noexcept;
+
+  void performSpatialSplit(std::vector<PrimRef>& refs,
+                           const SplitResult& split,
+                           std::vector<PrimRef>& left_refs,
+                           std::vector<PrimRef>& right_refs) noexcept;
+
+  AABB clipAABBToPlane(const AABB& aabb, int axis, float pos, bool left) const noexcept;
+  float computeOverlap(const AABB& a, const AABB& b) const noexcept;
 };
 
 } // namespace lightrt

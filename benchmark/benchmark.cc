@@ -434,6 +434,215 @@ void benchmarkOverlappingTriangles() {
 }
 
 // ============================================================================
+// SBVH vs BVH Comparison
+// ============================================================================
+
+struct SBVHBenchmarkResult {
+  double build_time_ms;
+  double traverse_time_ms;
+  uint32_t num_primitives;
+  uint32_t num_references;
+  uint32_t num_rays;
+  uint32_t num_hits;
+  double rays_per_second;
+  SBVH::Stats sbvh_stats;
+};
+
+void printSBVHResult(const char* name, const SBVHBenchmarkResult& r) {
+  std::cout << "\n--- " << name << " ---\n";
+  std::cout << "  Primitives: " << r.num_primitives << "\n";
+  std::cout << "  References: " << r.num_references
+            << " (split ratio: " << std::fixed << std::setprecision(2)
+            << r.sbvh_stats.split_ratio << "x)\n";
+  std::cout << "  Build time: " << std::setprecision(2) << r.build_time_ms << " ms\n";
+  std::cout << "  BVH nodes: " << r.sbvh_stats.num_nodes << " (leaves: " << r.sbvh_stats.num_leaves << ")\n";
+  std::cout << "  Max depth: " << r.sbvh_stats.max_depth << "\n";
+  std::cout << "  Avg leaf size: " << std::setprecision(1) << r.sbvh_stats.avg_leaf_size << "\n";
+  std::cout << "  SAH cost: " << std::scientific << std::setprecision(2) << r.sbvh_stats.sah_cost << "\n";
+  std::cout << "  Rays traced: " << r.num_rays << "\n";
+  std::cout << "  Traverse time: " << std::fixed << std::setprecision(2) << r.traverse_time_ms << " ms\n";
+  std::cout << "  Hit rate: " << std::setprecision(1) << (100.0 * r.num_hits / r.num_rays) << "%\n";
+  std::cout << "  Rays/second: " << std::scientific << std::setprecision(2) << r.rays_per_second << "\n";
+}
+
+// Generate large triangles that span significant scene area (good for SBVH)
+std::vector<Triangle> generateLargeTriangles(uint32_t count, float scene_size, RNG& rng) {
+  std::vector<Triangle> triangles;
+  triangles.reserve(count);
+
+  for (uint32_t i = 0; i < count; i++) {
+    // Large triangles spanning multiple regions
+    float tri_size = rng.uniform(scene_size * 0.3f, scene_size * 0.8f);
+    Vec3 center = rng.uniformVec3(-scene_size * 0.5f, scene_size * 0.5f);
+
+    Vec3 v0 = center + Vec3(tri_size, 0.0f, 0.0f);
+    Vec3 v1 = center + Vec3(-tri_size * 0.5f, tri_size * 0.866f, 0.0f);
+    Vec3 v2 = center + Vec3(-tri_size * 0.5f, -tri_size * 0.866f, 0.0f);
+
+    // Random rotation
+    float angle = rng.uniform(0.0f, 3.14159265f);
+    float ca = std::cos(angle), sa = std::sin(angle);
+    auto rotate = [&](Vec3& v) {
+      float x = v.x, y = v.y;
+      v.x = x * ca - y * sa;
+      v.y = x * sa + y * ca;
+    };
+    rotate(v0); rotate(v1); rotate(v2);
+
+    triangles.emplace_back(v0, v1, v2);
+  }
+
+  return triangles;
+}
+
+void benchmarkSBVHvsTriangleBVH(uint32_t num_triangles, uint32_t num_rays) {
+  std::cout << "\n========================================\n";
+  std::cout << "SBVH vs TriangleBVH Comparison\n";
+  std::cout << "========================================\n";
+
+  RNG rng(42);
+
+  // Test with large triangles (where SBVH excels)
+  std::cout << "\n=== Large Triangles (SBVH-favorable) ===\n";
+  std::vector<Triangle> large_triangles = generateLargeTriangles(num_triangles, 10.0f, rng);
+  std::vector<Ray> rays = generateRandomRays(num_rays, 10.0f, rng);
+
+  // TriangleBVH
+  {
+    TriangleBVH bvh;
+    BVHBuildConfig config;
+    config.use_sah = true;
+    config.use_binning = true;
+    config.max_leaf_size = 4;
+
+    BenchmarkResult result = {};
+    result.num_primitives = num_triangles;
+    result.num_rays = num_rays;
+
+    result.build_time_ms = measureTime([&]() {
+      bvh.build(large_triangles, config);
+    });
+    result.bvh_stats = bvh.getStats();
+
+    result.traverse_time_ms = measureTime([&]() {
+      for (const auto& ray : rays) {
+        float t, u, v;
+        if (bvh.traverse(ray, t, u, v) != kInvalidIndex) {
+          result.num_hits++;
+        }
+      }
+    });
+    result.rays_per_second = (num_rays / result.traverse_time_ms) * 1000.0;
+    printResult("TriangleBVH (large triangles)", result);
+  }
+
+  // SBVH
+  {
+    SBVH sbvh;
+    SBVHBuildConfig config;
+    config.max_leaf_size = 4;
+    config.num_spatial_bins = 256;
+    config.num_object_bins = 32;
+    config.alpha = 1e-5f;
+    config.max_split_factor = 1.5f;
+
+    SBVHBenchmarkResult result = {};
+    result.num_primitives = num_triangles;
+    result.num_rays = num_rays;
+
+    result.build_time_ms = measureTime([&]() {
+      sbvh.build(large_triangles, config);
+    });
+    result.sbvh_stats = sbvh.getStats();
+    result.num_references = result.sbvh_stats.num_references;
+
+    result.traverse_time_ms = measureTime([&]() {
+      for (const auto& ray : rays) {
+        float t, u, v;
+        if (sbvh.traverse(ray, t, u, v) != kInvalidIndex) {
+          result.num_hits++;
+        }
+      }
+    });
+    result.rays_per_second = (num_rays / result.traverse_time_ms) * 1000.0;
+    printSBVHResult("SBVH (large triangles)", result);
+  }
+
+  // Test with random triangles
+  std::cout << "\n=== Random Triangles (baseline) ===\n";
+  std::vector<Triangle> random_triangles = generateRandomTriangles(num_triangles, 10.0f, rng);
+  rays = generateRandomRays(num_rays, 10.0f, rng);
+
+  // TriangleBVH
+  {
+    TriangleBVH bvh;
+    BVHBuildConfig config;
+    config.use_sah = true;
+    config.use_binning = true;
+    config.max_leaf_size = 4;
+
+    BenchmarkResult result = {};
+    result.num_primitives = num_triangles;
+    result.num_rays = num_rays;
+
+    result.build_time_ms = measureTime([&]() {
+      bvh.build(random_triangles, config);
+    });
+    result.bvh_stats = bvh.getStats();
+
+    result.traverse_time_ms = measureTime([&]() {
+      for (const auto& ray : rays) {
+        float t, u, v;
+        if (bvh.traverse(ray, t, u, v) != kInvalidIndex) {
+          result.num_hits++;
+        }
+      }
+    });
+    result.rays_per_second = (num_rays / result.traverse_time_ms) * 1000.0;
+    printResult("TriangleBVH (random triangles)", result);
+  }
+
+  // SBVH
+  {
+    SBVH sbvh;
+    SBVHBuildConfig config;
+    config.max_leaf_size = 4;
+    config.num_spatial_bins = 256;
+    config.num_object_bins = 32;
+    config.alpha = 1e-5f;
+    config.max_split_factor = 1.5f;
+
+    SBVHBenchmarkResult result = {};
+    result.num_primitives = num_triangles;
+    result.num_rays = num_rays;
+
+    result.build_time_ms = measureTime([&]() {
+      sbvh.build(random_triangles, config);
+    });
+    result.sbvh_stats = sbvh.getStats();
+    result.num_references = result.sbvh_stats.num_references;
+
+    result.traverse_time_ms = measureTime([&]() {
+      for (const auto& ray : rays) {
+        float t, u, v;
+        if (sbvh.traverse(ray, t, u, v) != kInvalidIndex) {
+          result.num_hits++;
+        }
+      }
+    });
+    result.rays_per_second = (num_rays / result.traverse_time_ms) * 1000.0;
+    printSBVHResult("SBVH (random triangles)", result);
+  }
+
+  std::cout << "\nSBVH Analysis:\n";
+  std::cout << "- SBVH allows primitives to be split across nodes (spatial splits)\n";
+  std::cout << "- Benefits large triangles that span multiple spatial regions\n";
+  std::cout << "- Split ratio > 1.0 means primitives were duplicated\n";
+  std::cout << "- Lower SAH cost generally correlates with faster traversal\n";
+  std::cout << "- Trade-off: longer build time for potentially faster traversal\n";
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -477,6 +686,9 @@ int main(int argc, char** argv) {
 
   // Overlapping triangles test
   benchmarkOverlappingTriangles();
+
+  // SBVH comparison
+  benchmarkSBVHvsTriangleBVH(num_triangles, num_rays);
 
   std::cout << "\n============================================\n";
   std::cout << "Benchmark Complete\n";
