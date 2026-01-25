@@ -81,6 +81,19 @@ LightRT is a two-file BVH (Bounding Volume Hierarchy) library: `lightrt.hh` (hea
   - `alpha`: Overlap threshold for considering spatial splits (default: 1e-5)
   - `max_split_factor`: Maximum reference count increase (default: 1.5 = 50% more)
 
+### Traversal Configuration
+`TraversalConfig` controls traversal behavior:
+- `max_prim_tests`: Limit primitive tests to avoid O(N) worst case (0 = unlimited)
+- `use_mailboxing`: Avoid duplicate tests in SBVH (important when split_ratio > 1)
+- `early_termination`: Stop on first hit (for shadow rays)
+
+Presets:
+- `TraversalConfig::fast(K)`: Limit to K tests with mailboxing
+- `TraversalConfig::anyHit()`: Stop on first hit
+
+`TraversalStats` returns traversal statistics:
+- `nodes_visited`, `prims_tested`, `prims_hit`, `terminated_early`
+
 ### Build Configuration
 `BVHBuildConfig` controls construction:
 - `use_sah`: Surface Area Heuristic for optimal splits (default: true)
@@ -95,8 +108,14 @@ Tests BVH performance with different scenarios:
 2. **Uniform grid triangles + random rays**: Spatially coherent geometry
 3. **Random triangles + coherent rays**: Camera-like ray patterns
 4. **Overlapping triangles**: Degenerate case where all primitives share same centroid
+5. **SBVH vs TriangleBVH**: Comparison with large and random triangles
+6. **Pathological scenes**: Thin spanning, diagonal, hair-like triangles
+7. **Co-planar triangles**: Single layer, tessellated plane, overlapping, multiple layers
 
-The overlapping triangles test demonstrates that for spatially overlapping primitives, BVH traversal is O(N) regardless of structure - no spatial acceleration is possible when primitives cannot be separated.
+Co-planar and pathological tests demonstrate:
+- `max_prim_tests` limit caps O(N) to O(K) with configurable accuracy trade-off
+- Mailboxing reduces duplicate tests in SBVH (split_ratio > 1)
+- K=64-128 typically provides good speed/accuracy balance
 
 ## Memory Usage
 
