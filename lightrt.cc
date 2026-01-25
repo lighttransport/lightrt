@@ -618,6 +618,387 @@ bool Curve::intersectLinear(const Ray& ray, float& t_hit, float& u_hit) const no
 }
 
 // ============================================================================
+// Quantized Triangle Implementation
+// ============================================================================
+
+void QuantizedTriangle::quantize(const Triangle& tri, const Vec3& global_min, const Vec3& global_max) noexcept {
+  v0[0] = quantizeFloat(tri.v0.x, global_min.x, global_max.x);
+  v0[1] = quantizeFloat(tri.v0.y, global_min.y, global_max.y);
+  v0[2] = quantizeFloat(tri.v0.z, global_min.z, global_max.z);
+
+  v1[0] = quantizeFloat(tri.v1.x, global_min.x, global_max.x);
+  v1[1] = quantizeFloat(tri.v1.y, global_min.y, global_max.y);
+  v1[2] = quantizeFloat(tri.v1.z, global_min.z, global_max.z);
+
+  v2[0] = quantizeFloat(tri.v2.x, global_min.x, global_max.x);
+  v2[1] = quantizeFloat(tri.v2.y, global_min.y, global_max.y);
+  v2[2] = quantizeFloat(tri.v2.z, global_min.z, global_max.z);
+}
+
+Triangle QuantizedTriangle::dequantize(const Vec3& global_min, const Vec3& global_max) const noexcept {
+  Triangle tri;
+  tri.v0.x = dequantizeFloat(v0[0], global_min.x, global_max.x);
+  tri.v0.y = dequantizeFloat(v0[1], global_min.y, global_max.y);
+  tri.v0.z = dequantizeFloat(v0[2], global_min.z, global_max.z);
+
+  tri.v1.x = dequantizeFloat(v1[0], global_min.x, global_max.x);
+  tri.v1.y = dequantizeFloat(v1[1], global_min.y, global_max.y);
+  tri.v1.z = dequantizeFloat(v1[2], global_min.z, global_max.z);
+
+  tri.v2.x = dequantizeFloat(v2[0], global_min.x, global_max.x);
+  tri.v2.y = dequantizeFloat(v2[1], global_min.y, global_max.y);
+  tri.v2.z = dequantizeFloat(v2[2], global_min.z, global_max.z);
+
+  return tri;
+}
+
+bool QuantizedTriangle::intersect(const Ray& ray, const Vec3& global_min, const Vec3& global_max,
+                                   float& t, float& u, float& v) const noexcept {
+  Triangle tri = dequantize(global_min, global_max);
+  return tri.intersect(ray, t, u, v);
+}
+
+// ============================================================================
+// Gaussian Splat Implementation
+// ============================================================================
+
+GaussianSplat::GaussianSplat() noexcept
+  : scale(1.0f, 1.0f, 1.0f), opacity(1.0f), sh_degree(SHDegree::DC) {
+  rotation[0] = 1.0f;  // w
+  rotation[1] = 0.0f;  // x
+  rotation[2] = 0.0f;  // y
+  rotation[3] = 0.0f;  // z
+  std::memset(sh_coeffs, 0, sizeof(sh_coeffs));
+}
+
+void GaussianSplat::getCovariance(float cov[6]) const noexcept {
+  // Build rotation matrix from quaternion
+  float w = rotation[0], x = rotation[1], y = rotation[2], z = rotation[3];
+
+  float R[9];
+  R[0] = 1.0f - 2.0f * (y * y + z * z);
+  R[1] = 2.0f * (x * y - w * z);
+  R[2] = 2.0f * (x * z + w * y);
+  R[3] = 2.0f * (x * y + w * z);
+  R[4] = 1.0f - 2.0f * (x * x + z * z);
+  R[5] = 2.0f * (y * z - w * x);
+  R[6] = 2.0f * (x * z - w * y);
+  R[7] = 2.0f * (y * z + w * x);
+  R[8] = 1.0f - 2.0f * (x * x + y * y);
+
+  // Scale matrix S = diag(scale)
+  float sx2 = scale.x * scale.x;
+  float sy2 = scale.y * scale.y;
+  float sz2 = scale.z * scale.z;
+
+  // Covariance = R * S^2 * R^T
+  // Since S is diagonal, S^2 is also diagonal
+  // Compute RS first, then RS * R^T
+  float RS[9];
+  RS[0] = R[0] * sx2; RS[1] = R[1] * sy2; RS[2] = R[2] * sz2;
+  RS[3] = R[3] * sx2; RS[4] = R[4] * sy2; RS[5] = R[5] * sz2;
+  RS[6] = R[6] * sx2; RS[7] = R[7] * sy2; RS[8] = R[8] * sz2;
+
+  // Cov = RS * R^T (symmetric, store upper triangle)
+  cov[0] = RS[0] * R[0] + RS[1] * R[1] + RS[2] * R[2];  // xx
+  cov[1] = RS[0] * R[3] + RS[1] * R[4] + RS[2] * R[5];  // xy
+  cov[2] = RS[0] * R[6] + RS[1] * R[7] + RS[2] * R[8];  // xz
+  cov[3] = RS[3] * R[3] + RS[4] * R[4] + RS[5] * R[5];  // yy
+  cov[4] = RS[3] * R[6] + RS[4] * R[7] + RS[5] * R[8];  // yz
+  cov[5] = RS[6] * R[6] + RS[7] * R[7] + RS[8] * R[8];  // zz
+}
+
+void GaussianSplat::getCovarianceMatrix(float mat[9]) const noexcept {
+  float cov[6];
+  getCovariance(cov);
+  mat[0] = cov[0]; mat[1] = cov[1]; mat[2] = cov[2];
+  mat[3] = cov[1]; mat[4] = cov[3]; mat[5] = cov[4];
+  mat[6] = cov[2]; mat[7] = cov[4]; mat[8] = cov[5];
+}
+
+AABB GaussianSplat::bounds() const noexcept {
+  // Conservative 3-sigma bounds
+  // For an axis-aligned ellipsoid, the extent along each axis is 3*sigma
+  // For a rotated Gaussian, we compute the diagonal of the covariance
+  float cov[6];
+  getCovariance(cov);
+
+  // 3-sigma extent along each axis
+  float extent_x = 3.0f * std::sqrt(cov[0]);
+  float extent_y = 3.0f * std::sqrt(cov[3]);
+  float extent_z = 3.0f * std::sqrt(cov[5]);
+
+  return AABB(
+    Vec3(position.x - extent_x, position.y - extent_y, position.z - extent_z),
+    Vec3(position.x + extent_x, position.y + extent_y, position.z + extent_z)
+  );
+}
+
+bool GaussianSplat::intersect(const Ray& ray, float& t_hit, float& density) const noexcept {
+  // Ray-ellipsoid intersection using quadric form
+  // The 3-sigma confidence ellipsoid is defined by:
+  // (p - center)^T * Cov^(-1) * (p - center) = 9  (for 3-sigma)
+
+  float cov[6];
+  getCovariance(cov);
+
+  // Invert the 3x3 symmetric covariance matrix
+  // For symmetric matrix: [a b c; b d e; c e f]
+  float a = cov[0], b = cov[1], c = cov[2];
+  float d = cov[3], e = cov[4], f = cov[5];
+
+  float det = a * (d * f - e * e) - b * (b * f - c * e) + c * (b * e - c * d);
+  if (std::abs(det) < kEpsilon) {
+    return false;  // Degenerate Gaussian
+  }
+
+  float inv_det = 1.0f / det;
+
+  // Inverse covariance (also symmetric)
+  float inv_cov[6];
+  inv_cov[0] = (d * f - e * e) * inv_det;
+  inv_cov[1] = (c * e - b * f) * inv_det;
+  inv_cov[2] = (b * e - c * d) * inv_det;
+  inv_cov[3] = (a * f - c * c) * inv_det;
+  inv_cov[4] = (b * c - a * e) * inv_det;
+  inv_cov[5] = (a * d - b * b) * inv_det;
+
+  // Ray: P(t) = O + t*D
+  // Ellipsoid: (P - C)^T * M * (P - C) = 9
+  // Let V = P - C = O - C + t*D
+  // V^T * M * V = 9
+  // Expanding: (O-C)^T*M*(O-C) + 2*t*(O-C)^T*M*D + t^2*D^T*M*D = 9
+
+  Vec3 oc = ray.origin - position;
+
+  // Compute quadratic coefficients
+  // A = D^T * M * D
+  float A = inv_cov[0] * ray.direction.x * ray.direction.x +
+            inv_cov[3] * ray.direction.y * ray.direction.y +
+            inv_cov[5] * ray.direction.z * ray.direction.z +
+            2.0f * inv_cov[1] * ray.direction.x * ray.direction.y +
+            2.0f * inv_cov[2] * ray.direction.x * ray.direction.z +
+            2.0f * inv_cov[4] * ray.direction.y * ray.direction.z;
+
+  // B = 2 * (O-C)^T * M * D
+  float B = 2.0f * (inv_cov[0] * oc.x * ray.direction.x +
+                    inv_cov[3] * oc.y * ray.direction.y +
+                    inv_cov[5] * oc.z * ray.direction.z +
+                    inv_cov[1] * (oc.x * ray.direction.y + oc.y * ray.direction.x) +
+                    inv_cov[2] * (oc.x * ray.direction.z + oc.z * ray.direction.x) +
+                    inv_cov[4] * (oc.y * ray.direction.z + oc.z * ray.direction.y));
+
+  // C = (O-C)^T * M * (O-C) - 9
+  float C = inv_cov[0] * oc.x * oc.x +
+            inv_cov[3] * oc.y * oc.y +
+            inv_cov[5] * oc.z * oc.z +
+            2.0f * inv_cov[1] * oc.x * oc.y +
+            2.0f * inv_cov[2] * oc.x * oc.z +
+            2.0f * inv_cov[4] * oc.y * oc.z - 9.0f;
+
+  // Solve quadratic
+  float discriminant = B * B - 4.0f * A * C;
+  if (discriminant < 0) {
+    return false;
+  }
+
+  float sqrt_disc = std::sqrt(discriminant);
+  float t0 = (-B - sqrt_disc) / (2.0f * A);
+  float t1 = (-B + sqrt_disc) / (2.0f * A);
+
+  // Find nearest valid intersection
+  float t = t0;
+  if (t < ray.tmin || t > ray.tmax) {
+    t = t1;
+    if (t < ray.tmin || t > ray.tmax) {
+      return false;
+    }
+  }
+
+  t_hit = t;
+
+  // Compute density at hit point
+  Vec3 hit_point = ray.at(t);
+  density = evaluate(hit_point) * opacity;
+
+  return true;
+}
+
+float GaussianSplat::evaluate(const Vec3& point) const noexcept {
+  // Evaluate Gaussian: exp(-0.5 * (p-c)^T * Cov^(-1) * (p-c))
+  float cov[6];
+  getCovariance(cov);
+
+  // Invert covariance
+  float a = cov[0], b = cov[1], c = cov[2];
+  float d = cov[3], e = cov[4], f = cov[5];
+
+  float det = a * (d * f - e * e) - b * (b * f - c * e) + c * (b * e - c * d);
+  if (std::abs(det) < kEpsilon) {
+    return 0.0f;
+  }
+
+  float inv_det = 1.0f / det;
+
+  float inv_cov[6];
+  inv_cov[0] = (d * f - e * e) * inv_det;
+  inv_cov[1] = (c * e - b * f) * inv_det;
+  inv_cov[2] = (b * e - c * d) * inv_det;
+  inv_cov[3] = (a * f - c * c) * inv_det;
+  inv_cov[4] = (b * c - a * e) * inv_det;
+  inv_cov[5] = (a * d - b * b) * inv_det;
+
+  Vec3 diff = point - position;
+
+  float mahal_sq = inv_cov[0] * diff.x * diff.x +
+                   inv_cov[3] * diff.y * diff.y +
+                   inv_cov[5] * diff.z * diff.z +
+                   2.0f * inv_cov[1] * diff.x * diff.y +
+                   2.0f * inv_cov[2] * diff.x * diff.z +
+                   2.0f * inv_cov[4] * diff.y * diff.z;
+
+  return std::exp(-0.5f * mahal_sq);
+}
+
+Vec3 GaussianSplat::getColor(const Vec3& view_dir) const noexcept {
+  // Evaluate spherical harmonics for view-dependent color
+  Vec3 color(0.0f, 0.0f, 0.0f);
+
+  // DC term (degree 0)
+  color.x = sh_coeffs[0];
+  color.y = sh_coeffs[1];
+  color.z = sh_coeffs[2];
+
+  if (sh_degree >= SHDegree::Degree1) {
+    // Degree 1 terms
+    float x = view_dir.x, y = view_dir.y, z = view_dir.z;
+    color.x += sh_coeffs[3] * y + sh_coeffs[6] * z + sh_coeffs[9] * x;
+    color.y += sh_coeffs[4] * y + sh_coeffs[7] * z + sh_coeffs[10] * x;
+    color.z += sh_coeffs[5] * y + sh_coeffs[8] * z + sh_coeffs[11] * x;
+  }
+
+  if (sh_degree >= SHDegree::Degree2) {
+    // Degree 2 terms
+    float x = view_dir.x, y = view_dir.y, z = view_dir.z;
+    float xy = x * y, yz = y * z, xz = x * z;
+    float x2 = x * x, y2 = y * y, z2 = z * z;
+
+    color.x += sh_coeffs[12] * xy + sh_coeffs[15] * yz +
+               sh_coeffs[18] * (2.0f * z2 - x2 - y2) +
+               sh_coeffs[21] * xz + sh_coeffs[24] * (x2 - y2);
+    color.y += sh_coeffs[13] * xy + sh_coeffs[16] * yz +
+               sh_coeffs[19] * (2.0f * z2 - x2 - y2) +
+               sh_coeffs[22] * xz + sh_coeffs[25] * (x2 - y2);
+    color.z += sh_coeffs[14] * xy + sh_coeffs[17] * yz +
+               sh_coeffs[20] * (2.0f * z2 - x2 - y2) +
+               sh_coeffs[23] * xz + sh_coeffs[26] * (x2 - y2);
+  }
+
+  // Clamp to valid range
+  color.x = std::max(0.0f, color.x);
+  color.y = std::max(0.0f, color.y);
+  color.z = std::max(0.0f, color.z);
+
+  return color;
+}
+
+// ============================================================================
+// Quantized Gaussian Splat Implementation
+// ============================================================================
+
+void QuantizedGaussianSplat::quantize(const GaussianSplat& gs, const Vec3& pos_min, const Vec3& pos_max,
+                                       float scale_min, float scale_max) noexcept {
+  // Quantize position
+  position[0] = quantizeFloat(gs.position.x, pos_min.x, pos_max.x);
+  position[1] = quantizeFloat(gs.position.y, pos_min.y, pos_max.y);
+  position[2] = quantizeFloat(gs.position.z, pos_min.z, pos_max.z);
+
+  // Quantize scale (in log space for better precision)
+  float log_scale_min = std::log(scale_min + kEpsilon);
+  float log_scale_max = std::log(scale_max + kEpsilon);
+  scale[0] = quantizeFloat(std::log(gs.scale.x + kEpsilon), log_scale_min, log_scale_max);
+  scale[1] = quantizeFloat(std::log(gs.scale.y + kEpsilon), log_scale_min, log_scale_max);
+  scale[2] = quantizeFloat(std::log(gs.scale.z + kEpsilon), log_scale_min, log_scale_max);
+
+  // Quantize quaternion (normalize first)
+  float qlen = std::sqrt(gs.rotation[0] * gs.rotation[0] +
+                         gs.rotation[1] * gs.rotation[1] +
+                         gs.rotation[2] * gs.rotation[2] +
+                         gs.rotation[3] * gs.rotation[3]);
+  if (qlen > kEpsilon) {
+    float inv_qlen = 1.0f / qlen;
+    rotation[0] = static_cast<int8_t>(std::max(-127.0f, std::min(127.0f, gs.rotation[0] * inv_qlen * 127.0f)));
+    rotation[1] = static_cast<int8_t>(std::max(-127.0f, std::min(127.0f, gs.rotation[1] * inv_qlen * 127.0f)));
+    rotation[2] = static_cast<int8_t>(std::max(-127.0f, std::min(127.0f, gs.rotation[2] * inv_qlen * 127.0f)));
+    rotation[3] = static_cast<int8_t>(std::max(-127.0f, std::min(127.0f, gs.rotation[3] * inv_qlen * 127.0f)));
+  } else {
+    rotation[0] = 127;  // Identity quaternion
+    rotation[1] = rotation[2] = rotation[3] = 0;
+  }
+
+  // Quantize opacity
+  opacity = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, gs.opacity * 255.0f)));
+
+  // Quantize DC color
+  color_dc[0] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, gs.sh_coeffs[0] * 255.0f)));
+  color_dc[1] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, gs.sh_coeffs[1] * 255.0f)));
+  color_dc[2] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, gs.sh_coeffs[2] * 255.0f)));
+}
+
+GaussianSplat QuantizedGaussianSplat::dequantize(const Vec3& pos_min, const Vec3& pos_max,
+                                                  float scale_min, float scale_max) const noexcept {
+  GaussianSplat gs;
+
+  // Dequantize position
+  gs.position.x = dequantizeFloat(position[0], pos_min.x, pos_max.x);
+  gs.position.y = dequantizeFloat(position[1], pos_min.y, pos_max.y);
+  gs.position.z = dequantizeFloat(position[2], pos_min.z, pos_max.z);
+
+  // Dequantize scale (from log space)
+  float log_scale_min = std::log(scale_min + kEpsilon);
+  float log_scale_max = std::log(scale_max + kEpsilon);
+  gs.scale.x = std::exp(dequantizeFloat(scale[0], log_scale_min, log_scale_max));
+  gs.scale.y = std::exp(dequantizeFloat(scale[1], log_scale_min, log_scale_max));
+  gs.scale.z = std::exp(dequantizeFloat(scale[2], log_scale_min, log_scale_max));
+
+  // Dequantize quaternion and normalize
+  gs.rotation[0] = static_cast<float>(rotation[0]) / 127.0f;
+  gs.rotation[1] = static_cast<float>(rotation[1]) / 127.0f;
+  gs.rotation[2] = static_cast<float>(rotation[2]) / 127.0f;
+  gs.rotation[3] = static_cast<float>(rotation[3]) / 127.0f;
+
+  float qlen = std::sqrt(gs.rotation[0] * gs.rotation[0] +
+                         gs.rotation[1] * gs.rotation[1] +
+                         gs.rotation[2] * gs.rotation[2] +
+                         gs.rotation[3] * gs.rotation[3]);
+  if (qlen > kEpsilon) {
+    float inv_qlen = 1.0f / qlen;
+    gs.rotation[0] *= inv_qlen;
+    gs.rotation[1] *= inv_qlen;
+    gs.rotation[2] *= inv_qlen;
+    gs.rotation[3] *= inv_qlen;
+  }
+
+  // Dequantize opacity
+  gs.opacity = static_cast<float>(opacity) / 255.0f;
+
+  // Dequantize DC color
+  gs.sh_coeffs[0] = static_cast<float>(color_dc[0]) / 255.0f;
+  gs.sh_coeffs[1] = static_cast<float>(color_dc[1]) / 255.0f;
+  gs.sh_coeffs[2] = static_cast<float>(color_dc[2]) / 255.0f;
+  gs.sh_degree = SHDegree::DC;
+
+  return gs;
+}
+
+bool QuantizedGaussianSplat::intersect(const Ray& ray, const Vec3& pos_min, const Vec3& pos_max,
+                                        float scale_min, float scale_max,
+                                        float& t_hit, float& density) const noexcept {
+  GaussianSplat gs = dequantize(pos_min, pos_max, scale_min, scale_max);
+  return gs.intersect(ray, t_hit, density);
+}
+
+// ============================================================================
 // AABB Ray Intersection (Scalar)
 // ============================================================================
 
