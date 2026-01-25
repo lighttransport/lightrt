@@ -8,6 +8,49 @@
 namespace lightrt {
 
 // ============================================================================
+// Triangle Implementation
+// ============================================================================
+
+AABB Triangle::bounds() const noexcept {
+  AABB b;
+  b.expand(v0);
+  b.expand(v1);
+  b.expand(v2);
+  return b;
+}
+
+bool Triangle::intersect(const Ray& ray, float& t, float& u, float& v) const noexcept {
+  // Moller-Trumbore algorithm
+  const Vec3 e1 = v1 - v0;
+  const Vec3 e2 = v2 - v0;
+
+  const Vec3 pvec = ray.direction.cross(e2);
+  const float det = e1.dot(pvec);
+
+  // Backface culling disabled - test both sides
+  if (std::abs(det) < kEpsilon) {
+    return false;
+  }
+
+  const float inv_det = 1.0f / det;
+
+  const Vec3 tvec = ray.origin - v0;
+  u = tvec.dot(pvec) * inv_det;
+  if (u < 0.0f || u > 1.0f) {
+    return false;
+  }
+
+  const Vec3 qvec = tvec.cross(e1);
+  v = ray.direction.dot(qvec) * inv_det;
+  if (v < 0.0f || u + v > 1.0f) {
+    return false;
+  }
+
+  t = e2.dot(qvec) * inv_det;
+  return t > ray.tmin && t < ray.tmax;
+}
+
+// ============================================================================
 // AABB Ray Intersection (Scalar)
 // ============================================================================
 
@@ -134,23 +177,25 @@ bool BVH::build(const std::vector<AABB>& prim_aabbs, const BVHBuildConfig& confi
   if (prim_aabbs.empty()) {
     return false;
   }
-  
+
   prim_aabbs_ = prim_aabbs;
   config_ = config;
-  
-  // Initialize primitive indices
-  prim_indices_.resize(prim_aabbs.size());
+
+  // Use a separate working buffer to avoid invalidation during insert
+  std::vector<uint32_t> work_indices(prim_aabbs.size());
   for (uint32_t i = 0; i < prim_aabbs.size(); i++) {
-    prim_indices_[i] = i;
+    work_indices[i] = i;
   }
-  
-  // Reserve space for nodes (estimate)
+
+  // Clear output arrays
+  prim_indices_.clear();
+  prim_indices_.reserve(prim_aabbs.size());
   nodes_.clear();
   nodes_.reserve(prim_aabbs.size() * 2);
-  
+
   // Build recursively
-  buildRecursive(prim_indices_.data(), static_cast<uint32_t>(prim_aabbs.size()), 0);
-  
+  buildRecursive(work_indices.data(), static_cast<uint32_t>(prim_aabbs.size()), 0);
+
   return true;
 }
 
@@ -186,11 +231,12 @@ uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t dep
   }
   
   // Find best split
+  float parent_area = bounds.surfaceArea();
   SplitResult split;
   if (config_.use_binning && num_prims > 64) {
-    split = findBestSplitBinned(indices, num_prims, centroid_bounds);
+    split = findBestSplitBinned(indices, num_prims, centroid_bounds, parent_area);
   } else if (config_.use_sah) {
-    split = findBestSplit(indices, num_prims, centroid_bounds);
+    split = findBestSplit(indices, num_prims, centroid_bounds, parent_area);
   } else {
     // Simple midpoint split
     split.axis = centroid_bounds.longestAxis();
@@ -220,7 +266,9 @@ uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t dep
   }
   
   // Check if split is worth it (SAH cost)
-  if (config_.use_sah && split.cost >= config_.intersection_cost * num_prims) {
+  // Skip this check if force_max_leaf_size is enabled (always split until leaf size reached)
+  if (config_.use_sah && !config_.force_max_leaf_size &&
+      split.cost >= config_.intersection_cost * num_prims) {
     // Don't split, create leaf
     uint32_t offset = static_cast<uint32_t>(prim_indices_.size());
     prim_indices_.insert(prim_indices_.end(), indices, indices + num_prims);
@@ -241,18 +289,21 @@ uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t dep
 BVH::SplitResult BVH::findBestSplit(
     const uint32_t* indices,
     uint32_t num_prims,
-    const AABB& /* centroid_bounds */) noexcept {
-  
+    const AABB& /* centroid_bounds */,
+    float parent_area) noexcept {
+
   SplitResult best;
   best.cost = kInfinity;
   best.axis = 0;
   best.pos = 0.0f;
-  
+
+  float inv_parent_area = (parent_area > kEpsilon) ? 1.0f / parent_area : 0.0f;
+
   // Try each axis
   for (int axis = 0; axis < 3; axis++) {
     // Sort primitives by centroid along axis
     std::vector<uint32_t> sorted_indices(indices, indices + num_prims);
-    
+
     std::sort(sorted_indices.begin(), sorted_indices.end(), [&](uint32_t a, uint32_t b) {
       Vec3 ca = prim_aabbs_[a].center();
       Vec3 cb = prim_aabbs_[b].center();
@@ -260,24 +311,24 @@ BVH::SplitResult BVH::findBestSplit(
       float vb = axis == 0 ? cb.x : axis == 1 ? cb.y : cb.z;
       return va < vb;
     });
-    
+
     // Try splits between primitives
     for (uint32_t i = 1; i < num_prims; i++) {
       // Compute bounds for left and right
       AABB left_bounds, right_bounds;
-      
+
       for (uint32_t j = 0; j < i; j++) {
         left_bounds.expand(prim_aabbs_[sorted_indices[j]]);
       }
-      
+
       for (uint32_t j = i; j < num_prims; j++) {
         right_bounds.expand(prim_aabbs_[sorted_indices[j]]);
       }
-      
-      // Compute SAH cost
-      float left_area = left_bounds.surfaceArea();
-      float right_area = right_bounds.surfaceArea();
-      float cost = config_.traversal_cost + 
+
+      // Compute SAH cost (normalized by parent area)
+      float left_area = left_bounds.surfaceArea() * inv_parent_area;
+      float right_area = right_bounds.surfaceArea() * inv_parent_area;
+      float cost = config_.traversal_cost +
                    config_.intersection_cost * (i * left_area + (num_prims - i) * right_area);
       
       if (cost < best.cost) {
@@ -298,71 +349,75 @@ BVH::SplitResult BVH::findBestSplit(
 BVH::SplitResult BVH::findBestSplitBinned(
     const uint32_t* indices,
     uint32_t num_prims,
-    const AABB& centroid_bounds) noexcept {
-  
+    const AABB& centroid_bounds,
+    float parent_area) noexcept {
+
   SplitResult best;
   best.cost = kInfinity;
   best.axis = 0;
   best.pos = 0.0f;
-  
+
+  float inv_parent_area = (parent_area > kEpsilon) ? 1.0f / parent_area : 0.0f;
+
   // Try each axis
   for (int axis = 0; axis < 3; axis++) {
-    float min_val = axis == 0 ? centroid_bounds.min.x : 
+    float min_val = axis == 0 ? centroid_bounds.min.x :
                     axis == 1 ? centroid_bounds.min.y : centroid_bounds.min.z;
-    float max_val = axis == 0 ? centroid_bounds.max.x : 
+    float max_val = axis == 0 ? centroid_bounds.max.x :
                     axis == 1 ? centroid_bounds.max.y : centroid_bounds.max.z;
-    
+
     if (max_val - min_val < kEpsilon) {
       continue;
     }
-    
+
     // Initialize bins
     struct Bin {
       AABB bounds;
       uint32_t count;
-      
+
       Bin() : count(0) {}
     };
-    
+
     std::vector<Bin> bins(config_.num_bins);
-    
+
     // Put primitives into bins
     float scale = config_.num_bins / (max_val - min_val);
     for (uint32_t i = 0; i < num_prims; i++) {
       Vec3 centroid = prim_aabbs_[indices[i]].center();
       float val = axis == 0 ? centroid.x : axis == 1 ? centroid.y : centroid.z;
-      
+
       uint32_t bin_idx = static_cast<uint32_t>((val - min_val) * scale);
       bin_idx = std::min(bin_idx, config_.num_bins - 1);
-      
+
       bins[bin_idx].bounds.expand(prim_aabbs_[indices[i]]);
       bins[bin_idx].count++;
     }
-    
+
     // Compute costs for each split
     for (uint32_t i = 1; i < config_.num_bins; i++) {
       AABB left_bounds, right_bounds;
       uint32_t left_count = 0, right_count = 0;
-      
+
       for (uint32_t j = 0; j < i; j++) {
         left_bounds.expand(bins[j].bounds);
         left_count += bins[j].count;
       }
-      
+
       for (uint32_t j = i; j < config_.num_bins; j++) {
         right_bounds.expand(bins[j].bounds);
         right_count += bins[j].count;
       }
-      
+
       if (left_count == 0 || right_count == 0) {
         continue;
       }
-      
-      float left_area = left_bounds.surfaceArea();
-      float right_area = right_bounds.surfaceArea();
-      float cost = config_.traversal_cost + 
+
+      // Normalize by parent area for proper SAH comparison
+      float left_area = left_bounds.surfaceArea() * inv_parent_area;
+      float right_area = right_bounds.surfaceArea() * inv_parent_area;
+      float cost = config_.traversal_cost +
                    config_.intersection_cost * (left_count * left_area + right_count * right_area);
-      
+
       if (cost < best.cost) {
         best.cost = cost;
         best.axis = axis;
@@ -596,6 +651,83 @@ TLAS::TraceResult TLAS::trace(const Ray& ray, const std::vector<BLAS>& blas_arra
   }
   
   return result;
+}
+
+// ============================================================================
+// Triangle BVH Implementation
+// ============================================================================
+
+bool TriangleBVH::build(const std::vector<Triangle>& triangles, const BVHBuildConfig& config) noexcept {
+  if (triangles.empty()) {
+    return false;
+  }
+
+  triangles_ = triangles;
+
+  // Build AABBs from triangles for BVH construction
+  std::vector<AABB> aabbs;
+  aabbs.reserve(triangles.size());
+  for (const auto& tri : triangles) {
+    aabbs.push_back(tri.bounds());
+  }
+
+  return bvh_.build(aabbs, config);
+}
+
+uint32_t TriangleBVH::traverse(const Ray& ray, float& hit_t, float& hit_u, float& hit_v) const noexcept {
+  const auto& nodes = bvh_.getNodes();
+  const auto& prim_indices = bvh_.getPrimitiveIndices();
+
+  if (nodes.empty()) {
+    return kInvalidIndex;
+  }
+
+  uint32_t hit_tri = kInvalidIndex;
+  hit_t = ray.tmax;
+
+  // Stack-based traversal
+  struct StackEntry {
+    uint32_t node_idx;
+  };
+
+  StackEntry stack[64];
+  int stack_ptr = 0;
+
+  stack[stack_ptr++].node_idx = 0;
+
+  while (stack_ptr > 0) {
+    uint32_t node_idx = stack[--stack_ptr].node_idx;
+    const BVHNode& node = nodes[node_idx];
+
+    float tmin, tmax;
+    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > hit_t) {
+      continue;
+    }
+
+    if (node.isLeaf()) {
+      // Test triangles in leaf
+      for (uint32_t i = 0; i < node.prim_count; i++) {
+        uint32_t tri_idx = prim_indices[node.prim_offset + i];
+        float t, u, v;
+        if (triangles_[tri_idx].intersect(ray, t, u, v)) {
+          if (t < hit_t) {
+            hit_t = t;
+            hit_u = u;
+            hit_v = v;
+            hit_tri = tri_idx;
+          }
+        }
+      }
+    } else {
+      // Add children to stack (front-to-back ordering)
+      if (stack_ptr < 62) {
+        stack[stack_ptr++].node_idx = node.left_child;
+        stack[stack_ptr++].node_idx = node.right_child;
+      }
+    }
+  }
+
+  return hit_tri;
 }
 
 } // namespace lightrt
