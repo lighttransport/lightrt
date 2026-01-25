@@ -738,6 +738,104 @@ struct SBVHBuildConfig {
 };
 
 // ============================================================================
+// Traversal Configuration (for limiting primitive tests)
+// ============================================================================
+
+struct TraversalConfig {
+  uint32_t max_prim_tests;       // Maximum primitive intersection tests (0 = unlimited)
+  bool use_mailboxing;           // Use mailboxing to avoid duplicate tests (for SBVH)
+  bool early_termination;        // Stop on first hit (any-hit query)
+
+  TraversalConfig() noexcept
+    : max_prim_tests(0)
+    , use_mailboxing(false)
+    , early_termination(false) {}
+
+  // Preset for fast approximate traversal
+  static TraversalConfig fast(uint32_t max_tests = 64) noexcept {
+    TraversalConfig cfg;
+    cfg.max_prim_tests = max_tests;
+    cfg.use_mailboxing = true;
+    return cfg;
+  }
+
+  // Preset for any-hit (shadow rays)
+  static TraversalConfig anyHit() noexcept {
+    TraversalConfig cfg;
+    cfg.early_termination = true;
+    return cfg;
+  }
+};
+
+// Traversal statistics
+struct TraversalStats {
+  uint32_t nodes_visited;
+  uint32_t prims_tested;
+  uint32_t prims_hit;
+  bool terminated_early;         // Hit max_prim_tests limit
+
+  TraversalStats() noexcept
+    : nodes_visited(0)
+    , prims_tested(0)
+    , prims_hit(0)
+    , terminated_early(false) {}
+};
+
+// Simple mailbox using bitset for small primitive counts, or hash set for large
+class Mailbox {
+public:
+  explicit Mailbox(uint32_t num_prims) noexcept : num_prims_(num_prims) {
+    if (num_prims <= kBitsetThreshold) {
+      bitset_.resize((num_prims + 63) / 64, 0);
+    } else {
+      // Use simple hash table for large primitive counts
+      hash_table_.resize(std::max(num_prims / 4, 256u), kInvalidIndex);
+    }
+  }
+
+  // Returns true if primitive was already tested, marks it as tested
+  bool testAndMark(uint32_t prim_id) noexcept {
+    if (num_prims_ <= kBitsetThreshold) {
+      uint32_t word = prim_id / 64;
+      uint64_t bit = 1ULL << (prim_id % 64);
+      if (bitset_[word] & bit) {
+        return true;  // Already tested
+      }
+      bitset_[word] |= bit;
+      return false;
+    } else {
+      // Linear probing hash table
+      uint32_t idx = prim_id % hash_table_.size();
+      for (uint32_t i = 0; i < hash_table_.size(); i++) {
+        uint32_t probe = (idx + i) % hash_table_.size();
+        if (hash_table_[probe] == prim_id) {
+          return true;  // Already tested
+        }
+        if (hash_table_[probe] == kInvalidIndex) {
+          hash_table_[probe] = prim_id;
+          return false;
+        }
+      }
+      return false;  // Table full, test anyway
+    }
+  }
+
+  void clear() noexcept {
+    if (num_prims_ <= kBitsetThreshold) {
+      std::fill(bitset_.begin(), bitset_.end(), 0);
+    } else {
+      std::fill(hash_table_.begin(), hash_table_.end(), kInvalidIndex);
+    }
+  }
+
+private:
+  static constexpr uint32_t kBitsetThreshold = 65536;
+  uint32_t num_prims_;
+  std::vector<uint64_t> bitset_;
+  std::vector<uint32_t> hash_table_;
+};
+
+// ============================================================================
 // BVH Builder
 // ============================================================================
 
@@ -898,8 +996,14 @@ public:
   // hit_t: distance to hit, hit_u/hit_v: barycentric coordinates
   uint32_t traverse(const Ray& ray, float& hit_t, float& hit_u, float& hit_v) const noexcept;
 
+  // Traverse with configuration (max prim tests, early termination)
+  uint32_t traverseWithConfig(const Ray& ray, float& hit_t, float& hit_u, float& hit_v,
+                              const TraversalConfig& config,
+                              TraversalStats* stats = nullptr) const noexcept;
+
   // Get statistics
   BVH::Stats getStats() const noexcept { return bvh_.getStats(); }
+  uint32_t getNumPrimitives() const noexcept { return static_cast<uint32_t>(triangles_.size()); }
 
   // Access internals
   const BVH& getBVH() const noexcept { return bvh_; }
@@ -936,6 +1040,12 @@ public:
   // Traverse and find closest triangle intersection
   uint32_t traverse(const Ray& ray, float& hit_t, float& hit_u, float& hit_v) const noexcept;
 
+  // Traverse with configuration (max prim tests, mailboxing, early termination)
+  // Mailboxing avoids testing same primitive multiple times (important for SBVH)
+  uint32_t traverseWithConfig(const Ray& ray, float& hit_t, float& hit_u, float& hit_v,
+                              const TraversalConfig& config,
+                              TraversalStats* stats = nullptr) const noexcept;
+
   // Get statistics
   struct Stats {
     uint32_t num_nodes;
@@ -949,6 +1059,7 @@ public:
   };
 
   Stats getStats() const noexcept;
+  uint32_t getNumPrimitives() const noexcept { return static_cast<uint32_t>(triangles_.size()); }
 
   // Access internals
   const std::vector<BVHNode>& getNodes() const noexcept { return nodes_; }

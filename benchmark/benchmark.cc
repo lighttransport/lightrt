@@ -465,6 +465,118 @@ void printSBVHResult(const char* name, const SBVHBenchmarkResult& r) {
   std::cout << "  Rays/second: " << std::scientific << std::setprecision(2) << r.rays_per_second << "\n";
 }
 
+// ============================================================================
+// Co-planar Triangle Generators
+// ============================================================================
+
+// Generate co-planar triangles on XY plane (worst case for Z-axis BVH splits)
+std::vector<Triangle> generateCoplanarTrianglesXY(uint32_t count, float scene_size, float z_pos, RNG& rng) {
+  std::vector<Triangle> triangles;
+  triangles.reserve(count);
+
+  for (uint32_t i = 0; i < count; i++) {
+    float cx = rng.uniform(-scene_size, scene_size);
+    float cy = rng.uniform(-scene_size, scene_size);
+    float size = rng.uniform(0.1f, 0.5f);
+    float angle = rng.uniform(0.0f, 6.28318f);
+
+    Vec3 v0(cx + size * std::cos(angle), cy + size * std::sin(angle), z_pos);
+    Vec3 v1(cx + size * std::cos(angle + 2.094f), cy + size * std::sin(angle + 2.094f), z_pos);
+    Vec3 v2(cx + size * std::cos(angle + 4.189f), cy + size * std::sin(angle + 4.189f), z_pos);
+
+    triangles.emplace_back(v0, v1, v2);
+  }
+
+  return triangles;
+}
+
+// Generate co-planar triangles on XZ plane (floor-like geometry)
+std::vector<Triangle> generateCoplanarTrianglesXZ(uint32_t count, float scene_size, float y_pos, RNG& rng) {
+  std::vector<Triangle> triangles;
+  triangles.reserve(count);
+
+  for (uint32_t i = 0; i < count; i++) {
+    float cx = rng.uniform(-scene_size, scene_size);
+    float cz = rng.uniform(-scene_size, scene_size);
+    float size = rng.uniform(0.1f, 0.5f);
+    float angle = rng.uniform(0.0f, 6.28318f);
+
+    Vec3 v0(cx + size * std::cos(angle), y_pos, cz + size * std::sin(angle));
+    Vec3 v1(cx + size * std::cos(angle + 2.094f), y_pos, cz + size * std::sin(angle + 2.094f));
+    Vec3 v2(cx + size * std::cos(angle + 4.189f), y_pos, cz + size * std::sin(angle + 4.189f));
+
+    triangles.emplace_back(v0, v1, v2);
+  }
+
+  return triangles;
+}
+
+// Generate multiple co-planar layers (like building floors)
+std::vector<Triangle> generateMultipleCoplanarLayers(uint32_t tris_per_layer, uint32_t num_layers,
+                                                      float scene_size, RNG& rng) {
+  std::vector<Triangle> triangles;
+  triangles.reserve(tris_per_layer * num_layers);
+
+  float layer_spacing = (2.0f * scene_size) / (num_layers + 1);
+
+  for (uint32_t layer = 0; layer < num_layers; layer++) {
+    float y_pos = -scene_size + (layer + 1) * layer_spacing;
+    auto layer_tris = generateCoplanarTrianglesXZ(tris_per_layer, scene_size, y_pos, rng);
+    triangles.insert(triangles.end(), layer_tris.begin(), layer_tris.end());
+  }
+
+  return triangles;
+}
+
+// Generate tightly packed co-planar triangles (tessellated plane)
+std::vector<Triangle> generateTessellatedPlane(uint32_t grid_res, float scene_size, float y_pos) {
+  std::vector<Triangle> triangles;
+  triangles.reserve(grid_res * grid_res * 2);
+
+  float cell_size = (2.0f * scene_size) / grid_res;
+
+  for (uint32_t x = 0; x < grid_res; x++) {
+    for (uint32_t z = 0; z < grid_res; z++) {
+      float x0 = -scene_size + x * cell_size;
+      float x1 = x0 + cell_size;
+      float z0 = -scene_size + z * cell_size;
+      float z1 = z0 + cell_size;
+
+      Vec3 v00(x0, y_pos, z0);
+      Vec3 v10(x1, y_pos, z0);
+      Vec3 v01(x0, y_pos, z1);
+      Vec3 v11(x1, y_pos, z1);
+
+      triangles.emplace_back(v00, v10, v11);
+      triangles.emplace_back(v00, v11, v01);
+    }
+  }
+
+  return triangles;
+}
+
+// Generate overlapping co-planar triangles at exact same height (worst case)
+std::vector<Triangle> generateOverlappingCoplanar(uint32_t count, float scene_size, float y_pos, RNG& rng) {
+  std::vector<Triangle> triangles;
+  triangles.reserve(count);
+
+  for (uint32_t i = 0; i < count; i++) {
+    // Large triangles that overlap significantly
+    float cx = rng.uniform(-scene_size * 0.5f, scene_size * 0.5f);
+    float cz = rng.uniform(-scene_size * 0.5f, scene_size * 0.5f);
+    float size = rng.uniform(scene_size * 0.3f, scene_size * 0.8f);
+    float angle = rng.uniform(0.0f, 6.28318f);
+
+    Vec3 v0(cx + size * std::cos(angle), y_pos, cz + size * std::sin(angle));
+    Vec3 v1(cx + size * std::cos(angle + 2.094f), y_pos, cz + size * std::sin(angle + 2.094f));
+    Vec3 v2(cx + size * std::cos(angle + 4.189f), y_pos, cz + size * std::sin(angle + 4.189f));
+
+    triangles.emplace_back(v0, v1, v2);
+  }
+
+  return triangles;
+}
+
 // Generate thin triangles spanning the scene (pathological for standard BVH)
 // These triangles have long edges that span most of the scene but are very thin
 std::vector<Triangle> generateThinSpanningTriangles(uint32_t count, float scene_size, RNG& rng) {
@@ -929,6 +1041,268 @@ void benchmarkPathologicalScenes(uint32_t num_triangles, uint32_t num_rays) {
 }
 
 // ============================================================================
+// Co-planar Triangle Benchmark with Max Prim Test Limits
+// ============================================================================
+
+void benchmarkCoplanarTriangles(uint32_t num_triangles, uint32_t num_rays) {
+  std::cout << "\n========================================\n";
+  std::cout << "Co-planar Triangle Scenes\n";
+  std::cout << "========================================\n";
+  std::cout << "\nCo-planar triangles stress BVH construction because\n";
+  std::cout << "they have zero extent in one axis, making splits difficult.\n";
+
+  RNG rng(42);
+
+  // Generate rays from above looking down (hits co-planar triangles)
+  auto generateDownwardRays = [&](uint32_t count, float scene_size) {
+    std::vector<Ray> rays;
+    rays.reserve(count);
+    for (uint32_t i = 0; i < count; i++) {
+      float x = rng.uniform(-scene_size, scene_size);
+      float z = rng.uniform(-scene_size, scene_size);
+      Vec3 origin(x, scene_size * 2.0f, z);
+      Vec3 dir(0.0f, -1.0f, 0.0f);
+      rays.emplace_back(origin, dir);
+    }
+    return rays;
+  };
+
+  // Helper for running benchmark
+  auto runCoplanarBenchmark = [&](const char* name, const std::vector<Triangle>& triangles,
+                                   const std::vector<Ray>& rays) {
+    std::cout << "\n=== " << name << " ===\n";
+    std::cout << "Triangles: " << triangles.size() << ", Rays: " << rays.size() << "\n";
+
+    // Build TriangleBVH
+    TriangleBVH bvh;
+    BVHBuildConfig config;
+    config.use_sah = true;
+    config.use_binning = true;
+    config.max_leaf_size = 4;
+    bvh.build(triangles, config);
+
+    BVH::Stats bvh_stats = bvh.getStats();
+    std::cout << "BVH: " << bvh_stats.num_nodes << " nodes, depth=" << bvh_stats.max_depth
+              << ", avg_leaf=" << std::fixed << std::setprecision(1) << bvh_stats.avg_leaf_size << "\n";
+
+    // Test with different max_prim_tests limits
+    std::vector<uint32_t> limits = {0, 32, 64, 128, 256, 512};
+
+    std::cout << "\nMax Prim Tests Impact (K << N):\n";
+    std::cout << std::setw(12) << "Limit"
+              << std::setw(12) << "Time(ms)"
+              << std::setw(14) << "Rays/sec"
+              << std::setw(10) << "Hits"
+              << std::setw(12) << "AvgTests"
+              << std::setw(10) << "Trunc%\n";
+    std::cout << std::string(70, '-') << "\n";
+
+    for (uint32_t limit : limits) {
+      TraversalConfig trav_config;
+      trav_config.max_prim_tests = limit;
+
+      uint32_t total_hits = 0;
+      uint64_t total_prim_tests = 0;
+      uint32_t truncated_rays = 0;
+
+      double traverse_time = measureTime([&]() {
+        for (const auto& ray : rays) {
+          float t, u, v;
+          TraversalStats stats;
+          if (bvh.traverseWithConfig(ray, t, u, v, trav_config, &stats) != kInvalidIndex) {
+            total_hits++;
+          }
+          total_prim_tests += stats.prims_tested;
+          if (stats.terminated_early) {
+            truncated_rays++;
+          }
+        }
+      });
+
+      double rays_per_sec = (rays.size() / traverse_time) * 1000.0;
+      double avg_tests = static_cast<double>(total_prim_tests) / rays.size();
+      double trunc_pct = 100.0 * truncated_rays / rays.size();
+
+      std::cout << std::fixed
+                << std::setw(12) << (limit == 0 ? "unlimited" : std::to_string(limit))
+                << std::setw(12) << std::setprecision(2) << traverse_time
+                << std::setw(14) << std::scientific << std::setprecision(2) << rays_per_sec
+                << std::setw(10) << std::fixed << total_hits
+                << std::setw(12) << std::setprecision(1) << avg_tests
+                << std::setw(10) << std::setprecision(1) << trunc_pct << "%\n";
+    }
+  };
+
+  // Test 1: Single co-planar layer
+  {
+    auto triangles = generateCoplanarTrianglesXZ(num_triangles, 10.0f, 0.0f, rng);
+    auto rays = generateDownwardRays(num_rays, 10.0f);
+    runCoplanarBenchmark("Single Co-planar Layer (XZ plane, y=0)", triangles, rays);
+  }
+
+  // Test 2: Tessellated plane (no gaps, worst case for overlapping AABBs)
+  {
+    uint32_t grid_res = static_cast<uint32_t>(std::sqrt(num_triangles / 2.0));
+    auto triangles = generateTessellatedPlane(grid_res, 10.0f, 0.0f);
+    auto rays = generateDownwardRays(num_rays, 10.0f);
+    runCoplanarBenchmark("Tessellated Plane (grid, no gaps)", triangles, rays);
+  }
+
+  // Test 3: Overlapping co-planar (large triangles, many overlaps)
+  {
+    auto triangles = generateOverlappingCoplanar(num_triangles / 10, 10.0f, 0.0f, rng);
+    auto rays = generateDownwardRays(num_rays, 10.0f);
+    runCoplanarBenchmark("Overlapping Co-planar (large, overlapping)", triangles, rays);
+  }
+
+  // Test 4: Multiple layers
+  {
+    uint32_t num_layers = 10;
+    uint32_t tris_per_layer = num_triangles / num_layers;
+    auto triangles = generateMultipleCoplanarLayers(tris_per_layer, num_layers, 10.0f, rng);
+    auto rays = generateDownwardRays(num_rays, 10.0f);
+    runCoplanarBenchmark("Multiple Co-planar Layers (10 floors)", triangles, rays);
+  }
+
+  // Test 5: SBVH comparison on co-planar scene
+  std::cout << "\n=== SBVH vs TriangleBVH on Co-planar Scene ===\n";
+  {
+    auto triangles = generateOverlappingCoplanar(num_triangles / 10, 10.0f, 0.0f, rng);
+    auto rays = generateDownwardRays(num_rays, 10.0f);
+
+    std::cout << "Triangles: " << triangles.size() << "\n";
+
+    // TriangleBVH
+    {
+      TriangleBVH bvh;
+      BVHBuildConfig config;
+      config.use_sah = true;
+      config.use_binning = true;
+      config.max_leaf_size = 4;
+      bvh.build(triangles, config);
+
+      uint32_t hits = 0;
+      uint64_t total_tests = 0;
+
+      double time = measureTime([&]() {
+        for (const auto& ray : rays) {
+          float t, u, v;
+          TraversalStats stats;
+          TraversalConfig cfg;
+          if (bvh.traverseWithConfig(ray, t, u, v, cfg, &stats) != kInvalidIndex) {
+            hits++;
+          }
+          total_tests += stats.prims_tested;
+        }
+      });
+
+      std::cout << "\nTriangleBVH:\n";
+      std::cout << "  Time: " << std::fixed << std::setprecision(2) << time << " ms\n";
+      std::cout << "  Rays/sec: " << std::scientific << (rays.size() / time * 1000.0) << "\n";
+      std::cout << std::fixed << "  Avg prim tests: " << std::setprecision(1)
+                << (static_cast<double>(total_tests) / rays.size()) << "\n";
+      std::cout << "  Hits: " << hits << "\n";
+    }
+
+    // SBVH with mailboxing
+    {
+      SBVH sbvh;
+      SBVHBuildConfig config;
+      config.max_leaf_size = 4;
+      config.max_split_factor = 2.0f;
+      sbvh.build(triangles, config);
+
+      auto sbvh_stats = sbvh.getStats();
+      std::cout << "\nSBVH (split ratio: " << std::setprecision(2) << sbvh_stats.split_ratio << "x):\n";
+
+      // Without mailboxing
+      {
+        uint32_t hits = 0;
+        uint64_t total_tests = 0;
+
+        double time = measureTime([&]() {
+          for (const auto& ray : rays) {
+            float t, u, v;
+            TraversalStats stats;
+            TraversalConfig cfg;
+            cfg.use_mailboxing = false;
+            if (sbvh.traverseWithConfig(ray, t, u, v, cfg, &stats) != kInvalidIndex) {
+              hits++;
+            }
+            total_tests += stats.prims_tested;
+          }
+        });
+
+        std::cout << "  Without mailboxing:\n";
+        std::cout << "    Time: " << std::setprecision(2) << time << " ms\n";
+        std::cout << "    Avg prim tests: " << std::setprecision(1)
+                  << (static_cast<double>(total_tests) / rays.size()) << "\n";
+      }
+
+      // With mailboxing
+      {
+        uint32_t hits = 0;
+        uint64_t total_tests = 0;
+
+        double time = measureTime([&]() {
+          for (const auto& ray : rays) {
+            float t, u, v;
+            TraversalStats stats;
+            TraversalConfig cfg;
+            cfg.use_mailboxing = true;
+            if (sbvh.traverseWithConfig(ray, t, u, v, cfg, &stats) != kInvalidIndex) {
+              hits++;
+            }
+            total_tests += stats.prims_tested;
+          }
+        });
+
+        std::cout << "  With mailboxing:\n";
+        std::cout << "    Time: " << std::setprecision(2) << time << " ms\n";
+        std::cout << "    Avg prim tests: " << std::setprecision(1)
+                  << (static_cast<double>(total_tests) / rays.size()) << "\n";
+      }
+
+      // With max_prim_tests limit
+      {
+        uint32_t hits = 0;
+        uint64_t total_tests = 0;
+        uint32_t truncated = 0;
+
+        double time = measureTime([&]() {
+          for (const auto& ray : rays) {
+            float t, u, v;
+            TraversalStats stats;
+            TraversalConfig cfg = TraversalConfig::fast(64);
+            if (sbvh.traverseWithConfig(ray, t, u, v, cfg, &stats) != kInvalidIndex) {
+              hits++;
+            }
+            total_tests += stats.prims_tested;
+            if (stats.terminated_early) truncated++;
+          }
+        });
+
+        std::cout << "  With max_prim_tests=64 + mailboxing:\n";
+        std::cout << "    Time: " << std::setprecision(2) << time << " ms\n";
+        std::cout << "    Avg prim tests: " << std::setprecision(1)
+                  << (static_cast<double>(total_tests) / rays.size()) << "\n";
+        std::cout << "    Hits: " << hits << " (truncated: " << truncated << ")\n";
+      }
+    }
+  }
+
+  std::cout << "\n--- Analysis ---\n";
+  std::cout << "Co-planar triangles have zero extent in one axis (e.g., all y=0).\n";
+  std::cout << "BVH cannot split along that axis, leading to large leaves or deep trees.\n";
+  std::cout << "\nMax prim tests (K << N) limits worst-case behavior:\n";
+  std::cout << "  - K=0 (unlimited): Full accuracy but O(N) worst case\n";
+  std::cout << "  - K=64-256: Good balance of speed and accuracy\n";
+  std::cout << "  - Truncation % shows how often K limit was hit\n";
+  std::cout << "\nMailboxing in SBVH avoids duplicate tests when same primitive\n";
+  std::cout << "appears in multiple leaves due to spatial splits.\n";
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -978,6 +1352,9 @@ int main(int argc, char** argv) {
 
   // Pathological scenes for SBVH
   benchmarkPathologicalScenes(num_triangles, num_rays);
+
+  // Co-planar triangle scenes with max prim test limits
+  benchmarkCoplanarTriangles(num_triangles, num_rays);
 
   std::cout << "\n============================================\n";
   std::cout << "Benchmark Complete\n";
