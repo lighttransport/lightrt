@@ -1678,4 +1678,1049 @@ uint32_t TriangleBVH::traverse(const Ray& ray, float& hit_t, float& hit_u, float
   return hit_tri;
 }
 
+// ============================================================================
+// SBVH Implementation
+// Reference: "Spatial Splits in Bounding Volume Hierarchies" (Stich et al., HPG 2009)
+// ============================================================================
+
+bool SBVH::build(const std::vector<Triangle>& triangles, const SBVHBuildConfig& config) noexcept {
+  if (triangles.empty()) {
+    return false;
+  }
+
+  triangles_ = triangles;
+  config_ = config;
+
+  // Compute scene bounds and create initial references
+  scene_bounds_ = AABB();
+  std::vector<PrimRef> initial_refs;
+  initial_refs.reserve(triangles.size());
+
+  for (uint32_t i = 0; i < triangles.size(); i++) {
+    AABB bounds = triangles[i].bounds();
+    scene_bounds_.expand(bounds);
+    initial_refs.emplace_back(i, bounds);
+  }
+
+  // Clear output arrays
+  nodes_.clear();
+  nodes_.reserve(triangles.size() * 2);
+  refs_.clear();
+  refs_.reserve(static_cast<size_t>(triangles.size() * config_.max_split_factor));
+
+  // Build recursively
+  buildRecursive(initial_refs, 0);
+
+  return true;
+}
+
+uint32_t SBVH::buildRecursive(std::vector<PrimRef>& refs, uint32_t depth) noexcept {
+  uint32_t num_refs = static_cast<uint32_t>(refs.size());
+
+  // Allocate new node
+  uint32_t node_idx = static_cast<uint32_t>(nodes_.size());
+  nodes_.emplace_back();
+
+  // Compute node bounds and centroid bounds
+  AABB node_bounds;
+  AABB centroid_bounds;
+  for (const auto& ref : refs) {
+    node_bounds.expand(ref.bounds);
+    centroid_bounds.expand(ref.bounds.center());
+  }
+  nodes_[node_idx].bounds = node_bounds;
+
+  // Check if we should create a leaf
+  if (num_refs <= config_.max_leaf_size) {
+    uint32_t offset = static_cast<uint32_t>(refs_.size());
+    refs_.insert(refs_.end(), refs.begin(), refs.end());
+    nodes_[node_idx].setLeaf(offset, num_refs);
+    return node_idx;
+  }
+
+  // Find best object split
+  SplitResult object_split = findObjectSplit(refs, node_bounds, centroid_bounds);
+
+  // Compute overlap ratio to decide if we should try spatial splits
+  float overlap_area = computeOverlap(object_split.left_bounds, object_split.right_bounds);
+  float scene_area = scene_bounds_.surfaceArea();
+  float overlap_ratio = scene_area > kEpsilon ? overlap_area / scene_area : 0.0f;
+
+  // Check reference count limit
+  bool can_split_spatially = refs_.size() + refs.size() * 2 <
+                              static_cast<size_t>(triangles_.size() * config_.max_split_factor);
+
+  // Find best spatial split if overlap is significant and we haven't hit the limit
+  SplitResult best_split = object_split;
+  if (overlap_ratio > config_.alpha && can_split_spatially) {
+    SplitResult spatial_split = findSpatialSplit(refs, node_bounds);
+    if (spatial_split.cost < object_split.cost) {
+      best_split = spatial_split;
+    }
+  }
+
+  // Check if split is worth it
+  float leaf_cost = config_.intersection_cost * num_refs;
+  if (best_split.cost >= leaf_cost || best_split.left_count == 0 || best_split.right_count == 0) {
+    // Create leaf
+    uint32_t offset = static_cast<uint32_t>(refs_.size());
+    refs_.insert(refs_.end(), refs.begin(), refs.end());
+    nodes_[node_idx].setLeaf(offset, num_refs);
+    return node_idx;
+  }
+
+  // Perform the split
+  std::vector<PrimRef> left_refs, right_refs;
+  left_refs.reserve(best_split.left_count);
+  right_refs.reserve(best_split.right_count);
+
+  if (best_split.type == SplitType::Object) {
+    performObjectSplit(refs, best_split, left_refs, right_refs);
+  } else {
+    performSpatialSplit(refs, best_split, left_refs, right_refs);
+  }
+
+  // Handle degenerate case
+  if (left_refs.empty() || right_refs.empty()) {
+    size_t mid = refs.size() / 2;
+    left_refs.assign(refs.begin(), refs.begin() + mid);
+    right_refs.assign(refs.begin() + mid, refs.end());
+  }
+
+  // Clear refs to save memory
+  refs.clear();
+  refs.shrink_to_fit();
+
+  // Build children
+  uint32_t left_child = buildRecursive(left_refs, depth + 1);
+  uint32_t right_child = buildRecursive(right_refs, depth + 1);
+
+  nodes_[node_idx].setInterior(left_child, right_child);
+  return node_idx;
+}
+
+SBVH::SplitResult SBVH::findObjectSplit(
+    const std::vector<PrimRef>& refs,
+    const AABB& node_bounds,
+    const AABB& centroid_bounds) noexcept {
+
+  SplitResult best;
+  best.type = SplitType::Object;
+  best.cost = kInfinity;
+  best.axis = 0;
+  best.pos = 0.0f;
+  best.left_count = 0;
+  best.right_count = 0;
+
+  float inv_node_area = 1.0f / node_bounds.surfaceArea();
+
+  // Try each axis with binned SAH
+  for (int axis = 0; axis < 3; axis++) {
+    float min_val = axis == 0 ? centroid_bounds.min.x :
+                    axis == 1 ? centroid_bounds.min.y : centroid_bounds.min.z;
+    float max_val = axis == 0 ? centroid_bounds.max.x :
+                    axis == 1 ? centroid_bounds.max.y : centroid_bounds.max.z;
+
+    if (max_val - min_val < kEpsilon) {
+      continue;
+    }
+
+    // Initialize bins
+    std::vector<ObjectBin> bins(config_.num_object_bins);
+
+    // Put references into bins
+    float scale = config_.num_object_bins / (max_val - min_val);
+    for (const auto& ref : refs) {
+      Vec3 centroid = ref.bounds.center();
+      float val = axis == 0 ? centroid.x : axis == 1 ? centroid.y : centroid.z;
+
+      uint32_t bin_idx = static_cast<uint32_t>((val - min_val) * scale);
+      bin_idx = std::min(bin_idx, config_.num_object_bins - 1);
+
+      bins[bin_idx].bounds.expand(ref.bounds);
+      bins[bin_idx].count++;
+    }
+
+    // Sweep from left to compute prefix bounds/counts
+    std::vector<AABB> left_bounds(config_.num_object_bins);
+    std::vector<uint32_t> left_counts(config_.num_object_bins);
+    AABB running_bounds;
+    uint32_t running_count = 0;
+
+    for (uint32_t i = 0; i < config_.num_object_bins - 1; i++) {
+      running_bounds.expand(bins[i].bounds);
+      running_count += bins[i].count;
+      left_bounds[i] = running_bounds;
+      left_counts[i] = running_count;
+    }
+
+    // Sweep from right to compute costs
+    running_bounds = AABB();
+    running_count = 0;
+
+    for (uint32_t i = config_.num_object_bins - 1; i > 0; i--) {
+      running_bounds.expand(bins[i].bounds);
+      running_count += bins[i].count;
+
+      uint32_t left_count = left_counts[i - 1];
+      uint32_t right_count = running_count;
+
+      if (left_count == 0 || right_count == 0) {
+        continue;
+      }
+
+      float left_area = left_bounds[i - 1].surfaceArea() * inv_node_area;
+      float right_area = running_bounds.surfaceArea() * inv_node_area;
+
+      float cost = config_.traversal_cost +
+                   config_.intersection_cost * (left_count * left_area + right_count * right_area);
+
+      if (cost < best.cost) {
+        best.cost = cost;
+        best.axis = axis;
+        best.pos = min_val + (max_val - min_val) * (static_cast<float>(i) / config_.num_object_bins);
+        best.left_bounds = left_bounds[i - 1];
+        best.right_bounds = running_bounds;
+        best.left_count = left_count;
+        best.right_count = right_count;
+      }
+    }
+  }
+
+  return best;
+}
+
+SBVH::SplitResult SBVH::findSpatialSplit(
+    const std::vector<PrimRef>& refs,
+    const AABB& node_bounds) noexcept {
+
+  SplitResult best;
+  best.type = SplitType::Spatial;
+  best.cost = kInfinity;
+  best.axis = 0;
+  best.pos = 0.0f;
+  best.left_count = 0;
+  best.right_count = 0;
+
+  float inv_node_area = 1.0f / node_bounds.surfaceArea();
+
+  // Try each axis
+  for (int axis = 0; axis < 3; axis++) {
+    float min_val = axis == 0 ? node_bounds.min.x :
+                    axis == 1 ? node_bounds.min.y : node_bounds.min.z;
+    float max_val = axis == 0 ? node_bounds.max.x :
+                    axis == 1 ? node_bounds.max.y : node_bounds.max.z;
+
+    if (max_val - min_val < kEpsilon) {
+      continue;
+    }
+
+    // Initialize spatial bins
+    std::vector<SpatialBin> bins(config_.num_spatial_bins);
+    float bin_size = (max_val - min_val) / config_.num_spatial_bins;
+
+    // Fill bins with clipped triangle bounds
+    for (const auto& ref : refs) {
+      // Find bins this reference overlaps
+      float ref_min = axis == 0 ? ref.bounds.min.x :
+                      axis == 1 ? ref.bounds.min.y : ref.bounds.min.z;
+      float ref_max = axis == 0 ? ref.bounds.max.x :
+                      axis == 1 ? ref.bounds.max.y : ref.bounds.max.z;
+
+      uint32_t first_bin = static_cast<uint32_t>((ref_min - min_val) / bin_size);
+      uint32_t last_bin = static_cast<uint32_t>((ref_max - min_val) / bin_size);
+      first_bin = std::min(first_bin, config_.num_spatial_bins - 1);
+      last_bin = std::min(last_bin, config_.num_spatial_bins - 1);
+
+      bins[first_bin].enter++;
+      bins[last_bin].exit++;
+
+      // Clip triangle to each overlapping bin
+      const Triangle& tri = triangles_[ref.prim_id];
+      for (uint32_t b = first_bin; b <= last_bin; b++) {
+        float plane_left = min_val + b * bin_size;
+        float plane_right = min_val + (b + 1) * bin_size;
+
+        // Clip to left plane
+        AABB clipped = ref.bounds;
+        if (axis == 0) {
+          clipped.min.x = std::max(clipped.min.x, plane_left);
+          clipped.max.x = std::min(clipped.max.x, plane_right);
+        } else if (axis == 1) {
+          clipped.min.y = std::max(clipped.min.y, plane_left);
+          clipped.max.y = std::min(clipped.max.y, plane_right);
+        } else {
+          clipped.min.z = std::max(clipped.min.z, plane_left);
+          clipped.max.z = std::min(clipped.max.z, plane_right);
+        }
+
+        // Refine with actual triangle clipping for tighter bounds
+        AABB tri_clipped = clipTriangleToPlane(tri, axis, plane_left, false);
+        AABB tri_clipped2 = clipTriangleToPlane(tri, axis, plane_right, true);
+
+        // Intersect all bounds
+        clipped.min.x = std::max(clipped.min.x, std::max(tri_clipped.min.x, tri_clipped2.min.x));
+        clipped.min.y = std::max(clipped.min.y, std::max(tri_clipped.min.y, tri_clipped2.min.y));
+        clipped.min.z = std::max(clipped.min.z, std::max(tri_clipped.min.z, tri_clipped2.min.z));
+        clipped.max.x = std::min(clipped.max.x, std::min(tri_clipped.max.x, tri_clipped2.max.x));
+        clipped.max.y = std::min(clipped.max.y, std::min(tri_clipped.max.y, tri_clipped2.max.y));
+        clipped.max.z = std::min(clipped.max.z, std::min(tri_clipped.max.z, tri_clipped2.max.z));
+
+        bins[b].bounds.expand(clipped);
+      }
+    }
+
+    // Sweep from left
+    std::vector<AABB> left_bounds(config_.num_spatial_bins);
+    std::vector<uint32_t> left_counts(config_.num_spatial_bins);
+    AABB running_bounds;
+    uint32_t running_count = 0;
+
+    for (uint32_t i = 0; i < config_.num_spatial_bins - 1; i++) {
+      running_bounds.expand(bins[i].bounds);
+      running_count += bins[i].enter;
+      left_bounds[i] = running_bounds;
+      left_counts[i] = running_count;
+    }
+
+    // Sweep from right and compute costs
+    running_bounds = AABB();
+    running_count = 0;
+
+    for (uint32_t i = config_.num_spatial_bins - 1; i > 0; i--) {
+      running_count += bins[i].exit;
+      running_bounds.expand(bins[i].bounds);
+
+      uint32_t left_count = left_counts[i - 1];
+      uint32_t right_count = running_count;
+
+      if (left_count == 0 || right_count == 0) {
+        continue;
+      }
+
+      float left_area = left_bounds[i - 1].surfaceArea() * inv_node_area;
+      float right_area = running_bounds.surfaceArea() * inv_node_area;
+
+      float cost = config_.traversal_cost +
+                   config_.intersection_cost * (left_count * left_area + right_count * right_area);
+
+      if (cost < best.cost) {
+        best.cost = cost;
+        best.axis = axis;
+        best.pos = min_val + (max_val - min_val) * (static_cast<float>(i) / config_.num_spatial_bins);
+        best.left_bounds = left_bounds[i - 1];
+        best.right_bounds = running_bounds;
+        best.left_count = left_count;
+        best.right_count = right_count;
+      }
+    }
+  }
+
+  return best;
+}
+
+void SBVH::performObjectSplit(
+    std::vector<PrimRef>& refs,
+    const SplitResult& split,
+    std::vector<PrimRef>& left_refs,
+    std::vector<PrimRef>& right_refs) noexcept {
+
+  for (auto& ref : refs) {
+    Vec3 centroid = ref.bounds.center();
+    float val = split.axis == 0 ? centroid.x : split.axis == 1 ? centroid.y : centroid.z;
+
+    if (val < split.pos) {
+      left_refs.push_back(std::move(ref));
+    } else {
+      right_refs.push_back(std::move(ref));
+    }
+  }
+}
+
+void SBVH::performSpatialSplit(
+    std::vector<PrimRef>& refs,
+    const SplitResult& split,
+    std::vector<PrimRef>& left_refs,
+    std::vector<PrimRef>& right_refs) noexcept {
+
+  for (const auto& ref : refs) {
+    float ref_min = split.axis == 0 ? ref.bounds.min.x :
+                    split.axis == 1 ? ref.bounds.min.y : ref.bounds.min.z;
+    float ref_max = split.axis == 0 ? ref.bounds.max.x :
+                    split.axis == 1 ? ref.bounds.max.y : ref.bounds.max.z;
+
+    // Reference is entirely on left
+    if (ref_max <= split.pos) {
+      left_refs.push_back(ref);
+      continue;
+    }
+
+    // Reference is entirely on right
+    if (ref_min >= split.pos) {
+      right_refs.push_back(ref);
+      continue;
+    }
+
+    // Reference straddles the split plane - clip and duplicate
+    const Triangle& tri = triangles_[ref.prim_id];
+
+    // Left portion
+    AABB left_bounds = clipTriangleToPlane(tri, split.axis, split.pos, true);
+    // Intersect with reference bounds
+    left_bounds.min.x = std::max(left_bounds.min.x, ref.bounds.min.x);
+    left_bounds.min.y = std::max(left_bounds.min.y, ref.bounds.min.y);
+    left_bounds.min.z = std::max(left_bounds.min.z, ref.bounds.min.z);
+    left_bounds.max.x = std::min(left_bounds.max.x, ref.bounds.max.x);
+    left_bounds.max.y = std::min(left_bounds.max.y, ref.bounds.max.y);
+    left_bounds.max.z = std::min(left_bounds.max.z, ref.bounds.max.z);
+
+    if (left_bounds.min.x <= left_bounds.max.x &&
+        left_bounds.min.y <= left_bounds.max.y &&
+        left_bounds.min.z <= left_bounds.max.z) {
+      left_refs.emplace_back(ref.prim_id, left_bounds);
+    }
+
+    // Right portion
+    AABB right_bounds = clipTriangleToPlane(tri, split.axis, split.pos, false);
+    right_bounds.min.x = std::max(right_bounds.min.x, ref.bounds.min.x);
+    right_bounds.min.y = std::max(right_bounds.min.y, ref.bounds.min.y);
+    right_bounds.min.z = std::max(right_bounds.min.z, ref.bounds.min.z);
+    right_bounds.max.x = std::min(right_bounds.max.x, ref.bounds.max.x);
+    right_bounds.max.y = std::min(right_bounds.max.y, ref.bounds.max.y);
+    right_bounds.max.z = std::min(right_bounds.max.z, ref.bounds.max.z);
+
+    if (right_bounds.min.x <= right_bounds.max.x &&
+        right_bounds.min.y <= right_bounds.max.y &&
+        right_bounds.min.z <= right_bounds.max.z) {
+      right_refs.emplace_back(ref.prim_id, right_bounds);
+    }
+  }
+}
+
+AABB SBVH::clipTriangleToPlane(const Triangle& tri, int axis, float pos, bool left) const noexcept {
+  // Clip triangle to half-space and return tight bounds
+  AABB result;
+
+  const Vec3* verts[3] = {&tri.v0, &tri.v1, &tri.v2};
+
+  // Check each vertex
+  for (int i = 0; i < 3; i++) {
+    float v = axis == 0 ? verts[i]->x : axis == 1 ? verts[i]->y : verts[i]->z;
+
+    if ((left && v <= pos) || (!left && v >= pos)) {
+      result.expand(*verts[i]);
+    }
+  }
+
+  // Check each edge for plane intersections
+  for (int i = 0; i < 3; i++) {
+    const Vec3& v0 = *verts[i];
+    const Vec3& v1 = *verts[(i + 1) % 3];
+
+    float t0 = axis == 0 ? v0.x : axis == 1 ? v0.y : v0.z;
+    float t1 = axis == 0 ? v1.x : axis == 1 ? v1.y : v1.z;
+
+    // Edge crosses plane
+    if ((t0 < pos && t1 > pos) || (t0 > pos && t1 < pos)) {
+      float t = (pos - t0) / (t1 - t0);
+      Vec3 intersection = v0 + (v1 - v0) * t;
+      result.expand(intersection);
+    }
+  }
+
+  return result;
+}
+
+float SBVH::computeOverlap(const AABB& a, const AABB& b) const noexcept {
+  // Compute surface area of intersection
+  float x_overlap = std::max(0.0f, std::min(a.max.x, b.max.x) - std::max(a.min.x, b.min.x));
+  float y_overlap = std::max(0.0f, std::min(a.max.y, b.max.y) - std::max(a.min.y, b.min.y));
+  float z_overlap = std::max(0.0f, std::min(a.max.z, b.max.z) - std::max(a.min.z, b.min.z));
+
+  if (x_overlap <= 0.0f || y_overlap <= 0.0f || z_overlap <= 0.0f) {
+    return 0.0f;
+  }
+
+  return 2.0f * (x_overlap * y_overlap + y_overlap * z_overlap + z_overlap * x_overlap);
+}
+
+uint32_t SBVH::traverse(const Ray& ray, float& hit_t, float& hit_u, float& hit_v) const noexcept {
+  if (nodes_.empty()) {
+    return kInvalidIndex;
+  }
+
+  uint32_t hit_tri = kInvalidIndex;
+  hit_t = ray.tmax;
+
+  // Stack-based traversal
+  struct StackEntry {
+    uint32_t node_idx;
+  };
+
+  StackEntry stack[64];
+  int stack_ptr = 0;
+
+  stack[stack_ptr++].node_idx = 0;
+
+  while (stack_ptr > 0) {
+    uint32_t node_idx = stack[--stack_ptr].node_idx;
+    const BVHNode& node = nodes_[node_idx];
+
+    float tmin, tmax;
+    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > hit_t) {
+      continue;
+    }
+
+    if (node.isLeaf()) {
+      // Test triangles in leaf (using references)
+      for (uint32_t i = 0; i < node.prim_count; i++) {
+        const PrimRef& ref = refs_[node.prim_offset + i];
+
+        // Early out: check if reference bounds are hit
+        float ref_tmin, ref_tmax;
+        if (!ref.bounds.intersect(ray, ref_tmin, ref_tmax) || ref_tmin > hit_t) {
+          continue;
+        }
+
+        float t, u, v;
+        if (triangles_[ref.prim_id].intersect(ray, t, u, v)) {
+          if (t < hit_t) {
+            hit_t = t;
+            hit_u = u;
+            hit_v = v;
+            hit_tri = ref.prim_id;
+          }
+        }
+      }
+    } else {
+      // Add children to stack
+      if (stack_ptr < 62) {
+        stack[stack_ptr++].node_idx = node.left_child;
+        stack[stack_ptr++].node_idx = node.right_child;
+      }
+    }
+  }
+
+  return hit_tri;
+}
+
+SBVH::Stats SBVH::getStats() const noexcept {
+  Stats stats = {};
+
+  if (nodes_.empty()) {
+    return stats;
+  }
+
+  stats.num_primitives = static_cast<uint32_t>(triangles_.size());
+  stats.num_references = static_cast<uint32_t>(refs_.size());
+  stats.split_ratio = static_cast<float>(stats.num_references) / stats.num_primitives;
+
+  // Count nodes and compute depth
+  std::vector<uint32_t> depths(nodes_.size(), 0);
+
+  for (uint32_t i = 0; i < nodes_.size(); i++) {
+    const BVHNode& node = nodes_[i];
+    stats.num_nodes++;
+
+    if (node.isLeaf()) {
+      stats.num_leaves++;
+      stats.avg_leaf_size += node.prim_count;
+      stats.max_depth = std::max(stats.max_depth, depths[i]);
+    } else {
+      depths[node.left_child] = depths[i] + 1;
+      depths[node.right_child] = depths[i] + 1;
+    }
+  }
+
+  if (stats.num_leaves > 0) {
+    stats.avg_leaf_size /= stats.num_leaves;
+  }
+
+  // Compute SAH cost
+  stats.sah_cost = 0.0f;
+  for (uint32_t i = 0; i < nodes_.size(); i++) {
+    const BVHNode& node = nodes_[i];
+    float area = node.bounds.surfaceArea();
+
+    if (node.isLeaf()) {
+      stats.sah_cost += area * node.prim_count * config_.intersection_cost;
+    } else {
+      stats.sah_cost += area * config_.traversal_cost;
+    }
+  }
+
+  return stats;
+}
+
+// ============================================================================
+// SBVHGeneric Implementation (AABB-based)
+// ============================================================================
+
+bool SBVHGeneric::build(const std::vector<AABB>& prim_aabbs, const SBVHBuildConfig& config) noexcept {
+  if (prim_aabbs.empty()) {
+    return false;
+  }
+
+  prim_aabbs_ = prim_aabbs;
+  config_ = config;
+
+  // Compute scene bounds and create initial references
+  scene_bounds_ = AABB();
+  std::vector<PrimRef> initial_refs;
+  initial_refs.reserve(prim_aabbs.size());
+
+  for (uint32_t i = 0; i < prim_aabbs.size(); i++) {
+    scene_bounds_.expand(prim_aabbs[i]);
+    initial_refs.emplace_back(i, prim_aabbs[i]);
+  }
+
+  nodes_.clear();
+  nodes_.reserve(prim_aabbs.size() * 2);
+  refs_.clear();
+  refs_.reserve(static_cast<size_t>(prim_aabbs.size() * config_.max_split_factor));
+
+  buildRecursive(initial_refs, 0);
+
+  return true;
+}
+
+uint32_t SBVHGeneric::buildRecursive(std::vector<PrimRef>& refs, uint32_t depth) noexcept {
+  uint32_t num_refs = static_cast<uint32_t>(refs.size());
+
+  uint32_t node_idx = static_cast<uint32_t>(nodes_.size());
+  nodes_.emplace_back();
+
+  AABB node_bounds;
+  AABB centroid_bounds;
+  for (const auto& ref : refs) {
+    node_bounds.expand(ref.bounds);
+    centroid_bounds.expand(ref.bounds.center());
+  }
+  nodes_[node_idx].bounds = node_bounds;
+
+  if (num_refs <= config_.max_leaf_size) {
+    uint32_t offset = static_cast<uint32_t>(refs_.size());
+    refs_.insert(refs_.end(), refs.begin(), refs.end());
+    nodes_[node_idx].setLeaf(offset, num_refs);
+    return node_idx;
+  }
+
+  SplitResult object_split = findObjectSplit(refs, node_bounds, centroid_bounds);
+
+  float overlap_area = computeOverlap(object_split.left_bounds, object_split.right_bounds);
+  float scene_area = scene_bounds_.surfaceArea();
+  float overlap_ratio = scene_area > kEpsilon ? overlap_area / scene_area : 0.0f;
+
+  bool can_split_spatially = refs_.size() + refs.size() * 2 <
+                              static_cast<size_t>(prim_aabbs_.size() * config_.max_split_factor);
+
+  SplitResult best_split = object_split;
+  if (overlap_ratio > config_.alpha && can_split_spatially) {
+    SplitResult spatial_split = findSpatialSplit(refs, node_bounds);
+    if (spatial_split.cost < object_split.cost) {
+      best_split = spatial_split;
+    }
+  }
+
+  float leaf_cost = config_.intersection_cost * num_refs;
+  if (best_split.cost >= leaf_cost || best_split.left_count == 0 || best_split.right_count == 0) {
+    uint32_t offset = static_cast<uint32_t>(refs_.size());
+    refs_.insert(refs_.end(), refs.begin(), refs.end());
+    nodes_[node_idx].setLeaf(offset, num_refs);
+    return node_idx;
+  }
+
+  std::vector<PrimRef> left_refs, right_refs;
+  left_refs.reserve(best_split.left_count);
+  right_refs.reserve(best_split.right_count);
+
+  if (best_split.type == SplitType::Object) {
+    performObjectSplit(refs, best_split, left_refs, right_refs);
+  } else {
+    performSpatialSplit(refs, best_split, left_refs, right_refs);
+  }
+
+  if (left_refs.empty() || right_refs.empty()) {
+    size_t mid = refs.size() / 2;
+    left_refs.assign(refs.begin(), refs.begin() + mid);
+    right_refs.assign(refs.begin() + mid, refs.end());
+  }
+
+  refs.clear();
+  refs.shrink_to_fit();
+
+  uint32_t left_child = buildRecursive(left_refs, depth + 1);
+  uint32_t right_child = buildRecursive(right_refs, depth + 1);
+
+  nodes_[node_idx].setInterior(left_child, right_child);
+  return node_idx;
+}
+
+SBVHGeneric::SplitResult SBVHGeneric::findObjectSplit(
+    const std::vector<PrimRef>& refs,
+    const AABB& node_bounds,
+    const AABB& centroid_bounds) noexcept {
+
+  SplitResult best;
+  best.type = SplitType::Object;
+  best.cost = kInfinity;
+  best.axis = 0;
+  best.pos = 0.0f;
+  best.left_count = 0;
+  best.right_count = 0;
+
+  float inv_node_area = 1.0f / node_bounds.surfaceArea();
+
+  for (int axis = 0; axis < 3; axis++) {
+    float min_val = axis == 0 ? centroid_bounds.min.x :
+                    axis == 1 ? centroid_bounds.min.y : centroid_bounds.min.z;
+    float max_val = axis == 0 ? centroid_bounds.max.x :
+                    axis == 1 ? centroid_bounds.max.y : centroid_bounds.max.z;
+
+    if (max_val - min_val < kEpsilon) {
+      continue;
+    }
+
+    std::vector<ObjectBin> bins(config_.num_object_bins);
+
+    float scale = config_.num_object_bins / (max_val - min_val);
+    for (const auto& ref : refs) {
+      Vec3 centroid = ref.bounds.center();
+      float val = axis == 0 ? centroid.x : axis == 1 ? centroid.y : centroid.z;
+
+      uint32_t bin_idx = static_cast<uint32_t>((val - min_val) * scale);
+      bin_idx = std::min(bin_idx, config_.num_object_bins - 1);
+
+      bins[bin_idx].bounds.expand(ref.bounds);
+      bins[bin_idx].count++;
+    }
+
+    std::vector<AABB> left_bounds(config_.num_object_bins);
+    std::vector<uint32_t> left_counts(config_.num_object_bins);
+    AABB running_bounds;
+    uint32_t running_count = 0;
+
+    for (uint32_t i = 0; i < config_.num_object_bins - 1; i++) {
+      running_bounds.expand(bins[i].bounds);
+      running_count += bins[i].count;
+      left_bounds[i] = running_bounds;
+      left_counts[i] = running_count;
+    }
+
+    running_bounds = AABB();
+    running_count = 0;
+
+    for (uint32_t i = config_.num_object_bins - 1; i > 0; i--) {
+      running_bounds.expand(bins[i].bounds);
+      running_count += bins[i].count;
+
+      uint32_t left_count = left_counts[i - 1];
+      uint32_t right_count = running_count;
+
+      if (left_count == 0 || right_count == 0) {
+        continue;
+      }
+
+      float left_area = left_bounds[i - 1].surfaceArea() * inv_node_area;
+      float right_area = running_bounds.surfaceArea() * inv_node_area;
+
+      float cost = config_.traversal_cost +
+                   config_.intersection_cost * (left_count * left_area + right_count * right_area);
+
+      if (cost < best.cost) {
+        best.cost = cost;
+        best.axis = axis;
+        best.pos = min_val + (max_val - min_val) * (static_cast<float>(i) / config_.num_object_bins);
+        best.left_bounds = left_bounds[i - 1];
+        best.right_bounds = running_bounds;
+        best.left_count = left_count;
+        best.right_count = right_count;
+      }
+    }
+  }
+
+  return best;
+}
+
+SBVHGeneric::SplitResult SBVHGeneric::findSpatialSplit(
+    const std::vector<PrimRef>& refs,
+    const AABB& node_bounds) noexcept {
+
+  SplitResult best;
+  best.type = SplitType::Spatial;
+  best.cost = kInfinity;
+  best.axis = 0;
+  best.pos = 0.0f;
+  best.left_count = 0;
+  best.right_count = 0;
+
+  float inv_node_area = 1.0f / node_bounds.surfaceArea();
+
+  for (int axis = 0; axis < 3; axis++) {
+    float min_val = axis == 0 ? node_bounds.min.x :
+                    axis == 1 ? node_bounds.min.y : node_bounds.min.z;
+    float max_val = axis == 0 ? node_bounds.max.x :
+                    axis == 1 ? node_bounds.max.y : node_bounds.max.z;
+
+    if (max_val - min_val < kEpsilon) {
+      continue;
+    }
+
+    std::vector<SpatialBin> bins(config_.num_spatial_bins);
+    float bin_size = (max_val - min_val) / config_.num_spatial_bins;
+
+    for (const auto& ref : refs) {
+      float ref_min = axis == 0 ? ref.bounds.min.x :
+                      axis == 1 ? ref.bounds.min.y : ref.bounds.min.z;
+      float ref_max = axis == 0 ? ref.bounds.max.x :
+                      axis == 1 ? ref.bounds.max.y : ref.bounds.max.z;
+
+      uint32_t first_bin = static_cast<uint32_t>((ref_min - min_val) / bin_size);
+      uint32_t last_bin = static_cast<uint32_t>((ref_max - min_val) / bin_size);
+      first_bin = std::min(first_bin, config_.num_spatial_bins - 1);
+      last_bin = std::min(last_bin, config_.num_spatial_bins - 1);
+
+      bins[first_bin].enter++;
+      bins[last_bin].exit++;
+
+      for (uint32_t b = first_bin; b <= last_bin; b++) {
+        float plane_left = min_val + b * bin_size;
+        float plane_right = min_val + (b + 1) * bin_size;
+
+        AABB clipped = clipAABBToPlane(ref.bounds, axis, plane_left, false);
+        AABB clipped2 = clipAABBToPlane(clipped, axis, plane_right, true);
+        bins[b].bounds.expand(clipped2);
+      }
+    }
+
+    std::vector<AABB> left_bounds(config_.num_spatial_bins);
+    std::vector<uint32_t> left_counts(config_.num_spatial_bins);
+    AABB running_bounds;
+    uint32_t running_count = 0;
+
+    for (uint32_t i = 0; i < config_.num_spatial_bins - 1; i++) {
+      running_bounds.expand(bins[i].bounds);
+      running_count += bins[i].enter;
+      left_bounds[i] = running_bounds;
+      left_counts[i] = running_count;
+    }
+
+    running_bounds = AABB();
+    running_count = 0;
+
+    for (uint32_t i = config_.num_spatial_bins - 1; i > 0; i--) {
+      running_count += bins[i].exit;
+      running_bounds.expand(bins[i].bounds);
+
+      uint32_t left_count = left_counts[i - 1];
+      uint32_t right_count = running_count;
+
+      if (left_count == 0 || right_count == 0) {
+        continue;
+      }
+
+      float left_area = left_bounds[i - 1].surfaceArea() * inv_node_area;
+      float right_area = running_bounds.surfaceArea() * inv_node_area;
+
+      float cost = config_.traversal_cost +
+                   config_.intersection_cost * (left_count * left_area + right_count * right_area);
+
+      if (cost < best.cost) {
+        best.cost = cost;
+        best.axis = axis;
+        best.pos = min_val + (max_val - min_val) * (static_cast<float>(i) / config_.num_spatial_bins);
+        best.left_bounds = left_bounds[i - 1];
+        best.right_bounds = running_bounds;
+        best.left_count = left_count;
+        best.right_count = right_count;
+      }
+    }
+  }
+
+  return best;
+}
+
+void SBVHGeneric::performObjectSplit(
+    std::vector<PrimRef>& refs,
+    const SplitResult& split,
+    std::vector<PrimRef>& left_refs,
+    std::vector<PrimRef>& right_refs) noexcept {
+
+  for (auto& ref : refs) {
+    Vec3 centroid = ref.bounds.center();
+    float val = split.axis == 0 ? centroid.x : split.axis == 1 ? centroid.y : centroid.z;
+
+    if (val < split.pos) {
+      left_refs.push_back(std::move(ref));
+    } else {
+      right_refs.push_back(std::move(ref));
+    }
+  }
+}
+
+void SBVHGeneric::performSpatialSplit(
+    std::vector<PrimRef>& refs,
+    const SplitResult& split,
+    std::vector<PrimRef>& left_refs,
+    std::vector<PrimRef>& right_refs) noexcept {
+
+  for (const auto& ref : refs) {
+    float ref_min = split.axis == 0 ? ref.bounds.min.x :
+                    split.axis == 1 ? ref.bounds.min.y : ref.bounds.min.z;
+    float ref_max = split.axis == 0 ? ref.bounds.max.x :
+                    split.axis == 1 ? ref.bounds.max.y : ref.bounds.max.z;
+
+    if (ref_max <= split.pos) {
+      left_refs.push_back(ref);
+      continue;
+    }
+
+    if (ref_min >= split.pos) {
+      right_refs.push_back(ref);
+      continue;
+    }
+
+    // Split the reference
+    AABB left_bounds = clipAABBToPlane(ref.bounds, split.axis, split.pos, true);
+    AABB right_bounds = clipAABBToPlane(ref.bounds, split.axis, split.pos, false);
+
+    if (left_bounds.min.x <= left_bounds.max.x &&
+        left_bounds.min.y <= left_bounds.max.y &&
+        left_bounds.min.z <= left_bounds.max.z) {
+      left_refs.emplace_back(ref.prim_id, left_bounds);
+    }
+
+    if (right_bounds.min.x <= right_bounds.max.x &&
+        right_bounds.min.y <= right_bounds.max.y &&
+        right_bounds.min.z <= right_bounds.max.z) {
+      right_refs.emplace_back(ref.prim_id, right_bounds);
+    }
+  }
+}
+
+AABB SBVHGeneric::clipAABBToPlane(const AABB& aabb, int axis, float pos, bool left) const noexcept {
+  AABB result = aabb;
+
+  if (left) {
+    // Keep left half (min to pos)
+    if (axis == 0) result.max.x = std::min(result.max.x, pos);
+    else if (axis == 1) result.max.y = std::min(result.max.y, pos);
+    else result.max.z = std::min(result.max.z, pos);
+  } else {
+    // Keep right half (pos to max)
+    if (axis == 0) result.min.x = std::max(result.min.x, pos);
+    else if (axis == 1) result.min.y = std::max(result.min.y, pos);
+    else result.min.z = std::max(result.min.z, pos);
+  }
+
+  return result;
+}
+
+float SBVHGeneric::computeOverlap(const AABB& a, const AABB& b) const noexcept {
+  float x_overlap = std::max(0.0f, std::min(a.max.x, b.max.x) - std::max(a.min.x, b.min.x));
+  float y_overlap = std::max(0.0f, std::min(a.max.y, b.max.y) - std::max(a.min.y, b.min.y));
+  float z_overlap = std::max(0.0f, std::min(a.max.z, b.max.z) - std::max(a.min.z, b.min.z));
+
+  if (x_overlap <= 0.0f || y_overlap <= 0.0f || z_overlap <= 0.0f) {
+    return 0.0f;
+  }
+
+  return 2.0f * (x_overlap * y_overlap + y_overlap * z_overlap + z_overlap * x_overlap);
+}
+
+uint32_t SBVHGeneric::traverse(const Ray& ray, float& hit_t) const noexcept {
+  if (nodes_.empty()) {
+    return kInvalidIndex;
+  }
+
+  uint32_t hit_prim = kInvalidIndex;
+  hit_t = ray.tmax;
+
+  struct StackEntry {
+    uint32_t node_idx;
+  };
+
+  StackEntry stack[64];
+  int stack_ptr = 0;
+
+  stack[stack_ptr++].node_idx = 0;
+
+  while (stack_ptr > 0) {
+    uint32_t node_idx = stack[--stack_ptr].node_idx;
+    const BVHNode& node = nodes_[node_idx];
+
+    float tmin, tmax;
+    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > hit_t) {
+      continue;
+    }
+
+    if (node.isLeaf()) {
+      for (uint32_t i = 0; i < node.prim_count; i++) {
+        const PrimRef& ref = refs_[node.prim_offset + i];
+
+        float prim_tmin, prim_tmax;
+        if (prim_aabbs_[ref.prim_id].intersect(ray, prim_tmin, prim_tmax)) {
+          if (prim_tmin < hit_t && prim_tmin > ray.tmin) {
+            hit_t = prim_tmin;
+            hit_prim = ref.prim_id;
+          }
+        }
+      }
+    } else {
+      if (stack_ptr < 62) {
+        stack[stack_ptr++].node_idx = node.left_child;
+        stack[stack_ptr++].node_idx = node.right_child;
+      }
+    }
+  }
+
+  return hit_prim;
+}
+
+SBVHGeneric::Stats SBVHGeneric::getStats() const noexcept {
+  Stats stats = {};
+
+  if (nodes_.empty()) {
+    return stats;
+  }
+
+  stats.num_primitives = static_cast<uint32_t>(prim_aabbs_.size());
+  stats.num_references = static_cast<uint32_t>(refs_.size());
+  stats.split_ratio = static_cast<float>(stats.num_references) / stats.num_primitives;
+
+  std::vector<uint32_t> depths(nodes_.size(), 0);
+
+  for (uint32_t i = 0; i < nodes_.size(); i++) {
+    const BVHNode& node = nodes_[i];
+    stats.num_nodes++;
+
+    if (node.isLeaf()) {
+      stats.num_leaves++;
+      stats.avg_leaf_size += node.prim_count;
+      stats.max_depth = std::max(stats.max_depth, depths[i]);
+    } else {
+      depths[node.left_child] = depths[i] + 1;
+      depths[node.right_child] = depths[i] + 1;
+    }
+  }
+
+  if (stats.num_leaves > 0) {
+    stats.avg_leaf_size /= stats.num_leaves;
+  }
+
+  stats.sah_cost = 0.0f;
+  for (uint32_t i = 0; i < nodes_.size(); i++) {
+    const BVHNode& node = nodes_[i];
+    float area = node.bounds.surfaceArea();
+
+    if (node.isLeaf()) {
+      stats.sah_cost += area * node.prim_count * config_.intersection_cost;
+    } else {
+      stats.sah_cost += area * config_.traversal_cost;
+    }
+  }
+
+  return stats;
+}
+
 } // namespace lightrt
