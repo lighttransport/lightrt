@@ -48,7 +48,8 @@ LightRT is a two-file BVH (Bounding Volume Hierarchy) library: `lightrt.hh` (hea
 - `BVHNode`: Interior/leaf node using union for child indices or primitive offset/count
 
 ### Primitive Types
-- `Triangle`: 3 vertices, Moller-Trumbore intersection
+- `Triangle`: 3 vertices (36 bytes), Moller-Trumbore intersection
+- `QuantizedTriangle`: 16-bit quantized vertices (18 bytes), requires global bounding box for dequantization
 - `Quad`: 4 vertices (bilinear patch), split into 2 triangles
 - `NGon`: N vertices (convex polygon), Newell normal + crossing number test
 - `Sphere`: Center + radius, analytic quadratic intersection
@@ -59,6 +60,14 @@ LightRT is a two-file BVH (Bounding Volume Hierarchy) library: `lightrt.hh` (hea
   - `CurveType::Bezier`: Phantom Ray-Hair algorithm (Reshetov & Luebke, HPG 2018)
   - `CurveType::CatmullRom`: Catmull-Rom spline evaluation
 - `CustomGeometry`: AABB + callback functions for user-defined intersection
+- `GaussianSplat`: 3D Gaussian for neural radiance fields (~220 bytes)
+  - Position, scale, quaternion rotation, opacity
+  - Spherical harmonics coefficients (up to degree 3)
+  - Ray-ellipsoid intersection using 3-sigma confidence ellipsoid
+  - View-dependent color via SH evaluation
+- `QuantizedGaussianSplat`: Compressed Gaussian (~32 bytes)
+  - 16-bit quantized position, log-scale
+  - 8-bit quantized quaternion, opacity, DC color
 
 ### Build Configuration
 `BVHBuildConfig` controls construction:
@@ -76,6 +85,17 @@ Tests BVH performance with different scenarios:
 4. **Overlapping triangles**: Degenerate case where all primitives share same centroid
 
 The overlapping triangles test demonstrates that for spatially overlapping primitives, BVH traversal is O(N) regardless of structure - no spatial acceleration is possible when primitives cannot be separated.
+
+## Memory Usage
+
+Quantized primitives trade precision for memory savings:
+
+| Primitive | Full Size | Quantized Size | Compression |
+|-----------|-----------|----------------|-------------|
+| Triangle | 36 bytes | 18 bytes | 2x |
+| GaussianSplat | ~220 bytes | ~32 bytes | 7x |
+
+Quantized types require a global bounding box for coordinate reconstruction. Use `quantize()` to compress and `dequantize()` to restore full precision before intersection testing.
 
 ## Code Conventions
 
