@@ -43,10 +43,22 @@ LightRT is a two-file BVH (Bounding Volume Hierarchy) library: `lightrt.hh` (hea
 ### Key Classes (all in `lightrt` namespace)
 - `BVH`: Single-level BVH with SAH-based construction and SIMD traversal (AABB primitives)
 - `TriangleBVH`: BVH over triangles with Moller-Trumbore ray-triangle intersection
-- `Triangle`: Triangle primitive with `intersect()` using Moller-Trumbore algorithm
 - `BLAS`: Wraps BVH for bottom-level geometry
 - `TLAS`: Manages instanced scene with `BLASInstance` transforms
 - `BVHNode`: Interior/leaf node using union for child indices or primitive offset/count
+
+### Primitive Types
+- `Triangle`: 3 vertices, Moller-Trumbore intersection
+- `Quad`: 4 vertices (bilinear patch), split into 2 triangles
+- `NGon`: N vertices (convex polygon), Newell normal + crossing number test
+- `Sphere`: Center + radius, analytic quadratic intersection
+- `Disk`: Center + normal + radius, ray-plane + distance check
+- `OrientedDisk`: Billboard/screen-oriented disk that faces ray origin
+- `Curve`: Hair/fiber with varying radius, supports:
+  - `CurveType::Linear`: Fast capsule-based segments
+  - `CurveType::Bezier`: Phantom Ray-Hair algorithm (Reshetov & Luebke, HPG 2018)
+  - `CurveType::CatmullRom`: Catmull-Rom spline evaluation
+- `CustomGeometry`: AABB + callback functions for user-defined intersection
 
 ### Build Configuration
 `BVHBuildConfig` controls construction:

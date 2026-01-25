@@ -213,6 +213,214 @@ struct alignas(16) Triangle {
 };
 
 // ============================================================================
+// Quad (Bilinear Patch)
+// ============================================================================
+
+struct alignas(16) Quad {
+  Vec3 v0, v1, v2, v3;  // Counter-clockwise: v0-v1-v2-v3
+
+  Quad() noexcept = default;
+  Quad(const Vec3& a, const Vec3& b, const Vec3& c, const Vec3& d) noexcept
+    : v0(a), v1(b), v2(c), v3(d) {}
+
+  Vec3 centroid() const noexcept {
+    return (v0 + v1 + v2 + v3) * 0.25f;
+  }
+
+  AABB bounds() const noexcept;
+
+  // Ray-quad intersection (bilinear patch)
+  // Returns true if hit, sets t, u, v (parametric coordinates)
+  bool intersect(const Ray& ray, float& t, float& u, float& v) const noexcept;
+};
+
+// ============================================================================
+// NGon (Convex Polygon with N vertices)
+// ============================================================================
+
+struct NGon {
+  std::vector<Vec3> vertices;  // Counter-clockwise vertices
+  Vec3 normal;                 // Precomputed normal (for planar ngons)
+
+  NGon() noexcept = default;
+  NGon(const std::vector<Vec3>& verts) noexcept;
+
+  void computeNormal() noexcept;
+  Vec3 centroid() const noexcept;
+  AABB bounds() const noexcept;
+
+  // Ray-ngon intersection (assumes convex, planar polygon)
+  bool intersect(const Ray& ray, float& t) const noexcept;
+};
+
+// ============================================================================
+// Sphere
+// ============================================================================
+
+struct alignas(16) Sphere {
+  Vec3 center;
+  float radius;
+
+  Sphere() noexcept : radius(1.0f) {}
+  Sphere(const Vec3& c, float r) noexcept : center(c), radius(r) {}
+
+  Vec3 centroid() const noexcept { return center; }
+  AABB bounds() const noexcept;
+
+  // Ray-sphere intersection
+  // Returns true if hit, sets t (nearest hit), and optionally normal at hit
+  bool intersect(const Ray& ray, float& t) const noexcept;
+  bool intersect(const Ray& ray, float& t, Vec3& hit_normal) const noexcept;
+};
+
+// ============================================================================
+// Disk
+// ============================================================================
+
+struct alignas(16) Disk {
+  Vec3 center;
+  Vec3 normal;
+  float radius;
+
+  Disk() noexcept : normal(0, 1, 0), radius(1.0f) {}
+  Disk(const Vec3& c, const Vec3& n, float r) noexcept
+    : center(c), normal(n.normalize()), radius(r) {}
+
+  Vec3 centroid() const noexcept { return center; }
+  AABB bounds() const noexcept;
+
+  // Ray-disk intersection
+  bool intersect(const Ray& ray, float& t) const noexcept;
+};
+
+// ============================================================================
+// OrientedDisk (Screen-oriented / Billboard)
+// Always faces toward a reference point (typically camera/ray origin)
+// ============================================================================
+
+struct alignas(16) OrientedDisk {
+  Vec3 center;
+  float radius;
+
+  OrientedDisk() noexcept : radius(1.0f) {}
+  OrientedDisk(const Vec3& c, float r) noexcept : center(c), radius(r) {}
+
+  Vec3 centroid() const noexcept { return center; }
+  AABB bounds() const noexcept;
+
+  // Ray-oriented disk intersection (disk faces ray origin)
+  bool intersect(const Ray& ray, float& t) const noexcept;
+};
+
+// ============================================================================
+// Curve Types
+// ============================================================================
+
+enum class CurveType : uint8_t {
+  Linear,       // Linear segments (fast, simple)
+  Bezier,       // Cubic Bezier (smooth, uses Phantom algorithm)
+  CatmullRom,   // Catmull-Rom spline
+  BSpline       // B-spline
+};
+
+// ============================================================================
+// Curve (Hair/Fiber primitive)
+// Implements Phantom Ray-Hair Intersector for robust Bezier curves
+// Reference: Reshetov & Luebke, HPG 2018
+// ============================================================================
+
+struct Curve {
+  std::vector<Vec3> control_points;  // Control points
+  std::vector<float> radii;          // Radius at each control point (for varying width)
+  CurveType type;
+
+  Curve() noexcept : type(CurveType::Bezier) {}
+  Curve(const std::vector<Vec3>& points, float radius, CurveType t = CurveType::Bezier) noexcept;
+  Curve(const std::vector<Vec3>& points, const std::vector<float>& r, CurveType t = CurveType::Bezier) noexcept;
+
+  Vec3 centroid() const noexcept;
+  AABB bounds() const noexcept;
+
+  // Evaluate curve position at parameter t [0,1]
+  Vec3 evaluate(float t) const noexcept;
+
+  // Evaluate curve tangent at parameter t
+  Vec3 evaluateTangent(float t) const noexcept;
+
+  // Interpolate radius at parameter t
+  float radiusAt(float t) const noexcept;
+
+  // Ray-curve intersection
+  // Returns true if hit, sets t_hit (ray parameter), u_hit (curve parameter)
+  bool intersect(const Ray& ray, float& t_hit, float& u_hit) const noexcept;
+
+private:
+  // Phantom Ray-Hair algorithm for Bezier curves
+  bool intersectPhantom(const Ray& ray, float& t_hit, float& u_hit) const noexcept;
+
+  // Simple linear segment intersection (fast approximation)
+  bool intersectLinear(const Ray& ray, float& t_hit, float& u_hit) const noexcept;
+};
+
+// ============================================================================
+// Custom Geometry (AABB + Callback)
+// For user-defined intersection routines
+// ============================================================================
+
+// Intersection callback function type
+// Parameters: ray, user_data, out_t, out_u, out_v
+// Returns: true if hit
+using IntersectCallback = bool (*)(const Ray&, void*, float&, float&, float&);
+
+// Bounds callback function type (optional, for dynamic bounds)
+// Parameters: user_data
+// Returns: AABB
+using BoundsCallback = AABB (*)(void*);
+
+struct CustomGeometry {
+  AABB bounds_cache;           // Cached/static bounds
+  void* user_data;             // User-provided data pointer
+  IntersectCallback intersect_fn;
+  BoundsCallback bounds_fn;    // Optional: for dynamic bounds
+
+  CustomGeometry() noexcept
+    : user_data(nullptr), intersect_fn(nullptr), bounds_fn(nullptr) {}
+
+  CustomGeometry(const AABB& b, IntersectCallback fn, void* data = nullptr) noexcept
+    : bounds_cache(b), user_data(data), intersect_fn(fn), bounds_fn(nullptr) {}
+
+  Vec3 centroid() const noexcept { return bounds_cache.center(); }
+
+  AABB bounds() const noexcept {
+    if (bounds_fn) {
+      return bounds_fn(user_data);
+    }
+    return bounds_cache;
+  }
+
+  bool intersect(const Ray& ray, float& t, float& u, float& v) const noexcept {
+    if (intersect_fn) {
+      return intersect_fn(ray, user_data, t, u, v);
+    }
+    return false;
+  }
+};
+
+// ============================================================================
+// Primitive Variant (Type-safe union for mixed primitive BVH)
+// ============================================================================
+
+enum class PrimitiveType : uint8_t {
+  Triangle,
+  Quad,
+  Sphere,
+  Disk,
+  OrientedDisk,
+  Curve,
+  Custom
+};
+
+// ============================================================================
 // Quantization Support
 // ============================================================================
 
