@@ -407,6 +407,108 @@ struct CustomGeometry {
 };
 
 // ============================================================================
+// Quantized Triangle (Low Memory)
+// Uses 16-bit quantized coordinates relative to a global bounding box
+// Memory: 18 bytes vs 36 bytes for full-precision Triangle
+// ============================================================================
+
+struct QuantizedTriangle {
+  uint16_t v0[3];  // Quantized vertex 0
+  uint16_t v1[3];  // Quantized vertex 1
+  uint16_t v2[3];  // Quantized vertex 2
+
+  QuantizedTriangle() noexcept = default;
+
+  // Quantize from full-precision triangle
+  void quantize(const Triangle& tri, const Vec3& global_min, const Vec3& global_max) noexcept;
+
+  // Dequantize to full-precision triangle
+  Triangle dequantize(const Vec3& global_min, const Vec3& global_max) const noexcept;
+
+  // Direct intersection (dequantizes internally)
+  bool intersect(const Ray& ray, const Vec3& global_min, const Vec3& global_max,
+                 float& t, float& u, float& v) const noexcept;
+};
+
+// ============================================================================
+// Gaussian Splat Primitive
+// For 3D Gaussian Splatting (3DGS) ray tracing
+// Reference: "3D Gaussian Ray Tracing" (SIGGRAPH Asia 2024)
+// ============================================================================
+
+// Spherical Harmonics degree for color (0=DC only, 1=4 coeffs, 2=9, 3=16)
+enum class SHDegree : uint8_t {
+  DC = 0,      // 1 coefficient per channel (3 total)
+  Degree1 = 1, // 4 coefficients per channel (12 total)
+  Degree2 = 2, // 9 coefficients per channel (27 total)
+  Degree3 = 3  // 16 coefficients per channel (48 total)
+};
+
+struct GaussianSplat {
+  Vec3 position;           // Center position
+  Vec3 scale;              // Scale along each axis (before rotation)
+  float rotation[4];       // Quaternion (w, x, y, z)
+  float opacity;           // Opacity [0, 1]
+  float sh_coeffs[48];     // Spherical harmonics (up to degree 3)
+  SHDegree sh_degree;      // Active SH degree
+
+  GaussianSplat() noexcept;
+
+  // Compute covariance matrix from scale and rotation
+  void getCovariance(float cov[6]) const noexcept;  // Upper triangle: xx, xy, xz, yy, yz, zz
+
+  // Compute world-space 3x3 covariance matrix
+  void getCovarianceMatrix(float mat[9]) const noexcept;
+
+  Vec3 centroid() const noexcept { return position; }
+
+  // Conservative AABB bounds (3-sigma ellipsoid)
+  AABB bounds() const noexcept;
+
+  // Ray-Gaussian intersection (ellipsoid approximation)
+  // Returns true if ray intersects the 3-sigma confidence ellipsoid
+  // t_hit: ray parameter at intersection
+  // density: Gaussian density at hit point (for alpha compositing)
+  bool intersect(const Ray& ray, float& t_hit, float& density) const noexcept;
+
+  // Evaluate Gaussian density at a point
+  float evaluate(const Vec3& point) const noexcept;
+
+  // Get color from SH coefficients for a given view direction
+  Vec3 getColor(const Vec3& view_dir) const noexcept;
+};
+
+// ============================================================================
+// Quantized Gaussian Splat (Low Memory)
+// Quantized version for large-scale scenes
+// Memory: ~32 bytes vs ~220 bytes for full GaussianSplat
+// ============================================================================
+
+struct QuantizedGaussianSplat {
+  uint16_t position[3];    // Quantized position (relative to scene bounds)
+  uint16_t scale[3];       // Quantized log-scale
+  int8_t rotation[4];      // Quantized quaternion (normalized, -127 to 127)
+  uint8_t opacity;         // Quantized opacity (0-255)
+  uint8_t color_dc[3];     // DC color (RGB, 0-255)
+  // Optional: additional SH stored separately in SoA layout
+
+  QuantizedGaussianSplat() noexcept = default;
+
+  // Quantize from full-precision Gaussian
+  void quantize(const GaussianSplat& gs, const Vec3& pos_min, const Vec3& pos_max,
+                float scale_min, float scale_max) noexcept;
+
+  // Dequantize to full-precision Gaussian
+  GaussianSplat dequantize(const Vec3& pos_min, const Vec3& pos_max,
+                           float scale_min, float scale_max) const noexcept;
+
+  // Direct intersection (dequantizes internally for accuracy)
+  bool intersect(const Ray& ray, const Vec3& pos_min, const Vec3& pos_max,
+                 float scale_min, float scale_max,
+                 float& t_hit, float& density) const noexcept;
+};
+
+// ============================================================================
 // Primitive Variant (Type-safe union for mixed primitive BVH)
 // ============================================================================
 
@@ -417,7 +519,10 @@ enum class PrimitiveType : uint8_t {
   Disk,
   OrientedDisk,
   Curve,
-  Custom
+  Custom,
+  QuantizedTriangle,
+  GaussianSplat,
+  QuantizedGaussianSplat
 };
 
 // ============================================================================
