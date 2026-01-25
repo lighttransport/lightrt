@@ -465,6 +465,136 @@ void printSBVHResult(const char* name, const SBVHBenchmarkResult& r) {
   std::cout << "  Rays/second: " << std::scientific << std::setprecision(2) << r.rays_per_second << "\n";
 }
 
+// Generate thin triangles spanning the scene (pathological for standard BVH)
+// These triangles have long edges that span most of the scene but are very thin
+std::vector<Triangle> generateThinSpanningTriangles(uint32_t count, float scene_size, RNG& rng) {
+  std::vector<Triangle> triangles;
+  triangles.reserve(count);
+
+  for (uint32_t i = 0; i < count; i++) {
+    // Random axis to span (0=X, 1=Y, 2=Z)
+    int span_axis = static_cast<int>(rng.next() % 3);
+
+    // Triangle spans most of the scene along span_axis
+    float span_start = -scene_size * rng.uniform(0.8f, 1.0f);
+    float span_end = scene_size * rng.uniform(0.8f, 1.0f);
+
+    // Very thin perpendicular to span axis
+    float thickness = rng.uniform(0.001f, 0.01f) * scene_size;
+
+    // Random position along other axes
+    float pos1 = rng.uniform(-scene_size * 0.8f, scene_size * 0.8f);
+    float pos2 = rng.uniform(-scene_size * 0.8f, scene_size * 0.8f);
+
+    Vec3 v0, v1, v2;
+    if (span_axis == 0) {
+      // Spans X axis
+      v0 = Vec3(span_start, pos1, pos2);
+      v1 = Vec3(span_end, pos1, pos2);
+      v2 = Vec3((span_start + span_end) * 0.5f, pos1 + thickness, pos2);
+    } else if (span_axis == 1) {
+      // Spans Y axis
+      v0 = Vec3(pos1, span_start, pos2);
+      v1 = Vec3(pos1, span_end, pos2);
+      v2 = Vec3(pos1 + thickness, (span_start + span_end) * 0.5f, pos2);
+    } else {
+      // Spans Z axis
+      v0 = Vec3(pos1, pos2, span_start);
+      v1 = Vec3(pos1, pos2, span_end);
+      v2 = Vec3(pos1 + thickness, pos2, (span_start + span_end) * 0.5f);
+    }
+
+    triangles.emplace_back(v0, v1, v2);
+  }
+
+  return triangles;
+}
+
+// Generate diagonal triangles (worst case: spans all 3 axes)
+std::vector<Triangle> generateDiagonalTriangles(uint32_t count, float scene_size, RNG& rng) {
+  std::vector<Triangle> triangles;
+  triangles.reserve(count);
+
+  for (uint32_t i = 0; i < count; i++) {
+    // Diagonal from one corner toward opposite corner
+    float t0 = rng.uniform(0.0f, 0.3f);
+    float t1 = rng.uniform(0.7f, 1.0f);
+
+    Vec3 corner0(-scene_size, -scene_size, -scene_size);
+    Vec3 corner1(scene_size, scene_size, scene_size);
+    Vec3 dir = corner1 - corner0;
+
+    Vec3 v0 = corner0 + dir * t0;
+    Vec3 v1 = corner0 + dir * t1;
+
+    // Small offset perpendicular to diagonal
+    float thickness = rng.uniform(0.001f, 0.02f) * scene_size;
+    Vec3 perp(rng.uniform(-1.0f, 1.0f), rng.uniform(-1.0f, 1.0f), rng.uniform(-1.0f, 1.0f));
+    perp = perp - dir * (perp.x * dir.x + perp.y * dir.y + perp.z * dir.z) /
+                        (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+    float len = std::sqrt(perp.x * perp.x + perp.y * perp.y + perp.z * perp.z);
+    if (len > 0.0001f) {
+      perp = perp * (thickness / len);
+    } else {
+      perp = Vec3(thickness, 0.0f, 0.0f);
+    }
+
+    Vec3 v2 = (v0 + v1) * 0.5f + perp;
+
+    // Random offset to spread triangles
+    Vec3 offset = rng.uniformVec3(-scene_size * 0.5f, scene_size * 0.5f);
+    v0 = v0 + offset;
+    v1 = v1 + offset;
+    v2 = v2 + offset;
+
+    triangles.emplace_back(v0, v1, v2);
+  }
+
+  return triangles;
+}
+
+// Generate hair-like triangles (very thin, elongated)
+std::vector<Triangle> generateHairTriangles(uint32_t count, float scene_size, RNG& rng) {
+  std::vector<Triangle> triangles;
+  triangles.reserve(count);
+
+  for (uint32_t i = 0; i < count; i++) {
+    // Hair root position
+    Vec3 root = rng.uniformVec3(-scene_size * 0.8f, scene_size * 0.8f);
+
+    // Hair direction (mostly upward with some randomness)
+    Vec3 dir = Vec3(rng.uniform(-0.3f, 0.3f), 1.0f, rng.uniform(-0.3f, 0.3f));
+    float len = std::sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+    dir = dir * (1.0f / len);
+
+    // Hair length (can be quite long relative to scene)
+    float hair_length = rng.uniform(scene_size * 0.3f, scene_size * 0.9f);
+
+    // Hair thickness (very thin)
+    float thickness = rng.uniform(0.001f, 0.005f) * scene_size;
+
+    Vec3 tip = root + dir * hair_length;
+
+    // Perpendicular vector for width
+    Vec3 perp;
+    if (std::abs(dir.y) < 0.9f) {
+      perp = Vec3(-dir.z, 0.0f, dir.x);
+    } else {
+      perp = Vec3(1.0f, 0.0f, 0.0f);
+    }
+    float perp_len = std::sqrt(perp.x * perp.x + perp.y * perp.y + perp.z * perp.z);
+    perp = perp * (thickness / perp_len);
+
+    Vec3 v0 = root - perp;
+    Vec3 v1 = root + perp;
+    Vec3 v2 = tip;
+
+    triangles.emplace_back(v0, v1, v2);
+  }
+
+  return triangles;
+}
+
 // Generate large triangles that span significant scene area (good for SBVH)
 std::vector<Triangle> generateLargeTriangles(uint32_t count, float scene_size, RNG& rng) {
   std::vector<Triangle> triangles;
@@ -643,6 +773,162 @@ void benchmarkSBVHvsTriangleBVH(uint32_t num_triangles, uint32_t num_rays) {
 }
 
 // ============================================================================
+// Pathological Scenes for SBVH
+// ============================================================================
+
+void benchmarkPathologicalScenes(uint32_t num_triangles, uint32_t num_rays) {
+  std::cout << "\n========================================\n";
+  std::cout << "Pathological Scenes (SBVH vs TriangleBVH)\n";
+  std::cout << "========================================\n";
+  std::cout << "\nThese scenes are designed to stress standard BVH\n";
+  std::cout << "and demonstrate SBVH's spatial split benefits.\n";
+
+  RNG rng(42);
+  std::vector<Ray> rays = generateRandomRays(num_rays, 10.0f, rng);
+
+  // Helper lambda for running benchmark on a scene
+  auto runBenchmark = [&](const char* scene_name, const std::vector<Triangle>& triangles) {
+    std::cout << "\n=== " << scene_name << " ===\n";
+    std::cout << "Triangles: " << triangles.size() << "\n";
+
+    // TriangleBVH
+    double bvh_build_time, bvh_traverse_time;
+    uint32_t bvh_hits = 0;
+    BVH::Stats bvh_stats;
+    {
+      TriangleBVH bvh;
+      BVHBuildConfig config;
+      config.use_sah = true;
+      config.use_binning = true;
+      config.max_leaf_size = 4;
+
+      bvh_build_time = measureTime([&]() {
+        bvh.build(triangles, config);
+      });
+      bvh_stats = bvh.getStats();
+
+      bvh_traverse_time = measureTime([&]() {
+        for (const auto& ray : rays) {
+          float t, u, v;
+          if (bvh.traverse(ray, t, u, v) != kInvalidIndex) {
+            bvh_hits++;
+          }
+        }
+      });
+    }
+
+    // SBVH
+    double sbvh_build_time, sbvh_traverse_time;
+    uint32_t sbvh_hits = 0;
+    SBVH::Stats sbvh_stats;
+    {
+      SBVH sbvh;
+      SBVHBuildConfig config;
+      config.max_leaf_size = 4;
+      config.num_spatial_bins = 256;
+      config.num_object_bins = 32;
+      config.alpha = 1e-5f;
+      config.max_split_factor = 2.0f;  // Allow more splits for pathological cases
+
+      sbvh_build_time = measureTime([&]() {
+        sbvh.build(triangles, config);
+      });
+      sbvh_stats = sbvh.getStats();
+
+      sbvh_traverse_time = measureTime([&]() {
+        for (const auto& ray : rays) {
+          float t, u, v;
+          if (sbvh.traverse(ray, t, u, v) != kInvalidIndex) {
+            sbvh_hits++;
+          }
+        }
+      });
+    }
+
+    // Print comparison
+    double bvh_rays_per_sec = (num_rays / bvh_traverse_time) * 1000.0;
+    double sbvh_rays_per_sec = (num_rays / sbvh_traverse_time) * 1000.0;
+    double speedup = bvh_traverse_time / sbvh_traverse_time;
+
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "\n  TriangleBVH:\n";
+    std::cout << "    Build: " << bvh_build_time << " ms\n";
+    std::cout << "    Traverse: " << bvh_traverse_time << " ms\n";
+    std::cout << "    Rays/sec: " << std::scientific << bvh_rays_per_sec << "\n";
+    std::cout << std::fixed;
+    std::cout << "    Nodes: " << bvh_stats.num_nodes << ", Depth: " << bvh_stats.max_depth << "\n";
+    std::cout << "    Hits: " << bvh_hits << " (" << (100.0 * bvh_hits / num_rays) << "%)\n";
+
+    std::cout << "\n  SBVH:\n";
+    std::cout << "    Build: " << sbvh_build_time << " ms\n";
+    std::cout << "    Traverse: " << sbvh_traverse_time << " ms\n";
+    std::cout << "    Rays/sec: " << std::scientific << sbvh_rays_per_sec << "\n";
+    std::cout << std::fixed;
+    std::cout << "    Nodes: " << sbvh_stats.num_nodes << ", Depth: " << sbvh_stats.max_depth << "\n";
+    std::cout << "    References: " << sbvh_stats.num_references
+              << " (split ratio: " << sbvh_stats.split_ratio << "x)\n";
+    std::cout << "    Hits: " << sbvh_hits << " (" << (100.0 * sbvh_hits / num_rays) << "%)\n";
+
+    std::cout << "\n  Speedup: " << speedup << "x";
+    if (speedup > 1.0) {
+      std::cout << " (SBVH faster)";
+    } else if (speedup < 1.0) {
+      std::cout << " (TriangleBVH faster)";
+    }
+    std::cout << "\n";
+  };
+
+  // Test 1: Thin spanning triangles (long edges across scene)
+  {
+    std::vector<Triangle> triangles = generateThinSpanningTriangles(num_triangles, 10.0f, rng);
+    runBenchmark("Thin Spanning Triangles (long edges across bbox)", triangles);
+  }
+
+  // Test 2: Diagonal triangles (span all 3 axes)
+  {
+    std::vector<Triangle> triangles = generateDiagonalTriangles(num_triangles, 10.0f, rng);
+    runBenchmark("Diagonal Triangles (span all 3 axes)", triangles);
+  }
+
+  // Test 3: Hair-like triangles (thin and elongated)
+  {
+    std::vector<Triangle> triangles = generateHairTriangles(num_triangles, 10.0f, rng);
+    runBenchmark("Hair-like Triangles (thin elongated)", triangles);
+  }
+
+  // Test 4: Mixed scene (some large, some small)
+  {
+    std::vector<Triangle> triangles;
+    triangles.reserve(num_triangles);
+
+    // 30% thin spanning
+    auto thin = generateThinSpanningTriangles(num_triangles * 3 / 10, 10.0f, rng);
+    triangles.insert(triangles.end(), thin.begin(), thin.end());
+
+    // 30% hair-like
+    auto hair = generateHairTriangles(num_triangles * 3 / 10, 10.0f, rng);
+    triangles.insert(triangles.end(), hair.begin(), hair.end());
+
+    // 40% small random (normal)
+    auto small = generateRandomTriangles(num_triangles * 4 / 10, 10.0f, rng);
+    triangles.insert(triangles.end(), small.begin(), small.end());
+
+    runBenchmark("Mixed Scene (30% thin + 30% hair + 40% small)", triangles);
+  }
+
+  std::cout << "\n--- Analysis ---\n";
+  std::cout << "Thin spanning triangles: AABB covers large area but actual geometry is thin.\n";
+  std::cout << "  Standard BVH cannot separate them well -> many false positive AABB hits.\n";
+  std::cout << "  SBVH splits them spatially -> tighter bounds, fewer false positives.\n";
+  std::cout << "\nDiagonal triangles: Span all 3 axes, worst case for axis-aligned BVH.\n";
+  std::cout << "  Any split plane intersects most triangles.\n";
+  std::cout << "  SBVH can clip triangles to create tighter local bounds.\n";
+  std::cout << "\nHair-like triangles: Common in production scenes (fur, grass, cables).\n";
+  std::cout << "  High aspect ratio causes AABB bloat.\n";
+  std::cout << "  SBVH's spatial splits help significantly.\n";
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -689,6 +975,9 @@ int main(int argc, char** argv) {
 
   // SBVH comparison
   benchmarkSBVHvsTriangleBVH(num_triangles, num_rays);
+
+  // Pathological scenes for SBVH
+  benchmarkPathologicalScenes(num_triangles, num_rays);
 
   std::cout << "\n============================================\n";
   std::cout << "Benchmark Complete\n";
