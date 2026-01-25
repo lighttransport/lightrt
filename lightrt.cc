@@ -1678,6 +1678,92 @@ uint32_t TriangleBVH::traverse(const Ray& ray, float& hit_t, float& hit_u, float
   return hit_tri;
 }
 
+uint32_t TriangleBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hit_u, float& hit_v,
+                                          const TraversalConfig& config,
+                                          TraversalStats* stats) const noexcept {
+  const auto& nodes = bvh_.getNodes();
+  const auto& prim_indices = bvh_.getPrimitiveIndices();
+
+  if (nodes.empty()) {
+    return kInvalidIndex;
+  }
+
+  uint32_t hit_tri = kInvalidIndex;
+  hit_t = ray.tmax;
+
+  TraversalStats local_stats;
+  uint32_t prim_tests = 0;
+  const uint32_t max_tests = config.max_prim_tests;
+
+  // Stack-based traversal
+  struct StackEntry {
+    uint32_t node_idx;
+  };
+
+  StackEntry stack[64];
+  int stack_ptr = 0;
+
+  stack[stack_ptr++].node_idx = 0;
+
+  while (stack_ptr > 0) {
+    // Check if we've hit the primitive test limit
+    if (max_tests > 0 && prim_tests >= max_tests) {
+      local_stats.terminated_early = true;
+      break;
+    }
+
+    uint32_t node_idx = stack[--stack_ptr].node_idx;
+    const BVHNode& node = nodes[node_idx];
+    local_stats.nodes_visited++;
+
+    float tmin, tmax;
+    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > hit_t) {
+      continue;
+    }
+
+    if (node.isLeaf()) {
+      // Test triangles in leaf
+      for (uint32_t i = 0; i < node.prim_count; i++) {
+        // Check limit before each test
+        if (max_tests > 0 && prim_tests >= max_tests) {
+          local_stats.terminated_early = true;
+          break;
+        }
+
+        uint32_t tri_idx = prim_indices[node.prim_offset + i];
+        prim_tests++;
+        local_stats.prims_tested++;
+
+        float t, u, v;
+        if (triangles_[tri_idx].intersect(ray, t, u, v)) {
+          if (t < hit_t) {
+            hit_t = t;
+            hit_u = u;
+            hit_v = v;
+            hit_tri = tri_idx;
+            local_stats.prims_hit++;
+
+            // Early termination for any-hit queries
+            if (config.early_termination) {
+              if (stats) *stats = local_stats;
+              return hit_tri;
+            }
+          }
+        }
+      }
+    } else {
+      // Add children to stack
+      if (stack_ptr < 62) {
+        stack[stack_ptr++].node_idx = node.left_child;
+        stack[stack_ptr++].node_idx = node.right_child;
+      }
+    }
+  }
+
+  if (stats) *stats = local_stats;
+  return hit_tri;
+}
+
 // ============================================================================
 // SBVH Implementation
 // Reference: "Spatial Splits in Bounding Volume Hierarchies" (Stich et al., HPG 2009)
@@ -2201,6 +2287,143 @@ uint32_t SBVH::traverse(const Ray& ray, float& hit_t, float& hit_u, float& hit_v
     }
   }
 
+  return hit_tri;
+}
+
+uint32_t SBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hit_u, float& hit_v,
+                                   const TraversalConfig& config,
+                                   TraversalStats* stats) const noexcept {
+  if (nodes_.empty()) {
+    return kInvalidIndex;
+  }
+
+  uint32_t hit_tri = kInvalidIndex;
+  hit_t = ray.tmax;
+
+  TraversalStats local_stats;
+  uint32_t prim_tests = 0;
+  const uint32_t max_tests = config.max_prim_tests;
+
+  // Optional mailbox for avoiding duplicate tests
+  // In SBVH, the same primitive can appear in multiple leaves
+  std::vector<uint64_t> mailbox_bitset;
+  std::vector<uint32_t> mailbox_hash;
+  const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
+  const bool use_mailbox = config.use_mailboxing && num_prims > 0;
+
+  if (use_mailbox) {
+    if (num_prims <= 65536) {
+      mailbox_bitset.resize((num_prims + 63) / 64, 0);
+    } else {
+      mailbox_hash.resize(std::max(num_prims / 4, 256u), kInvalidIndex);
+    }
+  }
+
+  auto testAndMarkMailbox = [&](uint32_t prim_id) -> bool {
+    if (!use_mailbox) return false;
+
+    if (num_prims <= 65536) {
+      uint32_t word = prim_id / 64;
+      uint64_t bit = 1ULL << (prim_id % 64);
+      if (mailbox_bitset[word] & bit) {
+        return true;  // Already tested
+      }
+      mailbox_bitset[word] |= bit;
+      return false;
+    } else {
+      uint32_t idx = prim_id % mailbox_hash.size();
+      for (uint32_t i = 0; i < 16; i++) {  // Limited probing
+        uint32_t probe = (idx + i) % mailbox_hash.size();
+        if (mailbox_hash[probe] == prim_id) {
+          return true;  // Already tested
+        }
+        if (mailbox_hash[probe] == kInvalidIndex) {
+          mailbox_hash[probe] = prim_id;
+          return false;
+        }
+      }
+      return false;  // Probe limit reached, test anyway
+    }
+  };
+
+  // Stack-based traversal
+  struct StackEntry {
+    uint32_t node_idx;
+  };
+
+  StackEntry stack[64];
+  int stack_ptr = 0;
+
+  stack[stack_ptr++].node_idx = 0;
+
+  while (stack_ptr > 0) {
+    // Check if we've hit the primitive test limit
+    if (max_tests > 0 && prim_tests >= max_tests) {
+      local_stats.terminated_early = true;
+      break;
+    }
+
+    uint32_t node_idx = stack[--stack_ptr].node_idx;
+    const BVHNode& node = nodes_[node_idx];
+    local_stats.nodes_visited++;
+
+    float tmin, tmax;
+    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > hit_t) {
+      continue;
+    }
+
+    if (node.isLeaf()) {
+      // Test triangles in leaf (using references)
+      for (uint32_t i = 0; i < node.prim_count; i++) {
+        // Check limit before each test
+        if (max_tests > 0 && prim_tests >= max_tests) {
+          local_stats.terminated_early = true;
+          break;
+        }
+
+        const PrimRef& ref = refs_[node.prim_offset + i];
+
+        // Mailboxing: skip if already tested
+        if (testAndMarkMailbox(ref.prim_id)) {
+          continue;
+        }
+
+        // Early out: check if reference bounds are hit
+        float ref_tmin, ref_tmax;
+        if (!ref.bounds.intersect(ray, ref_tmin, ref_tmax) || ref_tmin > hit_t) {
+          continue;
+        }
+
+        prim_tests++;
+        local_stats.prims_tested++;
+
+        float t, u, v;
+        if (triangles_[ref.prim_id].intersect(ray, t, u, v)) {
+          if (t < hit_t) {
+            hit_t = t;
+            hit_u = u;
+            hit_v = v;
+            hit_tri = ref.prim_id;
+            local_stats.prims_hit++;
+
+            // Early termination for any-hit queries
+            if (config.early_termination) {
+              if (stats) *stats = local_stats;
+              return hit_tri;
+            }
+          }
+        }
+      }
+    } else {
+      // Add children to stack
+      if (stack_ptr < 62) {
+        stack[stack_ptr++].node_idx = node.left_child;
+        stack[stack_ptr++].node_idx = node.right_child;
+      }
+    }
+  }
+
+  if (stats) *stats = local_stats;
   return hit_tri;
 }
 
