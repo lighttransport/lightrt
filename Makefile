@@ -47,6 +47,7 @@ endif
 # Targets
 TARGET_LIB = liblightrt.a
 TARGET_EXAMPLE = lightrt_example
+TARGET_BENCHMARK = lightrt_benchmark
 
 # Source files
 SOURCES = lightrt.cc
@@ -56,8 +57,12 @@ OBJECTS = $(SOURCES:.cc=.o)
 EXAMPLE_SOURCES = example.cc
 EXAMPLE_OBJECTS = $(EXAMPLE_SOURCES:.cc=.o)
 
+# Benchmark source
+BENCHMARK_SOURCES = benchmark/benchmark.cc
+BENCHMARK_OBJECTS = benchmark/benchmark.o
+
 # Default target
-all: $(TARGET_LIB) $(TARGET_EXAMPLE)
+all: $(TARGET_LIB) $(TARGET_EXAMPLE) $(TARGET_BENCHMARK)
 
 # Build static library
 $(TARGET_LIB): $(OBJECTS)
@@ -69,18 +74,30 @@ $(TARGET_EXAMPLE): $(EXAMPLE_OBJECTS) $(TARGET_LIB)
 	$(CXX) $(CXXFLAGS) -o $@ $(EXAMPLE_OBJECTS) $(TARGET_LIB) $(LDFLAGS)
 	@echo "Built $(TARGET_EXAMPLE)"
 
+# Build benchmark
+$(TARGET_BENCHMARK): $(BENCHMARK_OBJECTS) $(TARGET_LIB)
+	$(CXX) $(CXXFLAGS) -o $@ $(BENCHMARK_OBJECTS) $(TARGET_LIB) $(LDFLAGS)
+	@echo "Built $(TARGET_BENCHMARK)"
+
 # Compile source files
 %.o: %.cc lightrt.hh
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
+benchmark/%.o: benchmark/%.cc lightrt.hh
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
 # Clean build artifacts
 clean:
-	rm -f $(OBJECTS) $(EXAMPLE_OBJECTS) $(TARGET_LIB) $(TARGET_EXAMPLE)
+	rm -f $(OBJECTS) $(EXAMPLE_OBJECTS) $(BENCHMARK_OBJECTS) $(TARGET_LIB) $(TARGET_EXAMPLE) $(TARGET_BENCHMARK)
 	@echo "Cleaned build artifacts"
 
 # Run example
 run: $(TARGET_EXAMPLE)
 	./$(TARGET_EXAMPLE)
+
+# Run benchmark (optional args: TRIANGLES=N RAYS=N)
+benchmark: $(TARGET_BENCHMARK)
+	./$(TARGET_BENCHMARK) $(TRIANGLES) $(RAYS)
 
 # Print configuration
 info:
@@ -90,4 +107,4 @@ info:
 	@echo "INCLUDES: $(INCLUDES)"
 	@echo "LDFLAGS: $(LDFLAGS)"
 
-.PHONY: all clean run info
+.PHONY: all clean run benchmark info

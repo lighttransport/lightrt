@@ -186,6 +186,33 @@ struct alignas(16) AABB {
 };
 
 // ============================================================================
+// Triangle
+// ============================================================================
+
+struct alignas(16) Triangle {
+  Vec3 v0, v1, v2;
+
+  Triangle() noexcept = default;
+  Triangle(const Vec3& a, const Vec3& b, const Vec3& c) noexcept : v0(a), v1(b), v2(c) {}
+
+  Vec3 centroid() const noexcept {
+    return (v0 + v1 + v2) * (1.0f / 3.0f);
+  }
+
+  Vec3 normal() const noexcept {
+    Vec3 e1 = v1 - v0;
+    Vec3 e2 = v2 - v0;
+    return e1.cross(e2).normalize();
+  }
+
+  AABB bounds() const noexcept;
+
+  // Moller-Trumbore ray-triangle intersection
+  // Returns true if hit, sets t, u, v (barycentric coordinates)
+  bool intersect(const Ray& ray, float& t, float& u, float& v) const noexcept;
+};
+
+// ============================================================================
 // Quantization Support
 // ============================================================================
 
@@ -361,7 +388,8 @@ struct BVHBuildConfig {
   bool use_sah;                // Use Surface Area Heuristic
   bool use_binning;            // Use binned SAH for large nodes
   uint32_t num_bins;           // Number of bins for binned SAH
-  
+  bool force_max_leaf_size;    // Always enforce max_leaf_size (ignore SAH cost)
+
   BVHBuildConfig() noexcept
     : max_leaf_size(4)
     , min_leaf_size(1)
@@ -369,7 +397,8 @@ struct BVHBuildConfig {
     , intersection_cost(1.0f)
     , use_sah(true)
     , use_binning(true)
-    , num_bins(16) {}
+    , num_bins(16)
+    , force_max_leaf_size(false) {}
 };
 
 // ============================================================================
@@ -430,12 +459,14 @@ private:
   SplitResult findBestSplit(
     const uint32_t* indices,
     uint32_t num_prims,
-    const AABB& centroid_bounds) noexcept;
-  
+    const AABB& centroid_bounds,
+    float parent_area) noexcept;
+
   SplitResult findBestSplitBinned(
     const uint32_t* indices,
     uint32_t num_prims,
-    const AABB& centroid_bounds) noexcept;
+    const AABB& centroid_bounds,
+    float parent_area) noexcept;
 };
 
 // ============================================================================
@@ -512,6 +543,35 @@ public:
 private:
   BVH bvh_;
   std::vector<BLASInstance> instances_;
+};
+
+// ============================================================================
+// Triangle BVH - BVH over triangles with proper ray-triangle intersection
+// ============================================================================
+
+class TriangleBVH {
+public:
+  TriangleBVH() noexcept = default;
+  ~TriangleBVH() noexcept = default;
+
+  // Build BVH from triangles
+  bool build(const std::vector<Triangle>& triangles, const BVHBuildConfig& config = BVHBuildConfig()) noexcept;
+
+  // Traverse and find closest triangle intersection
+  // Returns triangle index or kInvalidIndex if no hit
+  // hit_t: distance to hit, hit_u/hit_v: barycentric coordinates
+  uint32_t traverse(const Ray& ray, float& hit_t, float& hit_u, float& hit_v) const noexcept;
+
+  // Get statistics
+  BVH::Stats getStats() const noexcept { return bvh_.getStats(); }
+
+  // Access internals
+  const BVH& getBVH() const noexcept { return bvh_; }
+  const std::vector<Triangle>& getTriangles() const noexcept { return triangles_; }
+
+private:
+  BVH bvh_;
+  std::vector<Triangle> triangles_;
 };
 
 } // namespace lightrt

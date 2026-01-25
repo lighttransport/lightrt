@@ -99,6 +99,15 @@ target_link_libraries(lightrt_example
     lightrt
 )
 
+# Benchmark executable
+add_executable(lightrt_benchmark
+    benchmark/benchmark.cc
+)
+
+target_link_libraries(lightrt_benchmark
+    lightrt
+)
+
 # Installation
 install(TARGETS lightrt
     ARCHIVE DESTINATION lib
