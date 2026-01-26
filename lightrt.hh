@@ -13,6 +13,7 @@
 #define LIGHTRT_HH_
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <vector>
@@ -1730,6 +1731,258 @@ private:
   static size_t estimateMemory(const TriangleBVH& bvh) noexcept;
   static size_t estimateMemory(const SBVH& sbvh) noexcept;
 };
+
+// ============================================================================
+// Traversal Profiling (Zero-Overhead Template Design)
+// Use ProfilePolicy to enable/disable profiling with no runtime cost
+// ============================================================================
+
+// Profiling data collected during traversal
+struct TraversalProfile {
+  uint32_t nodes_visited = 0;    // Total BVH nodes visited
+  uint32_t leaf_visits = 0;      // Leaf nodes visited
+  uint32_t prims_tested = 0;     // Primitive intersection tests
+  uint32_t max_depth = 0;        // Maximum traversal depth reached
+
+  void reset() noexcept {
+    nodes_visited = 0;
+    leaf_visits = 0;
+    prims_tested = 0;
+    max_depth = 0;
+  }
+
+  // Add another profile (for aggregating stats)
+  void add(const TraversalProfile& other) noexcept {
+    nodes_visited += other.nodes_visited;
+    leaf_visits += other.leaf_visits;
+    prims_tested += other.prims_tested;
+    max_depth = std::max(max_depth, other.max_depth);
+  }
+};
+
+// Policy class: No profiling (zero overhead - all calls optimized away)
+struct NoProfiler {
+  static constexpr bool kEnabled = false;
+
+  void visitNode() noexcept {}
+  void visitLeaf() noexcept {}
+  void testPrim() noexcept {}
+  void testPrims(uint32_t) noexcept {}
+  void pushDepth(uint32_t) noexcept {}
+  void popDepth() noexcept {}
+};
+
+// Policy class: With profiling (collects statistics)
+class WithProfiler {
+public:
+  static constexpr bool kEnabled = true;
+
+  explicit WithProfiler(TraversalProfile* profile) noexcept
+    : profile_(profile), current_depth_(0) {}
+
+  void visitNode() noexcept {
+    profile_->nodes_visited++;
+  }
+
+  void visitLeaf() noexcept {
+    profile_->leaf_visits++;
+  }
+
+  void testPrim() noexcept {
+    profile_->prims_tested++;
+  }
+
+  void testPrims(uint32_t count) noexcept {
+    profile_->prims_tested += count;
+  }
+
+  void pushDepth(uint32_t depth) noexcept {
+    current_depth_ = depth;
+    if (depth > profile_->max_depth) {
+      profile_->max_depth = depth;
+    }
+  }
+
+  void popDepth() noexcept {
+    if (current_depth_ > 0) current_depth_--;
+  }
+
+private:
+  TraversalProfile* profile_;
+  uint32_t current_depth_;
+};
+
+// ============================================================================
+// Profiled Traversal Methods (Template-based)
+// ============================================================================
+
+// Profiled traversal for TriangleBVH
+// Usage:
+//   TraversalProfile profile;
+//   uint32_t hit = traverseProfiled<WithProfiler>(bvh, ray, hit_t, u, v, &profile);
+// Or without profiling (zero overhead):
+//   uint32_t hit = traverseProfiled<NoProfiler>(bvh, ray, hit_t, u, v, nullptr);
+template<typename Profiler = NoProfiler>
+uint32_t traverseProfiled(const TriangleBVH& bvh, const Ray& ray,
+                          float& hit_t, float& hit_u, float& hit_v,
+                          TraversalProfile* profile = nullptr) noexcept;
+
+// Profiled traversal for SBVH
+template<typename Profiler = NoProfiler>
+uint32_t traverseProfiled(const SBVH& sbvh, const Ray& ray,
+                          float& hit_t, float& hit_u, float& hit_v,
+                          TraversalProfile* profile = nullptr) noexcept;
+
+// Profiled traversal for MMapTriangleBVH
+template<typename Profiler = NoProfiler>
+uint32_t traverseProfiled(const MMapTriangleBVH& bvh, const Ray& ray,
+                          float& hit_t, float& hit_u, float& hit_v,
+                          TraversalProfile* profile = nullptr) noexcept;
+
+// ============================================================================
+// Heatmap / Pseudocolor Image Writer
+// Supports BMP, TGA, PPM, PNG - no external dependencies
+// PNG uses built-in DEFLATE compression (no zlib required)
+// ============================================================================
+
+// Colormap types for heatmap visualization
+enum class Colormap : uint8_t {
+  Grayscale,    // Black to white
+  Heat,         // Black -> Red -> Yellow -> White
+  Jet,          // Blue -> Cyan -> Green -> Yellow -> Red
+  Viridis,      // Perceptually uniform (purple -> blue -> green -> yellow)
+  Turbo,        // Improved rainbow (Google's turbo colormap)
+  Plasma,       // Perceptually uniform (purple -> pink -> orange -> yellow)
+  Inferno,      // Perceptually uniform (black -> purple -> red -> yellow)
+  Cool,         // Cyan to Magenta
+  Hot           // Black -> Red -> Yellow -> White (classic hot metal)
+};
+
+// Image format for output
+enum class ImageFormat : uint8_t {
+  BMP,          // Windows Bitmap (24-bit RGB, uncompressed)
+  TGA,          // Truevision TGA (24-bit RGB, uncompressed)
+  PPM,          // Portable Pixmap (binary P6 format)
+  PNG           // PNG (24-bit RGB, DEFLATE compressed, no zlib dependency)
+};
+
+// RGB color (8-bit per channel)
+struct RGB8 {
+  uint8_t r, g, b;
+
+  RGB8() noexcept : r(0), g(0), b(0) {}
+  RGB8(uint8_t r_, uint8_t g_, uint8_t b_) noexcept : r(r_), g(g_), b(b_) {}
+
+  // Create from float [0,1] values
+  static RGB8 fromFloat(float r, float g, float b) noexcept {
+    return RGB8(
+      static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, r * 255.0f))),
+      static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, g * 255.0f))),
+      static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, b * 255.0f)))
+    );
+  }
+};
+
+// Heatmap generator and image writer
+class HeatmapWriter {
+public:
+  // Map a value [0, 1] to RGB color using specified colormap
+  static RGB8 mapColor(float value, Colormap cmap = Colormap::Viridis) noexcept;
+
+  // Map an integer value to RGB color with automatic normalization
+  // value: The value to map
+  // max_value: Maximum expected value (values >= max map to 1.0)
+  static RGB8 mapColor(uint32_t value, uint32_t max_value,
+                       Colormap cmap = Colormap::Viridis) noexcept;
+
+  // Write image to file
+  // data: RGB8 array of size width * height (row-major, top-to-bottom)
+  // Returns true on success
+  static bool writeImage(const char* filename, const RGB8* data,
+                         uint32_t width, uint32_t height,
+                         ImageFormat format = ImageFormat::BMP) noexcept;
+
+  // Write image from float array [0, 1]
+  static bool writeImage(const char* filename, const float* data,
+                         uint32_t width, uint32_t height,
+                         Colormap cmap = Colormap::Viridis,
+                         ImageFormat format = ImageFormat::BMP) noexcept;
+
+  // Write image from uint32 array with automatic normalization
+  static bool writeImage(const char* filename, const uint32_t* data,
+                         uint32_t width, uint32_t height,
+                         uint32_t max_value,
+                         Colormap cmap = Colormap::Viridis,
+                         ImageFormat format = ImageFormat::BMP) noexcept;
+
+  // Generate heatmap from traversal profiles
+  // profiles: Array of TraversalProfile for each pixel (width * height)
+  // metric: Which metric to visualize
+  enum class Metric { NodesVisited, LeafVisits, PrimsTested, MaxDepth };
+
+  static bool writeHeatmap(const char* filename,
+                           const TraversalProfile* profiles,
+                           uint32_t width, uint32_t height,
+                           Metric metric = Metric::PrimsTested,
+                           Colormap cmap = Colormap::Viridis,
+                           ImageFormat format = ImageFormat::BMP,
+                           uint32_t max_value = 0) noexcept;  // 0 = auto
+
+private:
+  // BMP file writing
+  static bool writeBMP(const char* filename, const RGB8* data,
+                       uint32_t width, uint32_t height) noexcept;
+
+  // TGA file writing
+  static bool writeTGA(const char* filename, const RGB8* data,
+                       uint32_t width, uint32_t height) noexcept;
+
+  // PPM file writing (binary P6)
+  static bool writePPM(const char* filename, const RGB8* data,
+                       uint32_t width, uint32_t height) noexcept;
+
+  // PNG file writing (DEFLATE compressed, no external dependencies)
+  static bool writePNG(const char* filename, const RGB8* data,
+                       uint32_t width, uint32_t height) noexcept;
+
+  // Colormap lookup tables
+  static RGB8 grayscale(float t) noexcept;
+  static RGB8 heat(float t) noexcept;
+  static RGB8 jet(float t) noexcept;
+  static RGB8 viridis(float t) noexcept;
+  static RGB8 turbo(float t) noexcept;
+  static RGB8 plasma(float t) noexcept;
+  static RGB8 inferno(float t) noexcept;
+  static RGB8 cool(float t) noexcept;
+  static RGB8 hot(float t) noexcept;
+};
+
+// ============================================================================
+// Convenience functions for profiled rendering
+// ============================================================================
+
+// Render a single ray and collect profile data
+// Returns hit triangle index (or kInvalidIndex)
+template<typename BVHType>
+uint32_t renderRayProfiled(const BVHType& bvh, const Ray& ray,
+                           float& hit_t, float& hit_u, float& hit_v,
+                           TraversalProfile& profile) noexcept {
+  profile.reset();
+  return traverseProfiled<WithProfiler>(bvh, ray, hit_t, hit_u, hit_v, &profile);
+}
+
+// Render image and collect per-pixel profile data
+// Returns array of profiles (caller must delete[])
+// Also fills hit_image with triangle indices (optional, can be nullptr)
+template<typename BVHType>
+TraversalProfile* renderImageProfiled(
+    const BVHType& bvh,
+    uint32_t width, uint32_t height,
+    const Vec3& camera_pos,
+    const Vec3& camera_dir,
+    const Vec3& camera_up,
+    float fov_y,  // Field of view in radians
+    uint32_t* hit_image = nullptr) noexcept;
 
 } // namespace lightrt
 

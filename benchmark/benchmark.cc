@@ -1755,6 +1755,148 @@ int main(int argc, char** argv) {
     std::cout << "  BVH memory: " << (medium_stats.bvh_memory_bytes / 1024.0) << " KB\n";
   }
 
+  // ========================================
+  // Profiling and Heatmap Benchmark
+  // ========================================
+  {
+    std::cout << "\n========================================\n";
+    std::cout << "Profiling and Heatmap Benchmark\n";
+    std::cout << "========================================\n\n";
+
+    RNG profile_rng(99);
+
+    // Create a simple scene
+    auto profile_triangles = generateRandomTriangles(10000, 10.0f, profile_rng);
+    TriangleBVH profile_bvh;
+    profile_bvh.build(profile_triangles);
+
+    AABB scene_bounds;
+    for (const auto& tri : profile_triangles) {
+      scene_bounds.expand(tri.bounds());
+    }
+
+    // Test profiled traversal vs normal traversal
+    std::cout << "=== Profiled vs Non-Profiled Traversal ===\n";
+    std::cout << "Testing 10000 rays...\n\n";
+
+    std::vector<Ray> profile_rays;
+    for (uint32_t i = 0; i < 10000; i++) {
+      Vec3 origin = profile_rng.uniformVec3(-20.0f, 20.0f);
+      Vec3 target = profile_rng.uniformVec3(-10.0f, 10.0f);
+      profile_rays.emplace_back(origin, (target - origin).normalize());
+    }
+
+    // Non-profiled (template NoProfiler - should have zero overhead)
+    auto start = std::chrono::high_resolution_clock::now();
+    uint32_t hits_noprofile = 0;
+    for (const auto& ray : profile_rays) {
+      float t, u, v;
+      uint32_t hit = traverseProfiled<NoProfiler>(profile_bvh, ray, t, u, v, nullptr);
+      if (hit != kInvalidIndex) hits_noprofile++;
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    double time_noprofile = std::chrono::duration<double, std::milli>(end - start).count();
+
+    // Profiled (template WithProfiler - collects stats)
+    start = std::chrono::high_resolution_clock::now();
+    uint32_t hits_profile = 0;
+    TraversalProfile total_profile;
+    for (const auto& ray : profile_rays) {
+      float t, u, v;
+      TraversalProfile profile;
+      uint32_t hit = traverseProfiled<WithProfiler>(profile_bvh, ray, t, u, v, &profile);
+      if (hit != kInvalidIndex) hits_profile++;
+      total_profile.add(profile);
+    }
+    end = std::chrono::high_resolution_clock::now();
+    double time_profile = std::chrono::duration<double, std::milli>(end - start).count();
+
+    std::cout << "  Non-profiled: " << std::fixed << std::setprecision(2)
+              << time_noprofile << " ms (" << hits_noprofile << " hits)\n";
+    std::cout << "  Profiled:     " << time_profile << " ms (" << hits_profile << " hits)\n";
+    std::cout << "  Overhead:     " << ((time_profile / time_noprofile - 1.0) * 100.0) << "%\n";
+
+    std::cout << "\n=== Aggregate Profile Statistics ===\n";
+    std::cout << "  Total nodes visited: " << total_profile.nodes_visited << "\n";
+    std::cout << "  Total leaf visits:   " << total_profile.leaf_visits << "\n";
+    std::cout << "  Total prims tested:  " << total_profile.prims_tested << "\n";
+    std::cout << "  Max depth reached:   " << total_profile.max_depth << "\n";
+    std::cout << "  Avg nodes/ray:       " << (float)total_profile.nodes_visited / profile_rays.size() << "\n";
+    std::cout << "  Avg prims/ray:       " << (float)total_profile.prims_tested / profile_rays.size() << "\n";
+
+    // Test heatmap writing
+    std::cout << "\n=== Heatmap Image Writing ===\n";
+    const uint32_t img_width = 128;
+    const uint32_t img_height = 128;
+
+    // Render a small image with profiling
+    Vec3 camera_pos(0.0f, 0.0f, 30.0f);
+    Vec3 camera_dir(0.0f, 0.0f, -1.0f);
+    Vec3 camera_up(0.0f, 1.0f, 0.0f);
+    float fov_y = 60.0f * 3.14159265f / 180.0f;  // 60 degrees
+
+    TraversalProfile* image_profiles = renderImageProfiled(
+        profile_bvh, img_width, img_height,
+        camera_pos, camera_dir, camera_up, fov_y, nullptr);
+
+    // Write heatmaps in different formats and colormaps
+    bool ok = HeatmapWriter::writeHeatmap("heatmap_nodes.bmp", image_profiles,
+                                           img_width, img_height,
+                                           HeatmapWriter::Metric::NodesVisited,
+                                           Colormap::Viridis, ImageFormat::BMP);
+    std::cout << "  heatmap_nodes.bmp (Viridis):    " << (ok ? "OK" : "FAILED") << "\n";
+
+    ok = HeatmapWriter::writeHeatmap("heatmap_prims.bmp", image_profiles,
+                                      img_width, img_height,
+                                      HeatmapWriter::Metric::PrimsTested,
+                                      Colormap::Hot, ImageFormat::BMP);
+    std::cout << "  heatmap_prims.bmp (Hot):        " << (ok ? "OK" : "FAILED") << "\n";
+
+    ok = HeatmapWriter::writeHeatmap("heatmap_depth.tga", image_profiles,
+                                      img_width, img_height,
+                                      HeatmapWriter::Metric::MaxDepth,
+                                      Colormap::Jet, ImageFormat::TGA);
+    std::cout << "  heatmap_depth.tga (Jet):        " << (ok ? "OK" : "FAILED") << "\n";
+
+    ok = HeatmapWriter::writeHeatmap("heatmap_leaves.ppm", image_profiles,
+                                      img_width, img_height,
+                                      HeatmapWriter::Metric::LeafVisits,
+                                      Colormap::Turbo, ImageFormat::PPM);
+    std::cout << "  heatmap_leaves.ppm (Turbo):     " << (ok ? "OK" : "FAILED") << "\n";
+
+    // Test direct colormap API
+    std::vector<float> test_values(img_width * img_height);
+    for (uint32_t i = 0; i < img_width * img_height; i++) {
+      test_values[i] = static_cast<float>(i) / (img_width * img_height);
+    }
+    ok = HeatmapWriter::writeImage("colormap_test.bmp", test_values.data(),
+                                    img_width, img_height,
+                                    Colormap::Plasma, ImageFormat::BMP);
+    std::cout << "  colormap_test.bmp (Plasma):     " << (ok ? "OK" : "FAILED") << "\n";
+
+    // Test PNG format
+    ok = HeatmapWriter::writeHeatmap("heatmap_prims.png", image_profiles,
+                                      img_width, img_height,
+                                      HeatmapWriter::Metric::PrimsTested,
+                                      Colormap::Viridis, ImageFormat::PNG);
+    std::cout << "  heatmap_prims.png (Viridis):    " << (ok ? "OK" : "FAILED") << "\n";
+
+    ok = HeatmapWriter::writeImage("colormap_test.png", test_values.data(),
+                                    img_width, img_height,
+                                    Colormap::Inferno, ImageFormat::PNG);
+    std::cout << "  colormap_test.png (Inferno):    " << (ok ? "OK" : "FAILED") << "\n";
+
+    // Cleanup
+    delete[] image_profiles;
+
+    // Show statistics about generated heatmaps
+    std::cout << "\n=== Heatmap Statistics ===\n";
+    std::cout << "  Image size: " << img_width << "x" << img_height << " pixels\n";
+    std::cout << "  Files written: 7\n";
+    std::cout << "  Formats tested: BMP, TGA, PPM, PNG\n";
+    std::cout << "  Colormaps tested: Viridis, Hot, Jet, Turbo, Plasma, Inferno\n";
+  }
+
   std::cout << "\n============================================\n";
   std::cout << "Benchmark Complete\n";
   std::cout << "============================================\n";

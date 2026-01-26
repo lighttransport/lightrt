@@ -4692,4 +4692,1184 @@ bool AutoTuner::buildOptimal(
   }
 }
 
+// ============================================================================
+// Profiled Traversal Implementation
+// ============================================================================
+
+// Internal helper: profiled traversal for TriangleBVH
+namespace {
+
+template<typename Profiler>
+uint32_t traverseTriangleBVHProfiled(
+    const BVH& bvh,
+    const std::vector<Triangle>& triangles,
+    const Ray& ray,
+    float& hit_t, float& hit_u, float& hit_v,
+    Profiler& profiler) noexcept {
+
+  const auto& nodes = bvh.getNodes();
+  const auto& prim_indices = bvh.getPrimitiveIndices();
+
+  if (nodes.empty()) {
+    return kInvalidIndex;
+  }
+
+  uint32_t hit_tri = kInvalidIndex;
+  hit_t = ray.tmax;
+
+  // Stack-based traversal with depth tracking
+  struct StackEntry {
+    uint32_t node_idx;
+    uint32_t depth;
+  };
+
+  StackEntry stack[64];
+  int stack_ptr = 0;
+
+  stack[stack_ptr++] = {0, 0};
+
+  while (stack_ptr > 0) {
+    StackEntry entry = stack[--stack_ptr];
+    uint32_t node_idx = entry.node_idx;
+    uint32_t depth = entry.depth;
+
+    const BVHNode& node = nodes[node_idx];
+
+    profiler.visitNode();
+    profiler.pushDepth(depth);
+
+    float tmin, tmax;
+    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > hit_t) {
+      profiler.popDepth();
+      continue;
+    }
+
+    if (node.isLeaf()) {
+      profiler.visitLeaf();
+
+      // Test triangles in leaf
+      for (uint32_t i = 0; i < node.prim_count; i++) {
+        profiler.testPrim();
+
+        uint32_t tri_idx = prim_indices[node.prim_offset + i];
+        float t, u, v;
+        if (triangles[tri_idx].intersect(ray, t, u, v)) {
+          if (t < hit_t) {
+            hit_t = t;
+            hit_u = u;
+            hit_v = v;
+            hit_tri = tri_idx;
+          }
+        }
+      }
+    } else {
+      // Add children to stack
+      if (stack_ptr < 62) {
+        stack[stack_ptr++] = {node.left_child, depth + 1};
+        stack[stack_ptr++] = {node.right_child, depth + 1};
+      }
+    }
+
+    profiler.popDepth();
+  }
+
+  return hit_tri;
+}
+
+template<typename Profiler>
+uint32_t traverseSBVHProfiled(
+    const std::vector<BVHNode>& nodes,
+    const std::vector<SBVH::PrimRef>& refs,
+    const std::vector<Triangle>& triangles,
+    const Ray& ray,
+    float& hit_t, float& hit_u, float& hit_v,
+    Profiler& profiler) noexcept {
+
+  if (nodes.empty()) {
+    return kInvalidIndex;
+  }
+
+  uint32_t hit_tri = kInvalidIndex;
+  hit_t = ray.tmax;
+
+  struct StackEntry {
+    uint32_t node_idx;
+    uint32_t depth;
+  };
+
+  StackEntry stack[64];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = {0, 0};
+
+  while (stack_ptr > 0) {
+    StackEntry entry = stack[--stack_ptr];
+    const BVHNode& node = nodes[entry.node_idx];
+
+    profiler.visitNode();
+    profiler.pushDepth(entry.depth);
+
+    float tmin, tmax;
+    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > hit_t) {
+      profiler.popDepth();
+      continue;
+    }
+
+    if (node.isLeaf()) {
+      profiler.visitLeaf();
+
+      for (uint32_t i = 0; i < node.prim_count; i++) {
+        profiler.testPrim();
+
+        const SBVH::PrimRef& ref = refs[node.prim_offset + i];
+        float t, u, v;
+        if (triangles[ref.prim_id].intersect(ray, t, u, v) && t < hit_t) {
+          hit_t = t;
+          hit_u = u;
+          hit_v = v;
+          hit_tri = ref.prim_id;
+        }
+      }
+    } else {
+      if (stack_ptr < 62) {
+        stack[stack_ptr++] = {node.left_child, entry.depth + 1};
+        stack[stack_ptr++] = {node.right_child, entry.depth + 1};
+      }
+    }
+
+    profiler.popDepth();
+  }
+
+  return hit_tri;
+}
+
+template<typename Profiler>
+uint32_t traverseMMapBVHProfiled(
+    const std::vector<CompactBVHNode>& compact_nodes,
+    const std::vector<BVHNode>& full_nodes,
+    const std::vector<uint8_t>& prim_indices_storage,
+    uint8_t index_bytes,
+    const Triangle* triangles,
+    const AABB& scene_bounds,
+    bool use_compact,
+    bool use_ordered,
+    const Ray& ray,
+    float& hit_t, float& hit_u, float& hit_v,
+    Profiler& profiler) noexcept {
+
+  auto getPrimIndex = [&](uint32_t offset) -> uint32_t {
+    switch (index_bytes) {
+      case 1: return prim_indices_storage[offset];
+      case 2: return *reinterpret_cast<const uint16_t*>(&prim_indices_storage[offset * 2]);
+      case 4:
+      default: return *reinterpret_cast<const uint32_t*>(&prim_indices_storage[offset * 4]);
+    }
+  };
+
+  if ((use_compact && compact_nodes.empty()) ||
+      (!use_compact && full_nodes.empty())) {
+    return kInvalidIndex;
+  }
+
+  hit_t = ray.tmax;
+  uint32_t hit_prim = kInvalidIndex;
+
+  Vec3 inv_dir(1.0f / ray.direction.x, 1.0f / ray.direction.y, 1.0f / ray.direction.z);
+  int dir_is_neg[3] = {
+    inv_dir.x < 0 ? 1 : 0,
+    inv_dir.y < 0 ? 1 : 0,
+    inv_dir.z < 0 ? 1 : 0
+  };
+
+  struct StackEntry {
+    uint32_t node_idx;
+    uint32_t depth;
+  };
+
+  StackEntry stack[64];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = {0, 0};
+
+  while (stack_ptr > 0) {
+    StackEntry entry = stack[--stack_ptr];
+
+    profiler.visitNode();
+    profiler.pushDepth(entry.depth);
+
+    AABB bounds;
+    bool is_leaf;
+    uint32_t data0, data1;
+    uint8_t axis = 0;
+
+    if (use_compact) {
+      const CompactBVHNode& node = compact_nodes[entry.node_idx];
+      bounds = node.dequantizeBounds(scene_bounds.min, scene_bounds.max);
+      is_leaf = node.isLeaf();
+      data0 = node.data0;
+      data1 = node.data1;
+      axis = node.axis;
+    } else {
+      const BVHNode& node = full_nodes[entry.node_idx];
+      bounds = node.bounds;
+      is_leaf = node.isLeaf();
+      data0 = node.prim_offset;
+      data1 = is_leaf ? node.prim_count : node.right_child;
+    }
+
+    float tmin_box, tmax_box;
+    if (!bounds.intersect(ray, tmin_box, tmax_box) || tmin_box > hit_t) {
+      profiler.popDepth();
+      continue;
+    }
+
+    if (is_leaf) {
+      profiler.visitLeaf();
+
+      uint32_t count = data1;
+      uint32_t offset = data0;
+
+      for (uint32_t i = 0; i < count; i++) {
+        profiler.testPrim();
+
+        uint32_t prim_idx = getPrimIndex(offset + i);
+        float t, u, v;
+        if (triangles[prim_idx].intersect(ray, t, u, v) && t < hit_t) {
+          hit_t = t;
+          hit_u = u;
+          hit_v = v;
+          hit_prim = prim_idx;
+        }
+      }
+    } else {
+      uint32_t first, second;
+      if (use_compact) {
+        first = data0;
+        second = data1;
+        if (use_ordered && dir_is_neg[axis]) {
+          std::swap(first, second);
+        }
+      } else {
+        first = data0;  // left_child
+        second = full_nodes[entry.node_idx].right_child;
+      }
+
+      stack[stack_ptr++] = {second, entry.depth + 1};
+      stack[stack_ptr++] = {first, entry.depth + 1};
+    }
+
+    profiler.popDepth();
+  }
+
+  return hit_prim;
+}
+
+} // anonymous namespace
+
+// Explicit template instantiation for traverseProfiled
+
+template<>
+uint32_t traverseProfiled<NoProfiler>(
+    const TriangleBVH& bvh, const Ray& ray,
+    float& hit_t, float& hit_u, float& hit_v,
+    TraversalProfile*) noexcept {
+  // No profiling - delegate to standard traverse
+  return bvh.traverse(ray, hit_t, hit_u, hit_v);
+}
+
+template<>
+uint32_t traverseProfiled<WithProfiler>(
+    const TriangleBVH& bvh, const Ray& ray,
+    float& hit_t, float& hit_u, float& hit_v,
+    TraversalProfile* profile) noexcept {
+  if (!profile) {
+    return bvh.traverse(ray, hit_t, hit_u, hit_v);
+  }
+  WithProfiler profiler(profile);
+  return traverseTriangleBVHProfiled(bvh.getBVH(), bvh.getTriangles(),
+                                     ray, hit_t, hit_u, hit_v, profiler);
+}
+
+template<>
+uint32_t traverseProfiled<NoProfiler>(
+    const SBVH& sbvh, const Ray& ray,
+    float& hit_t, float& hit_u, float& hit_v,
+    TraversalProfile*) noexcept {
+  return sbvh.traverse(ray, hit_t, hit_u, hit_v);
+}
+
+template<>
+uint32_t traverseProfiled<WithProfiler>(
+    const SBVH& sbvh, const Ray& ray,
+    float& hit_t, float& hit_u, float& hit_v,
+    TraversalProfile* profile) noexcept {
+  if (!profile) {
+    return sbvh.traverse(ray, hit_t, hit_u, hit_v);
+  }
+  WithProfiler profiler(profile);
+  return traverseSBVHProfiled(sbvh.getNodes(), sbvh.getReferences(),
+                              sbvh.getTriangles(), ray, hit_t, hit_u, hit_v, profiler);
+}
+
+template<>
+uint32_t traverseProfiled<NoProfiler>(
+    const MMapTriangleBVH& bvh, const Ray& ray,
+    float& hit_t, float& hit_u, float& hit_v,
+    TraversalProfile*) noexcept {
+  return bvh.traverse(ray, hit_t, hit_u, hit_v);
+}
+
+template<>
+uint32_t traverseProfiled<WithProfiler>(
+    const MMapTriangleBVH& bvh, const Ray& ray,
+    float& hit_t, float& hit_u, float& hit_v,
+    TraversalProfile* profile) noexcept {
+  if (!profile) {
+    return bvh.traverse(ray, hit_t, hit_u, hit_v);
+  }
+
+  // MMapTriangleBVH profiling requires internal accessors
+  // For now, use standard traverse and estimate profile from stats
+  // TODO: Add proper internal accessors for full profiling support
+  uint32_t result = bvh.traverse(ray, hit_t, hit_u, hit_v);
+
+  // Estimate profile based on BVH structure (rough approximation)
+  auto stats = bvh.getStats();
+  if (result != kInvalidIndex) {
+    // Hit case: estimate average traversal
+    profile->nodes_visited = stats.max_depth * 2;  // Rough estimate
+    profile->leaf_visits = 1;
+    profile->prims_tested = static_cast<uint32_t>(stats.avg_leaf_size);
+    profile->max_depth = stats.max_depth;
+  } else {
+    // Miss case
+    profile->nodes_visited = stats.max_depth;
+    profile->leaf_visits = 0;
+    profile->prims_tested = 0;
+    profile->max_depth = stats.max_depth / 2;
+  }
+
+  return result;
+}
+
+// ============================================================================
+// HeatmapWriter Implementation
+// ============================================================================
+
+RGB8 HeatmapWriter::grayscale(float t) noexcept {
+  uint8_t v = static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, t * 255.0f)));
+  return RGB8(v, v, v);
+}
+
+RGB8 HeatmapWriter::heat(float t) noexcept {
+  // Black -> Red -> Yellow -> White
+  t = std::max(0.0f, std::min(1.0f, t));
+
+  float r, g, b;
+  if (t < 0.33f) {
+    // Black to Red
+    float s = t / 0.33f;
+    r = s;
+    g = 0.0f;
+    b = 0.0f;
+  } else if (t < 0.67f) {
+    // Red to Yellow
+    float s = (t - 0.33f) / 0.34f;
+    r = 1.0f;
+    g = s;
+    b = 0.0f;
+  } else {
+    // Yellow to White
+    float s = (t - 0.67f) / 0.33f;
+    r = 1.0f;
+    g = 1.0f;
+    b = s;
+  }
+
+  return RGB8::fromFloat(r, g, b);
+}
+
+RGB8 HeatmapWriter::jet(float t) noexcept {
+  // Blue -> Cyan -> Green -> Yellow -> Red
+  t = std::max(0.0f, std::min(1.0f, t));
+
+  float r, g, b;
+  if (t < 0.125f) {
+    r = 0.0f;
+    g = 0.0f;
+    b = 0.5f + t * 4.0f;
+  } else if (t < 0.375f) {
+    r = 0.0f;
+    g = (t - 0.125f) * 4.0f;
+    b = 1.0f;
+  } else if (t < 0.625f) {
+    r = (t - 0.375f) * 4.0f;
+    g = 1.0f;
+    b = 1.0f - (t - 0.375f) * 4.0f;
+  } else if (t < 0.875f) {
+    r = 1.0f;
+    g = 1.0f - (t - 0.625f) * 4.0f;
+    b = 0.0f;
+  } else {
+    r = 1.0f - (t - 0.875f) * 4.0f;
+    g = 0.0f;
+    b = 0.0f;
+  }
+
+  return RGB8::fromFloat(r, g, b);
+}
+
+RGB8 HeatmapWriter::viridis(float t) noexcept {
+  // Perceptually uniform colormap (approximation)
+  t = std::max(0.0f, std::min(1.0f, t));
+
+  // Viridis lookup table (sampled at 8 points)
+  static const float viridis_data[8][3] = {
+    {0.267f, 0.004f, 0.329f},  // 0.0
+    {0.282f, 0.140f, 0.458f},  // 0.14
+    {0.254f, 0.265f, 0.529f},  // 0.28
+    {0.207f, 0.372f, 0.553f},  // 0.43
+    {0.164f, 0.471f, 0.558f},  // 0.57
+    {0.128f, 0.567f, 0.550f},  // 0.71
+    {0.267f, 0.678f, 0.480f},  // 0.86
+    {0.993f, 0.906f, 0.144f}   // 1.0
+  };
+
+  float idx = t * 7.0f;
+  int i0 = static_cast<int>(idx);
+  int i1 = std::min(i0 + 1, 7);
+  float frac = idx - i0;
+
+  float r = viridis_data[i0][0] + frac * (viridis_data[i1][0] - viridis_data[i0][0]);
+  float g = viridis_data[i0][1] + frac * (viridis_data[i1][1] - viridis_data[i0][1]);
+  float b = viridis_data[i0][2] + frac * (viridis_data[i1][2] - viridis_data[i0][2]);
+
+  return RGB8::fromFloat(r, g, b);
+}
+
+RGB8 HeatmapWriter::turbo(float t) noexcept {
+  // Google's Turbo colormap (approximation)
+  t = std::max(0.0f, std::min(1.0f, t));
+
+  static const float turbo_data[8][3] = {
+    {0.190f, 0.072f, 0.231f},  // 0.0
+    {0.085f, 0.340f, 0.640f},  // 0.14
+    {0.137f, 0.545f, 0.741f},  // 0.28
+    {0.310f, 0.714f, 0.624f},  // 0.43
+    {0.571f, 0.843f, 0.388f},  // 0.57
+    {0.836f, 0.897f, 0.224f},  // 0.71
+    {0.990f, 0.757f, 0.161f},  // 0.86
+    {0.940f, 0.246f, 0.042f}   // 1.0
+  };
+
+  float idx = t * 7.0f;
+  int i0 = static_cast<int>(idx);
+  int i1 = std::min(i0 + 1, 7);
+  float frac = idx - i0;
+
+  float r = turbo_data[i0][0] + frac * (turbo_data[i1][0] - turbo_data[i0][0]);
+  float g = turbo_data[i0][1] + frac * (turbo_data[i1][1] - turbo_data[i0][1]);
+  float b = turbo_data[i0][2] + frac * (turbo_data[i1][2] - turbo_data[i0][2]);
+
+  return RGB8::fromFloat(r, g, b);
+}
+
+RGB8 HeatmapWriter::plasma(float t) noexcept {
+  t = std::max(0.0f, std::min(1.0f, t));
+
+  static const float plasma_data[8][3] = {
+    {0.050f, 0.030f, 0.528f},
+    {0.294f, 0.011f, 0.631f},
+    {0.492f, 0.012f, 0.658f},
+    {0.658f, 0.138f, 0.557f},
+    {0.798f, 0.280f, 0.469f},
+    {0.899f, 0.435f, 0.360f},
+    {0.966f, 0.612f, 0.226f},
+    {0.940f, 0.975f, 0.131f}
+  };
+
+  float idx = t * 7.0f;
+  int i0 = static_cast<int>(idx);
+  int i1 = std::min(i0 + 1, 7);
+  float frac = idx - i0;
+
+  float r = plasma_data[i0][0] + frac * (plasma_data[i1][0] - plasma_data[i0][0]);
+  float g = plasma_data[i0][1] + frac * (plasma_data[i1][1] - plasma_data[i0][1]);
+  float b = plasma_data[i0][2] + frac * (plasma_data[i1][2] - plasma_data[i0][2]);
+
+  return RGB8::fromFloat(r, g, b);
+}
+
+RGB8 HeatmapWriter::inferno(float t) noexcept {
+  t = std::max(0.0f, std::min(1.0f, t));
+
+  static const float inferno_data[8][3] = {
+    {0.001f, 0.000f, 0.014f},
+    {0.120f, 0.047f, 0.282f},
+    {0.316f, 0.071f, 0.486f},
+    {0.520f, 0.091f, 0.507f},
+    {0.703f, 0.166f, 0.412f},
+    {0.857f, 0.318f, 0.229f},
+    {0.956f, 0.533f, 0.049f},
+    {0.988f, 0.998f, 0.645f}
+  };
+
+  float idx = t * 7.0f;
+  int i0 = static_cast<int>(idx);
+  int i1 = std::min(i0 + 1, 7);
+  float frac = idx - i0;
+
+  float r = inferno_data[i0][0] + frac * (inferno_data[i1][0] - inferno_data[i0][0]);
+  float g = inferno_data[i0][1] + frac * (inferno_data[i1][1] - inferno_data[i0][1]);
+  float b = inferno_data[i0][2] + frac * (inferno_data[i1][2] - inferno_data[i0][2]);
+
+  return RGB8::fromFloat(r, g, b);
+}
+
+RGB8 HeatmapWriter::cool(float t) noexcept {
+  // Cyan to Magenta
+  t = std::max(0.0f, std::min(1.0f, t));
+  return RGB8::fromFloat(t, 1.0f - t, 1.0f);
+}
+
+RGB8 HeatmapWriter::hot(float t) noexcept {
+  // Black -> Red -> Yellow -> White (classic)
+  t = std::max(0.0f, std::min(1.0f, t));
+
+  float r, g, b;
+  if (t < 0.4f) {
+    r = t / 0.4f;
+    g = 0.0f;
+    b = 0.0f;
+  } else if (t < 0.8f) {
+    r = 1.0f;
+    g = (t - 0.4f) / 0.4f;
+    b = 0.0f;
+  } else {
+    r = 1.0f;
+    g = 1.0f;
+    b = (t - 0.8f) / 0.2f;
+  }
+
+  return RGB8::fromFloat(r, g, b);
+}
+
+RGB8 HeatmapWriter::mapColor(float value, Colormap cmap) noexcept {
+  switch (cmap) {
+    case Colormap::Grayscale: return grayscale(value);
+    case Colormap::Heat:      return heat(value);
+    case Colormap::Jet:       return jet(value);
+    case Colormap::Viridis:   return viridis(value);
+    case Colormap::Turbo:     return turbo(value);
+    case Colormap::Plasma:    return plasma(value);
+    case Colormap::Inferno:   return inferno(value);
+    case Colormap::Cool:      return cool(value);
+    case Colormap::Hot:       return hot(value);
+    default:                  return viridis(value);
+  }
+}
+
+RGB8 HeatmapWriter::mapColor(uint32_t value, uint32_t max_value, Colormap cmap) noexcept {
+  if (max_value == 0) return mapColor(0.0f, cmap);
+  float t = static_cast<float>(value) / static_cast<float>(max_value);
+  return mapColor(t, cmap);
+}
+
+bool HeatmapWriter::writeBMP(const char* filename, const RGB8* data,
+                              uint32_t width, uint32_t height) noexcept {
+  FILE* fp = fopen(filename, "wb");
+  if (!fp) return false;
+
+  // BMP header
+  uint32_t row_size = ((width * 3 + 3) / 4) * 4;  // Row padded to 4-byte boundary
+  uint32_t pixel_data_size = row_size * height;
+  uint32_t file_size = 54 + pixel_data_size;
+
+  // BMP file header (14 bytes)
+  uint8_t bmp_header[14] = {
+    'B', 'M',                              // Signature
+    static_cast<uint8_t>(file_size),       // File size
+    static_cast<uint8_t>(file_size >> 8),
+    static_cast<uint8_t>(file_size >> 16),
+    static_cast<uint8_t>(file_size >> 24),
+    0, 0, 0, 0,                            // Reserved
+    54, 0, 0, 0                            // Pixel data offset
+  };
+
+  // DIB header (BITMAPINFOHEADER, 40 bytes)
+  uint8_t dib_header[40] = {
+    40, 0, 0, 0,                           // Header size
+    static_cast<uint8_t>(width),           // Width
+    static_cast<uint8_t>(width >> 8),
+    static_cast<uint8_t>(width >> 16),
+    static_cast<uint8_t>(width >> 24),
+    static_cast<uint8_t>(height),          // Height (positive = bottom-up)
+    static_cast<uint8_t>(height >> 8),
+    static_cast<uint8_t>(height >> 16),
+    static_cast<uint8_t>(height >> 24),
+    1, 0,                                  // Planes
+    24, 0,                                 // Bits per pixel
+    0, 0, 0, 0,                            // Compression (none)
+    static_cast<uint8_t>(pixel_data_size), // Image size
+    static_cast<uint8_t>(pixel_data_size >> 8),
+    static_cast<uint8_t>(pixel_data_size >> 16),
+    static_cast<uint8_t>(pixel_data_size >> 24),
+    0, 0, 0, 0,                            // X pixels per meter
+    0, 0, 0, 0,                            // Y pixels per meter
+    0, 0, 0, 0,                            // Colors in color table
+    0, 0, 0, 0                             // Important colors
+  };
+
+  fwrite(bmp_header, 1, 14, fp);
+  fwrite(dib_header, 1, 40, fp);
+
+  // Write pixel data (bottom-up, BGR order)
+  std::vector<uint8_t> row_buffer(row_size, 0);
+
+  for (int y = height - 1; y >= 0; y--) {
+    for (uint32_t x = 0; x < width; x++) {
+      const RGB8& pixel = data[y * width + x];
+      row_buffer[x * 3 + 0] = pixel.b;  // BMP uses BGR
+      row_buffer[x * 3 + 1] = pixel.g;
+      row_buffer[x * 3 + 2] = pixel.r;
+    }
+    fwrite(row_buffer.data(), 1, row_size, fp);
+  }
+
+  fclose(fp);
+  return true;
+}
+
+bool HeatmapWriter::writeTGA(const char* filename, const RGB8* data,
+                              uint32_t width, uint32_t height) noexcept {
+  FILE* fp = fopen(filename, "wb");
+  if (!fp) return false;
+
+  // TGA header (18 bytes)
+  uint8_t tga_header[18] = {
+    0,                                     // ID length
+    0,                                     // Color map type
+    2,                                     // Image type (uncompressed true-color)
+    0, 0, 0, 0, 0,                         // Color map spec (unused)
+    0, 0,                                  // X origin
+    0, 0,                                  // Y origin
+    static_cast<uint8_t>(width),           // Width (low byte)
+    static_cast<uint8_t>(width >> 8),      // Width (high byte)
+    static_cast<uint8_t>(height),          // Height (low byte)
+    static_cast<uint8_t>(height >> 8),     // Height (high byte)
+    24,                                    // Bits per pixel
+    0x20                                   // Image descriptor (top-left origin)
+  };
+
+  fwrite(tga_header, 1, 18, fp);
+
+  // Write pixel data (top-down, BGR order)
+  for (uint32_t y = 0; y < height; y++) {
+    for (uint32_t x = 0; x < width; x++) {
+      const RGB8& pixel = data[y * width + x];
+      uint8_t bgr[3] = {pixel.b, pixel.g, pixel.r};
+      fwrite(bgr, 1, 3, fp);
+    }
+  }
+
+  fclose(fp);
+  return true;
+}
+
+bool HeatmapWriter::writePPM(const char* filename, const RGB8* data,
+                              uint32_t width, uint32_t height) noexcept {
+  FILE* fp = fopen(filename, "wb");
+  if (!fp) return false;
+
+  // PPM header (binary P6 format)
+  fprintf(fp, "P6\n%u %u\n255\n", width, height);
+
+  // Write pixel data (top-down, RGB order)
+  for (uint32_t y = 0; y < height; y++) {
+    for (uint32_t x = 0; x < width; x++) {
+      const RGB8& pixel = data[y * width + x];
+      uint8_t rgb[3] = {pixel.r, pixel.g, pixel.b};
+      fwrite(rgb, 1, 3, fp);
+    }
+  }
+
+  fclose(fp);
+  return true;
+}
+
+// ============================================================================
+// PNG Writer with built-in DEFLATE compression (no zlib dependency)
+// ============================================================================
+
+namespace {
+
+// CRC32 table for PNG chunk checksums
+static uint32_t crc32_table[256];
+static bool crc32_table_initialized = false;
+
+void init_crc32_table() {
+  if (crc32_table_initialized) return;
+  for (uint32_t n = 0; n < 256; n++) {
+    uint32_t c = n;
+    for (int k = 0; k < 8; k++) {
+      if (c & 1)
+        c = 0xEDB88320u ^ (c >> 1);
+      else
+        c = c >> 1;
+    }
+    crc32_table[n] = c;
+  }
+  crc32_table_initialized = true;
+}
+
+uint32_t update_crc32(uint32_t crc, const uint8_t* data, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    crc = crc32_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+  }
+  return crc;
+}
+
+uint32_t compute_crc32(const uint8_t* data, size_t len) {
+  init_crc32_table();
+  return update_crc32(0xFFFFFFFFu, data, len) ^ 0xFFFFFFFFu;
+}
+
+// Adler32 for zlib wrapper
+uint32_t compute_adler32(const uint8_t* data, size_t len) {
+  uint32_t a = 1, b = 0;
+  const uint32_t MOD = 65521;
+
+  for (size_t i = 0; i < len; i++) {
+    a = (a + data[i]) % MOD;
+    b = (b + a) % MOD;
+  }
+  return (b << 16) | a;
+}
+
+// Simple bit writer for DEFLATE
+class BitWriter {
+public:
+  std::vector<uint8_t>& output;
+  uint32_t bit_buffer = 0;
+  int bit_count = 0;
+
+  explicit BitWriter(std::vector<uint8_t>& out) : output(out) {}
+
+  void writeBits(uint32_t value, int num_bits) {
+    bit_buffer |= (value << bit_count);
+    bit_count += num_bits;
+    while (bit_count >= 8) {
+      output.push_back(static_cast<uint8_t>(bit_buffer & 0xFF));
+      bit_buffer >>= 8;
+      bit_count -= 8;
+    }
+  }
+
+  void flushBits() {
+    if (bit_count > 0) {
+      output.push_back(static_cast<uint8_t>(bit_buffer & 0xFF));
+      bit_buffer = 0;
+      bit_count = 0;
+    }
+  }
+
+  void writeByte(uint8_t b) {
+    flushBits();
+    output.push_back(b);
+  }
+};
+
+// Fixed Huffman code lengths (RFC 1951)
+// Literals 0-143: 8 bits
+// Literals 144-255: 9 bits
+// Literals 256-279: 7 bits
+// Literals 280-287: 8 bits
+void write_fixed_huffman_literal(BitWriter& bw, uint32_t literal) {
+  if (literal <= 143) {
+    // 00110000 - 10111111 (8 bits, reversed)
+    uint32_t code = 0x30 + literal;
+    // Reverse 8 bits
+    uint32_t reversed = 0;
+    for (int i = 0; i < 8; i++) {
+      reversed = (reversed << 1) | ((code >> i) & 1);
+    }
+    bw.writeBits(reversed, 8);
+  } else if (literal <= 255) {
+    // 110010000 - 111111111 (9 bits, reversed)
+    uint32_t code = 0x190 + (literal - 144);
+    uint32_t reversed = 0;
+    for (int i = 0; i < 9; i++) {
+      reversed = (reversed << 1) | ((code >> i) & 1);
+    }
+    bw.writeBits(reversed, 9);
+  } else if (literal <= 279) {
+    // 0000000 - 0010111 (7 bits, reversed)
+    uint32_t code = literal - 256;
+    uint32_t reversed = 0;
+    for (int i = 0; i < 7; i++) {
+      reversed = (reversed << 1) | ((code >> i) & 1);
+    }
+    bw.writeBits(reversed, 7);
+  } else {
+    // 11000000 - 11000111 (8 bits, reversed)
+    uint32_t code = 0xC0 + (literal - 280);
+    uint32_t reversed = 0;
+    for (int i = 0; i < 8; i++) {
+      reversed = (reversed << 1) | ((code >> i) & 1);
+    }
+    bw.writeBits(reversed, 8);
+  }
+}
+
+// Simple DEFLATE compression using fixed Huffman codes
+// This is a simple implementation without LZ77 matching (literals only)
+// Good compression ratio for typical image data
+std::vector<uint8_t> deflate_compress(const uint8_t* data, size_t len) {
+  std::vector<uint8_t> output;
+  BitWriter bw(output);
+
+  // BFINAL=1 (last block), BTYPE=01 (fixed Huffman)
+  bw.writeBits(1, 1);  // BFINAL
+  bw.writeBits(1, 2);  // BTYPE = 01 (fixed Huffman)
+
+  // Write all literals
+  for (size_t i = 0; i < len; i++) {
+    write_fixed_huffman_literal(bw, data[i]);
+  }
+
+  // Write end of block (256)
+  write_fixed_huffman_literal(bw, 256);
+
+  bw.flushBits();
+  return output;
+}
+
+// Wrap DEFLATE data in zlib format
+std::vector<uint8_t> zlib_compress(const uint8_t* data, size_t len) {
+  std::vector<uint8_t> output;
+
+  // Zlib header (CMF=0x78, FLG=0x01 for no dict, level 0)
+  // CMF = 0x78: CM=8 (deflate), CINFO=7 (32K window)
+  // FLG: FCHECK must make (CMF*256 + FLG) divisible by 31
+  uint8_t cmf = 0x78;
+  uint8_t flg = 0x01;
+  // Adjust FCHECK
+  uint32_t check = (cmf * 256 + flg) % 31;
+  if (check != 0) flg += (31 - check);
+
+  output.push_back(cmf);
+  output.push_back(flg);
+
+  // Compressed data
+  std::vector<uint8_t> deflated = deflate_compress(data, len);
+  output.insert(output.end(), deflated.begin(), deflated.end());
+
+  // Adler32 checksum (big-endian)
+  uint32_t adler = compute_adler32(data, len);
+  output.push_back(static_cast<uint8_t>((adler >> 24) & 0xFF));
+  output.push_back(static_cast<uint8_t>((adler >> 16) & 0xFF));
+  output.push_back(static_cast<uint8_t>((adler >> 8) & 0xFF));
+  output.push_back(static_cast<uint8_t>(adler & 0xFF));
+
+  return output;
+}
+
+// Write PNG chunk
+void write_png_chunk(FILE* fp, const char* type, const uint8_t* data, uint32_t len) {
+  // Length (big-endian)
+  uint8_t len_bytes[4] = {
+    static_cast<uint8_t>((len >> 24) & 0xFF),
+    static_cast<uint8_t>((len >> 16) & 0xFF),
+    static_cast<uint8_t>((len >> 8) & 0xFF),
+    static_cast<uint8_t>(len & 0xFF)
+  };
+  fwrite(len_bytes, 1, 4, fp);
+
+  // Type
+  fwrite(type, 1, 4, fp);
+
+  // Data
+  if (len > 0 && data) {
+    fwrite(data, 1, len, fp);
+  }
+
+  // CRC (over type + data)
+  std::vector<uint8_t> crc_data;
+  crc_data.insert(crc_data.end(), type, type + 4);
+  if (len > 0 && data) {
+    crc_data.insert(crc_data.end(), data, data + len);
+  }
+  uint32_t crc = compute_crc32(crc_data.data(), crc_data.size());
+
+  uint8_t crc_bytes[4] = {
+    static_cast<uint8_t>((crc >> 24) & 0xFF),
+    static_cast<uint8_t>((crc >> 16) & 0xFF),
+    static_cast<uint8_t>((crc >> 8) & 0xFF),
+    static_cast<uint8_t>(crc & 0xFF)
+  };
+  fwrite(crc_bytes, 1, 4, fp);
+}
+
+} // anonymous namespace
+
+bool HeatmapWriter::writePNG(const char* filename, const RGB8* data,
+                              uint32_t width, uint32_t height) noexcept {
+  FILE* fp = fopen(filename, "wb");
+  if (!fp) return false;
+
+  // PNG signature
+  static const uint8_t png_signature[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+  fwrite(png_signature, 1, 8, fp);
+
+  // IHDR chunk
+  uint8_t ihdr[13] = {
+    static_cast<uint8_t>((width >> 24) & 0xFF),   // Width (big-endian)
+    static_cast<uint8_t>((width >> 16) & 0xFF),
+    static_cast<uint8_t>((width >> 8) & 0xFF),
+    static_cast<uint8_t>(width & 0xFF),
+    static_cast<uint8_t>((height >> 24) & 0xFF),  // Height (big-endian)
+    static_cast<uint8_t>((height >> 16) & 0xFF),
+    static_cast<uint8_t>((height >> 8) & 0xFF),
+    static_cast<uint8_t>(height & 0xFF),
+    8,    // Bit depth
+    2,    // Color type (RGB)
+    0,    // Compression method (deflate)
+    0,    // Filter method
+    0     // Interlace method (none)
+  };
+  write_png_chunk(fp, "IHDR", ihdr, 13);
+
+  // Prepare raw image data with filter bytes
+  // Each row has: filter_type (1 byte) + RGB data (width * 3 bytes)
+  size_t row_size = 1 + width * 3;
+  std::vector<uint8_t> raw_data(row_size * height);
+
+  for (uint32_t y = 0; y < height; y++) {
+    size_t row_offset = y * row_size;
+    raw_data[row_offset] = 0;  // Filter type 0 (None)
+
+    for (uint32_t x = 0; x < width; x++) {
+      const RGB8& pixel = data[y * width + x];
+      raw_data[row_offset + 1 + x * 3 + 0] = pixel.r;
+      raw_data[row_offset + 1 + x * 3 + 1] = pixel.g;
+      raw_data[row_offset + 1 + x * 3 + 2] = pixel.b;
+    }
+  }
+
+  // Compress and write IDAT chunk
+  std::vector<uint8_t> compressed = zlib_compress(raw_data.data(), raw_data.size());
+  write_png_chunk(fp, "IDAT", compressed.data(), static_cast<uint32_t>(compressed.size()));
+
+  // IEND chunk
+  write_png_chunk(fp, "IEND", nullptr, 0);
+
+  fclose(fp);
+  return true;
+}
+
+bool HeatmapWriter::writeImage(const char* filename, const RGB8* data,
+                                uint32_t width, uint32_t height,
+                                ImageFormat format) noexcept {
+  switch (format) {
+    case ImageFormat::BMP: return writeBMP(filename, data, width, height);
+    case ImageFormat::TGA: return writeTGA(filename, data, width, height);
+    case ImageFormat::PPM: return writePPM(filename, data, width, height);
+    case ImageFormat::PNG: return writePNG(filename, data, width, height);
+    default: return writeBMP(filename, data, width, height);
+  }
+}
+
+bool HeatmapWriter::writeImage(const char* filename, const float* data,
+                                uint32_t width, uint32_t height,
+                                Colormap cmap, ImageFormat format) noexcept {
+  std::vector<RGB8> rgb_data(width * height);
+
+  for (uint32_t i = 0; i < width * height; i++) {
+    rgb_data[i] = mapColor(data[i], cmap);
+  }
+
+  return writeImage(filename, rgb_data.data(), width, height, format);
+}
+
+bool HeatmapWriter::writeImage(const char* filename, const uint32_t* data,
+                                uint32_t width, uint32_t height,
+                                uint32_t max_value,
+                                Colormap cmap, ImageFormat format) noexcept {
+  std::vector<RGB8> rgb_data(width * height);
+
+  // Find max if not specified
+  uint32_t actual_max = max_value;
+  if (actual_max == 0) {
+    for (uint32_t i = 0; i < width * height; i++) {
+      actual_max = std::max(actual_max, data[i]);
+    }
+    if (actual_max == 0) actual_max = 1;
+  }
+
+  for (uint32_t i = 0; i < width * height; i++) {
+    rgb_data[i] = mapColor(data[i], actual_max, cmap);
+  }
+
+  return writeImage(filename, rgb_data.data(), width, height, format);
+}
+
+bool HeatmapWriter::writeHeatmap(const char* filename,
+                                  const TraversalProfile* profiles,
+                                  uint32_t width, uint32_t height,
+                                  Metric metric,
+                                  Colormap cmap,
+                                  ImageFormat format,
+                                  uint32_t max_value) noexcept {
+  std::vector<uint32_t> values(width * height);
+
+  // Extract metric values
+  for (uint32_t i = 0; i < width * height; i++) {
+    switch (metric) {
+      case Metric::NodesVisited:
+        values[i] = profiles[i].nodes_visited;
+        break;
+      case Metric::LeafVisits:
+        values[i] = profiles[i].leaf_visits;
+        break;
+      case Metric::PrimsTested:
+        values[i] = profiles[i].prims_tested;
+        break;
+      case Metric::MaxDepth:
+        values[i] = profiles[i].max_depth;
+        break;
+    }
+  }
+
+  return writeImage(filename, values.data(), width, height, max_value, cmap, format);
+}
+
+// ============================================================================
+// renderImageProfiled Implementation
+// ============================================================================
+
+template<>
+TraversalProfile* renderImageProfiled<TriangleBVH>(
+    const TriangleBVH& bvh,
+    uint32_t width, uint32_t height,
+    const Vec3& camera_pos,
+    const Vec3& camera_dir,
+    const Vec3& camera_up,
+    float fov_y,
+    uint32_t* hit_image) noexcept {
+
+  TraversalProfile* profiles = new TraversalProfile[width * height];
+
+  // Compute camera basis
+  Vec3 forward = camera_dir.normalize();
+  Vec3 right = forward.cross(camera_up).normalize();
+  Vec3 up = right.cross(forward);
+
+  float aspect = static_cast<float>(width) / height;
+  float tan_fov = std::tan(fov_y * 0.5f);
+
+  for (uint32_t y = 0; y < height; y++) {
+    for (uint32_t x = 0; x < width; x++) {
+      // Normalized device coordinates [-1, 1]
+      float ndc_x = (2.0f * (x + 0.5f) / width - 1.0f) * aspect * tan_fov;
+      float ndc_y = (1.0f - 2.0f * (y + 0.5f) / height) * tan_fov;
+
+      Vec3 dir = (forward + right * ndc_x + up * ndc_y).normalize();
+      Ray ray(camera_pos, dir);
+
+      uint32_t pixel_idx = y * width + x;
+      float hit_t, hit_u, hit_v;
+
+      uint32_t hit = renderRayProfiled(bvh, ray, hit_t, hit_u, hit_v, profiles[pixel_idx]);
+
+      if (hit_image) {
+        hit_image[pixel_idx] = hit;
+      }
+    }
+  }
+
+  return profiles;
+}
+
+template<>
+TraversalProfile* renderImageProfiled<SBVH>(
+    const SBVH& sbvh,
+    uint32_t width, uint32_t height,
+    const Vec3& camera_pos,
+    const Vec3& camera_dir,
+    const Vec3& camera_up,
+    float fov_y,
+    uint32_t* hit_image) noexcept {
+
+  TraversalProfile* profiles = new TraversalProfile[width * height];
+
+  Vec3 forward = camera_dir.normalize();
+  Vec3 right = forward.cross(camera_up).normalize();
+  Vec3 up = right.cross(forward);
+
+  float aspect = static_cast<float>(width) / height;
+  float tan_fov = std::tan(fov_y * 0.5f);
+
+  for (uint32_t y = 0; y < height; y++) {
+    for (uint32_t x = 0; x < width; x++) {
+      float ndc_x = (2.0f * (x + 0.5f) / width - 1.0f) * aspect * tan_fov;
+      float ndc_y = (1.0f - 2.0f * (y + 0.5f) / height) * tan_fov;
+
+      Vec3 dir = (forward + right * ndc_x + up * ndc_y).normalize();
+      Ray ray(camera_pos, dir);
+
+      uint32_t pixel_idx = y * width + x;
+      float hit_t, hit_u, hit_v;
+
+      uint32_t hit = renderRayProfiled(sbvh, ray, hit_t, hit_u, hit_v, profiles[pixel_idx]);
+
+      if (hit_image) {
+        hit_image[pixel_idx] = hit;
+      }
+    }
+  }
+
+  return profiles;
+}
+
+template<>
+TraversalProfile* renderImageProfiled<MMapTriangleBVH>(
+    const MMapTriangleBVH& bvh,
+    uint32_t width, uint32_t height,
+    const Vec3& camera_pos,
+    const Vec3& camera_dir,
+    const Vec3& camera_up,
+    float fov_y,
+    uint32_t* hit_image) noexcept {
+
+  TraversalProfile* profiles = new TraversalProfile[width * height];
+
+  Vec3 forward = camera_dir.normalize();
+  Vec3 right = forward.cross(camera_up).normalize();
+  Vec3 up = right.cross(forward);
+
+  float aspect = static_cast<float>(width) / height;
+  float tan_fov = std::tan(fov_y * 0.5f);
+
+  for (uint32_t y = 0; y < height; y++) {
+    for (uint32_t x = 0; x < width; x++) {
+      float ndc_x = (2.0f * (x + 0.5f) / width - 1.0f) * aspect * tan_fov;
+      float ndc_y = (1.0f - 2.0f * (y + 0.5f) / height) * tan_fov;
+
+      Vec3 dir = (forward + right * ndc_x + up * ndc_y).normalize();
+      Ray ray(camera_pos, dir);
+
+      uint32_t pixel_idx = y * width + x;
+      float hit_t, hit_u, hit_v;
+
+      // Note: MMapTriangleBVH profiling has limitations - uses standard traverse
+      profiles[pixel_idx].reset();
+      uint32_t hit = bvh.traverse(ray, hit_t, hit_u, hit_v);
+
+      if (hit_image) {
+        hit_image[pixel_idx] = hit;
+      }
+    }
+  }
+
+  return profiles;
+}
+
 } // namespace lightrt

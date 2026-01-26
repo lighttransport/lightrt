@@ -49,6 +49,9 @@ LightRT is a two-file BVH (Bounding Volume Hierarchy) library: `lightrt.hh` (hea
 - `MMapTriangleBVH`: Zero-copy BVH over external triangle data with compact nodes
 - `MMapGenericBVH`: Zero-copy BVH for custom primitives via callbacks
 - `CompactBVHNode`: 24-byte node with 16-bit quantized bounds (vs 56-byte BVHNode)
+- `TraversalProfile`: Profiling data (nodes visited, prims tested, depth)
+- `NoProfiler` / `WithProfiler`: Template policies for zero-overhead profiling
+- `HeatmapWriter`: Image writer for BVH visualization (BMP, TGA, PPM)
 
 ### Primitive Types
 - `Triangle`: 3 vertices (36 bytes), Moller-Trumbore intersection
@@ -260,6 +263,105 @@ Benefits:
 - Quantized bounds have ~0.0015% precision loss (16-bit = 65536 levels)
 - External primitive data must remain valid during BVH lifetime
 - Slightly slower dequantization overhead for compact nodes
+
+## Traversal Profiling (Zero-Overhead Template)
+
+Template-based profiling system with zero overhead when disabled.
+
+### Usage
+
+```cpp
+// Non-profiled (zero overhead - NoProfiler calls are optimized away)
+float t, u, v;
+uint32_t hit = traverseProfiled<NoProfiler>(bvh, ray, t, u, v, nullptr);
+
+// Profiled (collects statistics)
+TraversalProfile profile;
+uint32_t hit = traverseProfiled<WithProfiler>(bvh, ray, t, u, v, &profile);
+
+// Access statistics
+std::cout << "Nodes visited: " << profile.nodes_visited << "\n";
+std::cout << "Prims tested: " << profile.prims_tested << "\n";
+std::cout << "Max depth: " << profile.max_depth << "\n";
+```
+
+### Profile Data
+
+`TraversalProfile` contains:
+- `nodes_visited`: Total BVH nodes visited
+- `leaf_visits`: Leaf nodes visited
+- `prims_tested`: Primitive intersection tests
+- `max_depth`: Maximum traversal depth reached
+
+### Supported BVH Types
+
+- `TriangleBVH`: Full profiling support
+- `SBVH`: Full profiling support
+- `MMapTriangleBVH`: Estimated profile based on BVH stats
+
+### Performance
+
+Benchmark results (10000 rays, 10000 triangles):
+- Non-profiled: ~29ms
+- Profiled: ~34ms
+- Overhead: ~16%
+
+## Heatmap / Pseudocolor Image Writer
+
+Zero-dependency image writer for BVH traversal visualization.
+
+### Supported Formats
+
+- **BMP**: Windows Bitmap (24-bit RGB, uncompressed)
+- **TGA**: Truevision TGA (24-bit RGB, uncompressed)
+- **PPM**: Portable Pixmap (binary P6)
+- **PNG**: PNG (24-bit RGB, DEFLATE compressed, no zlib dependency)
+
+### Colormaps
+
+- `Grayscale`: Black to white
+- `Heat`: Black → Red → Yellow → White
+- `Jet`: Blue → Cyan → Green → Yellow → Red
+- `Viridis`: Perceptually uniform (purple → blue → green → yellow)
+- `Turbo`: Google's improved rainbow
+- `Plasma`: Perceptually uniform (purple → pink → orange → yellow)
+- `Inferno`: Perceptually uniform (black → purple → red → yellow)
+- `Cool`: Cyan to Magenta
+- `Hot`: Black → Red → Yellow → White (classic)
+
+### Usage
+
+```cpp
+// Render image with profiling
+TraversalProfile* profiles = renderImageProfiled(
+    bvh, width, height,
+    camera_pos, camera_dir, camera_up, fov_y);
+
+// Write heatmap
+HeatmapWriter::writeHeatmap("nodes.bmp", profiles, width, height,
+                             HeatmapWriter::Metric::NodesVisited,
+                             Colormap::Viridis, ImageFormat::BMP);
+
+// Available metrics
+HeatmapWriter::Metric::NodesVisited  // Nodes visited per ray
+HeatmapWriter::Metric::LeafVisits    // Leaf nodes visited
+HeatmapWriter::Metric::PrimsTested   // Primitive tests per ray
+HeatmapWriter::Metric::MaxDepth      // Traversal depth
+
+// Direct colormap API
+HeatmapWriter::writeImage("out.bmp", float_data, w, h, Colormap::Plasma);
+HeatmapWriter::writeImage("out.bmp", uint_data, w, h, max_val, Colormap::Hot);
+
+delete[] profiles;  // Caller owns memory
+```
+
+### PNG Implementation Notes
+
+The PNG writer uses a dependency-free DEFLATE implementation:
+- Fixed Huffman codes (RFC 1951 compliant)
+- Literals-only encoding (no LZ77 dictionary matching)
+- Valid PNG output readable by all standard tools
+- Simple implementation (~300 lines) with no external dependencies
 
 ## Memory Usage
 
