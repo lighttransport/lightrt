@@ -1596,6 +1596,165 @@ int main(int argc, char** argv) {
   // Auto-tuning benchmark
   benchmarkAutoTuning(num_triangles, num_rays);
 
+  // MMap BVH benchmark
+  std::cout << "\n========================================\n";
+  std::cout << "MMap BVH Benchmark (Zero-Copy)\n";
+  std::cout << "========================================\n";
+  {
+    RNG rng(42);
+    auto triangles = generateRandomTriangles(num_triangles, 10.0f, rng);
+
+    std::cout << "\nScene: " << triangles.size() << " triangles\n";
+
+    // Standard TriangleBVH (copies data)
+    TriangleBVH standard_bvh;
+    auto start = std::chrono::high_resolution_clock::now();
+    standard_bvh.build(triangles);
+    auto end = std::chrono::high_resolution_clock::now();
+    double standard_build_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    auto standard_stats = standard_bvh.getStats();
+    size_t standard_memory = standard_stats.num_nodes * sizeof(BVHNode) +
+                             triangles.size() * sizeof(Triangle);
+
+    // MMap BVH with compact nodes (references external data)
+    MMapTriangleBVH mmap_compact_bvh;
+    start = std::chrono::high_resolution_clock::now();
+    mmap_compact_bvh.build(triangles.data(), static_cast<uint32_t>(triangles.size()),
+                           MMapBVHConfig::minMemory());
+    end = std::chrono::high_resolution_clock::now();
+    double mmap_compact_build_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    auto mmap_compact_stats = mmap_compact_bvh.getStats();
+
+    // MMap BVH with full precision nodes
+    MMapTriangleBVH mmap_full_bvh;
+    start = std::chrono::high_resolution_clock::now();
+    mmap_full_bvh.build(triangles.data(), static_cast<uint32_t>(triangles.size()),
+                        MMapBVHConfig::maxSpeed());
+    end = std::chrono::high_resolution_clock::now();
+    double mmap_full_build_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    auto mmap_full_stats = mmap_full_bvh.getStats();
+
+    std::cout << "\n=== Build Time ===\n";
+    std::cout << "  Standard TriangleBVH:  " << std::fixed << std::setprecision(2)
+              << standard_build_ms << " ms\n";
+    std::cout << "  MMap Compact (16-bit): " << mmap_compact_build_ms << " ms\n";
+    std::cout << "  MMap Full (32-bit):    " << mmap_full_build_ms << " ms\n";
+
+    std::cout << "\n=== BVH Memory Usage ===\n";
+    std::cout << "  Standard TriangleBVH:  " << (standard_memory / 1024.0) << " KB"
+              << " (includes triangle copy)\n";
+    std::cout << "  MMap Compact (16-bit): " << (mmap_compact_stats.bvh_memory_bytes / 1024.0) << " KB"
+              << " (BVH only, triangles external)\n";
+    std::cout << "  MMap Full (32-bit):    " << (mmap_full_stats.bvh_memory_bytes / 1024.0) << " KB"
+              << " (BVH only, triangles external)\n";
+
+    float savings_compact = 100.0f * (1.0f - static_cast<float>(mmap_compact_stats.bvh_memory_bytes) / standard_memory);
+    float savings_full = 100.0f * (1.0f - static_cast<float>(mmap_full_stats.bvh_memory_bytes) / standard_memory);
+    std::cout << "\n  Memory savings (vs standard with copy):\n";
+    std::cout << "    MMap Compact: " << std::setprecision(1) << savings_compact << "%\n";
+    std::cout << "    MMap Full:    " << savings_full << "%\n";
+
+    std::cout << "\n=== Index Precision ===\n";
+    std::cout << "  MMap Compact: " << static_cast<int>(mmap_compact_stats.index_bytes) << " bytes/index";
+    if (mmap_compact_stats.index_bytes == 1) std::cout << " (uint8)";
+    else if (mmap_compact_stats.index_bytes == 2) std::cout << " (uint16)";
+    else std::cout << " (uint32)";
+    std::cout << "\n";
+    std::cout << "  MMap Full:    " << static_cast<int>(mmap_full_stats.index_bytes) << " bytes/index";
+    if (mmap_full_stats.index_bytes == 1) std::cout << " (uint8)";
+    else if (mmap_full_stats.index_bytes == 2) std::cout << " (uint16)";
+    else std::cout << " (uint32)";
+    std::cout << "\n";
+
+    // Generate test rays
+    std::vector<Ray> rays;
+    rays.reserve(num_rays);
+    for (uint32_t i = 0; i < num_rays; i++) {
+      Vec3 origin = rng.uniformVec3(-20.0f, 20.0f);
+      Vec3 target = rng.uniformVec3(-10.0f, 10.0f);
+      rays.emplace_back(origin, (target - origin).normalize());
+    }
+
+    // Benchmark traversal
+    uint32_t standard_hits = 0;
+    start = std::chrono::high_resolution_clock::now();
+    for (const auto& ray : rays) {
+      float t, u, v;
+      if (standard_bvh.traverse(ray, t, u, v) != kInvalidIndex) {
+        standard_hits++;
+      }
+    }
+    end = std::chrono::high_resolution_clock::now();
+    double standard_trav_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    uint32_t mmap_compact_hits = 0;
+    start = std::chrono::high_resolution_clock::now();
+    for (const auto& ray : rays) {
+      float t, u, v;
+      if (mmap_compact_bvh.traverse(ray, t, u, v) != kInvalidIndex) {
+        mmap_compact_hits++;
+      }
+    }
+    end = std::chrono::high_resolution_clock::now();
+    double mmap_compact_trav_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    uint32_t mmap_full_hits = 0;
+    start = std::chrono::high_resolution_clock::now();
+    for (const auto& ray : rays) {
+      float t, u, v;
+      if (mmap_full_bvh.traverse(ray, t, u, v) != kInvalidIndex) {
+        mmap_full_hits++;
+      }
+    }
+    end = std::chrono::high_resolution_clock::now();
+    double mmap_full_trav_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    std::cout << "\n=== Traversal Performance ===\n";
+    std::cout << "  Standard TriangleBVH:  " << standard_trav_ms << " ms ("
+              << standard_hits << " hits, " << std::scientific << std::setprecision(2)
+              << (num_rays / standard_trav_ms * 1000) << " rays/sec)\n";
+    std::cout << "  MMap Compact (16-bit): " << std::fixed << std::setprecision(2)
+              << mmap_compact_trav_ms << " ms ("
+              << mmap_compact_hits << " hits, " << std::scientific << std::setprecision(2)
+              << (num_rays / mmap_compact_trav_ms * 1000) << " rays/sec)\n";
+    std::cout << "  MMap Full (32-bit):    " << std::fixed << std::setprecision(2)
+              << mmap_full_trav_ms << " ms ("
+              << mmap_full_hits << " hits, " << std::scientific << std::setprecision(2)
+              << (num_rays / mmap_full_trav_ms * 1000) << " rays/sec)\n";
+
+    // Verify correctness
+    if (standard_hits != mmap_compact_hits || standard_hits != mmap_full_hits) {
+      std::cout << "\n  WARNING: Hit counts differ!\n";
+    } else {
+      std::cout << "\n  All implementations produce same results.\n";
+    }
+
+    // Test with small primitive count to show uint8 index
+    std::cout << "\n=== Small Scene (uint8 indices) ===\n";
+    auto small_triangles = generateRandomTriangles(200, 10.0f, rng);
+    MMapTriangleBVH small_bvh;
+    small_bvh.build(small_triangles.data(), static_cast<uint32_t>(small_triangles.size()));
+    auto small_stats = small_bvh.getStats();
+    std::cout << "  Triangles: " << small_stats.num_primitives << "\n";
+    std::cout << "  Index precision: " << static_cast<int>(small_stats.index_bytes)
+              << " bytes (uint8)\n";
+    std::cout << "  BVH memory: " << small_stats.bvh_memory_bytes << " bytes\n";
+
+    // Test with medium scene for uint16 index
+    std::cout << "\n=== Medium Scene (uint16 indices) ===\n";
+    auto medium_triangles = generateRandomTriangles(30000, 10.0f, rng);
+    MMapTriangleBVH medium_bvh;
+    medium_bvh.build(medium_triangles.data(), static_cast<uint32_t>(medium_triangles.size()));
+    auto medium_stats = medium_bvh.getStats();
+    std::cout << "  Triangles: " << medium_stats.num_primitives << "\n";
+    std::cout << "  Index precision: " << static_cast<int>(medium_stats.index_bytes)
+              << " bytes (uint16)\n";
+    std::cout << "  BVH memory: " << (medium_stats.bvh_memory_bytes / 1024.0) << " KB\n";
+  }
+
   std::cout << "\n============================================\n";
   std::cout << "Benchmark Complete\n";
   std::cout << "============================================\n";

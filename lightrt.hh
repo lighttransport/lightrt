@@ -1233,6 +1233,260 @@ private:
 };
 
 // ============================================================================
+// Memory-Mapped BVH (Zero-Copy)
+// Supports external primitive data from mmap, with minimal index precision
+// ============================================================================
+
+// Primitive type for mmap BVH
+enum class MMapPrimType : uint8_t {
+  Triangle,
+  QuantizedTriangle,
+  Sphere,
+  Quad,
+  Custom
+};
+
+// Index precision for primitive indices
+enum class IndexPrecision : uint8_t {
+  Auto = 0,    // Automatically select based on primitive count
+  UInt8 = 1,   // Up to 255 primitives
+  UInt16 = 2,  // Up to 65535 primitives
+  UInt32 = 4   // Up to 4B primitives
+};
+
+// Compact BVH node with quantized bounds for low memory
+struct alignas(16) CompactBVHNode {
+  // Quantized bounds relative to scene AABB (12 bytes)
+  uint16_t bounds_min[3];
+  uint16_t bounds_max[3];
+
+  // Node data (8 bytes)
+  uint32_t data0;  // left_child or prim_offset
+  uint32_t data1;  // right_child or prim_count
+
+  // Flags (4 bytes, but only 1 used)
+  uint8_t flags;   // bit 0 = is_leaf
+  uint8_t axis;    // Split axis (for traversal order)
+  uint16_t pad;
+
+  CompactBVHNode() noexcept : data0(0), data1(0), flags(0), axis(0), pad(0) {
+    for (int i = 0; i < 3; i++) {
+      bounds_min[i] = 0;
+      bounds_max[i] = 0xFFFF;
+    }
+  }
+
+  bool isLeaf() const noexcept { return (flags & 0x1) != 0; }
+
+  void setLeaf(uint32_t offset, uint32_t count) noexcept {
+    data0 = offset;
+    data1 = count;
+    flags |= 0x1;
+  }
+
+  void setInterior(uint32_t left, uint32_t right, uint8_t split_axis) noexcept {
+    data0 = left;
+    data1 = right;
+    axis = split_axis;
+    flags &= ~0x1;
+  }
+
+  // Dequantize bounds
+  AABB dequantizeBounds(const Vec3& scene_min, const Vec3& scene_max) const noexcept {
+    AABB result;
+    result.min.x = dequantizeFloat(bounds_min[0], scene_min.x, scene_max.x);
+    result.min.y = dequantizeFloat(bounds_min[1], scene_min.y, scene_max.y);
+    result.min.z = dequantizeFloat(bounds_min[2], scene_min.z, scene_max.z);
+    result.max.x = dequantizeFloat(bounds_max[0], scene_min.x, scene_max.x);
+    result.max.y = dequantizeFloat(bounds_max[1], scene_min.y, scene_max.y);
+    result.max.z = dequantizeFloat(bounds_max[2], scene_min.z, scene_max.z);
+    return result;
+  }
+
+  // Quantize bounds
+  void quantizeBounds(const AABB& bounds, const Vec3& scene_min, const Vec3& scene_max) noexcept {
+    bounds_min[0] = quantizeFloat(bounds.min.x, scene_min.x, scene_max.x);
+    bounds_min[1] = quantizeFloat(bounds.min.y, scene_min.y, scene_max.y);
+    bounds_min[2] = quantizeFloat(bounds.min.z, scene_min.z, scene_max.z);
+    bounds_max[0] = quantizeFloat(bounds.max.x, scene_min.x, scene_max.x);
+    bounds_max[1] = quantizeFloat(bounds.max.y, scene_min.y, scene_max.y);
+    bounds_max[2] = quantizeFloat(bounds.max.z, scene_min.z, scene_max.z);
+  }
+};
+
+// MMap BVH configuration
+struct MMapBVHConfig {
+  BVHBuildConfig build;           // Standard build config
+  IndexPrecision index_precision; // Index precision (Auto recommended)
+  bool use_compact_nodes;         // Use CompactBVHNode with quantized bounds
+  bool use_ordered_traversal;     // Order traversal by split axis (slightly faster)
+
+  MMapBVHConfig() noexcept
+    : index_precision(IndexPrecision::Auto)
+    , use_compact_nodes(true)
+    , use_ordered_traversal(true) {}
+
+  // Preset: minimum memory
+  static MMapBVHConfig minMemory() noexcept {
+    MMapBVHConfig cfg;
+    cfg.use_compact_nodes = true;
+    cfg.build.max_leaf_size = 8;  // Larger leaves = fewer nodes
+    return cfg;
+  }
+
+  // Preset: maximum speed
+  static MMapBVHConfig maxSpeed() noexcept {
+    MMapBVHConfig cfg;
+    cfg.use_compact_nodes = false;  // Full precision bounds
+    cfg.use_ordered_traversal = true;
+    cfg.build.max_leaf_size = 4;
+    return cfg;
+  }
+};
+
+// Memory-mapped Triangle BVH (zero-copy primitive storage)
+// Primitives are referenced via pointer, not copied
+class MMapTriangleBVH {
+public:
+  MMapTriangleBVH() noexcept;
+  ~MMapTriangleBVH() noexcept = default;
+
+  // Build from external memory-mapped triangles (zero-copy)
+  // triangles: Pointer to mmap'd or external memory (must remain valid!)
+  // count: Number of triangles
+  bool build(const Triangle* triangles, uint32_t count,
+             const MMapBVHConfig& config = MMapBVHConfig()) noexcept;
+
+  // Traverse and find closest intersection
+  // Returns triangle index or kInvalidIndex if no hit
+  uint32_t traverse(const Ray& ray, float& hit_t, float& hit_u, float& hit_v) const noexcept;
+
+  // Traverse with configuration
+  uint32_t traverseWithConfig(const Ray& ray, float& hit_t, float& hit_u, float& hit_v,
+                              const TraversalConfig& config,
+                              TraversalStats* stats = nullptr) const noexcept;
+
+  // Get memory usage (BVH only, not primitives)
+  size_t getBVHMemoryUsage() const noexcept;
+
+  // Get total memory including primitive reference
+  size_t getTotalMemoryUsage() const noexcept;
+
+  // Get statistics
+  struct Stats {
+    uint32_t num_nodes;
+    uint32_t num_leaves;
+    uint32_t max_depth;
+    float avg_leaf_size;
+    uint32_t num_primitives;
+    uint8_t index_bytes;         // Bytes per primitive index
+    bool uses_compact_nodes;
+    size_t bvh_memory_bytes;
+    size_t prim_memory_bytes;    // 0 for mmap (external)
+  };
+
+  Stats getStats() const noexcept;
+
+  // Access to primitive data (read-only)
+  const Triangle* getTriangles() const noexcept { return triangles_; }
+  uint32_t getTriangleCount() const noexcept { return triangle_count_; }
+
+  // Check if primitive data is external (mmap)
+  bool isExternalData() const noexcept { return is_external_; }
+
+  // Get scene bounds
+  const AABB& getSceneBounds() const noexcept { return scene_bounds_; }
+
+private:
+  const Triangle* triangles_;    // Non-owning pointer to external data
+  uint32_t triangle_count_;
+  bool is_external_;
+
+  // Scene bounds (for compact node dequantization)
+  AABB scene_bounds_;
+
+  // Configuration
+  MMapBVHConfig config_;
+
+  // BVH storage (compact or full)
+  std::vector<CompactBVHNode> compact_nodes_;
+  std::vector<BVHNode> full_nodes_;
+
+  // Primitive indices with variable precision
+  // Storage format depends on index_bytes_
+  std::vector<uint8_t> prim_indices_storage_;
+  uint8_t index_bytes_;  // 1, 2, or 4
+
+  // Index access helpers
+  uint32_t getPrimIndex(uint32_t offset) const noexcept;
+  void reserveIndices(uint32_t count) noexcept;
+  void pushIndex(uint32_t index) noexcept;
+
+  // Build helpers
+  uint32_t buildRecursive(uint32_t* indices, uint32_t num_prims,
+                          uint32_t depth, std::vector<AABB>& prim_bounds) noexcept;
+
+  // Traversal helpers (compact vs full nodes)
+  uint32_t traverseCompact(const Ray& ray, float& hit_t, float& hit_u, float& hit_v) const noexcept;
+  uint32_t traverseFull(const Ray& ray, float& hit_t, float& hit_u, float& hit_v) const noexcept;
+};
+
+// Memory-mapped generic BVH (for custom primitives via callback)
+class MMapGenericBVH {
+public:
+  // Intersection callback: (ray, prim_data, prim_index, out_t, out_u, out_v) -> hit
+  using IntersectFn = bool (*)(const Ray&, const void*, uint32_t, float&, float&, float&);
+
+  // Bounds callback: (prim_data, prim_index) -> AABB
+  using BoundsFn = AABB (*)(const void*, uint32_t);
+
+  MMapGenericBVH() noexcept;
+  ~MMapGenericBVH() noexcept = default;
+
+  // Build from external primitive data
+  // prim_data: Pointer to primitive array (any type)
+  // count: Number of primitives
+  // bounds_fn: Function to compute AABB for each primitive
+  bool build(const void* prim_data, uint32_t count,
+             BoundsFn bounds_fn,
+             const MMapBVHConfig& config = MMapBVHConfig()) noexcept;
+
+  // Traverse with custom intersection function
+  uint32_t traverse(const Ray& ray, IntersectFn intersect_fn,
+                    float& hit_t, float& hit_u, float& hit_v) const noexcept;
+
+  // Get memory usage
+  size_t getBVHMemoryUsage() const noexcept;
+
+  // Get statistics
+  MMapTriangleBVH::Stats getStats() const noexcept;
+
+  // Access primitive data
+  const void* getPrimitiveData() const noexcept { return prim_data_; }
+  uint32_t getPrimitiveCount() const noexcept { return prim_count_; }
+
+private:
+  const void* prim_data_;
+  uint32_t prim_count_;
+
+  AABB scene_bounds_;
+  MMapBVHConfig config_;
+
+  std::vector<CompactBVHNode> compact_nodes_;
+  std::vector<BVHNode> full_nodes_;
+
+  std::vector<uint8_t> prim_indices_storage_;
+  uint8_t index_bytes_;
+
+  uint32_t getPrimIndex(uint32_t offset) const noexcept;
+  void reserveIndices(uint32_t count) noexcept;
+  void pushIndex(uint32_t index) noexcept;
+
+  uint32_t buildRecursive(uint32_t* indices, uint32_t num_prims,
+                          uint32_t depth, const std::vector<AABB>& prim_bounds) noexcept;
+};
+
+// ============================================================================
 // Auto-Tuning for BVH Construction and Traversal
 // Samples M primitives from N input, measures costs, selects best algorithms
 // ============================================================================

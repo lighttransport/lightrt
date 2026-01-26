@@ -2947,6 +2947,950 @@ SBVHGeneric::Stats SBVHGeneric::getStats() const noexcept {
 }
 
 // ============================================================================
+// MMapTriangleBVH Implementation
+// ============================================================================
+
+MMapTriangleBVH::MMapTriangleBVH() noexcept
+  : triangles_(nullptr)
+  , triangle_count_(0)
+  , is_external_(true)
+  , index_bytes_(4) {}
+
+uint32_t MMapTriangleBVH::getPrimIndex(uint32_t offset) const noexcept {
+  switch (index_bytes_) {
+    case 1:
+      return prim_indices_storage_[offset];
+    case 2:
+      return *reinterpret_cast<const uint16_t*>(&prim_indices_storage_[offset * 2]);
+    case 4:
+    default:
+      return *reinterpret_cast<const uint32_t*>(&prim_indices_storage_[offset * 4]);
+  }
+}
+
+void MMapTriangleBVH::reserveIndices(uint32_t count) noexcept {
+  prim_indices_storage_.reserve(count * index_bytes_);
+}
+
+void MMapTriangleBVH::pushIndex(uint32_t index) noexcept {
+  switch (index_bytes_) {
+    case 1:
+      prim_indices_storage_.push_back(static_cast<uint8_t>(index));
+      break;
+    case 2: {
+      uint16_t idx16 = static_cast<uint16_t>(index);
+      prim_indices_storage_.push_back(static_cast<uint8_t>(idx16 & 0xFF));
+      prim_indices_storage_.push_back(static_cast<uint8_t>(idx16 >> 8));
+      break;
+    }
+    case 4:
+    default: {
+      prim_indices_storage_.push_back(static_cast<uint8_t>(index & 0xFF));
+      prim_indices_storage_.push_back(static_cast<uint8_t>((index >> 8) & 0xFF));
+      prim_indices_storage_.push_back(static_cast<uint8_t>((index >> 16) & 0xFF));
+      prim_indices_storage_.push_back(static_cast<uint8_t>((index >> 24) & 0xFF));
+      break;
+    }
+  }
+}
+
+bool MMapTriangleBVH::build(const Triangle* triangles, uint32_t count,
+                            const MMapBVHConfig& config) noexcept {
+  if (!triangles || count == 0) {
+    return false;
+  }
+
+  triangles_ = triangles;
+  triangle_count_ = count;
+  is_external_ = true;
+  config_ = config;
+
+  // Determine index precision
+  if (config.index_precision == IndexPrecision::Auto) {
+    if (count <= 255) {
+      index_bytes_ = 1;
+    } else if (count <= 65535) {
+      index_bytes_ = 2;
+    } else {
+      index_bytes_ = 4;
+    }
+  } else {
+    index_bytes_ = static_cast<uint8_t>(config.index_precision);
+  }
+
+  // Compute scene bounds and primitive bounds
+  scene_bounds_ = AABB();
+  std::vector<AABB> prim_bounds(count);
+
+  for (uint32_t i = 0; i < count; i++) {
+    prim_bounds[i] = triangles[i].bounds();
+    scene_bounds_.expand(prim_bounds[i]);
+  }
+
+  // Slightly expand scene bounds to avoid edge cases
+  Vec3 epsilon = scene_bounds_.extents() * 0.001f;
+  scene_bounds_.min = scene_bounds_.min - epsilon;
+  scene_bounds_.max = scene_bounds_.max + epsilon;
+
+  // Initialize index array
+  std::vector<uint32_t> indices(count);
+  for (uint32_t i = 0; i < count; i++) {
+    indices[i] = i;
+  }
+
+  // Clear previous data
+  compact_nodes_.clear();
+  full_nodes_.clear();
+  prim_indices_storage_.clear();
+
+  // Reserve estimated space
+  uint32_t estimated_nodes = count * 2;
+  if (config.use_compact_nodes) {
+    compact_nodes_.reserve(estimated_nodes);
+  } else {
+    full_nodes_.reserve(estimated_nodes);
+  }
+  reserveIndices(count);
+
+  // Build recursively
+  buildRecursive(indices.data(), count, 0, prim_bounds);
+
+  return true;
+}
+
+uint32_t MMapTriangleBVH::buildRecursive(uint32_t* indices, uint32_t num_prims,
+                                          uint32_t depth, std::vector<AABB>& prim_bounds) noexcept {
+  // Compute bounds for this node
+  AABB node_bounds;
+  AABB centroid_bounds;
+
+  for (uint32_t i = 0; i < num_prims; i++) {
+    uint32_t prim_idx = indices[i];
+    node_bounds.expand(prim_bounds[prim_idx]);
+    centroid_bounds.expand(prim_bounds[prim_idx].center());
+  }
+
+  // Create node
+  uint32_t node_idx;
+  if (config_.use_compact_nodes) {
+    node_idx = static_cast<uint32_t>(compact_nodes_.size());
+    compact_nodes_.emplace_back();
+    compact_nodes_[node_idx].quantizeBounds(node_bounds, scene_bounds_.min, scene_bounds_.max);
+  } else {
+    node_idx = static_cast<uint32_t>(full_nodes_.size());
+    full_nodes_.emplace_back();
+    full_nodes_[node_idx].bounds = node_bounds;
+  }
+
+  // Check if we should make a leaf
+  if (num_prims <= config_.build.max_leaf_size) {
+    uint32_t prim_offset = static_cast<uint32_t>(prim_indices_storage_.size() / index_bytes_);
+
+    for (uint32_t i = 0; i < num_prims; i++) {
+      pushIndex(indices[i]);
+    }
+
+    if (config_.use_compact_nodes) {
+      compact_nodes_[node_idx].setLeaf(prim_offset, num_prims);
+    } else {
+      full_nodes_[node_idx].setLeaf(prim_offset, num_prims);
+    }
+    return node_idx;
+  }
+
+  // Find best split axis using SAH
+  int best_axis = centroid_bounds.longestAxis();
+  float best_pos = 0.0f;
+  float best_cost = kInfinity;
+
+  float parent_area = node_bounds.surfaceArea();
+
+  // Binned SAH
+  const uint32_t num_bins = config_.build.num_bins;
+
+  for (int axis = 0; axis < 3; axis++) {
+    float axis_min = 0.0f, axis_max = 0.0f;
+    switch (axis) {
+      case 0: axis_min = centroid_bounds.min.x; axis_max = centroid_bounds.max.x; break;
+      case 1: axis_min = centroid_bounds.min.y; axis_max = centroid_bounds.max.y; break;
+      case 2: axis_min = centroid_bounds.min.z; axis_max = centroid_bounds.max.z; break;
+    }
+
+    if (axis_max - axis_min < kEpsilon) continue;
+
+    float bin_size = (axis_max - axis_min) / num_bins;
+
+    // Count primitives per bin and compute bounds
+    std::vector<uint32_t> bin_counts(num_bins, 0);
+    std::vector<AABB> bin_bounds(num_bins);
+
+    for (uint32_t i = 0; i < num_prims; i++) {
+      uint32_t prim_idx = indices[i];
+      Vec3 centroid = prim_bounds[prim_idx].center();
+      float pos = 0.0f;
+      switch (axis) {
+        case 0: pos = centroid.x; break;
+        case 1: pos = centroid.y; break;
+        case 2: pos = centroid.z; break;
+      }
+
+      uint32_t bin = std::min(static_cast<uint32_t>((pos - axis_min) / bin_size), num_bins - 1);
+      bin_counts[bin]++;
+      bin_bounds[bin].expand(prim_bounds[prim_idx]);
+    }
+
+    // Sweep from left
+    std::vector<AABB> left_bounds(num_bins);
+    std::vector<uint32_t> left_counts(num_bins);
+    AABB running_bounds;
+    uint32_t running_count = 0;
+
+    for (uint32_t i = 0; i < num_bins; i++) {
+      running_bounds.expand(bin_bounds[i]);
+      running_count += bin_counts[i];
+      left_bounds[i] = running_bounds;
+      left_counts[i] = running_count;
+    }
+
+    // Sweep from right and compute costs
+    running_bounds = AABB();
+    running_count = 0;
+
+    for (uint32_t i = num_bins - 1; i > 0; i--) {
+      running_bounds.expand(bin_bounds[i]);
+      running_count += bin_counts[i];
+
+      uint32_t left_count = left_counts[i - 1];
+      if (left_count == 0 || running_count == 0) continue;
+
+      float left_area = left_bounds[i - 1].surfaceArea();
+      float right_area = running_bounds.surfaceArea();
+
+      float cost = config_.build.traversal_cost +
+                   config_.build.intersection_cost * (left_count * left_area + running_count * right_area) / parent_area;
+
+      if (cost < best_cost) {
+        best_cost = cost;
+        best_axis = axis;
+        best_pos = axis_min + i * bin_size;
+      }
+    }
+  }
+
+  // Check if split is beneficial
+  float leaf_cost = config_.build.intersection_cost * num_prims;
+  if (best_cost >= leaf_cost && !config_.build.force_max_leaf_size) {
+    // Make leaf
+    uint32_t prim_offset = static_cast<uint32_t>(prim_indices_storage_.size() / index_bytes_);
+
+    for (uint32_t i = 0; i < num_prims; i++) {
+      pushIndex(indices[i]);
+    }
+
+    if (config_.use_compact_nodes) {
+      compact_nodes_[node_idx].setLeaf(prim_offset, num_prims);
+    } else {
+      full_nodes_[node_idx].setLeaf(prim_offset, num_prims);
+    }
+    return node_idx;
+  }
+
+  // Partition primitives
+  uint32_t mid = 0;
+  for (uint32_t i = 0; i < num_prims; i++) {
+    uint32_t prim_idx = indices[i];
+    Vec3 centroid = prim_bounds[prim_idx].center();
+    float pos = 0.0f;
+    switch (best_axis) {
+      case 0: pos = centroid.x; break;
+      case 1: pos = centroid.y; break;
+      case 2: pos = centroid.z; break;
+    }
+
+    if (pos < best_pos) {
+      std::swap(indices[i], indices[mid]);
+      mid++;
+    }
+  }
+
+  // Handle degenerate case
+  if (mid == 0 || mid == num_prims) {
+    mid = num_prims / 2;
+  }
+
+  // Build children
+  uint32_t left_child = buildRecursive(indices, mid, depth + 1, prim_bounds);
+  uint32_t right_child = buildRecursive(indices + mid, num_prims - mid, depth + 1, prim_bounds);
+
+  // Set interior node
+  if (config_.use_compact_nodes) {
+    compact_nodes_[node_idx].setInterior(left_child, right_child, static_cast<uint8_t>(best_axis));
+  } else {
+    full_nodes_[node_idx].setInterior(left_child, right_child);
+  }
+
+  return node_idx;
+}
+
+uint32_t MMapTriangleBVH::traverse(const Ray& ray, float& hit_t, float& hit_u, float& hit_v) const noexcept {
+  if (config_.use_compact_nodes) {
+    return traverseCompact(ray, hit_t, hit_u, hit_v);
+  } else {
+    return traverseFull(ray, hit_t, hit_u, hit_v);
+  }
+}
+
+uint32_t MMapTriangleBVH::traverseCompact(const Ray& ray, float& hit_t, float& hit_u, float& hit_v) const noexcept {
+  if (compact_nodes_.empty()) return kInvalidIndex;
+
+  hit_t = ray.tmax;
+  uint32_t hit_prim = kInvalidIndex;
+
+  // Precompute inverse direction
+  Vec3 inv_dir(1.0f / ray.direction.x, 1.0f / ray.direction.y, 1.0f / ray.direction.z);
+  int dir_is_neg[3] = {
+    inv_dir.x < 0 ? 1 : 0,
+    inv_dir.y < 0 ? 1 : 0,
+    inv_dir.z < 0 ? 1 : 0
+  };
+
+  // Stack-based traversal
+  uint32_t stack[64];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0) {
+    uint32_t node_idx = stack[--stack_ptr];
+    const CompactBVHNode& node = compact_nodes_[node_idx];
+
+    // Dequantize and test bounds
+    AABB bounds = node.dequantizeBounds(scene_bounds_.min, scene_bounds_.max);
+    float tmin_box, tmax_box;
+    if (!bounds.intersect(ray, tmin_box, tmax_box) || tmin_box > hit_t) {
+      continue;
+    }
+
+    if (node.isLeaf()) {
+      // Test primitives
+      for (uint32_t i = 0; i < node.data1; i++) {
+        uint32_t prim_idx = getPrimIndex(node.data0 + i);
+        float t, u, v;
+        if (triangles_[prim_idx].intersect(ray, t, u, v) && t < hit_t) {
+          hit_t = t;
+          hit_u = u;
+          hit_v = v;
+          hit_prim = prim_idx;
+        }
+      }
+    } else {
+      // Interior node - order traversal by split axis
+      uint32_t first = node.data0;
+      uint32_t second = node.data1;
+
+      if (config_.use_ordered_traversal && dir_is_neg[node.axis]) {
+        std::swap(first, second);
+      }
+
+      // Push far child first (so near child is processed first)
+      stack[stack_ptr++] = second;
+      stack[stack_ptr++] = first;
+    }
+  }
+
+  return hit_prim;
+}
+
+uint32_t MMapTriangleBVH::traverseFull(const Ray& ray, float& hit_t, float& hit_u, float& hit_v) const noexcept {
+  if (full_nodes_.empty()) return kInvalidIndex;
+
+  hit_t = ray.tmax;
+  uint32_t hit_prim = kInvalidIndex;
+
+  uint32_t stack[64];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0) {
+    uint32_t node_idx = stack[--stack_ptr];
+    const BVHNode& node = full_nodes_[node_idx];
+
+    float tmin_box, tmax_box;
+    if (!node.bounds.intersect(ray, tmin_box, tmax_box) || tmin_box > hit_t) {
+      continue;
+    }
+
+    if (node.isLeaf()) {
+      for (uint32_t i = 0; i < node.prim_count; i++) {
+        uint32_t prim_idx = getPrimIndex(node.prim_offset + i);
+        float t, u, v;
+        if (triangles_[prim_idx].intersect(ray, t, u, v) && t < hit_t) {
+          hit_t = t;
+          hit_u = u;
+          hit_v = v;
+          hit_prim = prim_idx;
+        }
+      }
+    } else {
+      stack[stack_ptr++] = node.right_child;
+      stack[stack_ptr++] = node.left_child;
+    }
+  }
+
+  return hit_prim;
+}
+
+uint32_t MMapTriangleBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hit_u, float& hit_v,
+                                              const TraversalConfig& config,
+                                              TraversalStats* stats) const noexcept {
+  if (stats) {
+    *stats = TraversalStats();
+  }
+
+  if ((config_.use_compact_nodes && compact_nodes_.empty()) ||
+      (!config_.use_compact_nodes && full_nodes_.empty())) {
+    return kInvalidIndex;
+  }
+
+  hit_t = ray.tmax;
+  uint32_t hit_prim = kInvalidIndex;
+  uint32_t prims_tested = 0;
+
+  uint32_t stack[64];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0) {
+    uint32_t node_idx = stack[--stack_ptr];
+
+    AABB bounds;
+    bool is_leaf;
+    uint32_t data0, data1;
+    uint8_t axis = 0;
+
+    if (config_.use_compact_nodes) {
+      const CompactBVHNode& node = compact_nodes_[node_idx];
+      bounds = node.dequantizeBounds(scene_bounds_.min, scene_bounds_.max);
+      is_leaf = node.isLeaf();
+      data0 = node.data0;
+      data1 = node.data1;
+      axis = node.axis;
+    } else {
+      const BVHNode& node = full_nodes_[node_idx];
+      bounds = node.bounds;
+      is_leaf = node.isLeaf();
+      data0 = node.prim_offset;
+      data1 = is_leaf ? node.prim_count : node.right_child;
+    }
+
+    if (stats) stats->nodes_visited++;
+
+    float tmin_box, tmax_box;
+    if (!bounds.intersect(ray, tmin_box, tmax_box) || tmin_box > hit_t) {
+      continue;
+    }
+
+    if (is_leaf) {
+      uint32_t count = config_.use_compact_nodes ? data1 : data1;
+      uint32_t offset = data0;
+
+      for (uint32_t i = 0; i < count; i++) {
+        if (config.max_prim_tests > 0 && prims_tested >= config.max_prim_tests) {
+          if (stats) stats->terminated_early = true;
+          goto done;
+        }
+
+        uint32_t prim_idx = getPrimIndex(offset + i);
+        prims_tested++;
+
+        float t, u, v;
+        if (triangles_[prim_idx].intersect(ray, t, u, v) && t < hit_t) {
+          hit_t = t;
+          hit_u = u;
+          hit_v = v;
+          hit_prim = prim_idx;
+          if (stats) stats->prims_hit++;
+
+          if (config.early_termination) {
+            goto done;
+          }
+        }
+      }
+    } else {
+      uint32_t left = config_.use_compact_nodes ? data0 : data0;
+      uint32_t right = config_.use_compact_nodes ? data1 : (full_nodes_[node_idx].right_child);
+
+      // Order by axis if enabled
+      if (config_.use_ordered_traversal && config_.use_compact_nodes) {
+        float dir_component = 0.0f;
+        switch (axis) {
+          case 0: dir_component = ray.direction.x; break;
+          case 1: dir_component = ray.direction.y; break;
+          case 2: dir_component = ray.direction.z; break;
+        }
+        if (dir_component < 0) {
+          std::swap(left, right);
+        }
+      }
+
+      stack[stack_ptr++] = right;
+      stack[stack_ptr++] = left;
+    }
+  }
+
+done:
+  if (stats) {
+    stats->prims_tested = prims_tested;
+  }
+
+  return hit_prim;
+}
+
+size_t MMapTriangleBVH::getBVHMemoryUsage() const noexcept {
+  size_t memory = 0;
+
+  if (config_.use_compact_nodes) {
+    memory += compact_nodes_.size() * sizeof(CompactBVHNode);
+  } else {
+    memory += full_nodes_.size() * sizeof(BVHNode);
+  }
+
+  memory += prim_indices_storage_.size();
+
+  return memory;
+}
+
+size_t MMapTriangleBVH::getTotalMemoryUsage() const noexcept {
+  size_t memory = getBVHMemoryUsage();
+
+  // Primitives are external, so we don't count them
+  // But we can report the reference size
+  memory += sizeof(triangles_) + sizeof(triangle_count_);
+
+  return memory;
+}
+
+MMapTriangleBVH::Stats MMapTriangleBVH::getStats() const noexcept {
+  Stats stats = {};
+
+  stats.num_primitives = triangle_count_;
+  stats.index_bytes = index_bytes_;
+  stats.uses_compact_nodes = config_.use_compact_nodes;
+  stats.bvh_memory_bytes = getBVHMemoryUsage();
+  stats.prim_memory_bytes = 0;  // External data
+
+  if (config_.use_compact_nodes) {
+    for (const auto& node : compact_nodes_) {
+      stats.num_nodes++;
+      if (node.isLeaf()) {
+        stats.num_leaves++;
+        stats.avg_leaf_size += node.data1;
+      }
+    }
+  } else {
+    std::vector<uint32_t> depths(full_nodes_.size(), 0);
+    for (uint32_t i = 0; i < full_nodes_.size(); i++) {
+      const auto& node = full_nodes_[i];
+      stats.num_nodes++;
+      if (node.isLeaf()) {
+        stats.num_leaves++;
+        stats.avg_leaf_size += node.prim_count;
+        stats.max_depth = std::max(stats.max_depth, depths[i]);
+      } else {
+        depths[node.left_child] = depths[i] + 1;
+        depths[node.right_child] = depths[i] + 1;
+      }
+    }
+  }
+
+  if (stats.num_leaves > 0) {
+    stats.avg_leaf_size /= stats.num_leaves;
+  }
+
+  return stats;
+}
+
+// ============================================================================
+// MMapGenericBVH Implementation
+// ============================================================================
+
+MMapGenericBVH::MMapGenericBVH() noexcept
+  : prim_data_(nullptr)
+  , prim_count_(0)
+  , index_bytes_(4) {}
+
+uint32_t MMapGenericBVH::getPrimIndex(uint32_t offset) const noexcept {
+  switch (index_bytes_) {
+    case 1:
+      return prim_indices_storage_[offset];
+    case 2:
+      return *reinterpret_cast<const uint16_t*>(&prim_indices_storage_[offset * 2]);
+    case 4:
+    default:
+      return *reinterpret_cast<const uint32_t*>(&prim_indices_storage_[offset * 4]);
+  }
+}
+
+void MMapGenericBVH::reserveIndices(uint32_t count) noexcept {
+  prim_indices_storage_.reserve(count * index_bytes_);
+}
+
+void MMapGenericBVH::pushIndex(uint32_t index) noexcept {
+  switch (index_bytes_) {
+    case 1:
+      prim_indices_storage_.push_back(static_cast<uint8_t>(index));
+      break;
+    case 2: {
+      uint16_t idx16 = static_cast<uint16_t>(index);
+      prim_indices_storage_.push_back(static_cast<uint8_t>(idx16 & 0xFF));
+      prim_indices_storage_.push_back(static_cast<uint8_t>(idx16 >> 8));
+      break;
+    }
+    case 4:
+    default: {
+      prim_indices_storage_.push_back(static_cast<uint8_t>(index & 0xFF));
+      prim_indices_storage_.push_back(static_cast<uint8_t>((index >> 8) & 0xFF));
+      prim_indices_storage_.push_back(static_cast<uint8_t>((index >> 16) & 0xFF));
+      prim_indices_storage_.push_back(static_cast<uint8_t>((index >> 24) & 0xFF));
+      break;
+    }
+  }
+}
+
+bool MMapGenericBVH::build(const void* prim_data, uint32_t count,
+                           BoundsFn bounds_fn,
+                           const MMapBVHConfig& config) noexcept {
+  if (!prim_data || count == 0 || !bounds_fn) {
+    return false;
+  }
+
+  prim_data_ = prim_data;
+  prim_count_ = count;
+  config_ = config;
+
+  // Determine index precision
+  if (config.index_precision == IndexPrecision::Auto) {
+    if (count <= 255) {
+      index_bytes_ = 1;
+    } else if (count <= 65535) {
+      index_bytes_ = 2;
+    } else {
+      index_bytes_ = 4;
+    }
+  } else {
+    index_bytes_ = static_cast<uint8_t>(config.index_precision);
+  }
+
+  // Compute bounds
+  scene_bounds_ = AABB();
+  std::vector<AABB> prim_bounds(count);
+
+  for (uint32_t i = 0; i < count; i++) {
+    prim_bounds[i] = bounds_fn(prim_data, i);
+    scene_bounds_.expand(prim_bounds[i]);
+  }
+
+  Vec3 epsilon = scene_bounds_.extents() * 0.001f;
+  scene_bounds_.min = scene_bounds_.min - epsilon;
+  scene_bounds_.max = scene_bounds_.max + epsilon;
+
+  std::vector<uint32_t> indices(count);
+  for (uint32_t i = 0; i < count; i++) {
+    indices[i] = i;
+  }
+
+  compact_nodes_.clear();
+  full_nodes_.clear();
+  prim_indices_storage_.clear();
+
+  uint32_t estimated_nodes = count * 2;
+  if (config.use_compact_nodes) {
+    compact_nodes_.reserve(estimated_nodes);
+  } else {
+    full_nodes_.reserve(estimated_nodes);
+  }
+  reserveIndices(count);
+
+  buildRecursive(indices.data(), count, 0, prim_bounds);
+
+  return true;
+}
+
+uint32_t MMapGenericBVH::buildRecursive(uint32_t* indices, uint32_t num_prims,
+                                         uint32_t depth, const std::vector<AABB>& prim_bounds) noexcept {
+  AABB node_bounds;
+  AABB centroid_bounds;
+
+  for (uint32_t i = 0; i < num_prims; i++) {
+    uint32_t prim_idx = indices[i];
+    node_bounds.expand(prim_bounds[prim_idx]);
+    centroid_bounds.expand(prim_bounds[prim_idx].center());
+  }
+
+  uint32_t node_idx;
+  if (config_.use_compact_nodes) {
+    node_idx = static_cast<uint32_t>(compact_nodes_.size());
+    compact_nodes_.emplace_back();
+    compact_nodes_[node_idx].quantizeBounds(node_bounds, scene_bounds_.min, scene_bounds_.max);
+  } else {
+    node_idx = static_cast<uint32_t>(full_nodes_.size());
+    full_nodes_.emplace_back();
+    full_nodes_[node_idx].bounds = node_bounds;
+  }
+
+  if (num_prims <= config_.build.max_leaf_size) {
+    uint32_t prim_offset = static_cast<uint32_t>(prim_indices_storage_.size() / index_bytes_);
+
+    for (uint32_t i = 0; i < num_prims; i++) {
+      pushIndex(indices[i]);
+    }
+
+    if (config_.use_compact_nodes) {
+      compact_nodes_[node_idx].setLeaf(prim_offset, num_prims);
+    } else {
+      full_nodes_[node_idx].setLeaf(prim_offset, num_prims);
+    }
+    return node_idx;
+  }
+
+  // Find best split
+  int best_axis = centroid_bounds.longestAxis();
+  float best_pos = 0.0f;
+  float best_cost = kInfinity;
+  float parent_area = node_bounds.surfaceArea();
+  const uint32_t num_bins = config_.build.num_bins;
+
+  for (int axis = 0; axis < 3; axis++) {
+    float axis_min = 0.0f, axis_max = 0.0f;
+    switch (axis) {
+      case 0: axis_min = centroid_bounds.min.x; axis_max = centroid_bounds.max.x; break;
+      case 1: axis_min = centroid_bounds.min.y; axis_max = centroid_bounds.max.y; break;
+      case 2: axis_min = centroid_bounds.min.z; axis_max = centroid_bounds.max.z; break;
+    }
+
+    if (axis_max - axis_min < kEpsilon) continue;
+
+    float bin_size = (axis_max - axis_min) / num_bins;
+
+    std::vector<uint32_t> bin_counts(num_bins, 0);
+    std::vector<AABB> bin_bounds(num_bins);
+
+    for (uint32_t i = 0; i < num_prims; i++) {
+      uint32_t prim_idx = indices[i];
+      Vec3 centroid = prim_bounds[prim_idx].center();
+      float pos = 0.0f;
+      switch (axis) {
+        case 0: pos = centroid.x; break;
+        case 1: pos = centroid.y; break;
+        case 2: pos = centroid.z; break;
+      }
+
+      uint32_t bin = std::min(static_cast<uint32_t>((pos - axis_min) / bin_size), num_bins - 1);
+      bin_counts[bin]++;
+      bin_bounds[bin].expand(prim_bounds[prim_idx]);
+    }
+
+    std::vector<AABB> left_bounds(num_bins);
+    std::vector<uint32_t> left_counts(num_bins);
+    AABB running_bounds;
+    uint32_t running_count = 0;
+
+    for (uint32_t i = 0; i < num_bins; i++) {
+      running_bounds.expand(bin_bounds[i]);
+      running_count += bin_counts[i];
+      left_bounds[i] = running_bounds;
+      left_counts[i] = running_count;
+    }
+
+    running_bounds = AABB();
+    running_count = 0;
+
+    for (uint32_t i = num_bins - 1; i > 0; i--) {
+      running_bounds.expand(bin_bounds[i]);
+      running_count += bin_counts[i];
+
+      uint32_t left_count = left_counts[i - 1];
+      if (left_count == 0 || running_count == 0) continue;
+
+      float left_area = left_bounds[i - 1].surfaceArea();
+      float right_area = running_bounds.surfaceArea();
+
+      float cost = config_.build.traversal_cost +
+                   config_.build.intersection_cost * (left_count * left_area + running_count * right_area) / parent_area;
+
+      if (cost < best_cost) {
+        best_cost = cost;
+        best_axis = axis;
+        best_pos = axis_min + i * bin_size;
+      }
+    }
+  }
+
+  float leaf_cost = config_.build.intersection_cost * num_prims;
+  if (best_cost >= leaf_cost && !config_.build.force_max_leaf_size) {
+    uint32_t prim_offset = static_cast<uint32_t>(prim_indices_storage_.size() / index_bytes_);
+
+    for (uint32_t i = 0; i < num_prims; i++) {
+      pushIndex(indices[i]);
+    }
+
+    if (config_.use_compact_nodes) {
+      compact_nodes_[node_idx].setLeaf(prim_offset, num_prims);
+    } else {
+      full_nodes_[node_idx].setLeaf(prim_offset, num_prims);
+    }
+    return node_idx;
+  }
+
+  uint32_t mid = 0;
+  for (uint32_t i = 0; i < num_prims; i++) {
+    uint32_t prim_idx = indices[i];
+    Vec3 centroid = prim_bounds[prim_idx].center();
+    float pos = 0.0f;
+    switch (best_axis) {
+      case 0: pos = centroid.x; break;
+      case 1: pos = centroid.y; break;
+      case 2: pos = centroid.z; break;
+    }
+
+    if (pos < best_pos) {
+      std::swap(indices[i], indices[mid]);
+      mid++;
+    }
+  }
+
+  if (mid == 0 || mid == num_prims) {
+    mid = num_prims / 2;
+  }
+
+  uint32_t left_child = buildRecursive(indices, mid, depth + 1, prim_bounds);
+  uint32_t right_child = buildRecursive(indices + mid, num_prims - mid, depth + 1, prim_bounds);
+
+  if (config_.use_compact_nodes) {
+    compact_nodes_[node_idx].setInterior(left_child, right_child, static_cast<uint8_t>(best_axis));
+  } else {
+    full_nodes_[node_idx].setInterior(left_child, right_child);
+  }
+
+  return node_idx;
+}
+
+uint32_t MMapGenericBVH::traverse(const Ray& ray, IntersectFn intersect_fn,
+                                   float& hit_t, float& hit_u, float& hit_v) const noexcept {
+  if (!intersect_fn) return kInvalidIndex;
+
+  bool use_compact = config_.use_compact_nodes;
+  if ((use_compact && compact_nodes_.empty()) || (!use_compact && full_nodes_.empty())) {
+    return kInvalidIndex;
+  }
+
+  hit_t = ray.tmax;
+  uint32_t hit_prim = kInvalidIndex;
+
+  uint32_t stack[64];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0) {
+    uint32_t node_idx = stack[--stack_ptr];
+
+    AABB bounds;
+    bool is_leaf;
+    uint32_t data0, data1;
+
+    if (use_compact) {
+      const CompactBVHNode& node = compact_nodes_[node_idx];
+      bounds = node.dequantizeBounds(scene_bounds_.min, scene_bounds_.max);
+      is_leaf = node.isLeaf();
+      data0 = node.data0;
+      data1 = node.data1;
+    } else {
+      const BVHNode& node = full_nodes_[node_idx];
+      bounds = node.bounds;
+      is_leaf = node.isLeaf();
+      data0 = node.prim_offset;
+      data1 = is_leaf ? node.prim_count : node.right_child;
+    }
+
+    float tmin_box, tmax_box;
+    if (!bounds.intersect(ray, tmin_box, tmax_box) || tmin_box > hit_t) {
+      continue;
+    }
+
+    if (is_leaf) {
+      uint32_t count = data1;
+      uint32_t offset = data0;
+
+      for (uint32_t i = 0; i < count; i++) {
+        uint32_t prim_idx = getPrimIndex(offset + i);
+        float t, u, v;
+        if (intersect_fn(ray, prim_data_, prim_idx, t, u, v) && t < hit_t) {
+          hit_t = t;
+          hit_u = u;
+          hit_v = v;
+          hit_prim = prim_idx;
+        }
+      }
+    } else {
+      uint32_t left = data0;
+      uint32_t right = use_compact ? data1 : full_nodes_[node_idx].right_child;
+
+      stack[stack_ptr++] = right;
+      stack[stack_ptr++] = left;
+    }
+  }
+
+  return hit_prim;
+}
+
+size_t MMapGenericBVH::getBVHMemoryUsage() const noexcept {
+  size_t memory = 0;
+
+  if (config_.use_compact_nodes) {
+    memory += compact_nodes_.size() * sizeof(CompactBVHNode);
+  } else {
+    memory += full_nodes_.size() * sizeof(BVHNode);
+  }
+
+  memory += prim_indices_storage_.size();
+
+  return memory;
+}
+
+MMapTriangleBVH::Stats MMapGenericBVH::getStats() const noexcept {
+  MMapTriangleBVH::Stats stats = {};
+
+  stats.num_primitives = prim_count_;
+  stats.index_bytes = index_bytes_;
+  stats.uses_compact_nodes = config_.use_compact_nodes;
+  stats.bvh_memory_bytes = getBVHMemoryUsage();
+  stats.prim_memory_bytes = 0;
+
+  if (config_.use_compact_nodes) {
+    for (const auto& node : compact_nodes_) {
+      stats.num_nodes++;
+      if (node.isLeaf()) {
+        stats.num_leaves++;
+        stats.avg_leaf_size += node.data1;
+      }
+    }
+  } else {
+    for (const auto& node : full_nodes_) {
+      stats.num_nodes++;
+      if (node.isLeaf()) {
+        stats.num_leaves++;
+        stats.avg_leaf_size += node.prim_count;
+      }
+    }
+  }
+
+  if (stats.num_leaves > 0) {
+    stats.avg_leaf_size /= stats.num_leaves;
+  }
+
+  return stats;
+}
+
+// ============================================================================
 // SimpleTimer Implementation
 // ============================================================================
 
