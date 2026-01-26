@@ -115,14 +115,200 @@ struct alignas(16) Ray {
   Vec3 direction;
   float tmin;
   float tmax;
-  
+
   Ray() noexcept : tmin(kEpsilon), tmax(kInfinity) {}
-  
+
   Ray(const Vec3& o, const Vec3& d, float tmin_ = kEpsilon, float tmax_ = kInfinity) noexcept
     : origin(o), direction(d), tmin(tmin_), tmax(tmax_) {}
-  
+
   Vec3 at(float t) const noexcept {
     return origin + direction * t;
+  }
+};
+
+// ============================================================================
+// Ray Packets for SIMD Traversal
+// ============================================================================
+
+// Ray packet of 4 rays (for SSE/NEON)
+struct alignas(16) Ray4 {
+  // SoA (Structure of Arrays) layout for SIMD efficiency
+  float origin_x[4];
+  float origin_y[4];
+  float origin_z[4];
+  float dir_x[4];
+  float dir_y[4];
+  float dir_z[4];
+  float tmin[4];
+  float tmax[4];
+  uint32_t active_mask;  // Bit mask of active rays (0-15)
+
+  Ray4() noexcept : active_mask(0xF) {
+    for (int i = 0; i < 4; i++) {
+      tmin[i] = kEpsilon;
+      tmax[i] = kInfinity;
+    }
+  }
+
+  // Set ray at index
+  void setRay(int idx, const Ray& ray) noexcept {
+    origin_x[idx] = ray.origin.x;
+    origin_y[idx] = ray.origin.y;
+    origin_z[idx] = ray.origin.z;
+    dir_x[idx] = ray.direction.x;
+    dir_y[idx] = ray.direction.y;
+    dir_z[idx] = ray.direction.z;
+    tmin[idx] = ray.tmin;
+    tmax[idx] = ray.tmax;
+  }
+
+  // Get ray at index
+  Ray getRay(int idx) const noexcept {
+    return Ray(
+      Vec3(origin_x[idx], origin_y[idx], origin_z[idx]),
+      Vec3(dir_x[idx], dir_y[idx], dir_z[idx]),
+      tmin[idx], tmax[idx]
+    );
+  }
+
+  // Create from 4 rays
+  static Ray4 fromRays(const Ray& r0, const Ray& r1, const Ray& r2, const Ray& r3) noexcept {
+    Ray4 packet;
+    packet.setRay(0, r0);
+    packet.setRay(1, r1);
+    packet.setRay(2, r2);
+    packet.setRay(3, r3);
+    return packet;
+  }
+
+  // Create from array of rays (up to 4)
+  static Ray4 fromRays(const Ray* rays, int count) noexcept {
+    Ray4 packet;
+    packet.active_mask = (1u << count) - 1;
+    for (int i = 0; i < count && i < 4; i++) {
+      packet.setRay(i, rays[i]);
+    }
+    return packet;
+  }
+
+  // Check if ray at index is active
+  bool isActive(int idx) const noexcept {
+    return (active_mask & (1u << idx)) != 0;
+  }
+
+  // Set ray as inactive (hit found or terminated)
+  void deactivate(int idx) noexcept {
+    active_mask &= ~(1u << idx);
+  }
+
+  // Count active rays
+  int countActive() const noexcept {
+    int count = 0;
+    uint32_t mask = active_mask;
+    while (mask) {
+      count += mask & 1;
+      mask >>= 1;
+    }
+    return count;
+  }
+};
+
+// Ray packet of 8 rays (for AVX)
+struct alignas(32) Ray8 {
+  float origin_x[8];
+  float origin_y[8];
+  float origin_z[8];
+  float dir_x[8];
+  float dir_y[8];
+  float dir_z[8];
+  float tmin[8];
+  float tmax[8];
+  uint32_t active_mask;  // Bit mask of active rays (0-255)
+
+  Ray8() noexcept : active_mask(0xFF) {
+    for (int i = 0; i < 8; i++) {
+      tmin[i] = kEpsilon;
+      tmax[i] = kInfinity;
+    }
+  }
+
+  void setRay(int idx, const Ray& ray) noexcept {
+    origin_x[idx] = ray.origin.x;
+    origin_y[idx] = ray.origin.y;
+    origin_z[idx] = ray.origin.z;
+    dir_x[idx] = ray.direction.x;
+    dir_y[idx] = ray.direction.y;
+    dir_z[idx] = ray.direction.z;
+    tmin[idx] = ray.tmin;
+    tmax[idx] = ray.tmax;
+  }
+
+  Ray getRay(int idx) const noexcept {
+    return Ray(
+      Vec3(origin_x[idx], origin_y[idx], origin_z[idx]),
+      Vec3(dir_x[idx], dir_y[idx], dir_z[idx]),
+      tmin[idx], tmax[idx]
+    );
+  }
+
+  static Ray8 fromRays(const Ray* rays, int count) noexcept {
+    Ray8 packet;
+    packet.active_mask = (1u << count) - 1;
+    for (int i = 0; i < count && i < 8; i++) {
+      packet.setRay(i, rays[i]);
+    }
+    return packet;
+  }
+
+  bool isActive(int idx) const noexcept {
+    return (active_mask & (1u << idx)) != 0;
+  }
+
+  void deactivate(int idx) noexcept {
+    active_mask &= ~(1u << idx);
+  }
+
+  int countActive() const noexcept {
+    int count = 0;
+    uint32_t mask = active_mask;
+    while (mask) {
+      count += mask & 1;
+      mask >>= 1;
+    }
+    return count;
+  }
+};
+
+// Hit result for packet traversal
+struct HitResult4 {
+  uint32_t prim_id[4];  // Primitive ID (kInvalidIndex if no hit)
+  float t[4];           // Hit distance
+  float u[4];           // Barycentric U
+  float v[4];           // Barycentric V
+
+  HitResult4() noexcept {
+    for (int i = 0; i < 4; i++) {
+      prim_id[i] = kInvalidIndex;
+      t[i] = kInfinity;
+      u[i] = 0.0f;
+      v[i] = 0.0f;
+    }
+  }
+};
+
+struct HitResult8 {
+  uint32_t prim_id[8];
+  float t[8];
+  float u[8];
+  float v[8];
+
+  HitResult8() noexcept {
+    for (int i = 0; i < 8; i++) {
+      prim_id[i] = kInvalidIndex;
+      t[i] = kInfinity;
+      u[i] = 0.0f;
+      v[i] = 0.0f;
+    }
   }
 };
 
@@ -744,11 +930,13 @@ struct SBVHBuildConfig {
 
 struct TraversalConfig {
   uint32_t max_prim_tests;       // Maximum primitive intersection tests (0 = unlimited)
+  uint32_t exclude_prim_id;      // Primitive to skip (for self-intersection avoidance)
   bool use_mailboxing;           // Use mailboxing to avoid duplicate tests (for SBVH)
   bool early_termination;        // Stop on first hit (any-hit query)
 
   TraversalConfig() noexcept
     : max_prim_tests(0)
+    , exclude_prim_id(kInvalidIndex)
     , use_mailboxing(false)
     , early_termination(false) {}
 
@@ -764,6 +952,21 @@ struct TraversalConfig {
   static TraversalConfig anyHit() noexcept {
     TraversalConfig cfg;
     cfg.early_termination = true;
+    return cfg;
+  }
+
+  // Preset for shadow ray from a surface (any-hit + self-intersection avoidance)
+  static TraversalConfig shadowRay(uint32_t exclude_prim = kInvalidIndex) noexcept {
+    TraversalConfig cfg;
+    cfg.early_termination = true;
+    cfg.exclude_prim_id = exclude_prim;
+    return cfg;
+  }
+
+  // Preset for reflection/refraction ray (self-intersection avoidance)
+  static TraversalConfig secondaryRay(uint32_t exclude_prim) noexcept {
+    TraversalConfig cfg;
+    cfg.exclude_prim_id = exclude_prim;
     return cfg;
   }
 };
@@ -1006,6 +1209,23 @@ public:
   BVH::Stats getStats() const noexcept { return bvh_.getStats(); }
   uint32_t getNumPrimitives() const noexcept { return static_cast<uint32_t>(triangles_.size()); }
 
+  // Any-hit traversal (for shadow rays) - returns true if any hit found
+  // exclude_prim_id: skip this primitive (for self-intersection avoidance)
+  bool traverseAnyHit(const Ray& ray, uint32_t exclude_prim_id = kInvalidIndex) const noexcept;
+
+  // Packet traversal - traverse 4 rays in parallel
+  // Uses SIMD for coherent ray processing
+  void traverse4(const Ray4& rays, HitResult4& results) const noexcept;
+
+  // Any-hit packet traversal - returns bit mask of rays that hit something
+  uint32_t traverse4AnyHit(const Ray4& rays, uint32_t exclude_prim_id = kInvalidIndex) const noexcept;
+
+  // 8-ray packet traversal
+  void traverse8(const Ray8& rays, HitResult8& results) const noexcept;
+
+  // Any-hit 8-ray packet - returns bit mask of rays that hit something
+  uint32_t traverse8AnyHit(const Ray8& rays, uint32_t exclude_prim_id = kInvalidIndex) const noexcept;
+
   // Access internals
   const BVH& getBVH() const noexcept { return bvh_; }
   const std::vector<Triangle>& getTriangles() const noexcept { return triangles_; }
@@ -1061,6 +1281,15 @@ public:
 
   Stats getStats() const noexcept;
   uint32_t getNumPrimitives() const noexcept { return static_cast<uint32_t>(triangles_.size()); }
+
+  // Any-hit traversal (for shadow rays) - returns true if any hit found
+  bool traverseAnyHit(const Ray& ray, uint32_t exclude_prim_id = kInvalidIndex) const noexcept;
+
+  // Packet traversal
+  void traverse4(const Ray4& rays, HitResult4& results) const noexcept;
+  uint32_t traverse4AnyHit(const Ray4& rays, uint32_t exclude_prim_id = kInvalidIndex) const noexcept;
+  void traverse8(const Ray8& rays, HitResult8& results) const noexcept;
+  uint32_t traverse8AnyHit(const Ray8& rays, uint32_t exclude_prim_id = kInvalidIndex) const noexcept;
 
   // Access internals
   const std::vector<BVHNode>& getNodes() const noexcept { return nodes_; }

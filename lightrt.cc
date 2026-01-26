@@ -1731,6 +1731,12 @@ uint32_t TriangleBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hi
         }
 
         uint32_t tri_idx = prim_indices[node.prim_offset + i];
+
+        // Skip excluded primitive (self-intersection avoidance)
+        if (tri_idx == config.exclude_prim_id) {
+          continue;
+        }
+
         prim_tests++;
         local_stats.prims_tested++;
 
@@ -1762,6 +1768,411 @@ uint32_t TriangleBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hi
 
   if (stats) *stats = local_stats;
   return hit_tri;
+}
+
+bool TriangleBVH::traverseAnyHit(const Ray& ray, uint32_t exclude_prim_id) const noexcept {
+  const auto& nodes = bvh_.getNodes();
+  const auto& prim_indices = bvh_.getPrimitiveIndices();
+
+  if (nodes.empty()) {
+    return false;
+  }
+
+  // Stack-based traversal
+  uint32_t stack[64];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0) {
+    uint32_t node_idx = stack[--stack_ptr];
+    const BVHNode& node = nodes[node_idx];
+
+    float tmin, tmax;
+    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > ray.tmax) {
+      continue;
+    }
+
+    if (node.isLeaf()) {
+      for (uint32_t i = 0; i < node.prim_count; i++) {
+        uint32_t tri_idx = prim_indices[node.prim_offset + i];
+        if (tri_idx == exclude_prim_id) continue;
+
+        float t, u, v;
+        if (triangles_[tri_idx].intersect(ray, t, u, v)) {
+          return true;  // Found any hit
+        }
+      }
+    } else {
+      if (stack_ptr < 62) {
+        stack[stack_ptr++] = node.left_child;
+        stack[stack_ptr++] = node.right_child;
+      }
+    }
+  }
+
+  return false;
+}
+
+void TriangleBVH::traverse4(const Ray4& rays, HitResult4& results) const noexcept {
+  const auto& nodes = bvh_.getNodes();
+  const auto& prim_indices = bvh_.getPrimitiveIndices();
+
+  if (nodes.empty()) {
+    return;
+  }
+
+  // Initialize results
+  for (int i = 0; i < 4; i++) {
+    results.prim_id[i] = kInvalidIndex;
+    results.t[i] = rays.tmax[i];
+    results.u[i] = 0.0f;
+    results.v[i] = 0.0f;
+  }
+
+  uint32_t active = rays.active_mask & 0xF;
+  if (active == 0) return;
+
+  // Coherent traversal: all rays traverse together
+  uint32_t stack[64];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0 && active != 0) {
+    uint32_t node_idx = stack[--stack_ptr];
+    const BVHNode& node = nodes[node_idx];
+
+    // Test all active rays against node bounds
+    uint32_t hit_mask = 0;
+#if defined(LIGHTRT_HAS_SSE2) || defined(LIGHTRT_HAS_NEON)
+    // SIMD bounds test for 4 rays
+    __m128 node_min_x = _mm_set1_ps(node.bounds.min.x);
+    __m128 node_min_y = _mm_set1_ps(node.bounds.min.y);
+    __m128 node_min_z = _mm_set1_ps(node.bounds.min.z);
+    __m128 node_max_x = _mm_set1_ps(node.bounds.max.x);
+    __m128 node_max_y = _mm_set1_ps(node.bounds.max.y);
+    __m128 node_max_z = _mm_set1_ps(node.bounds.max.z);
+
+    __m128 ray_ox = _mm_loadu_ps(rays.origin_x);
+    __m128 ray_oy = _mm_loadu_ps(rays.origin_y);
+    __m128 ray_oz = _mm_loadu_ps(rays.origin_z);
+    __m128 ray_dx = _mm_loadu_ps(rays.dir_x);
+    __m128 ray_dy = _mm_loadu_ps(rays.dir_y);
+    __m128 ray_dz = _mm_loadu_ps(rays.dir_z);
+    __m128 ray_tmin = _mm_loadu_ps(rays.tmin);
+    __m128 ray_tmax = _mm_loadu_ps(results.t);
+
+    // Compute inverse direction
+    __m128 eps = _mm_set1_ps(1e-20f);
+    __m128 inv_dx = _mm_div_ps(_mm_set1_ps(1.0f), _mm_add_ps(ray_dx, eps));
+    __m128 inv_dy = _mm_div_ps(_mm_set1_ps(1.0f), _mm_add_ps(ray_dy, eps));
+    __m128 inv_dz = _mm_div_ps(_mm_set1_ps(1.0f), _mm_add_ps(ray_dz, eps));
+
+    // Slab intersection
+    __m128 t1x = _mm_mul_ps(_mm_sub_ps(node_min_x, ray_ox), inv_dx);
+    __m128 t2x = _mm_mul_ps(_mm_sub_ps(node_max_x, ray_ox), inv_dx);
+    __m128 t1y = _mm_mul_ps(_mm_sub_ps(node_min_y, ray_oy), inv_dy);
+    __m128 t2y = _mm_mul_ps(_mm_sub_ps(node_max_y, ray_oy), inv_dy);
+    __m128 t1z = _mm_mul_ps(_mm_sub_ps(node_min_z, ray_oz), inv_dz);
+    __m128 t2z = _mm_mul_ps(_mm_sub_ps(node_max_z, ray_oz), inv_dz);
+
+    __m128 tmin_x = _mm_min_ps(t1x, t2x);
+    __m128 tmax_x = _mm_max_ps(t1x, t2x);
+    __m128 tmin_y = _mm_min_ps(t1y, t2y);
+    __m128 tmax_y = _mm_max_ps(t1y, t2y);
+    __m128 tmin_z = _mm_min_ps(t1z, t2z);
+    __m128 tmax_z = _mm_max_ps(t1z, t2z);
+
+    __m128 tenter = _mm_max_ps(_mm_max_ps(tmin_x, tmin_y), _mm_max_ps(tmin_z, ray_tmin));
+    __m128 texit = _mm_min_ps(_mm_min_ps(tmax_x, tmax_y), _mm_min_ps(tmax_z, ray_tmax));
+
+    __m128 hit_cmp = _mm_cmple_ps(tenter, texit);
+    hit_mask = static_cast<uint32_t>(_mm_movemask_ps(hit_cmp)) & active;
+#else
+    // Scalar fallback
+    for (int i = 0; i < 4; i++) {
+      if (!(active & (1u << i))) continue;
+      Ray r = rays.getRay(i);
+      r.tmax = results.t[i];
+      float tmin_scalar, tmax_scalar;
+      if (node.bounds.intersectSIMD(r, tmin_scalar, tmax_scalar) && tmin_scalar <= results.t[i]) {
+        hit_mask |= (1u << i);
+      }
+    }
+#endif
+
+    if (hit_mask == 0) continue;
+
+    if (node.isLeaf()) {
+      // Test triangles for all rays that hit this node
+      for (uint32_t pi = 0; pi < node.prim_count; pi++) {
+        uint32_t tri_idx = prim_indices[node.prim_offset + pi];
+        const Triangle& tri = triangles_[tri_idx];
+
+        for (int i = 0; i < 4; i++) {
+          if (!(hit_mask & (1u << i))) continue;
+
+          Ray r = rays.getRay(i);
+          r.tmax = results.t[i];
+          float t, u, v;
+          if (tri.intersect(r, t, u, v) && t < results.t[i]) {
+            results.t[i] = t;
+            results.u[i] = u;
+            results.v[i] = v;
+            results.prim_id[i] = tri_idx;
+          }
+        }
+      }
+    } else {
+      if (stack_ptr < 62) {
+        stack[stack_ptr++] = node.left_child;
+        stack[stack_ptr++] = node.right_child;
+      }
+    }
+  }
+}
+
+uint32_t TriangleBVH::traverse4AnyHit(const Ray4& rays, uint32_t exclude_prim_id) const noexcept {
+  const auto& nodes = bvh_.getNodes();
+  const auto& prim_indices = bvh_.getPrimitiveIndices();
+
+  if (nodes.empty()) {
+    return 0;
+  }
+
+  uint32_t hit_mask = 0;
+  uint32_t active = rays.active_mask & 0xF;
+  if (active == 0) return 0;
+
+  uint32_t stack[64];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0 && active != 0) {
+    uint32_t node_idx = stack[--stack_ptr];
+    const BVHNode& node = nodes[node_idx];
+
+    // Test bounds for all active rays
+    uint32_t node_hit = 0;
+    for (int i = 0; i < 4; i++) {
+      if (!(active & (1u << i))) continue;
+      Ray r = rays.getRay(i);
+      float tmin, tmax;
+      if (node.bounds.intersectSIMD(r, tmin, tmax)) {
+        node_hit |= (1u << i);
+      }
+    }
+
+    if (node_hit == 0) continue;
+
+    if (node.isLeaf()) {
+      for (uint32_t pi = 0; pi < node.prim_count; pi++) {
+        uint32_t tri_idx = prim_indices[node.prim_offset + pi];
+        if (tri_idx == exclude_prim_id) continue;
+
+        const Triangle& tri = triangles_[tri_idx];
+
+        for (int i = 0; i < 4; i++) {
+          if (!(node_hit & (1u << i))) continue;
+          if (hit_mask & (1u << i)) continue;  // Already hit
+
+          Ray r = rays.getRay(i);
+          float t, u, v;
+          if (tri.intersect(r, t, u, v)) {
+            hit_mask |= (1u << i);
+            active &= ~(1u << i);  // Deactivate this ray
+          }
+        }
+
+        if (active == 0) break;  // All rays hit
+      }
+    } else {
+      if (stack_ptr < 62) {
+        stack[stack_ptr++] = node.left_child;
+        stack[stack_ptr++] = node.right_child;
+      }
+    }
+  }
+
+  return hit_mask;
+}
+
+void TriangleBVH::traverse8(const Ray8& rays, HitResult8& results) const noexcept {
+  const auto& nodes = bvh_.getNodes();
+  const auto& prim_indices = bvh_.getPrimitiveIndices();
+
+  if (nodes.empty()) {
+    return;
+  }
+
+  // Initialize results
+  for (int i = 0; i < 8; i++) {
+    results.prim_id[i] = kInvalidIndex;
+    results.t[i] = rays.tmax[i];
+    results.u[i] = 0.0f;
+    results.v[i] = 0.0f;
+  }
+
+  uint32_t active = rays.active_mask & 0xFF;
+  if (active == 0) return;
+
+  uint32_t stack[64];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0 && active != 0) {
+    uint32_t node_idx = stack[--stack_ptr];
+    const BVHNode& node = nodes[node_idx];
+
+    // Test bounds for all active rays
+    uint32_t hit_mask = 0;
+#if defined(LIGHTRT_HAS_AVX)
+    // AVX bounds test for 8 rays
+    __m256 node_min_x = _mm256_set1_ps(node.bounds.min.x);
+    __m256 node_min_y = _mm256_set1_ps(node.bounds.min.y);
+    __m256 node_min_z = _mm256_set1_ps(node.bounds.min.z);
+    __m256 node_max_x = _mm256_set1_ps(node.bounds.max.x);
+    __m256 node_max_y = _mm256_set1_ps(node.bounds.max.y);
+    __m256 node_max_z = _mm256_set1_ps(node.bounds.max.z);
+
+    __m256 ray_ox = _mm256_loadu_ps(rays.origin_x);
+    __m256 ray_oy = _mm256_loadu_ps(rays.origin_y);
+    __m256 ray_oz = _mm256_loadu_ps(rays.origin_z);
+    __m256 ray_dx = _mm256_loadu_ps(rays.dir_x);
+    __m256 ray_dy = _mm256_loadu_ps(rays.dir_y);
+    __m256 ray_dz = _mm256_loadu_ps(rays.dir_z);
+    __m256 ray_tmin = _mm256_loadu_ps(rays.tmin);
+    __m256 ray_tmax = _mm256_loadu_ps(results.t);
+
+    __m256 eps = _mm256_set1_ps(1e-20f);
+    __m256 inv_dx = _mm256_div_ps(_mm256_set1_ps(1.0f), _mm256_add_ps(ray_dx, eps));
+    __m256 inv_dy = _mm256_div_ps(_mm256_set1_ps(1.0f), _mm256_add_ps(ray_dy, eps));
+    __m256 inv_dz = _mm256_div_ps(_mm256_set1_ps(1.0f), _mm256_add_ps(ray_dz, eps));
+
+    __m256 t1x = _mm256_mul_ps(_mm256_sub_ps(node_min_x, ray_ox), inv_dx);
+    __m256 t2x = _mm256_mul_ps(_mm256_sub_ps(node_max_x, ray_ox), inv_dx);
+    __m256 t1y = _mm256_mul_ps(_mm256_sub_ps(node_min_y, ray_oy), inv_dy);
+    __m256 t2y = _mm256_mul_ps(_mm256_sub_ps(node_max_y, ray_oy), inv_dy);
+    __m256 t1z = _mm256_mul_ps(_mm256_sub_ps(node_min_z, ray_oz), inv_dz);
+    __m256 t2z = _mm256_mul_ps(_mm256_sub_ps(node_max_z, ray_oz), inv_dz);
+
+    __m256 tmin_x = _mm256_min_ps(t1x, t2x);
+    __m256 tmax_x = _mm256_max_ps(t1x, t2x);
+    __m256 tmin_y = _mm256_min_ps(t1y, t2y);
+    __m256 tmax_y = _mm256_max_ps(t1y, t2y);
+    __m256 tmin_z = _mm256_min_ps(t1z, t2z);
+    __m256 tmax_z = _mm256_max_ps(t1z, t2z);
+
+    __m256 tenter = _mm256_max_ps(_mm256_max_ps(tmin_x, tmin_y), _mm256_max_ps(tmin_z, ray_tmin));
+    __m256 texit = _mm256_min_ps(_mm256_min_ps(tmax_x, tmax_y), _mm256_min_ps(tmax_z, ray_tmax));
+
+    __m256 hit_cmp = _mm256_cmp_ps(tenter, texit, _CMP_LE_OQ);
+    hit_mask = static_cast<uint32_t>(_mm256_movemask_ps(hit_cmp)) & active;
+#else
+    // Scalar fallback
+    for (int i = 0; i < 8; i++) {
+      if (!(active & (1u << i))) continue;
+      Ray r = rays.getRay(i);
+      r.tmax = results.t[i];
+      float tmin_scalar, tmax_scalar;
+      if (node.bounds.intersectSIMD(r, tmin_scalar, tmax_scalar) && tmin_scalar <= results.t[i]) {
+        hit_mask |= (1u << i);
+      }
+    }
+#endif
+
+    if (hit_mask == 0) continue;
+
+    if (node.isLeaf()) {
+      for (uint32_t pi = 0; pi < node.prim_count; pi++) {
+        uint32_t tri_idx = prim_indices[node.prim_offset + pi];
+        const Triangle& tri = triangles_[tri_idx];
+
+        for (int i = 0; i < 8; i++) {
+          if (!(hit_mask & (1u << i))) continue;
+
+          Ray r = rays.getRay(i);
+          r.tmax = results.t[i];
+          float t, u, v;
+          if (tri.intersect(r, t, u, v) && t < results.t[i]) {
+            results.t[i] = t;
+            results.u[i] = u;
+            results.v[i] = v;
+            results.prim_id[i] = tri_idx;
+          }
+        }
+      }
+    } else {
+      if (stack_ptr < 62) {
+        stack[stack_ptr++] = node.left_child;
+        stack[stack_ptr++] = node.right_child;
+      }
+    }
+  }
+}
+
+uint32_t TriangleBVH::traverse8AnyHit(const Ray8& rays, uint32_t exclude_prim_id) const noexcept {
+  const auto& nodes = bvh_.getNodes();
+  const auto& prim_indices = bvh_.getPrimitiveIndices();
+
+  if (nodes.empty()) {
+    return 0;
+  }
+
+  uint32_t hit_mask = 0;
+  uint32_t active = rays.active_mask & 0xFF;
+  if (active == 0) return 0;
+
+  uint32_t stack[64];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0 && active != 0) {
+    uint32_t node_idx = stack[--stack_ptr];
+    const BVHNode& node = nodes[node_idx];
+
+    // Test bounds for all active rays
+    uint32_t node_hit = 0;
+    for (int i = 0; i < 8; i++) {
+      if (!(active & (1u << i))) continue;
+      Ray r = rays.getRay(i);
+      float tmin, tmax;
+      if (node.bounds.intersectSIMD(r, tmin, tmax)) {
+        node_hit |= (1u << i);
+      }
+    }
+
+    if (node_hit == 0) continue;
+
+    if (node.isLeaf()) {
+      for (uint32_t pi = 0; pi < node.prim_count; pi++) {
+        uint32_t tri_idx = prim_indices[node.prim_offset + pi];
+        if (tri_idx == exclude_prim_id) continue;
+
+        const Triangle& tri = triangles_[tri_idx];
+
+        for (int i = 0; i < 8; i++) {
+          if (!(node_hit & (1u << i))) continue;
+          if (hit_mask & (1u << i)) continue;
+
+          Ray r = rays.getRay(i);
+          float t, u, v;
+          if (tri.intersect(r, t, u, v)) {
+            hit_mask |= (1u << i);
+            active &= ~(1u << i);
+          }
+        }
+
+        if (active == 0) break;
+      }
+    } else {
+      if (stack_ptr < 62) {
+        stack[stack_ptr++] = node.left_child;
+        stack[stack_ptr++] = node.right_child;
+      }
+    }
+  }
+
+  return hit_mask;
 }
 
 // ============================================================================
@@ -2383,6 +2794,11 @@ uint32_t SBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hit_u, fl
 
         const PrimRef& ref = refs_[node.prim_offset + i];
 
+        // Skip excluded primitive (self-intersection avoidance)
+        if (ref.prim_id == config.exclude_prim_id) {
+          continue;
+        }
+
         // Mailboxing: skip if already tested
         if (testAndMarkMailbox(ref.prim_id)) {
           continue;
@@ -2425,6 +2841,370 @@ uint32_t SBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hit_u, fl
 
   if (stats) *stats = local_stats;
   return hit_tri;
+}
+
+bool SBVH::traverseAnyHit(const Ray& ray, uint32_t exclude_prim_id) const noexcept {
+  if (nodes_.empty()) {
+    return false;
+  }
+
+  // Simple mailbox for duplicate avoidance
+  const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
+  std::vector<uint64_t> mailbox((num_prims + 63) / 64, 0);
+
+  auto alreadyTested = [&](uint32_t prim_id) -> bool {
+    uint32_t word = prim_id / 64;
+    uint64_t bit = 1ULL << (prim_id % 64);
+    if (mailbox[word] & bit) return true;
+    mailbox[word] |= bit;
+    return false;
+  };
+
+  uint32_t stack[64];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0) {
+    uint32_t node_idx = stack[--stack_ptr];
+    const BVHNode& node = nodes_[node_idx];
+
+    float tmin, tmax;
+    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > ray.tmax) {
+      continue;
+    }
+
+    if (node.isLeaf()) {
+      for (uint32_t i = 0; i < node.prim_count; i++) {
+        const PrimRef& ref = refs_[node.prim_offset + i];
+        if (ref.prim_id == exclude_prim_id) continue;
+        if (alreadyTested(ref.prim_id)) continue;
+
+        float t, u, v;
+        if (triangles_[ref.prim_id].intersect(ray, t, u, v)) {
+          return true;
+        }
+      }
+    } else {
+      if (stack_ptr < 62) {
+        stack[stack_ptr++] = node.left_child;
+        stack[stack_ptr++] = node.right_child;
+      }
+    }
+  }
+
+  return false;
+}
+
+void SBVH::traverse4(const Ray4& rays, HitResult4& results) const noexcept {
+  if (nodes_.empty()) {
+    return;
+  }
+
+  // Initialize results
+  for (int i = 0; i < 4; i++) {
+    results.prim_id[i] = kInvalidIndex;
+    results.t[i] = rays.tmax[i];
+    results.u[i] = 0.0f;
+    results.v[i] = 0.0f;
+  }
+
+  uint32_t active = rays.active_mask & 0xF;
+  if (active == 0) return;
+
+  // Per-ray mailbox for duplicate avoidance
+  const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
+  std::vector<uint64_t> mailbox[4];
+  for (int i = 0; i < 4; i++) {
+    if (active & (1u << i)) {
+      mailbox[i].resize((num_prims + 63) / 64, 0);
+    }
+  }
+
+  auto alreadyTested = [&](int ray_idx, uint32_t prim_id) -> bool {
+    uint32_t word = prim_id / 64;
+    uint64_t bit = 1ULL << (prim_id % 64);
+    if (mailbox[ray_idx][word] & bit) return true;
+    mailbox[ray_idx][word] |= bit;
+    return false;
+  };
+
+  uint32_t stack[64];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0 && active != 0) {
+    uint32_t node_idx = stack[--stack_ptr];
+    const BVHNode& node = nodes_[node_idx];
+
+    // Test bounds for all active rays
+    uint32_t hit_mask = 0;
+    for (int i = 0; i < 4; i++) {
+      if (!(active & (1u << i))) continue;
+      Ray r = rays.getRay(i);
+      r.tmax = results.t[i];
+      float tmin, tmax;
+      if (node.bounds.intersectSIMD(r, tmin, tmax) && tmin <= results.t[i]) {
+        hit_mask |= (1u << i);
+      }
+    }
+
+    if (hit_mask == 0) continue;
+
+    if (node.isLeaf()) {
+      for (uint32_t pi = 0; pi < node.prim_count; pi++) {
+        const PrimRef& ref = refs_[node.prim_offset + pi];
+        const Triangle& tri = triangles_[ref.prim_id];
+
+        for (int i = 0; i < 4; i++) {
+          if (!(hit_mask & (1u << i))) continue;
+          if (alreadyTested(i, ref.prim_id)) continue;
+
+          Ray r = rays.getRay(i);
+          r.tmax = results.t[i];
+          float t, u, v;
+          if (tri.intersect(r, t, u, v) && t < results.t[i]) {
+            results.t[i] = t;
+            results.u[i] = u;
+            results.v[i] = v;
+            results.prim_id[i] = ref.prim_id;
+          }
+        }
+      }
+    } else {
+      if (stack_ptr < 62) {
+        stack[stack_ptr++] = node.left_child;
+        stack[stack_ptr++] = node.right_child;
+      }
+    }
+  }
+}
+
+uint32_t SBVH::traverse4AnyHit(const Ray4& rays, uint32_t exclude_prim_id) const noexcept {
+  if (nodes_.empty()) {
+    return 0;
+  }
+
+  uint32_t hit_mask = 0;
+  uint32_t active = rays.active_mask & 0xF;
+  if (active == 0) return 0;
+
+  // Shared mailbox
+  const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
+  std::vector<uint64_t> mailbox((num_prims + 63) / 64, 0);
+
+  auto alreadyTested = [&](uint32_t prim_id) -> bool {
+    uint32_t word = prim_id / 64;
+    uint64_t bit = 1ULL << (prim_id % 64);
+    if (mailbox[word] & bit) return true;
+    mailbox[word] |= bit;
+    return false;
+  };
+
+  uint32_t stack[64];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0 && active != 0) {
+    uint32_t node_idx = stack[--stack_ptr];
+    const BVHNode& node = nodes_[node_idx];
+
+    uint32_t node_hit = 0;
+    for (int i = 0; i < 4; i++) {
+      if (!(active & (1u << i))) continue;
+      Ray r = rays.getRay(i);
+      float tmin, tmax;
+      if (node.bounds.intersectSIMD(r, tmin, tmax)) {
+        node_hit |= (1u << i);
+      }
+    }
+
+    if (node_hit == 0) continue;
+
+    if (node.isLeaf()) {
+      for (uint32_t pi = 0; pi < node.prim_count; pi++) {
+        const PrimRef& ref = refs_[node.prim_offset + pi];
+        if (ref.prim_id == exclude_prim_id) continue;
+        if (alreadyTested(ref.prim_id)) continue;
+
+        const Triangle& tri = triangles_[ref.prim_id];
+
+        for (int i = 0; i < 4; i++) {
+          if (!(node_hit & (1u << i))) continue;
+          if (hit_mask & (1u << i)) continue;
+
+          Ray r = rays.getRay(i);
+          float t, u, v;
+          if (tri.intersect(r, t, u, v)) {
+            hit_mask |= (1u << i);
+            active &= ~(1u << i);
+          }
+        }
+
+        if (active == 0) break;
+      }
+    } else {
+      if (stack_ptr < 62) {
+        stack[stack_ptr++] = node.left_child;
+        stack[stack_ptr++] = node.right_child;
+      }
+    }
+  }
+
+  return hit_mask;
+}
+
+void SBVH::traverse8(const Ray8& rays, HitResult8& results) const noexcept {
+  if (nodes_.empty()) {
+    return;
+  }
+
+  for (int i = 0; i < 8; i++) {
+    results.prim_id[i] = kInvalidIndex;
+    results.t[i] = rays.tmax[i];
+    results.u[i] = 0.0f;
+    results.v[i] = 0.0f;
+  }
+
+  uint32_t active = rays.active_mask & 0xFF;
+  if (active == 0) return;
+
+  const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
+  std::vector<uint64_t> mailbox[8];
+  for (int i = 0; i < 8; i++) {
+    if (active & (1u << i)) {
+      mailbox[i].resize((num_prims + 63) / 64, 0);
+    }
+  }
+
+  auto alreadyTested = [&](int ray_idx, uint32_t prim_id) -> bool {
+    uint32_t word = prim_id / 64;
+    uint64_t bit = 1ULL << (prim_id % 64);
+    if (mailbox[ray_idx][word] & bit) return true;
+    mailbox[ray_idx][word] |= bit;
+    return false;
+  };
+
+  uint32_t stack[64];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0 && active != 0) {
+    uint32_t node_idx = stack[--stack_ptr];
+    const BVHNode& node = nodes_[node_idx];
+
+    uint32_t hit_mask = 0;
+    for (int i = 0; i < 8; i++) {
+      if (!(active & (1u << i))) continue;
+      Ray r = rays.getRay(i);
+      r.tmax = results.t[i];
+      float tmin, tmax;
+      if (node.bounds.intersectSIMD(r, tmin, tmax) && tmin <= results.t[i]) {
+        hit_mask |= (1u << i);
+      }
+    }
+
+    if (hit_mask == 0) continue;
+
+    if (node.isLeaf()) {
+      for (uint32_t pi = 0; pi < node.prim_count; pi++) {
+        const PrimRef& ref = refs_[node.prim_offset + pi];
+        const Triangle& tri = triangles_[ref.prim_id];
+
+        for (int i = 0; i < 8; i++) {
+          if (!(hit_mask & (1u << i))) continue;
+          if (alreadyTested(i, ref.prim_id)) continue;
+
+          Ray r = rays.getRay(i);
+          r.tmax = results.t[i];
+          float t, u, v;
+          if (tri.intersect(r, t, u, v) && t < results.t[i]) {
+            results.t[i] = t;
+            results.u[i] = u;
+            results.v[i] = v;
+            results.prim_id[i] = ref.prim_id;
+          }
+        }
+      }
+    } else {
+      if (stack_ptr < 62) {
+        stack[stack_ptr++] = node.left_child;
+        stack[stack_ptr++] = node.right_child;
+      }
+    }
+  }
+}
+
+uint32_t SBVH::traverse8AnyHit(const Ray8& rays, uint32_t exclude_prim_id) const noexcept {
+  if (nodes_.empty()) {
+    return 0;
+  }
+
+  uint32_t hit_mask = 0;
+  uint32_t active = rays.active_mask & 0xFF;
+  if (active == 0) return 0;
+
+  const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
+  std::vector<uint64_t> mailbox((num_prims + 63) / 64, 0);
+
+  auto alreadyTested = [&](uint32_t prim_id) -> bool {
+    uint32_t word = prim_id / 64;
+    uint64_t bit = 1ULL << (prim_id % 64);
+    if (mailbox[word] & bit) return true;
+    mailbox[word] |= bit;
+    return false;
+  };
+
+  uint32_t stack[64];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0 && active != 0) {
+    uint32_t node_idx = stack[--stack_ptr];
+    const BVHNode& node = nodes_[node_idx];
+
+    uint32_t node_hit = 0;
+    for (int i = 0; i < 8; i++) {
+      if (!(active & (1u << i))) continue;
+      Ray r = rays.getRay(i);
+      float tmin, tmax;
+      if (node.bounds.intersectSIMD(r, tmin, tmax)) {
+        node_hit |= (1u << i);
+      }
+    }
+
+    if (node_hit == 0) continue;
+
+    if (node.isLeaf()) {
+      for (uint32_t pi = 0; pi < node.prim_count; pi++) {
+        const PrimRef& ref = refs_[node.prim_offset + pi];
+        if (ref.prim_id == exclude_prim_id) continue;
+        if (alreadyTested(ref.prim_id)) continue;
+
+        const Triangle& tri = triangles_[ref.prim_id];
+
+        for (int i = 0; i < 8; i++) {
+          if (!(node_hit & (1u << i))) continue;
+          if (hit_mask & (1u << i)) continue;
+
+          Ray r = rays.getRay(i);
+          float t, u, v;
+          if (tri.intersect(r, t, u, v)) {
+            hit_mask |= (1u << i);
+            active &= ~(1u << i);
+          }
+        }
+
+        if (active == 0) break;
+      }
+    } else {
+      if (stack_ptr < 62) {
+        stack[stack_ptr++] = node.left_child;
+        stack[stack_ptr++] = node.right_child;
+      }
+    }
+  }
+
+  return hit_mask;
 }
 
 SBVH::Stats SBVH::getStats() const noexcept {

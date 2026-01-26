@@ -1897,6 +1897,284 @@ int main(int argc, char** argv) {
     std::cout << "  Colormaps tested: Viridis, Hot, Jet, Turbo, Plasma, Inferno\n";
   }
 
+  // ============================================================================
+  // Path Tracing Features (any-hit, self-intersection, packet traversal)
+  // ============================================================================
+  {
+    std::cout << "\n=== Path Tracing Features ===\n";
+
+    const uint32_t num_triangles = 10000;
+    const uint32_t num_rays = 10000;
+
+    RNG pt_rng(77);
+
+    // Create random triangles
+    std::vector<Triangle> triangles;
+    triangles.reserve(num_triangles);
+    for (uint32_t i = 0; i < num_triangles; i++) {
+      Vec3 center = pt_rng.uniformVec3(-10.0f, 10.0f);
+      Vec3 v0 = center + pt_rng.uniformVec3(-0.3f, 0.3f);
+      Vec3 v1 = center + pt_rng.uniformVec3(-0.3f, 0.3f);
+      Vec3 v2 = center + pt_rng.uniformVec3(-0.3f, 0.3f);
+      triangles.push_back(Triangle(v0, v1, v2));
+    }
+
+    TriangleBVH bvh;
+    bvh.build(triangles);
+
+    // Create random rays
+    std::vector<Ray> rays;
+    rays.reserve(num_rays);
+    for (uint32_t i = 0; i < num_rays; i++) {
+      Vec3 origin = pt_rng.uniformVec3(-15.0f, 15.0f);
+      Vec3 dir = pt_rng.uniformDirection();
+      rays.push_back(Ray(origin, dir));
+    }
+
+    // 1. Any-hit traversal (shadow rays)
+    std::cout << "  Any-hit traversal (shadow rays):\n";
+    {
+      uint32_t hits = 0;
+      auto start = std::chrono::high_resolution_clock::now();
+      for (const auto& ray : rays) {
+        if (bvh.traverseAnyHit(ray)) {
+          hits++;
+        }
+      }
+      auto end = std::chrono::high_resolution_clock::now();
+      double ms = std::chrono::duration<double, std::milli>(end - start).count();
+      double mrps = (num_rays / 1e6) / (ms / 1000.0);
+      std::cout << "    Time: " << std::fixed << std::setprecision(2) << ms << " ms";
+      std::cout << " (" << std::setprecision(2) << mrps << " Mrays/s)";
+      std::cout << " - " << hits << " hits\n";
+    }
+
+    // Compare with TraversalConfig::anyHit()
+    {
+      uint32_t hits = 0;
+      auto start = std::chrono::high_resolution_clock::now();
+      for (const auto& ray : rays) {
+        float t, u, v;
+        if (bvh.traverseWithConfig(ray, t, u, v, TraversalConfig::anyHit()) != kInvalidIndex) {
+          hits++;
+        }
+      }
+      auto end = std::chrono::high_resolution_clock::now();
+      double ms = std::chrono::duration<double, std::milli>(end - start).count();
+      double mrps = (num_rays / 1e6) / (ms / 1000.0);
+      std::cout << "    Config:anyHit(): " << std::fixed << std::setprecision(2) << ms << " ms";
+      std::cout << " (" << std::setprecision(2) << mrps << " Mrays/s)";
+      std::cout << " - " << hits << " hits\n";
+    }
+
+    // 2. Self-intersection avoidance
+    std::cout << "  Self-intersection avoidance:\n";
+    {
+      // First find hits, then trace secondary rays
+      uint32_t secondary_hits = 0;
+      uint32_t total_secondary = 0;
+      auto start = std::chrono::high_resolution_clock::now();
+      for (const auto& ray : rays) {
+        float t, u, v;
+        uint32_t hit_idx = bvh.traverse(ray, t, u, v);
+        if (hit_idx != kInvalidIndex) {
+          // Spawn secondary ray from hit point
+          Vec3 hit_pos = ray.origin + ray.direction * t;
+          Vec3 new_dir = pt_rng.uniformDirection();
+          Ray secondary(hit_pos + new_dir * 0.001f, new_dir);
+
+          // Trace with self-intersection avoidance
+          float t2, u2, v2;
+          uint32_t hit2 = bvh.traverseWithConfig(secondary, t2, u2, v2,
+                                                  TraversalConfig::secondaryRay(hit_idx));
+          if (hit2 != kInvalidIndex) {
+            secondary_hits++;
+          }
+          total_secondary++;
+        }
+      }
+      auto end = std::chrono::high_resolution_clock::now();
+      double ms = std::chrono::duration<double, std::milli>(end - start).count();
+      std::cout << "    Time: " << std::fixed << std::setprecision(2) << ms << " ms";
+      std::cout << " - " << secondary_hits << "/" << total_secondary << " secondary hits\n";
+    }
+
+    // 3. Shadow ray with self-intersection avoidance
+    std::cout << "  Shadow rays with exclude_prim_id:\n";
+    {
+      uint32_t shadow_tests = 0;
+      uint32_t occluded = 0;
+      Vec3 light_pos(0.0f, 20.0f, 0.0f);
+
+      auto start = std::chrono::high_resolution_clock::now();
+      for (const auto& ray : rays) {
+        float t, u, v;
+        uint32_t hit_idx = bvh.traverse(ray, t, u, v);
+        if (hit_idx != kInvalidIndex) {
+          Vec3 hit_pos = ray.origin + ray.direction * t;
+          Vec3 to_light = light_pos - hit_pos;
+          float light_dist = to_light.length();
+          to_light = to_light * (1.0f / light_dist);
+
+          Ray shadow_ray(hit_pos + to_light * 0.001f, to_light, kEpsilon, light_dist);
+          if (bvh.traverseAnyHit(shadow_ray, hit_idx)) {
+            occluded++;
+          }
+          shadow_tests++;
+        }
+      }
+      auto end = std::chrono::high_resolution_clock::now();
+      double ms = std::chrono::duration<double, std::milli>(end - start).count();
+      std::cout << "    Time: " << std::fixed << std::setprecision(2) << ms << " ms";
+      std::cout << " - " << occluded << "/" << shadow_tests << " occluded\n";
+    }
+
+    // 4. Packet traversal (4 rays)
+    std::cout << "  Packet traversal (4 rays at a time):\n";
+    {
+      uint32_t total_hits = 0;
+      auto start = std::chrono::high_resolution_clock::now();
+      for (uint32_t i = 0; i + 4 <= num_rays; i += 4) {
+        Ray4 packet = Ray4::fromRays(&rays[i], 4);
+        HitResult4 results;
+        bvh.traverse4(packet, results);
+        for (int j = 0; j < 4; j++) {
+          if (results.prim_id[j] != kInvalidIndex) {
+            total_hits++;
+          }
+        }
+      }
+      auto end = std::chrono::high_resolution_clock::now();
+      double ms = std::chrono::duration<double, std::milli>(end - start).count();
+      double mrps = (num_rays / 1e6) / (ms / 1000.0);
+      std::cout << "    Time: " << std::fixed << std::setprecision(2) << ms << " ms";
+      std::cout << " (" << std::setprecision(2) << mrps << " Mrays/s)";
+      std::cout << " - " << total_hits << " hits\n";
+    }
+
+    // Compare with single-ray traversal
+    {
+      uint32_t total_hits = 0;
+      auto start = std::chrono::high_resolution_clock::now();
+      for (const auto& ray : rays) {
+        float t, u, v;
+        if (bvh.traverse(ray, t, u, v) != kInvalidIndex) {
+          total_hits++;
+        }
+      }
+      auto end = std::chrono::high_resolution_clock::now();
+      double ms = std::chrono::duration<double, std::milli>(end - start).count();
+      double mrps = (num_rays / 1e6) / (ms / 1000.0);
+      std::cout << "    Single-ray: " << std::fixed << std::setprecision(2) << ms << " ms";
+      std::cout << " (" << std::setprecision(2) << mrps << " Mrays/s)";
+      std::cout << " - " << total_hits << " hits\n";
+    }
+
+    // 5. Packet any-hit traversal (4 rays)
+    std::cout << "  Packet any-hit (4 rays at a time):\n";
+    {
+      uint32_t total_hits = 0;
+      auto start = std::chrono::high_resolution_clock::now();
+      for (uint32_t i = 0; i + 4 <= num_rays; i += 4) {
+        Ray4 packet = Ray4::fromRays(&rays[i], 4);
+        uint32_t hit_mask = bvh.traverse4AnyHit(packet);
+        for (int j = 0; j < 4; j++) {
+          if (hit_mask & (1u << j)) {
+            total_hits++;
+          }
+        }
+      }
+      auto end = std::chrono::high_resolution_clock::now();
+      double ms = std::chrono::duration<double, std::milli>(end - start).count();
+      double mrps = (num_rays / 1e6) / (ms / 1000.0);
+      std::cout << "    Time: " << std::fixed << std::setprecision(2) << ms << " ms";
+      std::cout << " (" << std::setprecision(2) << mrps << " Mrays/s)";
+      std::cout << " - " << total_hits << " hits\n";
+    }
+
+    // 6. Packet traversal (8 rays)
+    std::cout << "  Packet traversal (8 rays at a time):\n";
+    {
+      uint32_t total_hits = 0;
+      auto start = std::chrono::high_resolution_clock::now();
+      for (uint32_t i = 0; i + 8 <= num_rays; i += 8) {
+        Ray8 packet = Ray8::fromRays(&rays[i], 8);
+        HitResult8 results;
+        bvh.traverse8(packet, results);
+        for (int j = 0; j < 8; j++) {
+          if (results.prim_id[j] != kInvalidIndex) {
+            total_hits++;
+          }
+        }
+      }
+      auto end = std::chrono::high_resolution_clock::now();
+      double ms = std::chrono::duration<double, std::milli>(end - start).count();
+      double mrps = (num_rays / 1e6) / (ms / 1000.0);
+      std::cout << "    Time: " << std::fixed << std::setprecision(2) << ms << " ms";
+      std::cout << " (" << std::setprecision(2) << mrps << " Mrays/s)";
+      std::cout << " - " << total_hits << " hits\n";
+    }
+
+    // 7. Coherent rays (camera-like pattern)
+    std::cout << "  Coherent ray packets (camera rays):\n";
+    {
+      // Generate coherent camera rays
+      std::vector<Ray> camera_rays;
+      camera_rays.reserve(num_rays);
+      Vec3 cam_pos(-20.0f, 0.0f, 0.0f);
+      Vec3 cam_dir(1.0f, 0.0f, 0.0f);
+      Vec3 cam_up(0.0f, 1.0f, 0.0f);
+      Vec3 cam_right = cam_dir.cross(cam_up);
+      float fov_scale = 0.5f;
+
+      uint32_t img_w = 100, img_h = 100;
+      for (uint32_t y = 0; y < img_h; y++) {
+        for (uint32_t x = 0; x < img_w; x++) {
+          float u = (2.0f * x / img_w - 1.0f) * fov_scale;
+          float v = (2.0f * y / img_h - 1.0f) * fov_scale;
+          Vec3 dir = cam_dir + cam_right * u + cam_up * v;
+          dir = dir.normalize();
+          camera_rays.push_back(Ray(cam_pos, dir));
+        }
+      }
+
+      // Packet traversal
+      uint32_t packet_hits = 0;
+      auto start = std::chrono::high_resolution_clock::now();
+      for (uint32_t i = 0; i + 4 <= camera_rays.size(); i += 4) {
+        Ray4 packet = Ray4::fromRays(&camera_rays[i], 4);
+        HitResult4 results;
+        bvh.traverse4(packet, results);
+        for (int j = 0; j < 4; j++) {
+          if (results.prim_id[j] != kInvalidIndex) {
+            packet_hits++;
+          }
+        }
+      }
+      auto end = std::chrono::high_resolution_clock::now();
+      double packet_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+      // Single-ray traversal
+      uint32_t single_hits = 0;
+      start = std::chrono::high_resolution_clock::now();
+      for (const auto& ray : camera_rays) {
+        float t, u, v;
+        if (bvh.traverse(ray, t, u, v) != kInvalidIndex) {
+          single_hits++;
+        }
+      }
+      end = std::chrono::high_resolution_clock::now();
+      double single_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+      double speedup = single_ms / packet_ms;
+      std::cout << "    Packet (4-ray): " << std::fixed << std::setprecision(2) << packet_ms << " ms";
+      std::cout << " - " << packet_hits << " hits\n";
+      std::cout << "    Single-ray:     " << std::setprecision(2) << single_ms << " ms";
+      std::cout << " - " << single_hits << " hits\n";
+      std::cout << "    Speedup: " << std::setprecision(2) << speedup << "x\n";
+    }
+  }
+
   std::cout << "\n============================================\n";
   std::cout << "Benchmark Complete\n";
   std::cout << "============================================\n";
