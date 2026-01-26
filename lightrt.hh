@@ -312,6 +312,47 @@ struct HitResult8 {
   }
 };
 
+// Single hit record for multi-hit traversal
+struct HitRecord {
+  uint32_t prim_id;
+  float t;
+  float u;
+  float v;
+
+  HitRecord() noexcept : prim_id(kInvalidIndex), t(kInfinity), u(0), v(0) {}
+  HitRecord(uint32_t id, float t_, float u_, float v_) noexcept
+    : prim_id(id), t(t_), u(u_), v(v_) {}
+
+  bool operator<(const HitRecord& other) const noexcept { return t < other.t; }
+};
+
+// Multi-hit result container (for transparency, volumetrics)
+struct MultiHitResult {
+  std::vector<HitRecord> hits;
+  bool terminated_early;  // True if max_hits reached
+
+  MultiHitResult() noexcept : terminated_early(false) {}
+
+  void clear() noexcept {
+    hits.clear();
+    terminated_early = false;
+  }
+
+  // Sort hits by distance (front to back)
+  void sort() noexcept {
+    std::sort(hits.begin(), hits.end());
+  }
+
+  // Add hit maintaining sorted order
+  void addSorted(const HitRecord& hit) noexcept {
+    auto it = std::lower_bound(hits.begin(), hits.end(), hit);
+    hits.insert(it, hit);
+  }
+
+  uint32_t count() const noexcept { return static_cast<uint32_t>(hits.size()); }
+  bool empty() const noexcept { return hits.empty(); }
+};
+
 // ============================================================================
 // AABB (Axis-Aligned Bounding Box)
 // ============================================================================
@@ -1070,11 +1111,16 @@ public:
   };
   
   Stats getStats() const noexcept;
-  
+
+  // Refit BVH bounds from updated primitive AABBs
+  // Tree structure remains unchanged, only bounds are updated (bottom-up)
+  void refit(const std::vector<AABB>& new_prim_aabbs) noexcept;
+
   // Access to nodes (for serialization, etc.)
   const std::vector<BVHNode>& getNodes() const noexcept { return nodes_; }
+  std::vector<BVHNode>& getMutableNodes() noexcept { return nodes_; }
   const std::vector<uint32_t>& getPrimitiveIndices() const noexcept { return prim_indices_; }
-  
+
 private:
   std::vector<BVHNode> nodes_;
   std::vector<uint32_t> prim_indices_;
@@ -1226,9 +1272,31 @@ public:
   // Any-hit 8-ray packet - returns bit mask of rays that hit something
   uint32_t traverse8AnyHit(const Ray8& rays, uint32_t exclude_prim_id = kInvalidIndex) const noexcept;
 
+  // Multi-hit traversal (for transparency, volumetrics)
+  // Collects all hits along the ray up to max_hits
+  // Returns number of hits found
+  uint32_t traverseMultiHit(const Ray& ray, MultiHitResult& result,
+                            uint32_t max_hits = 16,
+                            uint32_t exclude_prim_id = kInvalidIndex) const noexcept;
+
+  // Refit BVH bounds after geometry modification (for animation)
+  // Updates all node bounds bottom-up without rebuilding tree structure
+  // Call after modifying triangles via getMutableTriangles()
+  void refit() noexcept;
+
+  // Serialization - save/load BVH to binary format
+  // Format version is embedded for forward compatibility
+  bool save(const char* filename) const noexcept;
+  bool load(const char* filename) noexcept;
+
+  // Serialization to memory buffer
+  bool saveToMemory(std::vector<uint8_t>& buffer) const noexcept;
+  bool loadFromMemory(const uint8_t* data, size_t size) noexcept;
+
   // Access internals
   const BVH& getBVH() const noexcept { return bvh_; }
   const std::vector<Triangle>& getTriangles() const noexcept { return triangles_; }
+  std::vector<Triangle>& getMutableTriangles() noexcept { return triangles_; }
 
 private:
   BVH bvh_;
@@ -1290,6 +1358,11 @@ public:
   uint32_t traverse4AnyHit(const Ray4& rays, uint32_t exclude_prim_id = kInvalidIndex) const noexcept;
   void traverse8(const Ray8& rays, HitResult8& results) const noexcept;
   uint32_t traverse8AnyHit(const Ray8& rays, uint32_t exclude_prim_id = kInvalidIndex) const noexcept;
+
+  // Multi-hit traversal (for transparency, volumetrics)
+  uint32_t traverseMultiHit(const Ray& ray, MultiHitResult& result,
+                            uint32_t max_hits = 16,
+                            uint32_t exclude_prim_id = kInvalidIndex) const noexcept;
 
   // Access internals
   const std::vector<BVHNode>& getNodes() const noexcept { return nodes_; }
