@@ -1232,6 +1232,251 @@ private:
   float computeOverlap(const AABB& a, const AABB& b) const noexcept;
 };
 
+// ============================================================================
+// Auto-Tuning for BVH Construction and Traversal
+// Samples M primitives from N input, measures costs, selects best algorithms
+// ============================================================================
+
+// BVH build method
+enum class BVHBuildMethod : uint8_t {
+  TriangleBVH,    // Standard BVH with object splits only
+  SBVH            // Split BVH with spatial splits
+};
+
+// Auto-tune configuration
+struct AutoTuneConfig {
+  uint32_t sample_prim_count;      // Number of primitives to sample (M), 0 = auto (sqrt(N))
+  uint32_t sample_ray_count;       // Number of rays to test for traversal
+  uint32_t warmup_iterations;      // Warmup iterations before timing
+  uint32_t timing_iterations;      // Iterations for timing measurement
+  bool test_sbvh;                  // Test SBVH in addition to TriangleBVH
+  bool test_traversal_configs;     // Test different traversal configs
+  float build_weight;              // Weight for build time in cost (0-1)
+  float traversal_weight;          // Weight for traversal time in cost (0-1)
+  float memory_weight;             // Weight for memory usage in cost (0-1)
+
+  AutoTuneConfig() noexcept
+    : sample_prim_count(0)         // 0 = auto
+    , sample_ray_count(1000)
+    , warmup_iterations(3)
+    , timing_iterations(10)
+    , test_sbvh(true)
+    , test_traversal_configs(true)
+    , build_weight(0.1f)           // Build time typically matters less
+    , traversal_weight(0.8f)       // Traversal performance is most important
+    , memory_weight(0.1f) {}       // Memory matters for large scenes
+
+  // Preset: optimize for throughput (many rays)
+  static AutoTuneConfig throughput() noexcept {
+    AutoTuneConfig cfg;
+    cfg.build_weight = 0.05f;
+    cfg.traversal_weight = 0.9f;
+    cfg.memory_weight = 0.05f;
+    return cfg;
+  }
+
+  // Preset: optimize for interactive (frequent rebuilds)
+  static AutoTuneConfig interactive() noexcept {
+    AutoTuneConfig cfg;
+    cfg.build_weight = 0.4f;
+    cfg.traversal_weight = 0.5f;
+    cfg.memory_weight = 0.1f;
+    return cfg;
+  }
+
+  // Preset: optimize for memory (large scenes)
+  static AutoTuneConfig memory() noexcept {
+    AutoTuneConfig cfg;
+    cfg.build_weight = 0.1f;
+    cfg.traversal_weight = 0.5f;
+    cfg.memory_weight = 0.4f;
+    cfg.test_sbvh = false;  // SBVH uses more memory due to reference duplication
+    return cfg;
+  }
+
+  // Preset: quick tuning (fewer samples)
+  static AutoTuneConfig quick() noexcept {
+    AutoTuneConfig cfg;
+    cfg.sample_ray_count = 500;
+    cfg.warmup_iterations = 1;
+    cfg.timing_iterations = 5;
+    cfg.test_sbvh = false;
+    cfg.test_traversal_configs = false;
+    return cfg;
+  }
+};
+
+// Auto-tune result
+struct AutoTuneResult {
+  BVHBuildMethod best_method;
+  BVHBuildConfig best_bvh_config;        // Used if method == TriangleBVH
+  SBVHBuildConfig best_sbvh_config;      // Used if method == SBVH
+  TraversalConfig best_traversal_config;
+
+  // Measured metrics (normalized to per-primitive or per-ray)
+  float build_time_us_per_prim;          // Build time in microseconds per primitive
+  float traversal_time_ns_per_ray;       // Traversal time in nanoseconds per ray
+  float memory_bytes_per_prim;           // Memory usage in bytes per primitive
+
+  // Detailed metrics for each tested configuration
+  struct ConfigMetrics {
+    BVHBuildMethod method;
+    float build_time_us_per_prim;
+    float traversal_time_ns_per_ray;
+    float memory_bytes_per_prim;
+    float combined_cost;                 // Weighted cost used for selection
+    uint32_t max_leaf_size;
+    float sbvh_alpha;                    // Only for SBVH
+  };
+  std::vector<ConfigMetrics> all_metrics;
+
+  // Scene characteristics detected during tuning
+  struct SceneCharacteristics {
+    float avg_triangle_area;
+    float scene_volume;
+    float triangle_density;              // Triangles per unit volume
+    float overlap_ratio;                 // Estimated AABB overlap
+    bool has_thin_triangles;             // Long thin triangles detected
+    bool has_clustered_distribution;     // Spatial clustering detected
+    bool has_coplanar_regions;           // Co-planar triangles detected
+  };
+  SceneCharacteristics scene_info;
+
+  AutoTuneResult() noexcept
+    : best_method(BVHBuildMethod::TriangleBVH)
+    , build_time_us_per_prim(0)
+    , traversal_time_ns_per_ray(0)
+    , memory_bytes_per_prim(0) {}
+};
+
+// Simple timer for benchmarking (platform-independent)
+class SimpleTimer {
+public:
+  void start() noexcept;
+  void stop() noexcept;
+  double elapsedMicroseconds() const noexcept;
+  double elapsedMilliseconds() const noexcept { return elapsedMicroseconds() / 1000.0; }
+
+private:
+  uint64_t start_time_;
+  uint64_t end_time_;
+};
+
+// Simple RNG for sampling (Xorshift64)
+class SimpleRNG {
+public:
+  explicit SimpleRNG(uint64_t seed = 12345) noexcept : state_(seed ? seed : 1) {}
+
+  uint64_t next() noexcept {
+    state_ ^= state_ >> 12;
+    state_ ^= state_ << 25;
+    state_ ^= state_ >> 27;
+    return state_ * 0x2545F4914F6CDD1DULL;
+  }
+
+  float nextFloat() noexcept {
+    return static_cast<float>(next() & 0xFFFFFF) / static_cast<float>(0x1000000);
+  }
+
+  // Generate random float in range [min, max]
+  float nextFloat(float min_val, float max_val) noexcept {
+    return min_val + nextFloat() * (max_val - min_val);
+  }
+
+  // Shuffle array using Fisher-Yates
+  template<typename T>
+  void shuffle(std::vector<T>& arr) noexcept {
+    for (size_t i = arr.size() - 1; i > 0; i--) {
+      size_t j = next() % (i + 1);
+      std::swap(arr[i], arr[j]);
+    }
+  }
+
+private:
+  uint64_t state_;
+};
+
+// AutoTuner class
+class AutoTuner {
+public:
+  // Auto-tune BVH construction for triangles
+  // Returns the best configuration based on sampling and measurement
+  static AutoTuneResult tune(const std::vector<Triangle>& triangles,
+                             const AutoTuneConfig& config = AutoTuneConfig()) noexcept;
+
+  // Tune traversal configuration for an existing TriangleBVH
+  // Useful when you already have a BVH and want optimal traversal settings
+  static TraversalConfig tuneTraversal(const TriangleBVH& bvh,
+                                        const AABB& scene_bounds,
+                                        uint32_t sample_ray_count = 1000,
+                                        uint32_t timing_iterations = 10) noexcept;
+
+  // Tune traversal configuration for an existing SBVH
+  static TraversalConfig tuneTraversal(const SBVH& sbvh,
+                                        const AABB& scene_bounds,
+                                        uint32_t sample_ray_count = 1000,
+                                        uint32_t timing_iterations = 10) noexcept;
+
+  // Analyze scene characteristics (useful for manual tuning decisions)
+  static AutoTuneResult::SceneCharacteristics analyzeScene(
+      const std::vector<Triangle>& triangles) noexcept;
+
+  // Build BVH using auto-tuned configuration
+  // Convenience function that combines tune() and build()
+  static bool buildOptimal(const std::vector<Triangle>& triangles,
+                           TriangleBVH& out_bvh,
+                           const AutoTuneConfig& config = AutoTuneConfig()) noexcept;
+
+  static bool buildOptimal(const std::vector<Triangle>& triangles,
+                           SBVH& out_sbvh,
+                           const AutoTuneConfig& config = AutoTuneConfig()) noexcept;
+
+private:
+  // Sample M primitives from N using stratified sampling
+  static std::vector<Triangle> samplePrimitives(
+      const std::vector<Triangle>& triangles,
+      uint32_t sample_count,
+      SimpleRNG& rng) noexcept;
+
+  // Generate test rays covering the scene
+  static std::vector<Ray> generateTestRays(
+      const AABB& scene_bounds,
+      uint32_t ray_count,
+      SimpleRNG& rng) noexcept;
+
+  // Measure build time for TriangleBVH
+  static double measureBuildTime(
+      const std::vector<Triangle>& triangles,
+      const BVHBuildConfig& config,
+      uint32_t iterations,
+      TriangleBVH& out_bvh) noexcept;
+
+  // Measure build time for SBVH
+  static double measureBuildTime(
+      const std::vector<Triangle>& triangles,
+      const SBVHBuildConfig& config,
+      uint32_t iterations,
+      SBVH& out_sbvh) noexcept;
+
+  // Measure traversal time for TriangleBVH
+  static double measureTraversalTime(
+      const TriangleBVH& bvh,
+      const std::vector<Ray>& rays,
+      const TraversalConfig& trav_config,
+      uint32_t iterations) noexcept;
+
+  // Measure traversal time for SBVH
+  static double measureTraversalTime(
+      const SBVH& sbvh,
+      const std::vector<Ray>& rays,
+      const TraversalConfig& trav_config,
+      uint32_t iterations) noexcept;
+
+  // Estimate memory usage
+  static size_t estimateMemory(const TriangleBVH& bvh) noexcept;
+  static size_t estimateMemory(const SBVH& sbvh) noexcept;
+};
+
 } // namespace lightrt
 
 #endif // LIGHTRT_HH_

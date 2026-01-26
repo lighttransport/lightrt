@@ -2946,4 +2946,806 @@ SBVHGeneric::Stats SBVHGeneric::getStats() const noexcept {
   return stats;
 }
 
+// ============================================================================
+// SimpleTimer Implementation
+// ============================================================================
+
+#if defined(_WIN32)
+#include <windows.h>
+void SimpleTimer::start() noexcept {
+  LARGE_INTEGER counter;
+  QueryPerformanceCounter(&counter);
+  start_time_ = counter.QuadPart;
+}
+
+void SimpleTimer::stop() noexcept {
+  LARGE_INTEGER counter;
+  QueryPerformanceCounter(&counter);
+  end_time_ = counter.QuadPart;
+}
+
+double SimpleTimer::elapsedMicroseconds() const noexcept {
+  LARGE_INTEGER freq;
+  QueryPerformanceFrequency(&freq);
+  return static_cast<double>(end_time_ - start_time_) * 1000000.0 / freq.QuadPart;
+}
+#else
+#include <time.h>
+void SimpleTimer::start() noexcept {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  start_time_ = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
+}
+
+void SimpleTimer::stop() noexcept {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  end_time_ = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
+}
+
+double SimpleTimer::elapsedMicroseconds() const noexcept {
+  return static_cast<double>(end_time_ - start_time_) / 1000.0;
+}
+#endif
+
+// ============================================================================
+// AutoTuner Implementation
+// ============================================================================
+
+std::vector<Triangle> AutoTuner::samplePrimitives(
+    const std::vector<Triangle>& triangles,
+    uint32_t sample_count,
+    SimpleRNG& rng) noexcept {
+
+  if (triangles.empty()) {
+    return {};
+  }
+
+  // Clamp sample count to input size
+  sample_count = std::min(sample_count, static_cast<uint32_t>(triangles.size()));
+
+  if (sample_count == triangles.size()) {
+    return triangles;
+  }
+
+  // Stratified sampling: divide into strata and sample from each
+  // This preserves spatial distribution better than uniform random sampling
+
+  // Compute scene bounds for spatial stratification
+  AABB scene_bounds;
+  for (const auto& tri : triangles) {
+    scene_bounds.expand(tri.bounds());
+  }
+
+  Vec3 extent = scene_bounds.extents();
+  int primary_axis = scene_bounds.longestAxis();
+
+  // Divide along primary axis into strata
+  uint32_t num_strata = std::min(sample_count, 16u);
+  float strata_size = 0.0f;
+  switch (primary_axis) {
+    case 0: strata_size = extent.x / num_strata; break;
+    case 1: strata_size = extent.y / num_strata; break;
+    case 2: strata_size = extent.z / num_strata; break;
+  }
+
+  // Assign triangles to strata
+  std::vector<std::vector<uint32_t>> strata(num_strata);
+  for (uint32_t i = 0; i < triangles.size(); i++) {
+    Vec3 centroid = triangles[i].centroid();
+    float pos = 0.0f;
+    switch (primary_axis) {
+      case 0: pos = centroid.x - scene_bounds.min.x; break;
+      case 1: pos = centroid.y - scene_bounds.min.y; break;
+      case 2: pos = centroid.z - scene_bounds.min.z; break;
+    }
+    uint32_t stratum = std::min(static_cast<uint32_t>(pos / strata_size), num_strata - 1);
+    strata[stratum].push_back(i);
+  }
+
+  // Sample from each stratum proportionally
+  std::vector<Triangle> sampled;
+  sampled.reserve(sample_count);
+
+  uint32_t remaining = sample_count;
+  for (uint32_t s = 0; s < num_strata && remaining > 0; s++) {
+    if (strata[s].empty()) continue;
+
+    // Calculate samples for this stratum (proportional to its size)
+    uint32_t stratum_samples = static_cast<uint32_t>(
+        static_cast<float>(strata[s].size()) / triangles.size() * sample_count);
+    stratum_samples = std::max(1u, std::min(stratum_samples, remaining));
+    stratum_samples = std::min(stratum_samples, static_cast<uint32_t>(strata[s].size()));
+
+    // Shuffle and take first N
+    rng.shuffle(strata[s]);
+    for (uint32_t i = 0; i < stratum_samples && remaining > 0; i++) {
+      sampled.push_back(triangles[strata[s][i]]);
+      remaining--;
+    }
+  }
+
+  // If we didn't get enough samples (due to rounding), fill with random
+  while (sampled.size() < sample_count) {
+    uint32_t idx = rng.next() % triangles.size();
+    sampled.push_back(triangles[idx]);
+  }
+
+  return sampled;
+}
+
+std::vector<Ray> AutoTuner::generateTestRays(
+    const AABB& scene_bounds,
+    uint32_t ray_count,
+    SimpleRNG& rng) noexcept {
+
+  std::vector<Ray> rays;
+  rays.reserve(ray_count);
+
+  Vec3 center = scene_bounds.center();
+  Vec3 extent = scene_bounds.extents();
+  float diagonal = extent.length();
+
+  // Mix of ray types: random, coherent, and edge cases
+  uint32_t random_rays = ray_count * 60 / 100;      // 60% random
+  uint32_t coherent_rays = ray_count * 30 / 100;    // 30% coherent (similar origins/directions)
+  uint32_t edge_rays = ray_count - random_rays - coherent_rays; // 10% edge cases
+
+  // Random rays from outside the scene looking in
+  for (uint32_t i = 0; i < random_rays; i++) {
+    // Random point on sphere around scene
+    float theta = rng.nextFloat(0.0f, 2.0f * 3.14159265f);
+    float phi = rng.nextFloat(0.0f, 3.14159265f);
+    float r = diagonal * 1.5f;
+
+    Vec3 origin(
+        center.x + r * std::sin(phi) * std::cos(theta),
+        center.y + r * std::sin(phi) * std::sin(theta),
+        center.z + r * std::cos(phi)
+    );
+
+    // Random target inside scene
+    Vec3 target(
+        rng.nextFloat(scene_bounds.min.x, scene_bounds.max.x),
+        rng.nextFloat(scene_bounds.min.y, scene_bounds.max.y),
+        rng.nextFloat(scene_bounds.min.z, scene_bounds.max.z)
+    );
+
+    Vec3 dir = (target - origin).normalize();
+    rays.emplace_back(origin, dir);
+  }
+
+  // Coherent rays (simulate camera-like rays from one viewpoint)
+  Vec3 cam_origin = center + Vec3(0, 0, diagonal);
+  for (uint32_t i = 0; i < coherent_rays; i++) {
+    // Small variations around center target
+    Vec3 target(
+        center.x + rng.nextFloat(-extent.x * 0.5f, extent.x * 0.5f),
+        center.y + rng.nextFloat(-extent.y * 0.5f, extent.y * 0.5f),
+        center.z + rng.nextFloat(-extent.z * 0.1f, extent.z * 0.1f)
+    );
+    Vec3 dir = (target - cam_origin).normalize();
+    rays.emplace_back(cam_origin, dir);
+  }
+
+  // Edge case rays: axis-aligned, grazing angles
+  for (uint32_t i = 0; i < edge_rays; i++) {
+    Vec3 origin, dir;
+
+    switch (i % 6) {
+      case 0: // +X axis
+        origin = Vec3(scene_bounds.min.x - diagonal, center.y, center.z);
+        dir = Vec3(1, 0, 0);
+        break;
+      case 1: // -X axis
+        origin = Vec3(scene_bounds.max.x + diagonal, center.y, center.z);
+        dir = Vec3(-1, 0, 0);
+        break;
+      case 2: // +Y axis
+        origin = Vec3(center.x, scene_bounds.min.y - diagonal, center.z);
+        dir = Vec3(0, 1, 0);
+        break;
+      case 3: // -Y axis
+        origin = Vec3(center.x, scene_bounds.max.y + diagonal, center.z);
+        dir = Vec3(0, -1, 0);
+        break;
+      case 4: // +Z axis
+        origin = Vec3(center.x, center.y, scene_bounds.min.z - diagonal);
+        dir = Vec3(0, 0, 1);
+        break;
+      case 5: // -Z axis
+        origin = Vec3(center.x, center.y, scene_bounds.max.z + diagonal);
+        dir = Vec3(0, 0, -1);
+        break;
+    }
+
+    // Add small random perturbation
+    origin.x += rng.nextFloat(-extent.x * 0.4f, extent.x * 0.4f);
+    origin.y += rng.nextFloat(-extent.y * 0.4f, extent.y * 0.4f);
+    origin.z += rng.nextFloat(-extent.z * 0.4f, extent.z * 0.4f);
+
+    rays.emplace_back(origin, dir);
+  }
+
+  return rays;
+}
+
+double AutoTuner::measureBuildTime(
+    const std::vector<Triangle>& triangles,
+    const BVHBuildConfig& config,
+    uint32_t iterations,
+    TriangleBVH& out_bvh) noexcept {
+
+  SimpleTimer timer;
+  double total_time = 0.0;
+
+  for (uint32_t i = 0; i < iterations; i++) {
+    TriangleBVH temp_bvh;
+    timer.start();
+    temp_bvh.build(triangles, config);
+    timer.stop();
+    total_time += timer.elapsedMicroseconds();
+
+    // Keep the last one
+    if (i == iterations - 1) {
+      out_bvh = std::move(temp_bvh);
+    }
+  }
+
+  return total_time / iterations;
+}
+
+double AutoTuner::measureBuildTime(
+    const std::vector<Triangle>& triangles,
+    const SBVHBuildConfig& config,
+    uint32_t iterations,
+    SBVH& out_sbvh) noexcept {
+
+  SimpleTimer timer;
+  double total_time = 0.0;
+
+  for (uint32_t i = 0; i < iterations; i++) {
+    SBVH temp_sbvh;
+    timer.start();
+    temp_sbvh.build(triangles, config);
+    timer.stop();
+    total_time += timer.elapsedMicroseconds();
+
+    if (i == iterations - 1) {
+      out_sbvh = std::move(temp_sbvh);
+    }
+  }
+
+  return total_time / iterations;
+}
+
+double AutoTuner::measureTraversalTime(
+    const TriangleBVH& bvh,
+    const std::vector<Ray>& rays,
+    const TraversalConfig& trav_config,
+    uint32_t iterations) noexcept {
+
+  SimpleTimer timer;
+  double total_time = 0.0;
+
+  // Volatile to prevent optimization
+  volatile uint32_t hit_count = 0;
+
+  for (uint32_t iter = 0; iter < iterations; iter++) {
+    timer.start();
+    for (const auto& ray : rays) {
+      float t, u, v;
+      uint32_t hit = bvh.traverseWithConfig(ray, t, u, v, trav_config);
+      if (hit != kInvalidIndex) {
+        hit_count++;
+      }
+    }
+    timer.stop();
+    total_time += timer.elapsedMicroseconds();
+  }
+
+  (void)hit_count;  // Suppress unused warning
+  return total_time / iterations;
+}
+
+double AutoTuner::measureTraversalTime(
+    const SBVH& sbvh,
+    const std::vector<Ray>& rays,
+    const TraversalConfig& trav_config,
+    uint32_t iterations) noexcept {
+
+  SimpleTimer timer;
+  double total_time = 0.0;
+
+  volatile uint32_t hit_count = 0;
+
+  for (uint32_t iter = 0; iter < iterations; iter++) {
+    timer.start();
+    for (const auto& ray : rays) {
+      float t, u, v;
+      uint32_t hit = sbvh.traverseWithConfig(ray, t, u, v, trav_config);
+      if (hit != kInvalidIndex) {
+        hit_count++;
+      }
+    }
+    timer.stop();
+    total_time += timer.elapsedMicroseconds();
+  }
+
+  (void)hit_count;
+  return total_time / iterations;
+}
+
+size_t AutoTuner::estimateMemory(const TriangleBVH& bvh) noexcept {
+  size_t memory = 0;
+
+  // BVH nodes
+  memory += bvh.getBVH().getNodes().size() * sizeof(BVHNode);
+
+  // Primitive indices
+  memory += bvh.getBVH().getPrimitiveIndices().size() * sizeof(uint32_t);
+
+  // Triangles (stored internally)
+  memory += bvh.getTriangles().size() * sizeof(Triangle);
+
+  return memory;
+}
+
+size_t AutoTuner::estimateMemory(const SBVH& sbvh) noexcept {
+  size_t memory = 0;
+
+  // BVH nodes
+  memory += sbvh.getNodes().size() * sizeof(BVHNode);
+
+  // References (may be more than original primitives)
+  memory += sbvh.getReferences().size() * sizeof(SBVH::PrimRef);
+
+  // Triangles
+  memory += sbvh.getTriangles().size() * sizeof(Triangle);
+
+  return memory;
+}
+
+AutoTuneResult::SceneCharacteristics AutoTuner::analyzeScene(
+    const std::vector<Triangle>& triangles) noexcept {
+
+  AutoTuneResult::SceneCharacteristics info = {};
+
+  if (triangles.empty()) {
+    return info;
+  }
+
+  // Compute scene bounds
+  AABB scene_bounds;
+  std::vector<AABB> tri_bounds;
+  tri_bounds.reserve(triangles.size());
+
+  float total_area = 0.0f;
+  float thin_count = 0;
+
+  for (const auto& tri : triangles) {
+    AABB bounds = tri.bounds();
+    scene_bounds.expand(bounds);
+    tri_bounds.push_back(bounds);
+
+    // Compute triangle area using cross product
+    Vec3 e1 = tri.v1 - tri.v0;
+    Vec3 e2 = tri.v2 - tri.v0;
+    float area = e1.cross(e2).length() * 0.5f;
+    total_area += area;
+
+    // Check for thin triangles (aspect ratio > 10)
+    float edge_lengths[3] = {
+        e1.length(),
+        e2.length(),
+        (tri.v2 - tri.v1).length()
+    };
+    float max_edge = std::max({edge_lengths[0], edge_lengths[1], edge_lengths[2]});
+    float min_edge = std::min({edge_lengths[0], edge_lengths[1], edge_lengths[2]});
+    if (min_edge > kEpsilon && max_edge / min_edge > 10.0f) {
+      thin_count++;
+    }
+  }
+
+  info.avg_triangle_area = total_area / triangles.size();
+
+  Vec3 extent = scene_bounds.extents();
+  info.scene_volume = extent.x * extent.y * extent.z;
+
+  if (info.scene_volume > kEpsilon) {
+    info.triangle_density = triangles.size() / info.scene_volume;
+  }
+
+  info.has_thin_triangles = (thin_count > triangles.size() * 0.1f);
+
+  // Estimate overlap ratio using binning
+  const uint32_t num_bins = 32;
+  std::vector<uint32_t> bin_counts(num_bins * num_bins * num_bins, 0);
+
+  float inv_extent_x = (extent.x > kEpsilon) ? num_bins / extent.x : 0.0f;
+  float inv_extent_y = (extent.y > kEpsilon) ? num_bins / extent.y : 0.0f;
+  float inv_extent_z = (extent.z > kEpsilon) ? num_bins / extent.z : 0.0f;
+
+  for (const auto& bounds : tri_bounds) {
+    Vec3 centroid = bounds.center();
+    uint32_t bx = std::min(static_cast<uint32_t>((centroid.x - scene_bounds.min.x) * inv_extent_x), num_bins - 1);
+    uint32_t by = std::min(static_cast<uint32_t>((centroid.y - scene_bounds.min.y) * inv_extent_y), num_bins - 1);
+    uint32_t bz = std::min(static_cast<uint32_t>((centroid.z - scene_bounds.min.z) * inv_extent_z), num_bins - 1);
+    bin_counts[bx * num_bins * num_bins + by * num_bins + bz]++;
+  }
+
+  // Count bins with more than one primitive
+  uint32_t overlap_bins = 0;
+  uint32_t non_empty_bins = 0;
+  for (uint32_t count : bin_counts) {
+    if (count > 0) {
+      non_empty_bins++;
+      if (count > 1) {
+        overlap_bins++;
+      }
+    }
+  }
+
+  info.overlap_ratio = (non_empty_bins > 0) ?
+      static_cast<float>(overlap_bins) / non_empty_bins : 0.0f;
+
+  // Detect clustering: high variance in bin counts indicates clustering
+  float mean_count = static_cast<float>(triangles.size()) / (num_bins * num_bins * num_bins);
+  float variance = 0.0f;
+  for (uint32_t count : bin_counts) {
+    float diff = count - mean_count;
+    variance += diff * diff;
+  }
+  variance /= (num_bins * num_bins * num_bins);
+  info.has_clustered_distribution = (variance > mean_count * mean_count * 4.0f);
+
+  // Detect co-planar regions: check for flat normal distribution
+  const uint32_t normal_bins = 16;
+  std::vector<uint32_t> normal_counts(normal_bins * normal_bins, 0);
+
+  for (const auto& tri : triangles) {
+    Vec3 normal = tri.normal();
+    // Map normal to 2D bins using spherical coordinates
+    float theta = std::atan2(normal.y, normal.x);  // [-pi, pi]
+    float phi = std::acos(std::max(-1.0f, std::min(1.0f, normal.z)));  // [0, pi]
+
+    uint32_t bt = std::min(static_cast<uint32_t>((theta + 3.14159265f) / (2.0f * 3.14159265f) * normal_bins), normal_bins - 1);
+    uint32_t bp = std::min(static_cast<uint32_t>(phi / 3.14159265f * normal_bins), normal_bins - 1);
+
+    normal_counts[bt * normal_bins + bp]++;
+  }
+
+  // If any bin has > 20% of triangles, likely co-planar region
+  uint32_t threshold = triangles.size() / 5;
+  for (uint32_t count : normal_counts) {
+    if (count > threshold) {
+      info.has_coplanar_regions = true;
+      break;
+    }
+  }
+
+  return info;
+}
+
+AutoTuneResult AutoTuner::tune(
+    const std::vector<Triangle>& triangles,
+    const AutoTuneConfig& config) noexcept {
+
+  AutoTuneResult result;
+
+  if (triangles.empty()) {
+    return result;
+  }
+
+  // Analyze scene characteristics
+  result.scene_info = analyzeScene(triangles);
+
+  // Determine sample count: sqrt(N) for good coverage with reasonable cost
+  uint32_t sample_count = config.sample_prim_count;
+  if (sample_count == 0) {
+    sample_count = static_cast<uint32_t>(std::sqrt(static_cast<float>(triangles.size())));
+    sample_count = std::max(100u, std::min(sample_count, 5000u));
+  }
+  sample_count = std::min(sample_count, static_cast<uint32_t>(triangles.size()));
+
+  // Sample primitives
+  SimpleRNG rng(42);
+  std::vector<Triangle> sampled = samplePrimitives(triangles, sample_count, rng);
+
+  // Compute sample scene bounds
+  AABB sample_bounds;
+  for (const auto& tri : sampled) {
+    sample_bounds.expand(tri.bounds());
+  }
+
+  // Generate test rays
+  std::vector<Ray> test_rays = generateTestRays(sample_bounds, config.sample_ray_count, rng);
+
+  // Configurations to test
+  struct TestConfig {
+    BVHBuildMethod method;
+    BVHBuildConfig bvh_config;
+    SBVHBuildConfig sbvh_config;
+    TraversalConfig trav_config;
+  };
+
+  std::vector<TestConfig> configs_to_test;
+
+  // Test TriangleBVH with different max_leaf_sizes
+  uint32_t leaf_sizes[] = {2, 4, 8, 16};
+  for (uint32_t leaf_size : leaf_sizes) {
+    TestConfig tc;
+    tc.method = BVHBuildMethod::TriangleBVH;
+    tc.bvh_config.max_leaf_size = leaf_size;
+    tc.bvh_config.use_sah = true;
+    configs_to_test.push_back(tc);
+  }
+
+  // Test SBVH if enabled
+  if (config.test_sbvh) {
+    float alphas[] = {1e-5f, 1e-4f, 1e-3f};
+    for (float alpha : alphas) {
+      for (uint32_t leaf_size : {4u, 8u}) {
+        TestConfig tc;
+        tc.method = BVHBuildMethod::SBVH;
+        tc.sbvh_config.max_leaf_size = leaf_size;
+        tc.sbvh_config.alpha = alpha;
+        configs_to_test.push_back(tc);
+      }
+    }
+  }
+
+  // Warmup phase
+  for (uint32_t i = 0; i < config.warmup_iterations; i++) {
+    TriangleBVH warmup_bvh;
+    warmup_bvh.build(sampled);
+    for (const auto& ray : test_rays) {
+      float t, u, v;
+      warmup_bvh.traverse(ray, t, u, v);
+    }
+  }
+
+  // Test each configuration
+  float best_cost = kInfinity;
+
+  // Normalization factors (compute from first config)
+  float max_build_time = 1.0f;
+  float max_trav_time = 1.0f;
+  float max_memory = 1.0f;
+
+  // First pass: measure all configs and find max values for normalization
+  std::vector<std::tuple<double, double, size_t>> raw_metrics;
+  raw_metrics.reserve(configs_to_test.size());
+
+  for (const auto& tc : configs_to_test) {
+    double build_time;
+    double trav_time;
+    size_t memory;
+
+    if (tc.method == BVHBuildMethod::TriangleBVH) {
+      TriangleBVH temp_bvh;
+      build_time = measureBuildTime(sampled, tc.bvh_config, config.timing_iterations, temp_bvh);
+      trav_time = measureTraversalTime(temp_bvh, test_rays, tc.trav_config, config.timing_iterations);
+      memory = estimateMemory(temp_bvh);
+    } else {
+      SBVH temp_sbvh;
+      build_time = measureBuildTime(sampled, tc.sbvh_config, config.timing_iterations, temp_sbvh);
+      trav_time = measureTraversalTime(temp_sbvh, test_rays, tc.trav_config, config.timing_iterations);
+      memory = estimateMemory(temp_sbvh);
+    }
+
+    raw_metrics.push_back({build_time, trav_time, memory});
+
+    max_build_time = std::max(max_build_time, static_cast<float>(build_time));
+    max_trav_time = std::max(max_trav_time, static_cast<float>(trav_time));
+    max_memory = std::max(max_memory, static_cast<float>(memory));
+  }
+
+  // Second pass: compute normalized costs and select best
+  for (size_t i = 0; i < configs_to_test.size(); i++) {
+    const auto& tc = configs_to_test[i];
+    auto [build_time, trav_time, memory] = raw_metrics[i];
+
+    // Normalize to [0, 1]
+    float norm_build = static_cast<float>(build_time) / max_build_time;
+    float norm_trav = static_cast<float>(trav_time) / max_trav_time;
+    float norm_memory = static_cast<float>(memory) / max_memory;
+
+    float combined_cost = config.build_weight * norm_build +
+                          config.traversal_weight * norm_trav +
+                          config.memory_weight * norm_memory;
+
+    // Store metrics
+    AutoTuneResult::ConfigMetrics metrics;
+    metrics.method = tc.method;
+    metrics.build_time_us_per_prim = static_cast<float>(build_time / sample_count);
+    metrics.traversal_time_ns_per_ray = static_cast<float>(trav_time * 1000.0 / config.sample_ray_count);
+    metrics.memory_bytes_per_prim = static_cast<float>(memory) / sample_count;
+    metrics.combined_cost = combined_cost;
+    metrics.max_leaf_size = (tc.method == BVHBuildMethod::TriangleBVH) ?
+        tc.bvh_config.max_leaf_size : tc.sbvh_config.max_leaf_size;
+    metrics.sbvh_alpha = (tc.method == BVHBuildMethod::SBVH) ? tc.sbvh_config.alpha : 0.0f;
+
+    result.all_metrics.push_back(metrics);
+
+    // Update best
+    if (combined_cost < best_cost) {
+      best_cost = combined_cost;
+      result.best_method = tc.method;
+      result.best_bvh_config = tc.bvh_config;
+      result.best_sbvh_config = tc.sbvh_config;
+      result.build_time_us_per_prim = metrics.build_time_us_per_prim;
+      result.traversal_time_ns_per_ray = metrics.traversal_time_ns_per_ray;
+      result.memory_bytes_per_prim = metrics.memory_bytes_per_prim;
+    }
+  }
+
+  // Test traversal configurations if enabled
+  if (config.test_traversal_configs) {
+    // Build the best BVH
+    TriangleBVH best_bvh;
+    SBVH best_sbvh;
+
+    if (result.best_method == BVHBuildMethod::TriangleBVH) {
+      best_bvh.build(sampled, result.best_bvh_config);
+    } else {
+      best_sbvh.build(sampled, result.best_sbvh_config);
+    }
+
+    // Test different traversal configs
+    uint32_t max_prim_tests_values[] = {0, 32, 64, 128, 256};
+    bool mailboxing_values[] = {false, true};
+
+    float best_trav_cost = kInfinity;
+
+    for (uint32_t max_tests : max_prim_tests_values) {
+      for (bool mailbox : mailboxing_values) {
+        // Mailboxing only makes sense with max_prim_tests limit and SBVH
+        if (mailbox && (max_tests == 0 || result.best_method != BVHBuildMethod::SBVH)) {
+          continue;
+        }
+
+        TraversalConfig trav_cfg;
+        trav_cfg.max_prim_tests = max_tests;
+        trav_cfg.use_mailboxing = mailbox;
+
+        double trav_time;
+        if (result.best_method == BVHBuildMethod::TriangleBVH) {
+          trav_time = measureTraversalTime(best_bvh, test_rays, trav_cfg, config.timing_iterations);
+        } else {
+          trav_time = measureTraversalTime(best_sbvh, test_rays, trav_cfg, config.timing_iterations);
+        }
+
+        float trav_cost = static_cast<float>(trav_time);
+
+        // Penalize unlimited tests slightly for pathological cases
+        if (max_tests == 0 && (result.scene_info.has_coplanar_regions ||
+                               result.scene_info.overlap_ratio > 0.3f)) {
+          trav_cost *= 1.1f;  // 10% penalty
+        }
+
+        if (trav_cost < best_trav_cost) {
+          best_trav_cost = trav_cost;
+          result.best_traversal_config = trav_cfg;
+          result.traversal_time_ns_per_ray = static_cast<float>(trav_time * 1000.0 / config.sample_ray_count);
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+TraversalConfig AutoTuner::tuneTraversal(
+    const TriangleBVH& bvh,
+    const AABB& scene_bounds,
+    uint32_t sample_ray_count,
+    uint32_t timing_iterations) noexcept {
+
+  SimpleRNG rng(42);
+  std::vector<Ray> test_rays = generateTestRays(scene_bounds, sample_ray_count, rng);
+
+  TraversalConfig best_config;
+  float best_time = kInfinity;
+
+  // Warmup
+  for (const auto& ray : test_rays) {
+    float t, u, v;
+    bvh.traverse(ray, t, u, v);
+  }
+
+  // Test different configurations
+  uint32_t max_tests_values[] = {0, 32, 64, 128, 256, 512};
+
+  for (uint32_t max_tests : max_tests_values) {
+    TraversalConfig cfg;
+    cfg.max_prim_tests = max_tests;
+
+    double time = measureTraversalTime(bvh, test_rays, cfg, timing_iterations);
+
+    if (time < best_time) {
+      best_time = static_cast<float>(time);
+      best_config = cfg;
+    }
+  }
+
+  return best_config;
+}
+
+TraversalConfig AutoTuner::tuneTraversal(
+    const SBVH& sbvh,
+    const AABB& scene_bounds,
+    uint32_t sample_ray_count,
+    uint32_t timing_iterations) noexcept {
+
+  SimpleRNG rng(42);
+  std::vector<Ray> test_rays = generateTestRays(scene_bounds, sample_ray_count, rng);
+
+  TraversalConfig best_config;
+  float best_time = kInfinity;
+
+  // Warmup
+  for (const auto& ray : test_rays) {
+    float t, u, v;
+    sbvh.traverse(ray, t, u, v);
+  }
+
+  // Test different configurations
+  uint32_t max_tests_values[] = {0, 32, 64, 128, 256, 512};
+  bool mailbox_values[] = {false, true};
+
+  for (uint32_t max_tests : max_tests_values) {
+    for (bool mailbox : mailbox_values) {
+      // Mailboxing only useful with SBVH and limited tests
+      if (mailbox && max_tests == 0) {
+        continue;
+      }
+
+      TraversalConfig cfg;
+      cfg.max_prim_tests = max_tests;
+      cfg.use_mailboxing = mailbox;
+
+      double time = measureTraversalTime(sbvh, test_rays, cfg, timing_iterations);
+
+      if (time < best_time) {
+        best_time = static_cast<float>(time);
+        best_config = cfg;
+      }
+    }
+  }
+
+  return best_config;
+}
+
+bool AutoTuner::buildOptimal(
+    const std::vector<Triangle>& triangles,
+    TriangleBVH& out_bvh,
+    const AutoTuneConfig& config) noexcept {
+
+  AutoTuneResult result = tune(triangles, config);
+
+  if (result.best_method == BVHBuildMethod::TriangleBVH) {
+    return out_bvh.build(triangles, result.best_bvh_config);
+  } else {
+    // Caller wanted TriangleBVH but SBVH was better
+    // Build TriangleBVH with best config anyway
+    return out_bvh.build(triangles, result.best_bvh_config);
+  }
+}
+
+bool AutoTuner::buildOptimal(
+    const std::vector<Triangle>& triangles,
+    SBVH& out_sbvh,
+    const AutoTuneConfig& config) noexcept {
+
+  AutoTuneResult result = tune(triangles, config);
+
+  if (result.best_method == BVHBuildMethod::SBVH) {
+    return out_sbvh.build(triangles, result.best_sbvh_config);
+  } else {
+    // SBVH with default config since TriangleBVH was better
+    return out_sbvh.build(triangles, result.best_sbvh_config);
+  }
+}
+
 } // namespace lightrt

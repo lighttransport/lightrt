@@ -111,11 +111,77 @@ Tests BVH performance with different scenarios:
 5. **SBVH vs TriangleBVH**: Comparison with large and random triangles
 6. **Pathological scenes**: Thin spanning, diagonal, hair-like triangles
 7. **Co-planar triangles**: Single layer, tessellated plane, overlapping, multiple layers
+8. **Auto-tuning**: Tests AutoTuner with random, hair-like, and co-planar scenes
 
 Co-planar and pathological tests demonstrate:
 - `max_prim_tests` limit caps O(N) to O(K) with configurable accuracy trade-off
 - Mailboxing reduces duplicate tests in SBVH (split_ratio > 1)
 - K=64-128 typically provides good speed/accuracy balance
+
+Auto-tuning tests demonstrate:
+- Scene analysis detects thin triangles, co-planar regions, clustering
+- Quick vs full tuning trade-off (with/without SBVH testing)
+- Traversal config tuning for existing BVH
+
+## Auto-Tuning
+
+`AutoTuner` automatically selects optimal BVH construction and traversal parameters by sampling primitives and measuring performance.
+
+### Usage
+
+```cpp
+// Auto-tune and get best configuration
+auto result = AutoTuner::tune(triangles);
+
+// Build with tuned config
+if (result.best_method == BVHBuildMethod::TriangleBVH) {
+  bvh.build(triangles, result.best_bvh_config);
+} else {
+  sbvh.build(triangles, result.best_sbvh_config);
+}
+
+// Or use convenience function
+TriangleBVH bvh;
+AutoTuner::buildOptimal(triangles, bvh);
+
+// Tune traversal config for existing BVH
+auto trav_config = AutoTuner::tuneTraversal(bvh, scene_bounds);
+```
+
+### Configuration Presets
+
+`AutoTuneConfig` presets for different use cases:
+- `AutoTuneConfig()`: Default balanced tuning
+- `AutoTuneConfig::throughput()`: Optimize for ray throughput (90% traversal weight)
+- `AutoTuneConfig::interactive()`: Balance build/traversal for frequent rebuilds
+- `AutoTuneConfig::memory()`: Optimize for memory-constrained scenes
+- `AutoTuneConfig::quick()`: Fast tuning with fewer samples (no SBVH testing)
+
+### Tuning Process
+
+1. **Sample primitives**: Stratified sampling of M primitives from N input (default: sqrt(N), clamped to 100-5000)
+2. **Analyze scene**: Detect thin triangles, co-planar regions, clustering, overlap ratio
+3. **Test configurations**: Build and traverse with different settings
+4. **Select best**: Weighted cost function: `build_weight * build_time + traversal_weight * trav_time + memory_weight * memory`
+
+### AutoTuneResult
+
+Returns:
+- `best_method`: `BVHBuildMethod::TriangleBVH` or `BVHBuildMethod::SBVH`
+- `best_bvh_config` / `best_sbvh_config`: Optimal build parameters
+- `best_traversal_config`: Optimal traversal settings (max_prim_tests, mailboxing)
+- `scene_info`: Scene characteristics (avg_triangle_area, overlap_ratio, has_thin_triangles, etc.)
+- `all_metrics`: Detailed metrics for all tested configurations
+
+### Scene Analysis
+
+`AutoTuner::analyzeScene()` provides scene characteristics:
+- `avg_triangle_area`: Average triangle surface area
+- `triangle_density`: Triangles per unit volume
+- `overlap_ratio`: Estimated spatial overlap between primitives
+- `has_thin_triangles`: Long thin triangles detected (aspect ratio > 10)
+- `has_clustered_distribution`: Spatial clustering detected
+- `has_coplanar_regions`: Co-planar triangles detected
 
 ## Memory Usage
 
