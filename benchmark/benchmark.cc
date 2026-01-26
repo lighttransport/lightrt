@@ -1306,6 +1306,243 @@ void benchmarkCoplanarTriangles(uint32_t num_triangles, uint32_t num_rays) {
 // Main
 // ============================================================================
 
+// ============================================================================
+// Auto-Tuning Benchmark
+// ============================================================================
+
+void benchmarkAutoTuning(uint32_t num_triangles, uint32_t num_rays) {
+  std::cout << "\n========================================\n";
+  std::cout << "Auto-Tuning Benchmark\n";
+  std::cout << "========================================\n";
+
+  RNG rng(42);
+
+  // Test different scene types
+  struct SceneType {
+    std::string name;
+    std::vector<Triangle> (*generator)(uint32_t, float, RNG&);
+    bool needs_rng;
+  };
+
+  // Generate different scenes to test auto-tuning
+  std::cout << "\n1. Random Triangles Scene\n";
+  std::cout << "-------------------------\n";
+  {
+    auto triangles = generateRandomTriangles(num_triangles, 10.0f, rng);
+
+    std::cout << "Scene: " << triangles.size() << " random triangles\n";
+
+    // Quick tune
+    auto start = std::chrono::high_resolution_clock::now();
+    auto result = AutoTuner::tune(triangles, AutoTuneConfig::quick());
+    auto end = std::chrono::high_resolution_clock::now();
+    double tune_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    std::cout << "Quick tune time: " << std::fixed << std::setprecision(2)
+              << tune_time_ms << " ms\n";
+
+    std::cout << "Best method: "
+              << (result.best_method == BVHBuildMethod::TriangleBVH ? "TriangleBVH" : "SBVH") << "\n";
+    std::cout << "Best max_leaf_size: " << result.best_bvh_config.max_leaf_size << "\n";
+    std::cout << "Build time: " << result.build_time_us_per_prim << " us/prim\n";
+    std::cout << "Traversal time: " << result.traversal_time_ns_per_ray << " ns/ray\n";
+    std::cout << "Memory: " << result.memory_bytes_per_prim << " bytes/prim\n";
+
+    // Scene characteristics
+    std::cout << "\nScene analysis:\n";
+    std::cout << "  Avg triangle area: " << result.scene_info.avg_triangle_area << "\n";
+    std::cout << "  Triangle density: " << result.scene_info.triangle_density << "\n";
+    std::cout << "  Overlap ratio: " << result.scene_info.overlap_ratio << "\n";
+    std::cout << "  Has thin triangles: " << (result.scene_info.has_thin_triangles ? "yes" : "no") << "\n";
+    std::cout << "  Has clustered distribution: " << (result.scene_info.has_clustered_distribution ? "yes" : "no") << "\n";
+    std::cout << "  Has coplanar regions: " << (result.scene_info.has_coplanar_regions ? "yes" : "no") << "\n";
+  }
+
+  std::cout << "\n2. Hair-like Triangles Scene\n";
+  std::cout << "----------------------------\n";
+  {
+    auto triangles = generateHairTriangles(num_triangles, 10.0f, rng);
+
+    std::cout << "Scene: " << triangles.size() << " hair-like triangles\n";
+
+    // Full tune with SBVH
+    AutoTuneConfig cfg;
+    cfg.test_sbvh = true;
+    cfg.sample_prim_count = 2000;  // More samples for complex scene
+
+    auto start = std::chrono::high_resolution_clock::now();
+    auto result = AutoTuner::tune(triangles, cfg);
+    auto end = std::chrono::high_resolution_clock::now();
+    double tune_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    std::cout << "Full tune time: " << std::fixed << std::setprecision(2)
+              << tune_time_ms << " ms\n";
+
+    std::cout << "Best method: "
+              << (result.best_method == BVHBuildMethod::TriangleBVH ? "TriangleBVH" : "SBVH") << "\n";
+    if (result.best_method == BVHBuildMethod::SBVH) {
+      std::cout << "SBVH alpha: " << result.best_sbvh_config.alpha << "\n";
+      std::cout << "SBVH max_leaf_size: " << result.best_sbvh_config.max_leaf_size << "\n";
+    } else {
+      std::cout << "BVH max_leaf_size: " << result.best_bvh_config.max_leaf_size << "\n";
+    }
+
+    std::cout << "Best traversal config:\n";
+    std::cout << "  max_prim_tests: " << result.best_traversal_config.max_prim_tests << "\n";
+    std::cout << "  use_mailboxing: " << (result.best_traversal_config.use_mailboxing ? "yes" : "no") << "\n";
+
+    // Scene characteristics
+    std::cout << "\nScene analysis:\n";
+    std::cout << "  Has thin triangles: " << (result.scene_info.has_thin_triangles ? "yes" : "no") << "\n";
+    std::cout << "  Overlap ratio: " << result.scene_info.overlap_ratio << "\n";
+
+    // Show all tested configurations
+    std::cout << "\nAll tested configurations:\n";
+    std::cout << std::setw(12) << "Method" << std::setw(10) << "LeafSz"
+              << std::setw(12) << "Build(us)" << std::setw(12) << "Trav(ns)"
+              << std::setw(12) << "Mem(B)" << std::setw(10) << "Cost" << "\n";
+    for (const auto& m : result.all_metrics) {
+      std::cout << std::setw(12) << (m.method == BVHBuildMethod::TriangleBVH ? "TriBVH" : "SBVH")
+                << std::setw(10) << m.max_leaf_size
+                << std::setw(12) << std::setprecision(3) << m.build_time_us_per_prim
+                << std::setw(12) << std::setprecision(2) << m.traversal_time_ns_per_ray
+                << std::setw(12) << std::setprecision(1) << m.memory_bytes_per_prim
+                << std::setw(10) << std::setprecision(4) << m.combined_cost << "\n";
+    }
+  }
+
+  std::cout << "\n3. Co-planar Triangles Scene\n";
+  std::cout << "----------------------------\n";
+  {
+    auto triangles = generateOverlappingCoplanar(num_triangles, 10.0f, 0.0f, rng);
+
+    std::cout << "Scene: " << triangles.size() << " overlapping co-planar triangles\n";
+
+    // Throughput-optimized tuning
+    auto start = std::chrono::high_resolution_clock::now();
+    auto result = AutoTuner::tune(triangles, AutoTuneConfig::throughput());
+    auto end = std::chrono::high_resolution_clock::now();
+    double tune_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    std::cout << "Throughput-optimized tune time: " << std::fixed << std::setprecision(2)
+              << tune_time_ms << " ms\n";
+
+    std::cout << "Best method: "
+              << (result.best_method == BVHBuildMethod::TriangleBVH ? "TriangleBVH" : "SBVH") << "\n";
+
+    std::cout << "Best traversal config:\n";
+    std::cout << "  max_prim_tests: " << result.best_traversal_config.max_prim_tests << "\n";
+    std::cout << "  use_mailboxing: " << (result.best_traversal_config.use_mailboxing ? "yes" : "no") << "\n";
+
+    std::cout << "\nScene analysis:\n";
+    std::cout << "  Has coplanar regions: " << (result.scene_info.has_coplanar_regions ? "yes" : "no") << "\n";
+    std::cout << "  Overlap ratio: " << result.scene_info.overlap_ratio << "\n";
+  }
+
+  std::cout << "\n4. Verify Auto-Tuned Build\n";
+  std::cout << "--------------------------\n";
+  {
+    auto triangles = generateRandomTriangles(num_triangles, 10.0f, rng);
+
+    // Use buildOptimal for convenience
+    TriangleBVH auto_bvh;
+    auto start = std::chrono::high_resolution_clock::now();
+    AutoTuner::buildOptimal(triangles, auto_bvh, AutoTuneConfig::quick());
+    auto end = std::chrono::high_resolution_clock::now();
+    double build_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    std::cout << "buildOptimal() time (tune + build): " << std::fixed << std::setprecision(2)
+              << build_time_ms << " ms\n";
+
+    // Compare with default build
+    TriangleBVH default_bvh;
+    start = std::chrono::high_resolution_clock::now();
+    default_bvh.build(triangles);
+    end = std::chrono::high_resolution_clock::now();
+    double default_build_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    std::cout << "Default build() time: " << default_build_ms << " ms\n";
+
+    // Measure traversal performance
+    AABB scene_bounds;
+    for (const auto& tri : triangles) {
+      scene_bounds.expand(tri.bounds());
+    }
+
+    std::vector<Ray> rays;
+    rays.reserve(num_rays);
+    for (uint32_t i = 0; i < num_rays; i++) {
+      Vec3 origin = rng.uniformVec3(-20.0f, 20.0f);
+      Vec3 target = rng.uniformVec3(-10.0f, 10.0f);
+      rays.emplace_back(origin, (target - origin).normalize());
+    }
+
+    // Benchmark auto-tuned BVH
+    uint32_t auto_hits = 0;
+    start = std::chrono::high_resolution_clock::now();
+    for (const auto& ray : rays) {
+      float t, u, v;
+      if (auto_bvh.traverse(ray, t, u, v) != kInvalidIndex) {
+        auto_hits++;
+      }
+    }
+    end = std::chrono::high_resolution_clock::now();
+    double auto_trav_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    // Benchmark default BVH
+    uint32_t default_hits = 0;
+    start = std::chrono::high_resolution_clock::now();
+    for (const auto& ray : rays) {
+      float t, u, v;
+      if (default_bvh.traverse(ray, t, u, v) != kInvalidIndex) {
+        default_hits++;
+      }
+    }
+    end = std::chrono::high_resolution_clock::now();
+    double default_trav_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    std::cout << "\nTraversal comparison:\n";
+    std::cout << "  Auto-tuned: " << auto_trav_ms << " ms (" << auto_hits << " hits)\n";
+    std::cout << "  Default:    " << default_trav_ms << " ms (" << default_hits << " hits)\n";
+    std::cout << "  Speedup:    " << (default_trav_ms / auto_trav_ms) << "x\n";
+
+    // Verify hits match
+    if (auto_hits != default_hits) {
+      std::cout << "  WARNING: Hit counts differ!\n";
+    }
+  }
+
+  std::cout << "\n5. Traversal Config Tuning (Existing BVH)\n";
+  std::cout << "-----------------------------------------\n";
+  {
+    auto triangles = generateOverlappingCoplanar(num_triangles / 2, 10.0f, 0.0f, rng);
+
+    // Build BVH first
+    TriangleBVH bvh;
+    bvh.build(triangles);
+
+    AABB scene_bounds;
+    for (const auto& tri : triangles) {
+      scene_bounds.expand(tri.bounds());
+    }
+
+    std::cout << "Scene: " << triangles.size() << " overlapping triangles\n";
+
+    // Tune traversal config
+    auto start = std::chrono::high_resolution_clock::now();
+    auto best_trav = AutoTuner::tuneTraversal(bvh, scene_bounds, 2000, 5);
+    auto end = std::chrono::high_resolution_clock::now();
+    double tune_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    std::cout << "Traversal tune time: " << std::fixed << std::setprecision(2)
+              << tune_time_ms << " ms\n";
+    std::cout << "Best traversal config:\n";
+    std::cout << "  max_prim_tests: " << best_trav.max_prim_tests << "\n";
+    std::cout << "  use_mailboxing: " << (best_trav.use_mailboxing ? "yes" : "no") << "\n";
+    std::cout << "  early_termination: " << (best_trav.early_termination ? "yes" : "no") << "\n";
+  }
+}
+
 int main(int argc, char** argv) {
   std::cout << "============================================\n";
   std::cout << "LightRT BVH Benchmark Suite\n";
@@ -1355,6 +1592,9 @@ int main(int argc, char** argv) {
 
   // Co-planar triangle scenes with max prim test limits
   benchmarkCoplanarTriangles(num_triangles, num_rays);
+
+  // Auto-tuning benchmark
+  benchmarkAutoTuning(num_triangles, num_rays);
 
   std::cout << "\n============================================\n";
   std::cout << "Benchmark Complete\n";
