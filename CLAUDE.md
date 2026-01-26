@@ -51,7 +51,7 @@ LightRT is a two-file BVH (Bounding Volume Hierarchy) library: `lightrt.hh` (hea
 - `CompactBVHNode`: 24-byte node with 16-bit quantized bounds (vs 56-byte BVHNode)
 - `TraversalProfile`: Profiling data (nodes visited, prims tested, depth)
 - `NoProfiler` / `WithProfiler`: Template policies for zero-overhead profiling
-- `HeatmapWriter`: Image writer for BVH visualization (BMP, TGA, PPM)
+- `HeatmapWriter`: Image writer for BVH visualization (BMP, TGA, PPM, PNG)
 
 ### Primitive Types
 - `Triangle`: 3 vertices (36 bytes), Moller-Trumbore intersection
@@ -90,12 +90,50 @@ LightRT is a two-file BVH (Bounding Volume Hierarchy) library: `lightrt.hh` (hea
 ### Traversal Configuration
 `TraversalConfig` controls traversal behavior:
 - `max_prim_tests`: Limit primitive tests to avoid O(N) worst case (0 = unlimited)
+- `exclude_prim_id`: Primitive to skip (for self-intersection avoidance)
 - `use_mailboxing`: Avoid duplicate tests in SBVH (important when split_ratio > 1)
 - `early_termination`: Stop on first hit (for shadow rays)
 
 Presets:
 - `TraversalConfig::fast(K)`: Limit to K tests with mailboxing
-- `TraversalConfig::anyHit()`: Stop on first hit
+- `TraversalConfig::anyHit()`: Stop on first hit (shadow rays)
+- `TraversalConfig::shadowRay(exclude_prim)`: Any-hit + self-intersection avoidance
+- `TraversalConfig::secondaryRay(exclude_prim)`: Self-intersection avoidance for reflection/refraction
+
+### Packet Traversal (Path Tracing)
+Ray packets enable SIMD-parallel traversal for coherent rays:
+
+- `Ray4` / `Ray8`: SoA (Structure of Arrays) ray packets
+- `HitResult4` / `HitResult8`: Packet hit results with prim_id, t, u, v per ray
+
+Methods on `TriangleBVH` and `SBVH`:
+```cpp
+// Single-ray any-hit (shadow rays)
+bool traverseAnyHit(const Ray& ray, uint32_t exclude_prim_id = kInvalidIndex);
+
+// 4-ray packet traversal
+void traverse4(const Ray4& rays, HitResult4& results);
+uint32_t traverse4AnyHit(const Ray4& rays, uint32_t exclude_prim_id = kInvalidIndex);
+
+// 8-ray packet traversal (AVX optimized)
+void traverse8(const Ray8& rays, HitResult8& results);
+uint32_t traverse8AnyHit(const Ray8& rays, uint32_t exclude_prim_id = kInvalidIndex);
+```
+
+Usage:
+```cpp
+// Shadow ray from surface
+Ray shadow_ray(hit_pos + to_light * 0.001f, to_light, kEpsilon, light_dist);
+bool occluded = bvh.traverseAnyHit(shadow_ray, hit_prim_id);
+
+// Packet traversal for coherent rays
+Ray4 packet = Ray4::fromRays(rays, 4);
+HitResult4 results;
+bvh.traverse4(packet, results);
+
+// Packet any-hit returns bit mask
+uint32_t hit_mask = bvh.traverse4AnyHit(packet);
+```
 
 `TraversalStats` returns traversal statistics:
 - `nodes_visited`, `prims_tested`, `prims_hit`, `terminated_early`
