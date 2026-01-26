@@ -1531,6 +1531,39 @@ BVH::Stats BVH::getStats() const noexcept {
   return stats;
 }
 
+void BVH::refit(const std::vector<AABB>& new_prim_aabbs) noexcept {
+  if (nodes_.empty() || new_prim_aabbs.empty()) {
+    return;
+  }
+
+  // Store updated primitive AABBs
+  prim_aabbs_ = new_prim_aabbs;
+
+  // Bottom-up refit: process nodes in reverse order (leaves first)
+  // This works because children always have higher indices than parents
+  for (int32_t i = static_cast<int32_t>(nodes_.size()) - 1; i >= 0; i--) {
+    BVHNode& node = nodes_[i];
+
+    if (node.isLeaf()) {
+      // Recompute bounds from primitives
+      AABB bounds;
+      for (uint32_t j = 0; j < node.prim_count; j++) {
+        uint32_t prim_idx = prim_indices_[node.prim_offset + j];
+        if (prim_idx < prim_aabbs_.size()) {
+          bounds.expand(prim_aabbs_[prim_idx]);
+        }
+      }
+      node.bounds = bounds;
+    } else {
+      // Recompute bounds from children (already updated)
+      AABB bounds;
+      bounds.expand(nodes_[node.left_child].bounds);
+      bounds.expand(nodes_[node.right_child].bounds);
+      node.bounds = bounds;
+    }
+  }
+}
+
 // ============================================================================
 // Two-Level BVH (TLAS) Implementation
 // ============================================================================
@@ -2173,6 +2206,255 @@ uint32_t TriangleBVH::traverse8AnyHit(const Ray8& rays, uint32_t exclude_prim_id
   }
 
   return hit_mask;
+}
+
+uint32_t TriangleBVH::traverseMultiHit(const Ray& ray, MultiHitResult& result,
+                                        uint32_t max_hits,
+                                        uint32_t exclude_prim_id) const noexcept {
+  const auto& nodes = bvh_.getNodes();
+  const auto& prim_indices = bvh_.getPrimitiveIndices();
+
+  result.clear();
+
+  if (nodes.empty()) {
+    return 0;
+  }
+
+  // Mailbox to avoid duplicate hits
+  const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
+  std::vector<uint64_t> mailbox((num_prims + 63) / 64, 0);
+
+  auto alreadyTested = [&](uint32_t prim_id) -> bool {
+    uint32_t word = prim_id / 64;
+    uint64_t bit = 1ULL << (prim_id % 64);
+    if (mailbox[word] & bit) return true;
+    mailbox[word] |= bit;
+    return false;
+  };
+
+  // Stack-based traversal - visit all nodes that could contain hits
+  uint32_t stack[64];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0) {
+    if (result.hits.size() >= max_hits) {
+      result.terminated_early = true;
+      break;
+    }
+
+    uint32_t node_idx = stack[--stack_ptr];
+    const BVHNode& node = nodes[node_idx];
+
+    float tmin, tmax;
+    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > ray.tmax) {
+      continue;
+    }
+
+    if (node.isLeaf()) {
+      for (uint32_t i = 0; i < node.prim_count; i++) {
+        if (result.hits.size() >= max_hits) {
+          result.terminated_early = true;
+          break;
+        }
+
+        uint32_t tri_idx = prim_indices[node.prim_offset + i];
+        if (tri_idx == exclude_prim_id) continue;
+        if (alreadyTested(tri_idx)) continue;
+
+        float t, u, v;
+        if (triangles_[tri_idx].intersect(ray, t, u, v)) {
+          result.addSorted(HitRecord(tri_idx, t, u, v));
+        }
+      }
+    } else {
+      if (stack_ptr < 62) {
+        stack[stack_ptr++] = node.left_child;
+        stack[stack_ptr++] = node.right_child;
+      }
+    }
+  }
+
+  return result.count();
+}
+
+void TriangleBVH::refit() noexcept {
+  if (triangles_.empty()) {
+    return;
+  }
+
+  // Compute new AABBs from updated triangles
+  std::vector<AABB> new_aabbs;
+  new_aabbs.reserve(triangles_.size());
+  for (const auto& tri : triangles_) {
+    new_aabbs.push_back(tri.bounds());
+  }
+
+  // Refit the underlying BVH
+  bvh_.refit(new_aabbs);
+}
+
+// BVH Serialization format:
+// Header (16 bytes):
+//   magic: 4 bytes "LBVH"
+//   version: 4 bytes (1)
+//   num_nodes: 4 bytes
+//   num_triangles: 4 bytes
+// Nodes: num_nodes * sizeof(BVHNode)
+// Prim indices: variable
+// Triangles: num_triangles * sizeof(Triangle)
+
+static const uint32_t kBVHMagic = 0x4856424C;  // "LBVH"
+static const uint32_t kBVHVersion = 1;
+
+bool TriangleBVH::save(const char* filename) const noexcept {
+  std::vector<uint8_t> buffer;
+  if (!saveToMemory(buffer)) {
+    return false;
+  }
+
+  FILE* fp = fopen(filename, "wb");
+  if (!fp) {
+    return false;
+  }
+
+  size_t written = fwrite(buffer.data(), 1, buffer.size(), fp);
+  fclose(fp);
+
+  return written == buffer.size();
+}
+
+bool TriangleBVH::load(const char* filename) noexcept {
+  FILE* fp = fopen(filename, "rb");
+  if (!fp) {
+    return false;
+  }
+
+  fseek(fp, 0, SEEK_END);
+  size_t file_size = static_cast<size_t>(ftell(fp));
+  fseek(fp, 0, SEEK_SET);
+
+  std::vector<uint8_t> buffer(file_size);
+  size_t read = fread(buffer.data(), 1, file_size, fp);
+  fclose(fp);
+
+  if (read != file_size) {
+    return false;
+  }
+
+  return loadFromMemory(buffer.data(), buffer.size());
+}
+
+bool TriangleBVH::saveToMemory(std::vector<uint8_t>& buffer) const noexcept {
+  const auto& nodes = bvh_.getNodes();
+  const auto& prim_indices = bvh_.getPrimitiveIndices();
+
+  // Calculate size
+  size_t header_size = 16;
+  size_t nodes_size = nodes.size() * sizeof(BVHNode);
+  size_t indices_size = prim_indices.size() * sizeof(uint32_t);
+  size_t triangles_size = triangles_.size() * sizeof(Triangle);
+  size_t total_size = header_size + nodes_size + indices_size + triangles_size;
+
+  buffer.resize(total_size);
+  uint8_t* ptr = buffer.data();
+
+  // Write header
+  uint32_t magic = kBVHMagic;
+  uint32_t version = kBVHVersion;
+  uint32_t num_nodes = static_cast<uint32_t>(nodes.size());
+  uint32_t num_triangles = static_cast<uint32_t>(triangles_.size());
+
+  memcpy(ptr, &magic, 4); ptr += 4;
+  memcpy(ptr, &version, 4); ptr += 4;
+  memcpy(ptr, &num_nodes, 4); ptr += 4;
+  memcpy(ptr, &num_triangles, 4); ptr += 4;
+
+  // Write nodes
+  if (!nodes.empty()) {
+    memcpy(ptr, nodes.data(), nodes_size);
+    ptr += nodes_size;
+  }
+
+  // Write primitive indices
+  if (!prim_indices.empty()) {
+    memcpy(ptr, prim_indices.data(), indices_size);
+    ptr += indices_size;
+  }
+
+  // Write triangles
+  if (!triangles_.empty()) {
+    memcpy(ptr, triangles_.data(), triangles_size);
+  }
+
+  return true;
+}
+
+bool TriangleBVH::loadFromMemory(const uint8_t* data, size_t size) noexcept {
+  if (size < 16) {
+    return false;
+  }
+
+  const uint8_t* ptr = data;
+
+  // Read header
+  uint32_t magic, version, num_nodes, num_triangles;
+  memcpy(&magic, ptr, 4); ptr += 4;
+  memcpy(&version, ptr, 4); ptr += 4;
+  memcpy(&num_nodes, ptr, 4); ptr += 4;
+  memcpy(&num_triangles, ptr, 4); ptr += 4;
+
+  if (magic != kBVHMagic || version != kBVHVersion) {
+    return false;
+  }
+
+  // Read nodes
+  auto& nodes = bvh_.getMutableNodes();
+  nodes.resize(num_nodes);
+  if (num_nodes > 0) {
+    size_t nodes_size = num_nodes * sizeof(BVHNode);
+    if (ptr + nodes_size > data + size) return false;
+    memcpy(nodes.data(), ptr, nodes_size);
+    ptr += nodes_size;
+  }
+
+  // Calculate actual indices size from nodes
+  uint32_t total_prims = 0;
+  for (const auto& node : nodes) {
+    if (node.isLeaf()) {
+      total_prims += node.prim_count;
+    }
+  }
+
+  // Read primitive indices (need to use a workaround since getPrimitiveIndices returns const)
+  // We'll rebuild the internal state after loading
+  std::vector<uint32_t> prim_indices(total_prims);
+  if (total_prims > 0) {
+    size_t indices_size = total_prims * sizeof(uint32_t);
+    if (ptr + indices_size > data + size) return false;
+    memcpy(prim_indices.data(), ptr, indices_size);
+    ptr += indices_size;
+  }
+
+  // Read triangles
+  triangles_.resize(num_triangles);
+  if (num_triangles > 0) {
+    size_t triangles_size = num_triangles * sizeof(Triangle);
+    if (ptr + triangles_size > data + size) return false;
+    memcpy(triangles_.data(), ptr, triangles_size);
+  }
+
+  // Rebuild AABBs for the BVH
+  std::vector<AABB> aabbs;
+  aabbs.reserve(triangles_.size());
+  for (const auto& tri : triangles_) {
+    aabbs.push_back(tri.bounds());
+  }
+
+  // Note: The internal prim_indices_ in BVH needs to be reconstructed
+  // For now, we rebuild the BVH which is not optimal but correct
+  // A full implementation would need access to BVH internals
+  return build(triangles_);
 }
 
 // ============================================================================
@@ -3205,6 +3487,72 @@ uint32_t SBVH::traverse8AnyHit(const Ray8& rays, uint32_t exclude_prim_id) const
   }
 
   return hit_mask;
+}
+
+uint32_t SBVH::traverseMultiHit(const Ray& ray, MultiHitResult& result,
+                                 uint32_t max_hits,
+                                 uint32_t exclude_prim_id) const noexcept {
+  result.clear();
+
+  if (nodes_.empty()) {
+    return 0;
+  }
+
+  // Mailbox to avoid duplicate hits from split primitives
+  const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
+  std::vector<uint64_t> mailbox((num_prims + 63) / 64, 0);
+
+  auto alreadyTested = [&](uint32_t prim_id) -> bool {
+    uint32_t word = prim_id / 64;
+    uint64_t bit = 1ULL << (prim_id % 64);
+    if (mailbox[word] & bit) return true;
+    mailbox[word] |= bit;
+    return false;
+  };
+
+  uint32_t stack[64];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0) {
+    if (result.hits.size() >= max_hits) {
+      result.terminated_early = true;
+      break;
+    }
+
+    uint32_t node_idx = stack[--stack_ptr];
+    const BVHNode& node = nodes_[node_idx];
+
+    float tmin, tmax;
+    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > ray.tmax) {
+      continue;
+    }
+
+    if (node.isLeaf()) {
+      for (uint32_t i = 0; i < node.prim_count; i++) {
+        if (result.hits.size() >= max_hits) {
+          result.terminated_early = true;
+          break;
+        }
+
+        const PrimRef& ref = refs_[node.prim_offset + i];
+        if (ref.prim_id == exclude_prim_id) continue;
+        if (alreadyTested(ref.prim_id)) continue;
+
+        float t, u, v;
+        if (triangles_[ref.prim_id].intersect(ray, t, u, v)) {
+          result.addSorted(HitRecord(ref.prim_id, t, u, v));
+        }
+      }
+    } else {
+      if (stack_ptr < 62) {
+        stack[stack_ptr++] = node.left_child;
+        stack[stack_ptr++] = node.right_child;
+      }
+    }
+  }
+
+  return result.count();
 }
 
 SBVH::Stats SBVH::getStats() const noexcept {

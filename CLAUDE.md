@@ -52,6 +52,9 @@ LightRT is a two-file BVH (Bounding Volume Hierarchy) library: `lightrt.hh` (hea
 - `TraversalProfile`: Profiling data (nodes visited, prims tested, depth)
 - `NoProfiler` / `WithProfiler`: Template policies for zero-overhead profiling
 - `HeatmapWriter`: Image writer for BVH visualization (BMP, TGA, PPM, PNG)
+- `HitRecord` / `MultiHitResult`: Multi-hit traversal results for transparency
+- `Ray4` / `Ray8`: SoA ray packets for SIMD traversal
+- `HitResult4` / `HitResult8`: Packet hit results
 
 ### Primitive Types
 - `Triangle`: 3 vertices (36 bytes), Moller-Trumbore intersection
@@ -137,6 +140,53 @@ uint32_t hit_mask = bvh.traverse4AnyHit(packet);
 
 `TraversalStats` returns traversal statistics:
 - `nodes_visited`, `prims_tested`, `prims_hit`, `terminated_early`
+
+### Multi-Hit Traversal (Transparency)
+For rendering transparent surfaces, volumetrics, or CSG operations:
+
+```cpp
+MultiHitResult result;
+uint32_t count = bvh.traverseMultiHit(ray, result, max_hits, exclude_prim_id);
+
+// Iterate hits front-to-back (sorted by distance)
+for (const auto& hit : result.hits) {
+  // hit.prim_id, hit.t, hit.u, hit.v
+  float alpha = getAlpha(hit.prim_id, hit.u, hit.v);
+  if (alpha > 0.99f) break;  // Opaque - stop
+}
+```
+
+### BVH Refitting (Animation)
+For animated scenes, refit BVH bounds without rebuilding:
+
+```cpp
+// Modify triangle vertices
+auto& triangles = bvh.getMutableTriangles();
+for (auto& tri : triangles) {
+  tri.v0 = animate(tri.v0, time);
+  // ...
+}
+
+// Update BVH bounds (fast, preserves tree structure)
+bvh.refit();
+```
+
+### BVH Serialization
+Save/load BVH to disk for caching:
+
+```cpp
+// Save BVH to file
+bvh.save("scene.bvh");
+
+// Load BVH from file
+TriangleBVH loaded_bvh;
+loaded_bvh.load("scene.bvh");
+
+// Memory buffer serialization
+std::vector<uint8_t> buffer;
+bvh.saveToMemory(buffer);
+bvh.loadFromMemory(buffer.data(), buffer.size());
+```
 
 ### Build Configuration
 `BVHBuildConfig` controls construction:
