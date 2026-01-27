@@ -19,6 +19,12 @@
 #include <vector>
 #include <limits>
 #include <cmath>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <functional>
+#include <queue>
 
 // SIMD detection
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -55,6 +61,115 @@ namespace lightrt {
 constexpr float kInfinity = std::numeric_limits<float>::infinity();
 constexpr float kEpsilon = 1e-6f;
 constexpr uint32_t kInvalidIndex = 0xFFFFFFFF;
+
+// ============================================================================
+// Task System (Simple Thread Pool)
+// ============================================================================
+
+class TaskSystem {
+public:
+  // Initialize with hardware concurrency
+  static void initialize(uint32_t num_threads = 0) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!threads_.empty()) return; // Already initialized
+
+    if (num_threads == 0) num_threads = std::thread::hardware_concurrency();
+    if (num_threads < 1) num_threads = 1;
+
+    stop_ = false;
+    for (uint32_t i = 0; i < num_threads; ++i) {
+      threads_.emplace_back(workerThread);
+    }
+  }
+
+  // Shutdown threads
+  static void shutdown() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    condition_.notify_all();
+    for (std::thread& worker : threads_) {
+      if (worker.joinable()) worker.join();
+    }
+    threads_.clear();
+  }
+
+  // Submit a task
+  static void submit(std::function<void()> task) {
+    // If not initialized, run on main thread (fallback)
+    if (threads_.empty()) {
+      task();
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      tasks_.push(std::move(task));
+    }
+    condition_.notify_one();
+  }
+
+  // Parallel For Loop
+  // splits range [start, end) into chunks and runs them in parallel
+  static void parallelFor(uint32_t start, uint32_t end, std::function<void(uint32_t, uint32_t)> body, uint32_t min_chunk_size = 1024) {
+    if (threads_.empty()) {
+      body(start, end);
+      return;
+    }
+
+    uint32_t range = end - start;
+    if (range == 0) return;
+
+    if (range <= min_chunk_size) {
+      body(start, end);
+      return;
+    }
+
+    uint32_t num_tasks = (range + min_chunk_size - 1) / min_chunk_size;
+    std::atomic<uint32_t> tasks_remaining(num_tasks);
+    std::mutex wait_mutex;
+    std::condition_variable wait_cv;
+
+    for (uint32_t i = 0; i < num_tasks; ++i) {
+      uint32_t chunk_start = start + i * min_chunk_size;
+      uint32_t chunk_end = std::min(end, chunk_start + min_chunk_size);
+
+      submit([chunk_start, chunk_end, body, &tasks_remaining, &wait_cv]() {
+        body(chunk_start, chunk_end);
+        if (tasks_remaining.fetch_sub(1) == 1) {
+          wait_cv.notify_one();
+        }
+      });
+    }
+
+    // Wait for completion
+    // Improvement: Worker threads could help processing tasks instead of just waiting
+    std::unique_lock<std::mutex> lock(wait_mutex);
+    wait_cv.wait(lock, [&tasks_remaining] { return tasks_remaining == 0; });
+  }
+
+private:
+  static void workerThread() {
+    while (true) {
+      std::function<void()> task;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        condition_.wait(lock, [] { return stop_ || !tasks_.empty(); });
+        if (stop_ && tasks_.empty()) return;
+        task = std::move(tasks_.front());
+        tasks_.pop();
+      }
+      task();
+    }
+  }
+
+  static std::vector<std::thread> threads_;
+  static std::queue<std::function<void()>> tasks_;
+  static std::mutex mutex_;
+  static std::condition_variable condition_;
+  static bool stop_;
+};
 
 // ============================================================================
 // Vector Math
@@ -931,6 +1046,7 @@ struct BVHBuildConfig {
   uint32_t num_bins;           // Number of bins for binned SAH
   bool force_max_leaf_size;    // Always enforce max_leaf_size (ignore SAH cost)
   bool use_lbvh;               // Use LBVH (Morton code-based, fast but lower quality)
+  bool use_parallel_build;     // Use multi-threading for construction
 
   BVHBuildConfig() noexcept
     : max_leaf_size(4)
@@ -941,12 +1057,14 @@ struct BVHBuildConfig {
     , use_binning(true)
     , num_bins(16)
     , force_max_leaf_size(false)
-    , use_lbvh(false) {}
+    , use_lbvh(false)
+    , use_parallel_build(true) {}
 
   // Preset for fast build (LBVH)
   static BVHBuildConfig fast() noexcept {
     BVHBuildConfig cfg;
     cfg.use_lbvh = true;
+    cfg.use_parallel_build = true;
     return cfg;
   }
 
@@ -955,6 +1073,7 @@ struct BVHBuildConfig {
     BVHBuildConfig cfg;
     cfg.use_sah = true;
     cfg.use_binning = true;
+    cfg.use_parallel_build = true;
     return cfg;
   }
 };
@@ -1105,6 +1224,29 @@ class BVH {
 public:
   BVH() noexcept = default;
   ~BVH() noexcept = default;
+
+  // Move operations
+  BVH(BVH&& other) noexcept
+    : nodes_(std::move(other.nodes_))
+    , prim_indices_(std::move(other.prim_indices_))
+    , prim_aabbs_(std::move(other.prim_aabbs_))
+    , config_(other.config_)
+    , node_allocator_(other.node_allocator_.load()) {}
+
+  BVH& operator=(BVH&& other) noexcept {
+    if (this != &other) {
+      nodes_ = std::move(other.nodes_);
+      prim_indices_ = std::move(other.prim_indices_);
+      prim_aabbs_ = std::move(other.prim_aabbs_);
+      config_ = other.config_;
+      node_allocator_.store(other.node_allocator_.load());
+    }
+    return *this;
+  }
+
+  // Delete copy operations
+  BVH(const BVH&) = delete;
+  BVH& operator=(const BVH&) = delete;
   
   // Build BVH from primitives (AABBs)
   // prim_aabbs: Bounding boxes of primitives
@@ -1143,6 +1285,7 @@ private:
   std::vector<uint32_t> prim_indices_;
   std::vector<AABB> prim_aabbs_;
   BVHBuildConfig config_;
+  std::atomic<uint32_t> node_allocator_;
   
   // Recursive build
   uint32_t buildRecursive(
@@ -1264,6 +1407,23 @@ class TriangleBVH {
 public:
   TriangleBVH() noexcept = default;
   ~TriangleBVH() noexcept = default;
+
+  // Move operations
+  TriangleBVH(TriangleBVH&& other) noexcept
+    : bvh_(std::move(other.bvh_))
+    , triangles_(std::move(other.triangles_)) {}
+
+  TriangleBVH& operator=(TriangleBVH&& other) noexcept {
+    if (this != &other) {
+      bvh_ = std::move(other.bvh_);
+      triangles_ = std::move(other.triangles_);
+    }
+    return *this;
+  }
+
+  // Delete copy
+  TriangleBVH(const TriangleBVH&) = delete;
+  TriangleBVH& operator=(const TriangleBVH&) = delete;
 
   // Build BVH from triangles
   bool build(const std::vector<Triangle>& triangles, const BVHBuildConfig& config = BVHBuildConfig()) noexcept;

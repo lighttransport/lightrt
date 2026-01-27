@@ -8,6 +8,24 @@
 namespace lightrt {
 
 // ============================================================================
+// TaskSystem Implementation
+// ============================================================================
+
+std::vector<std::thread> TaskSystem::threads_;
+std::queue<std::function<void()>> TaskSystem::tasks_;
+std::mutex TaskSystem::mutex_;
+std::condition_variable TaskSystem::condition_;
+bool TaskSystem::stop_ = false;
+
+// Static guard to ensure shutdown on exit
+struct TaskSystemGuard {
+  ~TaskSystemGuard() {
+    TaskSystem::shutdown();
+  }
+};
+static TaskSystemGuard g_task_system_guard;
+
+// ============================================================================
 // Triangle Implementation
 // ============================================================================
 
@@ -1129,17 +1147,19 @@ bool BVH::build(const std::vector<AABB>& prim_aabbs, const BVHBuildConfig& confi
   prim_aabbs_ = prim_aabbs;
   config_ = config;
 
-  // Use a separate working buffer to avoid invalidation during insert
-  std::vector<uint32_t> work_indices(prim_aabbs.size());
-  for (uint32_t i = 0; i < prim_aabbs.size(); i++) {
-    work_indices[i] = i;
+  if (config_.use_parallel_build) {
+    TaskSystem::initialize();
   }
 
   // Clear output arrays
-  prim_indices_.clear();
-  prim_indices_.reserve(prim_aabbs.size());
-  nodes_.clear();
-  nodes_.reserve(prim_aabbs.size() * 2);
+  prim_indices_.resize(prim_aabbs.size());
+  for (uint32_t i = 0; i < prim_aabbs.size(); i++) {
+    prim_indices_[i] = i;
+  }
+
+  // Pre-allocate nodes (max 2*N - 1)
+  nodes_.resize(prim_aabbs.size() * 2);
+  node_allocator_ = 0;
 
   // Choose build method
   if (config.use_lbvh) {
@@ -1152,13 +1172,23 @@ bool BVH::build(const std::vector<AABB>& prim_aabbs, const BVHBuildConfig& confi
       scene_bounds.expand(aabb.center());
     }
 
-    // Compute Morton codes
-    for (uint32_t i = 0; i < prim_aabbs.size(); i++) {
-      morton_prims[i].prim_idx = i;
-      morton_prims[i].morton_code = computeMortonCode(prim_aabbs[i].center(), scene_bounds);
+    // Compute Morton codes (Parallelizable)
+    if (config.use_parallel_build) {
+      TaskSystem::parallelFor(0, static_cast<uint32_t>(prim_aabbs.size()), [&](uint32_t start, uint32_t end) {
+        for (uint32_t i = start; i < end; i++) {
+          morton_prims[i].prim_idx = i;
+          morton_prims[i].morton_code = computeMortonCode(prim_aabbs[i].center(), scene_bounds);
+        }
+      });
+    } else {
+      for (uint32_t i = 0; i < prim_aabbs.size(); i++) {
+        morton_prims[i].prim_idx = i;
+        morton_prims[i].morton_code = computeMortonCode(prim_aabbs[i].center(), scene_bounds);
+      }
     }
 
     // Sort by Morton code
+    // TODO: Parallel Sort
     std::sort(morton_prims.begin(), morton_prims.end(),
               [](const MortonPrimitive& a, const MortonPrimitive& b) {
                 return a.morton_code < b.morton_code;
@@ -1168,19 +1198,22 @@ bool BVH::build(const std::vector<AABB>& prim_aabbs, const BVHBuildConfig& confi
     buildLBVH(morton_prims.data(), static_cast<uint32_t>(morton_prims.size()), 29, scene_bounds);
   } else {
     // SAH-based build: Higher quality but slower
-    buildRecursive(work_indices.data(), static_cast<uint32_t>(prim_aabbs.size()), 0);
+    buildRecursive(prim_indices_.data(), static_cast<uint32_t>(prim_aabbs.size()), 0);
   }
+
+  // Resize nodes to actual count
+  nodes_.resize(node_allocator_);
 
   return true;
 }
 
 uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t depth) noexcept {
-  // Allocate new node
-  uint32_t node_idx = static_cast<uint32_t>(nodes_.size());
-  nodes_.emplace_back();
+  // Allocate new node (thread-safe)
+  uint32_t node_idx = node_allocator_.fetch_add(1);
   BVHNode& node = nodes_[node_idx];
   
   // Compute bounds of all primitives
+  // Improvement: Parallelize reduction for large leaf? Probably overkill here.
   AABB bounds;
   for (uint32_t i = 0; i < num_prims; i++) {
     bounds.expand(prim_aabbs_[indices[i]]);
@@ -1190,10 +1223,8 @@ uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t dep
   // Check if we should create a leaf
   if (num_prims <= config_.max_leaf_size) {
     // Create leaf node
-    uint32_t offset = static_cast<uint32_t>(prim_indices_.size());
-    
-    // Move primitives to end of array
-    prim_indices_.insert(prim_indices_.end(), indices, indices + num_prims);
+    // Offset is just difference from start
+    uint32_t offset = static_cast<uint32_t>(indices - prim_indices_.data());
     
     node.setLeaf(offset, num_prims);
     return node_idx;
@@ -1238,24 +1269,49 @@ uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t dep
   // Handle degenerate case where all primitives go to one side
   if (left_count == 0 || left_count == num_prims) {
     left_count = num_prims / 2;
+    mid = indices + left_count;
   }
   
   // Check if split is worth it (SAH cost)
-  // Skip this check if force_max_leaf_size is enabled (always split until leaf size reached)
   if (config_.use_sah && !config_.force_max_leaf_size &&
       split.cost >= config_.intersection_cost * num_prims) {
     // Don't split, create leaf
-    uint32_t offset = static_cast<uint32_t>(prim_indices_.size());
-    prim_indices_.insert(prim_indices_.end(), indices, indices + num_prims);
+    uint32_t offset = static_cast<uint32_t>(indices - prim_indices_.data());
     node.setLeaf(offset, num_prims);
     return node_idx;
   }
   
-  // Build children
-  uint32_t left_child = buildRecursive(indices, left_count, depth + 1);
-  uint32_t right_child = buildRecursive(mid, num_prims - left_count, depth + 1);
+  // Build children (Parallel)
+  uint32_t left_child = kInvalidIndex;
+  uint32_t right_child = kInvalidIndex;
+
+  if (config_.use_parallel_build && num_prims > 1024) {
+    // Spawn task for left, run right on current thread
+    std::mutex m;
+    std::condition_variable cv;
+    bool done = false;
+
+    TaskSystem::submit([&]() {
+      left_child = buildRecursive(indices, left_count, depth + 1);
+      {
+        std::lock_guard<std::mutex> lock(m);
+        done = true;
+      }
+      cv.notify_one();
+    });
+
+    right_child = buildRecursive(mid, num_prims - left_count, depth + 1);
+
+    {
+      std::unique_lock<std::mutex> lock(m);
+      cv.wait(lock, [&] { return done; });
+    }
+  } else {
+    left_child = buildRecursive(indices, left_count, depth + 1);
+    right_child = buildRecursive(mid, num_prims - left_count, depth + 1);
+  }
   
-  // Update node (it may have been reallocated)
+  // Update node
   nodes_[node_idx].setInterior(left_child, right_child);
   
   return node_idx;
@@ -1355,17 +1411,37 @@ BVH::SplitResult BVH::findBestSplitBinned(
 
     std::vector<Bin> bins(config_.num_bins);
 
-    // Put primitives into bins
+    // Put primitives into bins (Parallelizable)
     float scale = config_.num_bins / (max_val - min_val);
-    for (uint32_t i = 0; i < num_prims; i++) {
-      Vec3 centroid = prim_aabbs_[indices[i]].center();
-      float val = axis == 0 ? centroid.x : axis == 1 ? centroid.y : centroid.z;
+    if (config_.use_parallel_build && num_prims > 4096) {
+      std::mutex bins_mutex;
+      TaskSystem::parallelFor(0, num_prims, [&](uint32_t start, uint32_t end) {
+        std::vector<Bin> local_bins(config_.num_bins);
+        for (uint32_t i = start; i < end; i++) {
+          Vec3 centroid = prim_aabbs_[indices[i]].center();
+          float val = axis == 0 ? centroid.x : axis == 1 ? centroid.y : centroid.z;
+          uint32_t bin_idx = static_cast<uint32_t>((val - min_val) * scale);
+          bin_idx = std::min(bin_idx, config_.num_bins - 1);
+          local_bins[bin_idx].bounds.expand(prim_aabbs_[indices[i]]);
+          local_bins[bin_idx].count++;
+        }
+        std::lock_guard<std::mutex> lock(bins_mutex);
+        for (uint32_t b = 0; b < config_.num_bins; b++) {
+          bins[b].bounds.expand(local_bins[b].bounds);
+          bins[b].count += local_bins[b].count;
+        }
+      }, 1024);
+    } else {
+      for (uint32_t i = 0; i < num_prims; i++) {
+        Vec3 centroid = prim_aabbs_[indices[i]].center();
+        float val = axis == 0 ? centroid.x : axis == 1 ? centroid.y : centroid.z;
 
-      uint32_t bin_idx = static_cast<uint32_t>((val - min_val) * scale);
-      bin_idx = std::min(bin_idx, config_.num_bins - 1);
+        uint32_t bin_idx = static_cast<uint32_t>((val - min_val) * scale);
+        bin_idx = std::min(bin_idx, config_.num_bins - 1);
 
-      bins[bin_idx].bounds.expand(prim_aabbs_[indices[i]]);
-      bins[bin_idx].count++;
+        bins[bin_idx].bounds.expand(prim_aabbs_[indices[i]]);
+        bins[bin_idx].count++;
+      }
     }
 
     // Compute costs for each split
