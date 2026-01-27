@@ -1756,6 +1756,316 @@ uint32_t BVH::buildLBVH(MortonPrimitive* morton_prims, uint32_t num_prims,
 }
 
 // ============================================================================
+// ============================================================================
+// BVH4 Implementation
+// ============================================================================
+
+bool BVH4::build(const BVH& binary_bvh, const std::vector<AABB>& prim_aabbs, BVH4Precision precision) noexcept {
+  precision_ = precision;
+  prim_aabbs_ = prim_aabbs;
+  const auto& binary_nodes = binary_bvh.getNodes();
+  if (binary_nodes.empty()) return false;
+
+  prim_indices_ = binary_bvh.getPrimitiveIndices();
+  
+  nodes_fp32_.clear();
+  nodes_fp16_.clear();
+  nodes_int16_.clear();
+  nodes_int8_.clear();
+  
+  nodes_fp32_.reserve(binary_nodes.size() / 2);
+  
+  buildRecursive(binary_bvh, 0);
+  
+  if (precision_ != BVH4Precision::FP32) {
+    quantizeNodes();
+  }
+  
+  return true;
+}
+
+BVH4::CollapseResult BVH4::collapseBinaryNode(const BVH& binary_bvh, uint32_t binary_idx) const noexcept {
+  const auto& nodes = binary_bvh.getNodes();
+  CollapseResult res;
+  res.num_children = 0;
+
+  const BVHNode& node = nodes[binary_idx];
+  if (node.isLeaf()) {
+    res.child_indices[0] = binary_idx;
+    res.child_bounds[0] = node.bounds;
+    res.num_children = 1;
+    return res;
+  }
+
+  uint32_t level1[2] = { node.left_child, node.right_child };
+  
+  for (int i = 0; i < 2; i++) {
+    const BVHNode& child1 = nodes[level1[i]];
+    if (child1.isLeaf()) {
+      res.child_indices[res.num_children] = level1[i];
+      res.child_bounds[res.num_children] = child1.bounds;
+      res.num_children++;
+    } else {
+      // Level 2
+      res.child_indices[res.num_children] = child1.left_child;
+      res.child_bounds[res.num_children] = nodes[child1.left_child].bounds;
+      res.num_children++;
+      res.child_indices[res.num_children] = child1.right_child;
+      res.child_bounds[res.num_children] = nodes[child1.right_child].bounds;
+      res.num_children++;
+    }
+  }
+  
+  return res;
+}
+
+uint32_t BVH4::buildRecursive(const BVH& binary_bvh, uint32_t binary_idx) noexcept {
+  const auto& binary_nodes = binary_bvh.getNodes();
+  
+  uint32_t node_idx = static_cast<uint32_t>(nodes_fp32_.size());
+  nodes_fp32_.emplace_back();
+  
+  // Initialize node
+  for(int i=0; i<4; i++) {
+    nodes_fp32_[node_idx].children[i] = kInvalidIndex;
+    nodes_fp32_[node_idx].counts[i] = 0;
+    nodes_fp32_[node_idx].min_x[i] = nodes_fp32_[node_idx].min_y[i] = nodes_fp32_[node_idx].min_z[i] = kInfinity;
+    nodes_fp32_[node_idx].max_x[i] = nodes_fp32_[node_idx].max_y[i] = nodes_fp32_[node_idx].max_z[i] = -kInfinity;
+  }
+
+  CollapseResult res = collapseBinaryNode(binary_bvh, binary_idx);
+  
+  for (int i = 0; i < res.num_children; i++) {
+    const AABB& b = res.child_bounds[i];
+    nodes_fp32_[node_idx].min_x[i] = b.min.x;
+    nodes_fp32_[node_idx].min_y[i] = b.min.y;
+    nodes_fp32_[node_idx].min_z[i] = b.min.z;
+    nodes_fp32_[node_idx].max_x[i] = b.max.x;
+    nodes_fp32_[node_idx].max_y[i] = b.max.y;
+    nodes_fp32_[node_idx].max_z[i] = b.max.z;
+
+    uint32_t bin_child_idx = res.child_indices[i];
+    const BVHNode& bin_child = binary_nodes[bin_child_idx];
+
+    if (bin_child.isLeaf()) {
+      nodes_fp32_[node_idx].setLeaf(i, bin_child.prim_offset, bin_child.prim_count);
+    } else {
+      uint32_t child_idx = buildRecursive(binary_bvh, bin_child_idx);
+      nodes_fp32_[node_idx].setInterior(i, child_idx);
+    }
+  }
+
+  return node_idx;
+}
+
+void BVH4::quantizeNodes() noexcept {
+  if (precision_ == BVH4Precision::FP16) {
+    nodes_fp16_.resize(nodes_fp32_.size());
+    for (size_t i = 0; i < nodes_fp32_.size(); i++) {
+      const auto& src = nodes_fp32_[i];
+      auto& dst = nodes_fp16_[i];
+      for (int j = 0; j < 4; j++) {
+#ifdef LIGHTRT_HAS_FP16
+        dst.min_x[j] = floatToFP16(src.min_x[j]);
+        dst.min_y[j] = floatToFP16(src.min_y[j]);
+        dst.min_z[j] = floatToFP16(src.min_z[j]);
+        dst.max_x[j] = floatToFP16(src.max_x[j]);
+        dst.max_y[j] = floatToFP16(src.max_y[j]);
+        dst.max_z[j] = floatToFP16(src.max_z[j]);
+#else
+        // If no hardware support, we could use soft-float conversion
+        // or just store as is (not ideal)
+#endif
+        dst.children[j] = src.children[j];
+        dst.counts[j] = src.counts[j];
+      }
+    }
+  } else if (precision_ == BVH4Precision::Int16) {
+    nodes_int16_.resize(nodes_fp32_.size());
+    for (size_t i = 0; i < nodes_fp32_.size(); i++) {
+      const auto& src = nodes_fp32_[i];
+      auto& dst = nodes_int16_[i];
+      
+      AABB ref;
+      for (int j = 0; j < 4; j++) {
+        if (src.children[j] != kInvalidIndex) {
+          ref.expand(Vec3(src.min_x[j], src.min_y[j], src.min_z[j]));
+          ref.expand(Vec3(src.max_x[j], src.max_y[j], src.max_z[j]));
+        }
+      }
+      dst.reference_min[0] = ref.min.x; dst.reference_min[1] = ref.min.y; dst.reference_min[2] = ref.min.z;
+      dst.reference_max[0] = ref.max.x; dst.reference_max[1] = ref.max.y; dst.reference_max[2] = ref.max.z;
+
+      for (int j = 0; j < 4; j++) {
+        dst.min_x[j] = quantizeFloat16(src.min_x[j], ref.min.x, ref.max.x);
+        dst.min_y[j] = quantizeFloat16(src.min_y[j], ref.min.y, ref.max.y);
+        dst.min_z[j] = quantizeFloat16(src.min_z[j], ref.min.z, ref.max.z);
+        dst.max_x[j] = quantizeFloat16(src.max_x[j], ref.min.x, ref.max.x);
+        dst.max_y[j] = quantizeFloat16(src.max_y[j], ref.min.y, ref.max.y);
+        dst.max_z[j] = quantizeFloat16(src.max_z[j], ref.min.z, ref.max.z);
+        dst.children[j] = src.children[j];
+        dst.counts[j] = src.counts[j];
+      }
+    }
+  } else if (precision_ == BVH4Precision::Int8) {
+    nodes_int8_.resize(nodes_fp32_.size());
+    for (size_t i = 0; i < nodes_fp32_.size(); i++) {
+      const auto& src = nodes_fp32_[i];
+      auto& dst = nodes_int8_[i];
+      
+      AABB ref;
+      for (int j = 0; j < 4; j++) {
+        if (src.children[j] != kInvalidIndex) {
+          ref.expand(Vec3(src.min_x[j], src.min_y[j], src.min_z[j]));
+          ref.expand(Vec3(src.max_x[j], src.max_y[j], src.max_z[j]));
+        }
+      }
+      dst.reference_min[0] = ref.min.x; dst.reference_min[1] = ref.min.y; dst.reference_min[2] = ref.min.z;
+      dst.reference_max[0] = ref.max.x; dst.reference_max[1] = ref.max.y; dst.reference_max[2] = ref.max.z;
+
+      for (int j = 0; j < 4; j++) {
+        dst.min_x[j] = quantizeFloat8(src.min_x[j], ref.min.x, ref.max.x);
+        dst.min_y[j] = quantizeFloat8(src.min_y[j], ref.min.y, ref.max.y);
+        dst.min_z[j] = quantizeFloat8(src.min_z[j], ref.min.z, ref.max.z);
+        dst.max_x[j] = quantizeFloat8(src.max_x[j], ref.min.x, ref.max.x);
+        dst.max_y[j] = quantizeFloat8(src.max_y[j], ref.min.y, ref.max.y);
+        dst.max_z[j] = quantizeFloat8(src.max_z[j], ref.min.z, ref.max.z);
+        dst.children[j] = src.children[j];
+        dst.counts[j] = src.counts[j];
+      }
+    }
+  }
+}
+
+uint32_t BVH4::traverse(const Ray& ray, float& hit_t) const noexcept {
+  if (nodes_fp32_.empty() && nodes_fp16_.empty() && nodes_int16_.empty() && nodes_int8_.empty()) return kInvalidIndex;
+
+  uint32_t hit_prim = kInvalidIndex;
+  hit_t = ray.tmax;
+
+  uint32_t stack[128];
+  int stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+#if defined(LIGHTRT_HAS_SSE2) || defined(LIGHTRT_HAS_AVX)
+  __m128 ray_ox = _mm_set1_ps(ray.origin.x);
+  __m128 ray_oy = _mm_set1_ps(ray.origin.y);
+  __m128 ray_oz = _mm_set1_ps(ray.origin.z);
+  __m128 inv_dx = _mm_set1_ps(1.0f / ray.direction.x);
+  __m128 inv_dy = _mm_set1_ps(1.0f / ray.direction.y);
+  __m128 inv_dz = _mm_set1_ps(1.0f / ray.direction.z);
+  __m128 ray_tmin = _mm_set1_ps(ray.tmin);
+#endif
+
+  while (stack_ptr > 0) {
+    uint32_t node_idx = stack[--stack_ptr];
+    
+    int hit_mask = 0;
+    const uint32_t* children_ptr = nullptr;
+    const uint32_t* counts_ptr = nullptr;
+
+    if (precision_ == BVH4Precision::FP32) {
+      const BVH4Node& node = nodes_fp32_[node_idx];
+      children_ptr = node.children;
+      counts_ptr = node.counts;
+#if defined(LIGHTRT_HAS_SSE2) || defined(LIGHTRT_HAS_AVX)
+      __m128 min_x = _mm_load_ps(node.min_x);
+      __m128 min_y = _mm_load_ps(node.min_y);
+      __m128 min_z = _mm_load_ps(node.min_z);
+      __m128 max_x = _mm_load_ps(node.max_x);
+      __m128 max_y = _mm_load_ps(node.max_y);
+      __m128 max_z = _mm_load_ps(node.max_z);
+
+      __m128 t0x = _mm_mul_ps(_mm_sub_ps(min_x, ray_ox), inv_dx);
+      __m128 t1x = _mm_mul_ps(_mm_sub_ps(max_x, ray_ox), inv_dx);
+      __m128 t0y = _mm_mul_ps(_mm_sub_ps(min_y, ray_oy), inv_dy);
+      __m128 t1y = _mm_mul_ps(_mm_sub_ps(max_y, ray_oy), inv_dy);
+      __m128 t0z = _mm_mul_ps(_mm_sub_ps(min_z, ray_oz), inv_dz);
+      __m128 t1z = _mm_mul_ps(_mm_sub_ps(max_z, ray_oz), inv_dz);
+
+      __m128 tmin = _mm_max_ps(_mm_max_ps(_mm_min_ps(t0x, t1x), _mm_min_ps(t0y, t1y)), _mm_max_ps(_mm_min_ps(t0z, t1z), ray_tmin));
+      __m128 tmax = _mm_min_ps(_mm_min_ps(_mm_max_ps(t0x, t1x), _mm_max_ps(t0y, t1y)), _mm_min_ps(_mm_max_ps(t0z, t1z), _mm_set1_ps(hit_t)));
+
+      __m128 hit_cmp = _mm_cmple_ps(tmin, tmax);
+      hit_mask = _mm_movemask_ps(hit_cmp);
+#else
+      for(int i=0; i<4; i++) {
+        if (node.children[i] == kInvalidIndex) continue;
+        AABB b(Vec3(node.min_x[i], node.min_y[i], node.min_z[i]), Vec3(node.max_x[i], node.max_y[i], node.max_z[i]));
+        float t0, t1;
+        if (b.intersect(ray, t0, t1) && t0 < hit_t) hit_mask |= (1 << i);
+      }
+#endif
+    } else if (precision_ == BVH4Precision::FP16) {
+      const BVH4NodeFP16& node = nodes_fp16_[node_idx];
+      children_ptr = node.children;
+      counts_ptr = node.counts;
+      for(int i=0; i<4; i++) {
+        if (node.children[i] == kInvalidIndex) continue;
+        AABB b(Vec3(fp16ToFloat(node.min_x[i]), fp16ToFloat(node.min_y[i]), fp16ToFloat(node.min_z[i])),
+               Vec3(fp16ToFloat(node.max_x[i]), fp16ToFloat(node.max_y[i]), fp16ToFloat(node.max_z[i])));
+        float t0, t1;
+        if (b.intersect(ray, t0, t1) && t0 < hit_t) hit_mask |= (1 << i);
+      }
+    } else if (precision_ == BVH4Precision::Int16) {
+      const BVH4NodeInt16& node = nodes_int16_[node_idx];
+      children_ptr = node.children;
+      counts_ptr = node.counts;
+      Vec3 ref_min(node.reference_min[0], node.reference_min[1], node.reference_min[2]);
+      Vec3 ref_max(node.reference_max[0], node.reference_max[1], node.reference_max[2]);
+      for(int i=0; i<4; i++) {
+        if (node.children[i] == kInvalidIndex) continue;
+        AABB b(Vec3(dequantizeFloat16(node.min_x[i], ref_min.x, ref_max.x), dequantizeFloat16(node.min_y[i], ref_min.y, ref_max.y), dequantizeFloat16(node.min_z[i], ref_min.z, ref_max.z)),
+               Vec3(dequantizeFloat16(node.max_x[i], ref_min.x, ref_max.x), dequantizeFloat16(node.max_y[i], ref_min.y, ref_max.y), dequantizeFloat16(node.max_z[i], ref_min.z, ref_max.z)));
+        float t0, t1;
+        if (b.intersect(ray, t0, t1) && t0 < hit_t) hit_mask |= (1 << i);
+      }
+    } else if (precision_ == BVH4Precision::Int8) {
+      const BVH4NodeInt8& node = nodes_int8_[node_idx];
+      children_ptr = node.children;
+      counts_ptr = node.counts;
+      Vec3 ref_min(node.reference_min[0], node.reference_min[1], node.reference_min[2]);
+      Vec3 ref_max(node.reference_max[0], node.reference_max[1], node.reference_max[2]);
+      for(int i=0; i<4; i++) {
+        if (node.children[i] == kInvalidIndex) continue;
+        AABB b(Vec3(dequantizeFloat8(node.min_x[i], ref_min.x, ref_max.x), dequantizeFloat8(node.min_y[i], ref_min.y, ref_max.y), dequantizeFloat8(node.min_z[i], ref_min.z, ref_max.z)),
+               Vec3(dequantizeFloat8(node.max_x[i], ref_min.x, ref_max.x), dequantizeFloat8(node.max_y[i], ref_min.y, ref_max.y), dequantizeFloat8(node.max_z[i], ref_min.z, ref_max.z)));
+        float t0, t1;
+        if (b.intersect(ray, t0, t1) && t0 < hit_t) hit_mask |= (1 << i);
+      }
+    }
+
+    if (hit_mask == 0) continue;
+
+    // Ordered traversal
+    uint32_t hits[4];
+    int hit_count = 0;
+    for(int i=0; i<4; i++) {
+        if(hit_mask & (1 << i)) hits[hit_count++] = i;
+    }
+
+    for (int k = 0; k < hit_count; k++) {
+      int i = hits[k];
+      uint32_t child = children_ptr[i];
+      if (child & 0x80000000) {
+        uint32_t offset = child & 0x7FFFFFFF;
+        uint32_t count = counts_ptr[i];
+        for (uint32_t j = 0; j < count; j++) {
+          uint32_t prim_idx = prim_indices_[offset + j];
+          float t0, t1;
+          if (prim_aabbs_[prim_idx].intersectSIMD(ray, t0, t1) && t0 < hit_t) {
+            hit_t = t0;
+            hit_prim = prim_idx;
+          }
+        }
+      } else {
+        stack[stack_ptr++] = child;
+      }
+    }
+  }
+  return hit_prim;
+}
+
 // Two-Level BVH (TLAS) Implementation
 // ============================================================================
 

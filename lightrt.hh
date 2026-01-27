@@ -873,16 +873,40 @@ enum class PrimitiveType : uint8_t {
 // ============================================================================
 
 // Quantize float to 16-bit unsigned integer in range [min, max]
-inline uint16_t quantizeFloat(float value, float min_val, float max_val) noexcept {
+inline uint16_t quantizeFloat16(float value, float min_val, float max_val) noexcept {
+  if (max_val - min_val < 1e-10f) return 0;
   float normalized = (value - min_val) / (max_val - min_val);
   normalized = std::max(0.0f, std::min(1.0f, normalized));
   return static_cast<uint16_t>(normalized * 65535.0f);
 }
 
+// Quantize float to 8-bit unsigned integer in range [min, max]
+inline uint8_t quantizeFloat8(float value, float min_val, float max_val) noexcept {
+  if (max_val - min_val < 1e-10f) return 0;
+  float normalized = (value - min_val) / (max_val - min_val);
+  normalized = std::max(0.0f, std::min(1.0f, normalized));
+  return static_cast<uint8_t>(normalized * 255.0f);
+}
+
 // Dequantize 16-bit unsigned integer to float in range [min, max]
-inline float dequantizeFloat(uint16_t value, float min_val, float max_val) noexcept {
+inline float dequantizeFloat16(uint16_t value, float min_val, float max_val) noexcept {
   float normalized = static_cast<float>(value) / 65535.0f;
   return min_val + normalized * (max_val - min_val);
+}
+
+// Dequantize 8-bit unsigned integer to float in range [min, max]
+inline float dequantizeFloat8(uint8_t value, float min_val, float max_val) noexcept {
+  float normalized = static_cast<float>(value) / 255.0f;
+  return min_val + normalized * (max_val - min_val);
+}
+
+// Aliases for 16-bit versions (backward compatibility)
+inline uint16_t quantizeFloat(float value, float min_val, float max_val) noexcept {
+  return quantizeFloat16(value, min_val, max_val);
+}
+
+inline float dequantizeFloat(uint16_t value, float min_val, float max_val) noexcept {
+  return dequantizeFloat16(value, min_val, max_val);
 }
 
 // Quantized AABB using 16-bit integers
@@ -1321,6 +1345,104 @@ private:
   uint32_t buildLBVH(MortonPrimitive* morton_prims, uint32_t num_prims,
                      uint32_t bit, const AABB& scene_bounds) noexcept;
   uint32_t computeMortonCode(const Vec3& p, const AABB& bounds) const noexcept;
+};
+
+// ============================================================================
+// BVH4 - Wide BVH (4 children per node)
+// ============================================================================
+
+// Standard FP32 BVH4 Node (SoA layout for SIMD)
+struct alignas(16) BVH4Node {
+  float min_x[4], min_y[4], min_z[4];
+  float max_x[4], max_y[4], max_z[4];
+  uint32_t children[4]; // If MSB is 1, it's a leaf (offset in lower bits)
+  uint32_t counts[4];   // Primitive count if leaf, 0 if interior
+
+  bool isLeaf(int i) const noexcept { return (children[i] & 0x80000000) != 0; }
+  uint32_t getOffset(int i) const noexcept { return children[i] & 0x7FFFFFFF; }
+  void setLeaf(int i, uint32_t offset, uint32_t count) noexcept {
+    children[i] = offset | 0x80000000;
+    counts[i] = count;
+  }
+  void setInterior(int i, uint32_t child_idx) noexcept {
+    children[i] = child_idx;
+    counts[i] = 0;
+  }
+};
+
+// FP16 Quantized BVH4 Node
+struct alignas(16) BVH4NodeFP16 {
+  uint16_t min_x[4], min_y[4], min_z[4];
+  uint16_t max_x[4], max_y[4], max_z[4];
+  uint32_t children[4];
+  uint32_t counts[4];
+};
+
+// Int16 Quantized BVH4 Node
+struct alignas(16) BVH4NodeInt16 {
+  uint16_t min_x[4], min_y[4], min_z[4];
+  uint16_t max_x[4], max_y[4], max_z[4];
+  float reference_min[3];
+  float reference_max[3];
+  uint32_t children[4];
+  uint32_t counts[4];
+};
+
+// Int8 Quantized BVH4 Node
+struct alignas(16) BVH4NodeInt8 {
+  uint8_t min_x[4], min_y[4], min_z[4];
+  uint8_t max_x[4], max_y[4], max_z[4];
+  float reference_min[3];
+  float reference_max[3];
+  uint32_t children[4];
+  uint32_t counts[4];
+};
+
+enum class BVH4Precision : uint8_t {
+  FP32,
+  FP16,
+  Int16,
+  Int8
+};
+
+class BVH4 {
+public:
+  BVH4() noexcept = default;
+  ~BVH4() noexcept = default;
+
+  // Build BVH4 by collapsing a binary BVH
+  bool build(const BVH& binary_bvh, const std::vector<AABB>& prim_aabbs, BVH4Precision precision = BVH4Precision::FP32) noexcept;
+
+  // Traverse BVH4 using SIMD
+  uint32_t traverse(const Ray& ray, float& hit_t) const noexcept;
+
+  // Access internals
+  const std::vector<BVH4Node>& getNodesFP32() const noexcept { return nodes_fp32_; }
+  const std::vector<BVH4NodeFP16>& getNodesFP16() const noexcept { return nodes_fp16_; }
+  const std::vector<BVH4NodeInt16>& getNodesInt16() const noexcept { return nodes_int16_; }
+  const std::vector<BVH4NodeInt8>& getNodesInt8() const noexcept { return nodes_int8_; }
+  const std::vector<uint32_t>& getPrimitiveIndices() const noexcept { return prim_indices_; }
+
+private:
+  std::vector<BVH4Node> nodes_fp32_;
+  std::vector<BVH4NodeFP16> nodes_fp16_;
+  std::vector<BVH4NodeInt16> nodes_int16_;
+  std::vector<BVH4NodeInt8> nodes_int8_;
+  std::vector<uint32_t> prim_indices_;
+  std::vector<AABB> prim_aabbs_;
+  BVH4Precision precision_ = BVH4Precision::FP32;
+
+  // Collapse helper
+  struct CollapseResult {
+    uint32_t child_indices[4];
+    AABB child_bounds[4];
+    int num_children;
+  };
+
+  CollapseResult collapseBinaryNode(const BVH& binary_bvh, uint32_t binary_idx) const noexcept;
+  uint32_t buildRecursive(const BVH& binary_bvh, uint32_t binary_idx) noexcept;
+  
+  void quantizeNodes() noexcept;
 };
 
 // ============================================================================
