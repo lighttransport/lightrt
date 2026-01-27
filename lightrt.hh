@@ -930,6 +930,7 @@ struct BVHBuildConfig {
   bool use_binning;            // Use binned SAH for large nodes
   uint32_t num_bins;           // Number of bins for binned SAH
   bool force_max_leaf_size;    // Always enforce max_leaf_size (ignore SAH cost)
+  bool use_lbvh;               // Use LBVH (Morton code-based, fast but lower quality)
 
   BVHBuildConfig() noexcept
     : max_leaf_size(4)
@@ -939,7 +940,23 @@ struct BVHBuildConfig {
     , use_sah(true)
     , use_binning(true)
     , num_bins(16)
-    , force_max_leaf_size(false) {}
+    , force_max_leaf_size(false)
+    , use_lbvh(false) {}
+
+  // Preset for fast build (LBVH)
+  static BVHBuildConfig fast() noexcept {
+    BVHBuildConfig cfg;
+    cfg.use_lbvh = true;
+    return cfg;
+  }
+
+  // Preset for high quality (SAH with binning)
+  static BVHBuildConfig quality() noexcept {
+    BVHBuildConfig cfg;
+    cfg.use_sah = true;
+    cfg.use_binning = true;
+    return cfg;
+  }
 };
 
 // ============================================================================
@@ -1151,6 +1168,16 @@ private:
     uint32_t num_prims,
     const AABB& centroid_bounds,
     float parent_area) noexcept;
+
+  // LBVH (Linear BVH) construction
+  struct MortonPrimitive {
+    uint32_t prim_idx;
+    uint32_t morton_code;
+  };
+
+  uint32_t buildLBVH(MortonPrimitive* morton_prims, uint32_t num_prims,
+                     uint32_t bit, const AABB& scene_bounds) noexcept;
+  uint32_t computeMortonCode(const Vec3& p, const AABB& bounds) const noexcept;
 };
 
 // ============================================================================

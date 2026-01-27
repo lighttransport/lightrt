@@ -1141,8 +1141,35 @@ bool BVH::build(const std::vector<AABB>& prim_aabbs, const BVHBuildConfig& confi
   nodes_.clear();
   nodes_.reserve(prim_aabbs.size() * 2);
 
-  // Build recursively
-  buildRecursive(work_indices.data(), static_cast<uint32_t>(prim_aabbs.size()), 0);
+  // Choose build method
+  if (config.use_lbvh) {
+    // LBVH: Fast O(N log N) construction using Morton codes
+    std::vector<MortonPrimitive> morton_prims(prim_aabbs.size());
+
+    // Compute scene bounds
+    AABB scene_bounds;
+    for (const auto& aabb : prim_aabbs) {
+      scene_bounds.expand(aabb.center());
+    }
+
+    // Compute Morton codes
+    for (uint32_t i = 0; i < prim_aabbs.size(); i++) {
+      morton_prims[i].prim_idx = i;
+      morton_prims[i].morton_code = computeMortonCode(prim_aabbs[i].center(), scene_bounds);
+    }
+
+    // Sort by Morton code
+    std::sort(morton_prims.begin(), morton_prims.end(),
+              [](const MortonPrimitive& a, const MortonPrimitive& b) {
+                return a.morton_code < b.morton_code;
+              });
+
+    // Build tree top-down based on Morton code hierarchy
+    buildLBVH(morton_prims.data(), static_cast<uint32_t>(morton_prims.size()), 29, scene_bounds);
+  } else {
+    // SAH-based build: Higher quality but slower
+    buildRecursive(work_indices.data(), static_cast<uint32_t>(prim_aabbs.size()), 0);
+  }
 
   return true;
 }
@@ -1562,6 +1589,94 @@ void BVH::refit(const std::vector<AABB>& new_prim_aabbs) noexcept {
       node.bounds = bounds;
     }
   }
+}
+
+// Compute 30-bit Morton code for a point in [0,1]^3
+uint32_t BVH::computeMortonCode(const Vec3& p, const AABB& bounds) const noexcept {
+  // Normalize point to [0,1]^3
+  Vec3 extent = bounds.max - bounds.min;
+  float inv_x = extent.x > 1e-10f ? 1.0f / extent.x : 0.0f;
+  float inv_y = extent.y > 1e-10f ? 1.0f / extent.y : 0.0f;
+  float inv_z = extent.z > 1e-10f ? 1.0f / extent.z : 0.0f;
+
+  float nx = std::min(std::max((p.x - bounds.min.x) * inv_x, 0.0f), 1.0f);
+  float ny = std::min(std::max((p.y - bounds.min.y) * inv_y, 0.0f), 1.0f);
+  float nz = std::min(std::max((p.z - bounds.min.z) * inv_z, 0.0f), 1.0f);
+
+  // Convert to 10-bit integers
+  uint32_t x = std::min(static_cast<uint32_t>(nx * 1024.0f), 1023u);
+  uint32_t y = std::min(static_cast<uint32_t>(ny * 1024.0f), 1023u);
+  uint32_t z = std::min(static_cast<uint32_t>(nz * 1024.0f), 1023u);
+
+  // Interleave bits (Z-order curve)
+  auto expandBits = [](uint32_t v) -> uint32_t {
+    v = (v * 0x00010001u) & 0xFF0000FFu;
+    v = (v * 0x00000101u) & 0x0F00F00Fu;
+    v = (v * 0x00000011u) & 0xC30C30C3u;
+    v = (v * 0x00000005u) & 0x49249249u;
+    return v;
+  };
+
+  return (expandBits(z) << 2) | (expandBits(y) << 1) | expandBits(x);
+}
+
+// Build LBVH tree recursively using Morton code hierarchy
+uint32_t BVH::buildLBVH(MortonPrimitive* morton_prims, uint32_t num_prims,
+                        uint32_t bit, const AABB& scene_bounds) noexcept {
+  // Allocate node
+  uint32_t node_idx = static_cast<uint32_t>(nodes_.size());
+  nodes_.emplace_back();
+  BVHNode& node = nodes_[node_idx];
+
+  // Compute bounds
+  AABB bounds;
+  for (uint32_t i = 0; i < num_prims; i++) {
+    bounds.expand(prim_aabbs_[morton_prims[i].prim_idx]);
+  }
+  node.bounds = bounds;
+
+  // Create leaf if few primitives
+  if (num_prims <= config_.max_leaf_size || bit == 0) {
+    uint32_t offset = static_cast<uint32_t>(prim_indices_.size());
+    for (uint32_t i = 0; i < num_prims; i++) {
+      prim_indices_.push_back(morton_prims[i].prim_idx);
+    }
+    node.setLeaf(offset, num_prims);
+    return node_idx;
+  }
+
+  // Find split point in sorted Morton code array
+  // Look for the first differing bit at position 'bit'
+  uint32_t split_idx = 0;
+  uint32_t mask = 1u << bit;
+
+  for (uint32_t i = 0; i < num_prims; i++) {
+    if (morton_prims[i].morton_code & mask) {
+      split_idx = i;
+      break;
+    }
+  }
+
+  // Handle case where all codes are the same at this bit
+  if (split_idx == 0 || split_idx == num_prims) {
+    // Try next bit
+    if (bit > 0) {
+      return buildLBVH(morton_prims, num_prims, bit - 1, scene_bounds);
+    }
+    // Fallback: split in half
+    split_idx = num_prims / 2;
+  }
+
+  // Build children
+  uint32_t left_idx = buildLBVH(morton_prims, split_idx, bit > 0 ? bit - 1 : 0, scene_bounds);
+  uint32_t right_idx = buildLBVH(morton_prims + split_idx, num_prims - split_idx,
+                                  bit > 0 ? bit - 1 : 0, scene_bounds);
+
+  // Update node with children
+  nodes_[node_idx].left_child = left_idx;
+  nodes_[node_idx].right_child = right_idx;
+
+  return node_idx;
 }
 
 // ============================================================================
