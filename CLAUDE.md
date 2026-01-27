@@ -194,6 +194,30 @@ bvh.loadFromMemory(buffer.data(), buffer.size());
 - `use_binning`: Binned SAH for large datasets (default: true)
 - `max_leaf_size`: Maximum primitives per leaf (default: 4)
 - `force_max_leaf_size`: Always enforce max_leaf_size, ignore SAH cost (default: false)
+- `use_lbvh`: Use Linear BVH (Morton code-based, fast O(N log N) build) (default: false)
+
+Presets:
+```cpp
+BVHBuildConfig::fast()     // LBVH: ~5x faster build, good traversal
+BVHBuildConfig::quality()  // SAH with binning: slower build, best traversal
+```
+
+### LBVH (Linear BVH)
+Fast BVH construction using Morton codes (Z-order curve):
+- **Build time**: O(N log N) vs O(N log² N) for SAH
+- **Quality**: ~7-10% higher SAH cost than binned SAH
+- **Use case**: Dynamic scenes, fast preview, streaming
+
+Benchmark (100k triangles):
+| Method | Build Time | SAH Cost | Speedup |
+|--------|------------|----------|---------|
+| SAH    | 190ms      | 434,493  | 1x      |
+| LBVH   | 37ms       | 467,303  | 5x      |
+
+Implementation uses:
+- 30-bit Morton codes (10 bits per axis)
+- Radix sort for O(N) ordering
+- Bit-level tree construction
 
 ## Benchmark (`benchmark/benchmark.cc`)
 
