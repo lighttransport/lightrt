@@ -8,6 +8,8 @@
 
 # Compiled executables
 lightrt_example
+lightrt_benchmark
+viewer/viewer
 
 # Build directories
 build/
