@@ -313,6 +313,54 @@ void displayCapabilities() {
 #endif
 }
 
+void testBVH4() {
+  std::cout << "\n=== Wide BVH (BVH4) Test ===\n";
+  
+  const uint32_t num_primitives = 10000;
+  std::vector<AABB> primitives = createRandomScene(num_primitives);
+  
+  BVH binary_bvh;
+  binary_bvh.build(primitives);
+  
+  BVH4Precision precisions[] = {
+    BVH4Precision::FP32,
+    BVH4Precision::FP16,
+    BVH4Precision::Int16,
+    BVH4Precision::Int8
+  };
+  const char* names[] = {"FP32", "FP16", "Int16", "Int8"};
+
+  Ray ray(Vec3(0.0f, 0.0f, -20.0f), Vec3(0.0f, 0.0f, 1.0f).normalize());
+
+  for (int i = 0; i < 4; i++) {
+    std::cout << "\nTesting BVH4 with " << names[i] << " precision:\n";
+    BVH4 bvh4;
+    auto start = std::chrono::high_resolution_clock::now();
+    bvh4.build(binary_bvh, primitives, precisions[i]);
+    auto end = std::chrono::high_resolution_clock::now();
+    auto build_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    
+    std::cout << "  Build time (collapse + quantize): " << build_duration.count() << " ms\n";
+    
+    // Warmup
+    float hit_t = 0.0f;
+    bvh4.traverse(ray, hit_t);
+
+    start = std::chrono::high_resolution_clock::now();
+    hit_t = 0.0f;
+    uint32_t hit_prim = bvh4.traverse(ray, hit_t);
+    end = std::chrono::high_resolution_clock::now();
+    auto traverse_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+    
+    if (hit_prim != kInvalidIndex) {
+      std::cout << "  Hit primitive " << hit_prim << " at t=" << hit_t 
+                << " (" << traverse_duration.count() << " ns)\n";
+    } else {
+      std::cout << "  No hit (" << traverse_duration.count() << " ns)\n";
+    }
+  }
+}
+
 int main() {
   std::cout << "==============================================\n";
   std::cout << "LightRT - Lightweight Ray Tracing BVH Example\n";
@@ -321,6 +369,7 @@ int main() {
   displayCapabilities();
   testSingleLevelBVH();
   testTwoLevelBVH();
+  testBVH4();
   testQuantization();
   testFP16();
   
