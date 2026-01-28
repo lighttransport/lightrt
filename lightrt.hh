@@ -219,6 +219,15 @@ struct alignas(16) Vec3 {
     }
     return *this;
   }
+
+  // Array-style access for iteration
+  float operator[](int i) const noexcept {
+    return (i == 0) ? x : (i == 1) ? y : z;
+  }
+
+  float& operator[](int i) noexcept {
+    return (i == 0) ? x : (i == 1) ? y : z;
+  }
 };
 
 // ============================================================================
@@ -532,6 +541,121 @@ struct alignas(16) AABB {
     return (min.x <= other.max.x && max.x >= other.min.x) &&
            (min.y <= other.max.y && max.y >= other.min.y) &&
            (min.z <= other.max.z && max.z >= other.min.z);
+  }
+
+  // Squared distance from point to AABB (0 if inside)
+  float distanceSquared(const Vec3& point) const noexcept {
+    float dist_sq = 0.0f;
+    for (int i = 0; i < 3; i++) {
+      float v = point[i];
+      float lo = min[i];
+      float hi = max[i];
+      if (v < lo) dist_sq += (lo - v) * (lo - v);
+      else if (v > hi) dist_sq += (v - hi) * (v - hi);
+    }
+    return dist_sq;
+  }
+};
+
+// ============================================================================
+// Frustum (6 planes for view frustum culling)
+// ============================================================================
+
+struct alignas(16) Frustum {
+  // Plane equation: normal.x * x + normal.y * y + normal.z * z + d = 0
+  // Points on positive side are inside the frustum
+  struct Plane {
+    Vec3 normal;
+    float d;
+
+    Plane() noexcept : normal(0, 1, 0), d(0) {}
+    Plane(const Vec3& n, float dist) noexcept : normal(n), d(dist) {}
+    Plane(float a, float b, float c, float dist) noexcept : normal(a, b, c), d(dist) {}
+
+    // Distance from point to plane (positive = inside)
+    float distance(const Vec3& p) const noexcept {
+      return normal.dot(p) + d;
+    }
+  };
+
+  // Standard frustum planes: left, right, bottom, top, near, far
+  Plane planes[6];
+
+  Frustum() noexcept = default;
+
+  // Create frustum from view-projection matrix (column-major OpenGL style)
+  // Matrix should be: projection * view
+  static Frustum fromMatrix(const float m[16]) noexcept {
+    Frustum f;
+    // Left plane
+    f.planes[0] = Plane(m[3] + m[0], m[7] + m[4], m[11] + m[8], m[15] + m[12]);
+    // Right plane
+    f.planes[1] = Plane(m[3] - m[0], m[7] - m[4], m[11] - m[8], m[15] - m[12]);
+    // Bottom plane
+    f.planes[2] = Plane(m[3] + m[1], m[7] + m[5], m[11] + m[9], m[15] + m[13]);
+    // Top plane
+    f.planes[3] = Plane(m[3] - m[1], m[7] - m[5], m[11] - m[9], m[15] - m[13]);
+    // Near plane
+    f.planes[4] = Plane(m[3] + m[2], m[7] + m[6], m[11] + m[10], m[15] + m[14]);
+    // Far plane
+    f.planes[5] = Plane(m[3] - m[2], m[7] - m[6], m[11] - m[10], m[15] - m[14]);
+
+    // Normalize planes
+    for (int i = 0; i < 6; i++) {
+      float len = std::sqrt(f.planes[i].normal.x * f.planes[i].normal.x +
+                            f.planes[i].normal.y * f.planes[i].normal.y +
+                            f.planes[i].normal.z * f.planes[i].normal.z);
+      if (len > 1e-10f) {
+        float inv_len = 1.0f / len;
+        f.planes[i].normal.x *= inv_len;
+        f.planes[i].normal.y *= inv_len;
+        f.planes[i].normal.z *= inv_len;
+        f.planes[i].d *= inv_len;
+      }
+    }
+    return f;
+  }
+
+  // Test if AABB is inside or intersects frustum
+  // Returns: -1 = outside, 0 = intersecting, 1 = fully inside
+  int testAABB(const AABB& box) const noexcept {
+    int result = 1;  // Assume fully inside
+    for (int i = 0; i < 6; i++) {
+      // Find the corner most positive (p-vertex) and most negative (n-vertex)
+      Vec3 p_vertex, n_vertex;
+      for (int j = 0; j < 3; j++) {
+        if (planes[i].normal[j] >= 0) {
+          p_vertex[j] = box.max[j];
+          n_vertex[j] = box.min[j];
+        } else {
+          p_vertex[j] = box.min[j];
+          n_vertex[j] = box.max[j];
+        }
+      }
+
+      // If p-vertex is outside (negative distance), entire box is outside
+      if (planes[i].distance(p_vertex) < 0) {
+        return -1;  // Outside
+      }
+      // If n-vertex is outside but p-vertex inside, box intersects the plane
+      if (planes[i].distance(n_vertex) < 0) {
+        result = 0;  // Intersecting
+      }
+    }
+    return result;
+  }
+};
+
+// ============================================================================
+// KNN Result for K-nearest neighbor queries
+// ============================================================================
+
+struct KNNResult {
+  uint32_t prim_id;
+  float distance_sq;
+
+  bool operator<(const KNNResult& other) const noexcept {
+    return distance_sq < other.distance_sq;
   }
 };
 
@@ -1313,6 +1437,17 @@ public:
   // Sphere query: collect primitives within sphere radius
   void querySphere(const Vec3& center, float radius, std::vector<uint32_t>& results) const noexcept;
 
+  // Frustum culling: collect primitives visible in view frustum
+  void queryFrustum(const Frustum& frustum, std::vector<uint32_t>& results) const noexcept;
+
+  // K-nearest neighbor query: find K closest primitives to a point
+  // Results are sorted by distance (nearest first)
+  void queryKNN(const Vec3& point, uint32_t k, std::vector<KNNResult>& results) const noexcept;
+
+  // Nearest primitive query: find closest primitive to a point
+  // Returns kInvalidIndex if BVH is empty
+  uint32_t queryNearest(const Vec3& point, float& distance_sq) const noexcept;
+
   // Access to nodes (for serialization, etc.)
   const std::vector<BVHNode>& getNodes() const noexcept { return nodes_; }
   std::vector<BVHNode>& getMutableNodes() noexcept { return nodes_; }
@@ -1610,6 +1745,9 @@ public:
   // Spatial queries for culling and collision detection
   void queryAABB(const AABB& query_aabb, std::vector<uint32_t>& triangle_indices) const noexcept;
   void querySphere(const Vec3& center, float radius, std::vector<uint32_t>& triangle_indices) const noexcept;
+  void queryFrustum(const Frustum& frustum, std::vector<uint32_t>& triangle_indices) const noexcept;
+  void queryKNN(const Vec3& point, uint32_t k, std::vector<KNNResult>& results) const noexcept;
+  uint32_t queryNearest(const Vec3& point, float& distance_sq) const noexcept;
 
   // Serialization - save/load BVH to binary format
   // Format version is embedded for forward compatibility

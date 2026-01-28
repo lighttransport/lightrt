@@ -258,12 +258,54 @@ bvh.querySphere(center, radius, results);
 - **Area-of-effect**: Find entities within explosion/effect radius
 - **Spatial indexing**: Range queries for nearest neighbor search
 
+### Frustum Culling
+
+Collect primitives visible within a view frustum:
+
+```cpp
+// Create frustum from view-projection matrix (column-major)
+float mvp[16] = { ... };  // projection * view
+Frustum frustum = Frustum::fromMatrix(mvp);
+
+// Or construct planes manually
+Frustum frustum;
+frustum.planes[0] = Frustum::Plane(nx, ny, nz, d);  // Left
+frustum.planes[1] = Frustum::Plane(...);            // Right
+// ... near, far, top, bottom
+
+// Query visible primitives
+std::vector<uint32_t> visible;
+bvh.queryFrustum(frustum, visible);
+```
+
+### K-Nearest Neighbor (KNN)
+
+Find K closest primitives to a query point:
+
+```cpp
+// Find 10 nearest triangles to a point
+Vec3 query_point(5.0f, 0.0f, 5.0f);
+std::vector<KNNResult> results;
+bvh.queryKNN(query_point, 10, results);
+
+// Results sorted by distance (nearest first)
+for (const auto& r : results) {
+  uint32_t tri_idx = r.prim_id;
+  float dist_sq = r.distance_sq;
+}
+
+// For single nearest neighbor
+float dist_sq;
+uint32_t nearest = bvh.queryNearest(query_point, dist_sq);
+```
+
 ### Performance
 
 Spatial queries traverse the BVH tree, testing nodes against the query volume:
 - **Time complexity**: O(log N + K) where K is the result count
 - **Stack-based traversal**: No recursion overhead
 - **Early culling**: Skips entire subtrees when bounds don't intersect
+- **KNN uses priority queue**: Visits nodes in distance order for optimal pruning
 
 ## Benchmark (`benchmark/benchmark.cc`)
 
