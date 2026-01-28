@@ -1782,6 +1782,208 @@ void BVH::querySphere(const Vec3& center, float radius, std::vector<uint32_t>& r
   }
 }
 
+void BVH::queryFrustum(const Frustum& frustum, std::vector<uint32_t>& results) const noexcept {
+  if (nodes_.empty()) {
+    return;
+  }
+
+  results.clear();
+
+  // Track visited primitives to avoid duplicates
+  std::vector<bool> visited(prim_aabbs_.size(), false);
+
+  // Stack-based traversal
+  uint32_t stack[64];
+  uint32_t stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0) {
+    uint32_t node_idx = stack[--stack_ptr];
+    const BVHNode& node = nodes_[node_idx];
+
+    // Test frustum-AABB intersection
+    int test = frustum.testAABB(node.bounds);
+    if (test == -1) {
+      continue;  // Node completely outside frustum
+    }
+
+    if (node.isLeaf()) {
+      // Add primitives that are visible
+      for (uint32_t i = 0; i < node.prim_count; i++) {
+        uint32_t prim_idx = prim_indices_[node.prim_offset + i];
+        if (prim_idx >= prim_aabbs_.size() || visited[prim_idx]) {
+          continue;
+        }
+
+        // Test primitive AABB against frustum
+        int prim_test = frustum.testAABB(prim_aabbs_[prim_idx]);
+        if (prim_test != -1) {
+          visited[prim_idx] = true;
+          results.push_back(prim_idx);
+        }
+      }
+    } else {
+      // Traverse children
+      if (stack_ptr + 2 <= 64) {
+        stack[stack_ptr++] = node.left_child;
+        stack[stack_ptr++] = node.right_child;
+      }
+    }
+  }
+}
+
+void BVH::queryKNN(const Vec3& point, uint32_t k, std::vector<KNNResult>& results) const noexcept {
+  if (nodes_.empty() || k == 0) {
+    results.clear();
+    return;
+  }
+
+  results.clear();
+
+  // Track visited primitives to avoid duplicates
+  std::vector<bool> visited(prim_aabbs_.size(), false);
+
+  // Max-heap to keep track of K nearest (furthest is at top)
+  std::vector<KNNResult> heap;
+  heap.reserve(k);
+  float max_dist_sq = std::numeric_limits<float>::max();
+
+  // Priority queue for traversal: (distance, node_idx)
+  // Use min-heap to visit closest nodes first
+  std::vector<std::pair<float, uint32_t>> node_queue;
+  node_queue.reserve(64);
+  node_queue.push_back({0.0f, 0});
+
+  while (!node_queue.empty()) {
+    // Pop node with smallest distance
+    std::pop_heap(node_queue.begin(), node_queue.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+    auto [node_dist, node_idx] = node_queue.back();
+    node_queue.pop_back();
+
+    // Skip if this node can't have closer primitives than current K-th
+    if (heap.size() == k && node_dist > max_dist_sq) {
+      continue;
+    }
+
+    const BVHNode& node = nodes_[node_idx];
+
+    if (node.isLeaf()) {
+      // Test primitives
+      for (uint32_t i = 0; i < node.prim_count; i++) {
+        uint32_t prim_idx = prim_indices_[node.prim_offset + i];
+        if (prim_idx >= prim_aabbs_.size() || visited[prim_idx]) {
+          continue;
+        }
+        visited[prim_idx] = true;
+
+        float dist_sq = prim_aabbs_[prim_idx].distanceSquared(point);
+
+        if (heap.size() < k) {
+          // Room in heap, add this primitive
+          heap.push_back({prim_idx, dist_sq});
+          std::push_heap(heap.begin(), heap.end(),
+                        [](const KNNResult& a, const KNNResult& b) { return a.distance_sq < b.distance_sq; });
+          if (heap.size() == k) {
+            max_dist_sq = heap[0].distance_sq;
+          }
+        } else if (dist_sq < max_dist_sq) {
+          // Closer than current K-th nearest, replace
+          std::pop_heap(heap.begin(), heap.end(),
+                       [](const KNNResult& a, const KNNResult& b) { return a.distance_sq < b.distance_sq; });
+          heap.back() = {prim_idx, dist_sq};
+          std::push_heap(heap.begin(), heap.end(),
+                        [](const KNNResult& a, const KNNResult& b) { return a.distance_sq < b.distance_sq; });
+          max_dist_sq = heap[0].distance_sq;
+        }
+      }
+    } else {
+      // Test children and add to queue if they could contain closer primitives
+      float left_dist = nodes_[node.left_child].bounds.distanceSquared(point);
+      float right_dist = nodes_[node.right_child].bounds.distanceSquared(point);
+
+      if (heap.size() < k || left_dist <= max_dist_sq) {
+        node_queue.push_back({left_dist, node.left_child});
+        std::push_heap(node_queue.begin(), node_queue.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+      }
+      if (heap.size() < k || right_dist <= max_dist_sq) {
+        node_queue.push_back({right_dist, node.right_child});
+        std::push_heap(node_queue.begin(), node_queue.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+      }
+    }
+  }
+
+  // Convert heap to sorted vector (nearest first)
+  results = std::move(heap);
+  std::sort(results.begin(), results.end());
+}
+
+uint32_t BVH::queryNearest(const Vec3& point, float& distance_sq) const noexcept {
+  if (nodes_.empty()) {
+    distance_sq = std::numeric_limits<float>::max();
+    return kInvalidIndex;
+  }
+
+  uint32_t best_prim = kInvalidIndex;
+  float best_dist_sq = std::numeric_limits<float>::max();
+
+  // Priority queue for traversal: (distance, node_idx)
+  std::vector<std::pair<float, uint32_t>> node_queue;
+  node_queue.reserve(64);
+  node_queue.push_back({0.0f, 0});
+
+  while (!node_queue.empty()) {
+    // Pop node with smallest distance
+    std::pop_heap(node_queue.begin(), node_queue.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+    auto [node_dist, node_idx] = node_queue.back();
+    node_queue.pop_back();
+
+    // Skip if this node can't have closer primitives
+    if (node_dist > best_dist_sq) {
+      continue;
+    }
+
+    const BVHNode& node = nodes_[node_idx];
+
+    if (node.isLeaf()) {
+      // Test primitives
+      for (uint32_t i = 0; i < node.prim_count; i++) {
+        uint32_t prim_idx = prim_indices_[node.prim_offset + i];
+        if (prim_idx >= prim_aabbs_.size()) {
+          continue;
+        }
+
+        float dist_sq = prim_aabbs_[prim_idx].distanceSquared(point);
+        if (dist_sq < best_dist_sq) {
+          best_dist_sq = dist_sq;
+          best_prim = prim_idx;
+        }
+      }
+    } else {
+      // Test children and add to queue
+      float left_dist = nodes_[node.left_child].bounds.distanceSquared(point);
+      float right_dist = nodes_[node.right_child].bounds.distanceSquared(point);
+
+      if (left_dist <= best_dist_sq) {
+        node_queue.push_back({left_dist, node.left_child});
+        std::push_heap(node_queue.begin(), node_queue.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+      }
+      if (right_dist <= best_dist_sq) {
+        node_queue.push_back({right_dist, node.right_child});
+        std::push_heap(node_queue.begin(), node_queue.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+      }
+    }
+  }
+
+  distance_sq = best_dist_sq;
+  return best_prim;
+}
+
 // Compute 30-bit Morton code for a point in [0,1]^3
 uint32_t BVH::computeMortonCode(const Vec3& p, const AABB& bounds) const noexcept {
   // Normalize point to [0,1]^3
@@ -2916,6 +3118,18 @@ void TriangleBVH::queryAABB(const AABB& query_aabb, std::vector<uint32_t>& trian
 
 void TriangleBVH::querySphere(const Vec3& center, float radius, std::vector<uint32_t>& triangle_indices) const noexcept {
   bvh_.querySphere(center, radius, triangle_indices);
+}
+
+void TriangleBVH::queryFrustum(const Frustum& frustum, std::vector<uint32_t>& triangle_indices) const noexcept {
+  bvh_.queryFrustum(frustum, triangle_indices);
+}
+
+void TriangleBVH::queryKNN(const Vec3& point, uint32_t k, std::vector<KNNResult>& results) const noexcept {
+  bvh_.queryKNN(point, k, results);
+}
+
+uint32_t TriangleBVH::queryNearest(const Vec3& point, float& distance_sq) const noexcept {
+  return bvh_.queryNearest(point, distance_sq);
 }
 
 // BVH Serialization format:
