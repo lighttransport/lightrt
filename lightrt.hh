@@ -523,9 +523,16 @@ struct alignas(16) AABB {
   
   // Ray-AABB intersection test
   bool intersect(const Ray& ray, float& tmin_out, float& tmax_out) const noexcept;
-  
+
   // SIMD optimized intersection
   bool intersectSIMD(const Ray& ray, float& tmin_out, float& tmax_out) const noexcept;
+
+  // AABB-AABB intersection test
+  bool intersects(const AABB& other) const noexcept {
+    return (min.x <= other.max.x && max.x >= other.min.x) &&
+           (min.y <= other.max.y && max.y >= other.min.y) &&
+           (min.z <= other.max.z && max.z >= other.min.z);
+  }
 };
 
 // ============================================================================
@@ -1299,6 +1306,13 @@ public:
   // Tree structure remains unchanged, only bounds are updated (bottom-up)
   void refit(const std::vector<AABB>& new_prim_aabbs) noexcept;
 
+  // Frustum culling: collect primitives that intersect an AABB
+  // Returns indices of primitives whose AABBs overlap with query_aabb
+  void queryAABB(const AABB& query_aabb, std::vector<uint32_t>& results) const noexcept;
+
+  // Sphere query: collect primitives within sphere radius
+  void querySphere(const Vec3& center, float radius, std::vector<uint32_t>& results) const noexcept;
+
   // Access to nodes (for serialization, etc.)
   const std::vector<BVHNode>& getNodes() const noexcept { return nodes_; }
   std::vector<BVHNode>& getMutableNodes() noexcept { return nodes_; }
@@ -1592,6 +1606,10 @@ public:
   // Updates all node bounds bottom-up without rebuilding tree structure
   // Call after modifying triangles via getMutableTriangles()
   void refit() noexcept;
+
+  // Spatial queries for culling and collision detection
+  void queryAABB(const AABB& query_aabb, std::vector<uint32_t>& triangle_indices) const noexcept;
+  void querySphere(const Vec3& center, float radius, std::vector<uint32_t>& triangle_indices) const noexcept;
 
   // Serialization - save/load BVH to binary format
   // Format version is embedded for forward compatibility

@@ -1667,6 +1667,121 @@ void BVH::refit(const std::vector<AABB>& new_prim_aabbs) noexcept {
   }
 }
 
+// Spatial query: collect primitives that intersect an AABB
+void BVH::queryAABB(const AABB& query_aabb, std::vector<uint32_t>& results) const noexcept {
+  if (nodes_.empty()) {
+    return;
+  }
+
+  results.clear();
+
+  // Track visited primitives to avoid duplicates
+  std::vector<bool> visited(prim_aabbs_.size(), false);
+
+  // Stack-based traversal
+  uint32_t stack[64];
+  uint32_t stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0) {
+    uint32_t node_idx = stack[--stack_ptr];
+    const BVHNode& node = nodes_[node_idx];
+
+    // Test AABB intersection
+    if (!query_aabb.intersects(node.bounds)) {
+      continue;
+    }
+
+    if (node.isLeaf()) {
+      // Add all primitives in leaf to results
+      for (uint32_t i = 0; i < node.prim_count; i++) {
+        uint32_t prim_idx = prim_indices_[node.prim_offset + i];
+        // Test primitive AABB against query (with deduplication)
+        if (prim_idx < prim_aabbs_.size() && !visited[prim_idx] &&
+            query_aabb.intersects(prim_aabbs_[prim_idx])) {
+          visited[prim_idx] = true;
+          results.push_back(prim_idx);
+        }
+      }
+    } else {
+      // Traverse children
+      if (stack_ptr + 2 <= 64) {
+        stack[stack_ptr++] = node.left_child;
+        stack[stack_ptr++] = node.right_child;
+      }
+    }
+  }
+}
+
+// Spatial query: collect primitives within sphere radius
+void BVH::querySphere(const Vec3& center, float radius, std::vector<uint32_t>& results) const noexcept {
+  if (nodes_.empty()) {
+    return;
+  }
+
+  results.clear();
+
+  // Track visited primitives to avoid duplicates
+  std::vector<bool> visited(prim_aabbs_.size(), false);
+
+  float radius_sq = radius * radius;
+
+  // Stack-based traversal
+  uint32_t stack[64];
+  uint32_t stack_ptr = 0;
+  stack[stack_ptr++] = 0;
+
+  while (stack_ptr > 0) {
+    uint32_t node_idx = stack[--stack_ptr];
+    const BVHNode& node = nodes_[node_idx];
+
+    // Test sphere-AABB intersection
+    // Find closest point on AABB to sphere center
+    Vec3 closest;
+    closest.x = std::max(node.bounds.min.x, std::min(center.x, node.bounds.max.x));
+    closest.y = std::max(node.bounds.min.y, std::min(center.y, node.bounds.max.y));
+    closest.z = std::max(node.bounds.min.z, std::min(center.z, node.bounds.max.z));
+
+    Vec3 delta = closest - center;
+    float dist_sq = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
+
+    if (dist_sq > radius_sq) {
+      continue;
+    }
+
+    if (node.isLeaf()) {
+      // Test primitives against sphere
+      for (uint32_t i = 0; i < node.prim_count; i++) {
+        uint32_t prim_idx = prim_indices_[node.prim_offset + i];
+        if (prim_idx >= prim_aabbs_.size()) {
+          continue;
+        }
+
+        // Test primitive AABB against sphere
+        const AABB& prim_aabb = prim_aabbs_[prim_idx];
+        Vec3 prim_closest;
+        prim_closest.x = std::max(prim_aabb.min.x, std::min(center.x, prim_aabb.max.x));
+        prim_closest.y = std::max(prim_aabb.min.y, std::min(center.y, prim_aabb.max.y));
+        prim_closest.z = std::max(prim_aabb.min.z, std::min(center.z, prim_aabb.max.z));
+
+        Vec3 prim_delta = prim_closest - center;
+        float prim_dist_sq = prim_delta.x * prim_delta.x + prim_delta.y * prim_delta.y + prim_delta.z * prim_delta.z;
+
+        if (prim_dist_sq <= radius_sq && !visited[prim_idx]) {
+          visited[prim_idx] = true;
+          results.push_back(prim_idx);
+        }
+      }
+    } else {
+      // Traverse children
+      if (stack_ptr + 2 <= 64) {
+        stack[stack_ptr++] = node.left_child;
+        stack[stack_ptr++] = node.right_child;
+      }
+    }
+  }
+}
+
 // Compute 30-bit Morton code for a point in [0,1]^3
 uint32_t BVH::computeMortonCode(const Vec3& p, const AABB& bounds) const noexcept {
   // Normalize point to [0,1]^3
@@ -2793,6 +2908,14 @@ void TriangleBVH::refit() noexcept {
 
   // Refit the underlying BVH
   bvh_.refit(new_aabbs);
+}
+
+void TriangleBVH::queryAABB(const AABB& query_aabb, std::vector<uint32_t>& triangle_indices) const noexcept {
+  bvh_.queryAABB(query_aabb, triangle_indices);
+}
+
+void TriangleBVH::querySphere(const Vec3& center, float radius, std::vector<uint32_t>& triangle_indices) const noexcept {
+  bvh_.querySphere(center, radius, triangle_indices);
 }
 
 // BVH Serialization format:

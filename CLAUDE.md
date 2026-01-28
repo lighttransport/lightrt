@@ -41,8 +41,8 @@ LightRT is a two-file BVH (Bounding Volume Hierarchy) library: `lightrt.hh` (hea
 - **BVH**: Core single-level BVH used by both BLAS and TLAS
 
 ### Key Classes (all in `lightrt` namespace)
-- `BVH`: Single-level BVH with SAH-based construction and SIMD traversal (AABB primitives)
-- `TriangleBVH`: BVH over triangles with Moller-Trumbore ray-triangle intersection
+- `BVH`: Single-level BVH with SAH-based construction, SIMD traversal, and spatial queries (AABB primitives)
+- `TriangleBVH`: BVH over triangles with Moller-Trumbore ray-triangle intersection and spatial queries
 - `BLAS`: Wraps BVH for bottom-level geometry
 - `TLAS`: Manages instanced scene with `BLASInstance` transforms
 - `BVHNode`: Interior/leaf node using union for child indices or primitive offset/count
@@ -218,6 +218,52 @@ Implementation uses:
 - 30-bit Morton codes (10 bits per axis)
 - Radix sort for O(N) ordering
 - Bit-level tree construction
+
+## Spatial Queries
+
+BVH provides efficient spatial indexing for broad-phase collision detection and frustum culling.
+
+### AABB Query
+
+Collect all primitives whose AABBs intersect a query AABB:
+
+```cpp
+// Query all triangles within a bounding box
+AABB query_box(Vec3(0, 0, 0), Vec3(10, 10, 10));
+std::vector<uint32_t> results;
+bvh.queryAABB(query_box, results);
+
+// Results contains indices of intersecting triangles
+for (uint32_t tri_idx : results) {
+  // Process triangle tri_idx
+}
+```
+
+### Sphere Query
+
+Collect all primitives within a sphere radius:
+
+```cpp
+// Query all triangles within sphere
+Vec3 center(5.0f, 5.0f, 5.0f);
+float radius = 3.0f;
+std::vector<uint32_t> results;
+bvh.querySphere(center, radius, results);
+```
+
+### Use Cases
+
+- **Frustum culling**: Use AABB query with view frustum bounds
+- **Broad-phase collision**: Find potential collision candidates
+- **Area-of-effect**: Find entities within explosion/effect radius
+- **Spatial indexing**: Range queries for nearest neighbor search
+
+### Performance
+
+Spatial queries traverse the BVH tree, testing nodes against the query volume:
+- **Time complexity**: O(log N + K) where K is the result count
+- **Stack-based traversal**: No recursion overhead
+- **Early culling**: Skips entire subtrees when bounds don't intersect
 
 ## Benchmark (`benchmark/benchmark.cc`)
 
