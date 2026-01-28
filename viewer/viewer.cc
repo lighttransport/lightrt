@@ -56,6 +56,7 @@ bool g_keys[1024] = {0};
 double g_lastX = 0, g_lastY = 0;
 bool g_firstMouse = true;
 bool g_mouseCaptured = false;
+int g_renderMode = 0;  // 0=solid, 1=wireframe, 2=overlay
 
 // --- Loader Functions ---
 
@@ -376,6 +377,8 @@ struct VulkanContext {
 
 // --- Application Logic ---
 
+static bool g_fKeyWasPressed = false;
+
 void processInput(GLFWwindow* window, float dt) {
     if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
         glfwSetWindowShouldClose(window, true);
@@ -385,6 +388,13 @@ void processInput(GLFWwindow* window, float dt) {
     if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) g_camera.position = g_camera.position - g_camera.forward * speed;
     if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) g_camera.position = g_camera.position - g_camera.right * speed;
     if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) g_camera.position = g_camera.position + g_camera.right * speed;
+
+    // Toggle render mode with F key (solid -> wireframe -> overlay -> solid)
+    bool fKeyPressed = glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS;
+    if (fKeyPressed && !g_fKeyWasPressed) {
+        g_renderMode = (g_renderMode + 1) % 3;
+    }
+    g_fKeyWasPressed = fKeyPressed;
 }
 
 void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
@@ -430,6 +440,135 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
         } else {
             glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
         }
+    }
+}
+
+// Project 3D world point to screen coordinates
+// Returns false if point is behind camera
+bool projectToScreen(const Vec3& worldPos, const Camera& cam,
+                     int width, int height, int& screenX, int& screenY) {
+    // Transform to camera space
+    Vec3 toPoint = worldPos - cam.position;
+
+    // Project onto camera axes
+    float z = toPoint.dot(cam.forward);  // depth
+    if (z <= 0.001f) return false;  // Behind camera
+
+    float x = toPoint.dot(cam.right);
+    float y = toPoint.dot(cam.up);
+
+    // Perspective projection
+    float aspectRatio = (float)width / height;
+    float scale = tan(cam.fov * 0.5f * 3.14159f / 180.0f);
+
+    float ndcX = x / (z * aspectRatio * scale);
+    float ndcY = y / (z * scale);
+
+    // NDC to screen coordinates
+    screenX = (int)((ndcX + 1.0f) * 0.5f * width);
+    screenY = (int)((1.0f - ndcY) * 0.5f * height);  // Y is flipped
+
+    return true;
+}
+
+// Bresenham's line algorithm with bounds checking
+void drawLine(std::vector<uint32_t>& buffer, int width, int height,
+              int x0, int y0, int x1, int y1, uint32_t color) {
+    // Cohen-Sutherland clipping regions
+    auto computeCode = [width, height](int x, int y) -> int {
+        int code = 0;
+        if (x < 0) code |= 1;       // left
+        if (x >= width) code |= 2;  // right
+        if (y < 0) code |= 4;       // top
+        if (y >= height) code |= 8; // bottom
+        return code;
+    };
+
+    int code0 = computeCode(x0, y0);
+    int code1 = computeCode(x1, y1);
+
+    // Simple rejection: both points outside on same side
+    if (code0 & code1) return;
+
+    // Clip line to screen bounds (simplified)
+    auto clipLine = [&]() -> bool {
+        for (int i = 0; i < 4; i++) {
+            if (code0 == 0 && code1 == 0) return true;
+            if (code0 & code1) return false;
+
+            int code = code0 ? code0 : code1;
+            int x, y;
+
+            if (code & 8) {  // below
+                x = x0 + (x1 - x0) * (height - 1 - y0) / (y1 - y0);
+                y = height - 1;
+            } else if (code & 4) {  // above
+                x = x0 + (x1 - x0) * (0 - y0) / (y1 - y0);
+                y = 0;
+            } else if (code & 2) {  // right
+                y = y0 + (y1 - y0) * (width - 1 - x0) / (x1 - x0);
+                x = width - 1;
+            } else {  // left
+                y = y0 + (y1 - y0) * (0 - x0) / (x1 - x0);
+                x = 0;
+            }
+
+            if (code == code0) {
+                x0 = x; y0 = y;
+                code0 = computeCode(x0, y0);
+            } else {
+                x1 = x; y1 = y;
+                code1 = computeCode(x1, y1);
+            }
+        }
+        return code0 == 0 && code1 == 0;
+    };
+
+    if (!clipLine()) return;
+
+    // Bresenham's algorithm
+    int dx = abs(x1 - x0);
+    int dy = abs(y1 - y0);
+    int sx = x0 < x1 ? 1 : -1;
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx - dy;
+
+    while (true) {
+        if (x0 >= 0 && x0 < width && y0 >= 0 && y0 < height) {
+            buffer[y0 * width + x0] = color;
+        }
+
+        if (x0 == x1 && y0 == y1) break;
+
+        int e2 = 2 * err;
+        if (e2 > -dy) {
+            err -= dy;
+            x0 += sx;
+        }
+        if (e2 < dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+// Render wireframe edges of all triangles
+void RenderWireframe(std::vector<uint32_t>& buffer, int width, int height,
+                     const Camera& cam, uint32_t edgeColor) {
+    for (const auto& tri : g_mesh.triangles) {
+        int sx0 = 0, sy0 = 0, sx1 = 0, sy1 = 0, sx2 = 0, sy2 = 0;
+
+        bool v0_visible = projectToScreen(tri.v0, cam, width, height, sx0, sy0);
+        bool v1_visible = projectToScreen(tri.v1, cam, width, height, sx1, sy1);
+        bool v2_visible = projectToScreen(tri.v2, cam, width, height, sx2, sy2);
+
+        // Draw edges only if both vertices are in front of camera
+        if (v0_visible && v1_visible)
+            drawLine(buffer, width, height, sx0, sy0, sx1, sy1, edgeColor);
+        if (v1_visible && v2_visible)
+            drawLine(buffer, width, height, sx1, sy1, sx2, sy2, edgeColor);
+        if (v2_visible && v0_visible)
+            drawLine(buffer, width, height, sx2, sy2, sx0, sy0, edgeColor);
     }
 }
 
@@ -538,9 +677,21 @@ int main(int argc, char** argv) {
             lastTime = currentTime;
         }
 
-        processInput(window, 0.016f); 
+        processInput(window, 0.016f);
 
-        RayTrace(pixels, g_width, g_height);
+        // Render based on mode
+        if (g_renderMode == 0 || g_renderMode == 2) {
+            // Solid shading
+            RayTrace(pixels, g_width, g_height);
+        }
+        if (g_renderMode == 1) {
+            // Wireframe only - clear to dark background
+            std::fill(pixels.begin(), pixels.end(), 0xFF111111);
+        }
+        if (g_renderMode == 1 || g_renderMode == 2) {
+            // Draw wireframe edges (green)
+            RenderWireframe(pixels, g_width, g_height, g_camera, 0xFF00FF00);
+        }
 
         std::string stats = "FPS: " + std::to_string((int)fps);
         DrawString(10, 10, stats.c_str(), 0xFFFFFFFF, pixels.data(), g_width, g_height);
@@ -548,7 +699,8 @@ int main(int argc, char** argv) {
         std::string tris = "Tris: " + std::to_string(g_mesh.triangles.size());
         DrawString(10, 25, tris.c_str(), 0xFFFFFFFF, pixels.data(), g_width, g_height);
         
-        std::string help = "WASD Move, Click Mouse Capture";
+        const char* modeNames[] = {"Solid", "Wire", "Overlay"};
+        std::string help = "WASD Move, Click Mouse Capture, F: Mode [" + std::string(modeNames[g_renderMode]) + "]";
         DrawString(10, g_height - 20, help.c_str(), 0xFFFFFF00, pixels.data(), g_width, g_height);
 
         vk.Present(pixels);
