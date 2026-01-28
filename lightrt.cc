@@ -1984,6 +1984,460 @@ uint32_t BVH::queryNearest(const Vec3& point, float& distance_sq) const noexcept
   return best_prim;
 }
 
+// ============================================================================
+// Collision Detection
+// ============================================================================
+
+void BVH::findCollisions(const BVH& other, std::vector<CollisionPair>& pairs) const noexcept {
+  findCollisions(other, 0.0f, pairs);
+}
+
+void BVH::findCollisions(const BVH& other, float max_distance,
+                         std::vector<CollisionPair>& pairs) const noexcept {
+  pairs.clear();
+
+  if (nodes_.empty() || other.nodes_.empty()) {
+    return;
+  }
+
+  float max_dist_sq = max_distance * max_distance;
+
+  // Track visited pairs to avoid duplicates
+  // Use a simple approach: store pairs in a set-like structure
+  // For efficiency, we'll just check during traversal
+
+  // Stack for simultaneous BVH traversal: (node_a, node_b)
+  std::vector<std::pair<uint32_t, uint32_t>> stack;
+  stack.reserve(128);
+  stack.push_back({0, 0});
+
+  while (!stack.empty()) {
+    auto [idx_a, idx_b] = stack.back();
+    stack.pop_back();
+
+    const BVHNode& node_a = nodes_[idx_a];
+    const BVHNode& node_b = other.nodes_[idx_b];
+
+    // Check if node bounds overlap (with max_distance threshold)
+    if (max_distance > 0.0f) {
+      // Expand bounds by max_distance for threshold check
+      AABB expanded_a = node_a.bounds;
+      expanded_a.min = expanded_a.min - Vec3(max_distance, max_distance, max_distance);
+      expanded_a.max = expanded_a.max + Vec3(max_distance, max_distance, max_distance);
+      if (!expanded_a.intersects(node_b.bounds)) {
+        continue;
+      }
+    } else {
+      if (!node_a.bounds.intersects(node_b.bounds)) {
+        continue;
+      }
+    }
+
+    bool a_leaf = node_a.isLeaf();
+    bool b_leaf = node_b.isLeaf();
+
+    if (a_leaf && b_leaf) {
+      // Both leaves: test all primitive pairs
+      for (uint32_t i = 0; i < node_a.prim_count; i++) {
+        uint32_t prim_a = prim_indices_[node_a.prim_offset + i];
+        if (prim_a >= prim_aabbs_.size()) continue;
+
+        for (uint32_t j = 0; j < node_b.prim_count; j++) {
+          uint32_t prim_b = other.prim_indices_[node_b.prim_offset + j];
+          if (prim_b >= other.prim_aabbs_.size()) continue;
+
+          const AABB& aabb_a = prim_aabbs_[prim_a];
+          const AABB& aabb_b = other.prim_aabbs_[prim_b];
+
+          if (max_distance > 0.0f) {
+            // Check distance threshold
+            float dist_sq = 0.0f;
+            for (int k = 0; k < 3; k++) {
+              float gap = std::max(0.0f, std::max(aabb_a.min[k] - aabb_b.max[k],
+                                                   aabb_b.min[k] - aabb_a.max[k]));
+              dist_sq += gap * gap;
+            }
+            if (dist_sq <= max_dist_sq) {
+              pairs.push_back({prim_a, prim_b, dist_sq});
+            }
+          } else {
+            // Check exact overlap
+            if (aabb_a.intersects(aabb_b)) {
+              pairs.push_back({prim_a, prim_b, 0.0f});
+            }
+          }
+        }
+      }
+    } else if (a_leaf) {
+      // A is leaf, descend B
+      stack.push_back({idx_a, node_b.left_child});
+      stack.push_back({idx_a, node_b.right_child});
+    } else if (b_leaf) {
+      // B is leaf, descend A
+      stack.push_back({node_a.left_child, idx_b});
+      stack.push_back({node_a.right_child, idx_b});
+    } else {
+      // Both internal: descend larger node first for better culling
+      float vol_a = node_a.bounds.surfaceArea();
+      float vol_b = node_b.bounds.surfaceArea();
+      if (vol_a > vol_b) {
+        stack.push_back({node_a.left_child, idx_b});
+        stack.push_back({node_a.right_child, idx_b});
+      } else {
+        stack.push_back({idx_a, node_b.left_child});
+        stack.push_back({idx_a, node_b.right_child});
+      }
+    }
+  }
+}
+
+void BVH::findSelfCollisions(std::vector<CollisionPair>& pairs) const noexcept {
+  pairs.clear();
+
+  if (nodes_.empty()) {
+    return;
+  }
+
+  // Track visited primitive pairs to avoid duplicates
+  // Simple approach: only report pair (a, b) where a < b
+
+  // Stack for self-collision: (node_a, node_b) where we test node_a against node_b
+  // Also need to test children of same node against each other
+  std::vector<std::pair<uint32_t, uint32_t>> stack;
+  stack.reserve(128);
+
+  // Start with root's children against each other
+  if (!nodes_[0].isLeaf()) {
+    stack.push_back({nodes_[0].left_child, nodes_[0].right_child});
+    // Also recursively check within each child
+    stack.push_back({nodes_[0].left_child, nodes_[0].left_child});
+    stack.push_back({nodes_[0].right_child, nodes_[0].right_child});
+  } else {
+    // Root is a leaf - check all pairs within it
+    const BVHNode& root = nodes_[0];
+    for (uint32_t i = 0; i < root.prim_count; i++) {
+      for (uint32_t j = i + 1; j < root.prim_count; j++) {
+        uint32_t prim_a = prim_indices_[root.prim_offset + i];
+        uint32_t prim_b = prim_indices_[root.prim_offset + j];
+        if (prim_a >= prim_aabbs_.size() || prim_b >= prim_aabbs_.size()) continue;
+        if (prim_aabbs_[prim_a].intersects(prim_aabbs_[prim_b])) {
+          pairs.push_back({std::min(prim_a, prim_b), std::max(prim_a, prim_b), 0.0f});
+        }
+      }
+    }
+    return;
+  }
+
+  while (!stack.empty()) {
+    auto [idx_a, idx_b] = stack.back();
+    stack.pop_back();
+
+    const BVHNode& node_a = nodes_[idx_a];
+    const BVHNode& node_b = nodes_[idx_b];
+
+    // Same node: need to check within this subtree
+    if (idx_a == idx_b) {
+      if (node_a.isLeaf()) {
+        // Check all pairs within leaf
+        for (uint32_t i = 0; i < node_a.prim_count; i++) {
+          for (uint32_t j = i + 1; j < node_a.prim_count; j++) {
+            uint32_t prim_a = prim_indices_[node_a.prim_offset + i];
+            uint32_t prim_b = prim_indices_[node_a.prim_offset + j];
+            if (prim_a >= prim_aabbs_.size() || prim_b >= prim_aabbs_.size()) continue;
+            if (prim_aabbs_[prim_a].intersects(prim_aabbs_[prim_b])) {
+              pairs.push_back({std::min(prim_a, prim_b), std::max(prim_a, prim_b), 0.0f});
+            }
+          }
+        }
+      } else {
+        // Check children against each other and within themselves
+        stack.push_back({node_a.left_child, node_a.right_child});
+        stack.push_back({node_a.left_child, node_a.left_child});
+        stack.push_back({node_a.right_child, node_a.right_child});
+      }
+      continue;
+    }
+
+    // Different nodes: check if bounds overlap
+    if (!node_a.bounds.intersects(node_b.bounds)) {
+      continue;
+    }
+
+    bool a_leaf = node_a.isLeaf();
+    bool b_leaf = node_b.isLeaf();
+
+    if (a_leaf && b_leaf) {
+      // Both leaves: test all primitive pairs
+      for (uint32_t i = 0; i < node_a.prim_count; i++) {
+        uint32_t prim_a = prim_indices_[node_a.prim_offset + i];
+        if (prim_a >= prim_aabbs_.size()) continue;
+
+        for (uint32_t j = 0; j < node_b.prim_count; j++) {
+          uint32_t prim_b = prim_indices_[node_b.prim_offset + j];
+          if (prim_b >= prim_aabbs_.size()) continue;
+          if (prim_a == prim_b) continue;  // Skip same primitive
+
+          if (prim_aabbs_[prim_a].intersects(prim_aabbs_[prim_b])) {
+            pairs.push_back({std::min(prim_a, prim_b), std::max(prim_a, prim_b), 0.0f});
+          }
+        }
+      }
+    } else if (a_leaf) {
+      stack.push_back({idx_a, node_b.left_child});
+      stack.push_back({idx_a, node_b.right_child});
+    } else if (b_leaf) {
+      stack.push_back({node_a.left_child, idx_b});
+      stack.push_back({node_a.right_child, idx_b});
+    } else {
+      // Both internal: cross-check all pairs of children
+      stack.push_back({node_a.left_child, node_b.left_child});
+      stack.push_back({node_a.left_child, node_b.right_child});
+      stack.push_back({node_a.right_child, node_b.left_child});
+      stack.push_back({node_a.right_child, node_b.right_child});
+    }
+  }
+
+  // Remove duplicates (may occur due to traversal order)
+  std::sort(pairs.begin(), pairs.end(), [](const CollisionPair& a, const CollisionPair& b) {
+    if (a.prim_a != b.prim_a) return a.prim_a < b.prim_a;
+    return a.prim_b < b.prim_b;
+  });
+  pairs.erase(std::unique(pairs.begin(), pairs.end(), [](const CollisionPair& a, const CollisionPair& b) {
+    return a.prim_a == b.prim_a && a.prim_b == b.prim_b;
+  }), pairs.end());
+}
+
+bool BVH::findSweptCollision(const BVH& other, const Vec3& velocity,
+                             SweptCollisionResult& result) const noexcept {
+  std::vector<SweptCollisionResult> all_results;
+  findAllSweptCollisions(other, velocity, all_results);
+
+  if (all_results.empty()) {
+    return false;
+  }
+
+  // Find earliest collision
+  result = all_results[0];
+  for (const auto& r : all_results) {
+    if (r.t_first < result.t_first) {
+      result = r;
+    }
+  }
+  return true;
+}
+
+void BVH::findAllSweptCollisions(const BVH& other, const Vec3& velocity,
+                                 std::vector<SweptCollisionResult>& results) const noexcept {
+  results.clear();
+
+  if (nodes_.empty() || other.nodes_.empty()) {
+    return;
+  }
+
+  // Stack for simultaneous BVH traversal
+  std::vector<std::pair<uint32_t, uint32_t>> stack;
+  stack.reserve(128);
+  stack.push_back({0, 0});
+
+  while (!stack.empty()) {
+    auto [idx_a, idx_b] = stack.back();
+    stack.pop_back();
+
+    const BVHNode& node_a = nodes_[idx_a];
+    const BVHNode& node_b = other.nodes_[idx_b];
+
+    // Check if swept node_a bounds intersect node_b bounds
+    float t_first, t_last;
+    if (!node_a.bounds.intersectSwept(node_b.bounds, velocity, t_first, t_last)) {
+      continue;
+    }
+
+    bool a_leaf = node_a.isLeaf();
+    bool b_leaf = node_b.isLeaf();
+
+    if (a_leaf && b_leaf) {
+      // Both leaves: test all primitive pairs
+      for (uint32_t i = 0; i < node_a.prim_count; i++) {
+        uint32_t prim_a = prim_indices_[node_a.prim_offset + i];
+        if (prim_a >= prim_aabbs_.size()) continue;
+
+        for (uint32_t j = 0; j < node_b.prim_count; j++) {
+          uint32_t prim_b = other.prim_indices_[node_b.prim_offset + j];
+          if (prim_b >= other.prim_aabbs_.size()) continue;
+
+          float prim_t_first, prim_t_last;
+          if (prim_aabbs_[prim_a].intersectSwept(other.prim_aabbs_[prim_b], velocity,
+                                                  prim_t_first, prim_t_last)) {
+            // Compute collision normal (approximation using AABB penetration direction)
+            Vec3 normal(0, 1, 0);
+            AABB moved_a = prim_aabbs_[prim_a];
+            moved_a.min = moved_a.min + velocity * prim_t_first;
+            moved_a.max = moved_a.max + velocity * prim_t_first;
+            float depth;
+            moved_a.computePenetration(other.prim_aabbs_[prim_b], normal, depth);
+
+            results.push_back({prim_a, prim_b, prim_t_first, prim_t_last, normal});
+          }
+        }
+      }
+    } else if (a_leaf) {
+      stack.push_back({idx_a, node_b.left_child});
+      stack.push_back({idx_a, node_b.right_child});
+    } else if (b_leaf) {
+      stack.push_back({node_a.left_child, idx_b});
+      stack.push_back({node_a.right_child, idx_b});
+    } else {
+      float vol_a = node_a.bounds.surfaceArea();
+      float vol_b = node_b.bounds.surfaceArea();
+      if (vol_a > vol_b) {
+        stack.push_back({node_a.left_child, idx_b});
+        stack.push_back({node_a.right_child, idx_b});
+      } else {
+        stack.push_back({idx_a, node_b.left_child});
+        stack.push_back({idx_a, node_b.right_child});
+      }
+    }
+  }
+
+  // Sort by time of first contact
+  std::sort(results.begin(), results.end(), [](const SweptCollisionResult& a, const SweptCollisionResult& b) {
+    return a.t_first < b.t_first;
+  });
+}
+
+bool BVH::hasCollision(const BVH& other) const noexcept {
+  if (nodes_.empty() || other.nodes_.empty()) {
+    return false;
+  }
+
+  // Stack for simultaneous BVH traversal
+  std::vector<std::pair<uint32_t, uint32_t>> stack;
+  stack.reserve(64);
+  stack.push_back({0, 0});
+
+  while (!stack.empty()) {
+    auto [idx_a, idx_b] = stack.back();
+    stack.pop_back();
+
+    const BVHNode& node_a = nodes_[idx_a];
+    const BVHNode& node_b = other.nodes_[idx_b];
+
+    if (!node_a.bounds.intersects(node_b.bounds)) {
+      continue;
+    }
+
+    bool a_leaf = node_a.isLeaf();
+    bool b_leaf = node_b.isLeaf();
+
+    if (a_leaf && b_leaf) {
+      // Test primitives
+      for (uint32_t i = 0; i < node_a.prim_count; i++) {
+        uint32_t prim_a = prim_indices_[node_a.prim_offset + i];
+        if (prim_a >= prim_aabbs_.size()) continue;
+
+        for (uint32_t j = 0; j < node_b.prim_count; j++) {
+          uint32_t prim_b = other.prim_indices_[node_b.prim_offset + j];
+          if (prim_b >= other.prim_aabbs_.size()) continue;
+
+          if (prim_aabbs_[prim_a].intersects(other.prim_aabbs_[prim_b])) {
+            return true;  // Early exit
+          }
+        }
+      }
+    } else if (a_leaf) {
+      stack.push_back({idx_a, node_b.left_child});
+      stack.push_back({idx_a, node_b.right_child});
+    } else if (b_leaf) {
+      stack.push_back({node_a.left_child, idx_b});
+      stack.push_back({node_a.right_child, idx_b});
+    } else {
+      float vol_a = node_a.bounds.surfaceArea();
+      float vol_b = node_b.bounds.surfaceArea();
+      if (vol_a > vol_b) {
+        stack.push_back({node_a.left_child, idx_b});
+        stack.push_back({node_a.right_child, idx_b});
+      } else {
+        stack.push_back({idx_a, node_b.left_child});
+        stack.push_back({idx_a, node_b.right_child});
+      }
+    }
+  }
+
+  return false;
+}
+
+bool BVH::hasSelfCollision() const noexcept {
+  if (nodes_.empty()) {
+    return false;
+  }
+
+  // Stack for self-collision check
+  std::vector<std::pair<uint32_t, uint32_t>> stack;
+  stack.reserve(64);
+
+  if (!nodes_[0].isLeaf()) {
+    stack.push_back({nodes_[0].left_child, nodes_[0].right_child});
+  } else {
+    // Check pairs in root leaf
+    const BVHNode& root = nodes_[0];
+    for (uint32_t i = 0; i < root.prim_count; i++) {
+      for (uint32_t j = i + 1; j < root.prim_count; j++) {
+        uint32_t prim_a = prim_indices_[root.prim_offset + i];
+        uint32_t prim_b = prim_indices_[root.prim_offset + j];
+        if (prim_a >= prim_aabbs_.size() || prim_b >= prim_aabbs_.size()) continue;
+        if (prim_aabbs_[prim_a].intersects(prim_aabbs_[prim_b])) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  while (!stack.empty()) {
+    auto [idx_a, idx_b] = stack.back();
+    stack.pop_back();
+
+    const BVHNode& node_a = nodes_[idx_a];
+    const BVHNode& node_b = nodes_[idx_b];
+
+    if (!node_a.bounds.intersects(node_b.bounds)) {
+      continue;
+    }
+
+    bool a_leaf = node_a.isLeaf();
+    bool b_leaf = node_b.isLeaf();
+
+    if (a_leaf && b_leaf) {
+      for (uint32_t i = 0; i < node_a.prim_count; i++) {
+        uint32_t prim_a = prim_indices_[node_a.prim_offset + i];
+        if (prim_a >= prim_aabbs_.size()) continue;
+
+        for (uint32_t j = 0; j < node_b.prim_count; j++) {
+          uint32_t prim_b = prim_indices_[node_b.prim_offset + j];
+          if (prim_b >= prim_aabbs_.size() || prim_a == prim_b) continue;
+
+          if (prim_aabbs_[prim_a].intersects(prim_aabbs_[prim_b])) {
+            return true;
+          }
+        }
+      }
+    } else if (a_leaf) {
+      stack.push_back({idx_a, node_b.left_child});
+      stack.push_back({idx_a, node_b.right_child});
+    } else if (b_leaf) {
+      stack.push_back({node_a.left_child, idx_b});
+      stack.push_back({node_a.right_child, idx_b});
+    } else {
+      stack.push_back({node_a.left_child, node_b.left_child});
+      stack.push_back({node_a.left_child, node_b.right_child});
+      stack.push_back({node_a.right_child, node_b.left_child});
+      stack.push_back({node_a.right_child, node_b.right_child});
+    }
+  }
+
+  return false;
+}
+
 // Compute 30-bit Morton code for a point in [0,1]^3
 uint32_t BVH::computeMortonCode(const Vec3& p, const AABB& bounds) const noexcept {
   // Normalize point to [0,1]^3
@@ -3130,6 +3584,37 @@ void TriangleBVH::queryKNN(const Vec3& point, uint32_t k, std::vector<KNNResult>
 
 uint32_t TriangleBVH::queryNearest(const Vec3& point, float& distance_sq) const noexcept {
   return bvh_.queryNearest(point, distance_sq);
+}
+
+void TriangleBVH::findCollisions(const TriangleBVH& other, std::vector<CollisionPair>& pairs) const noexcept {
+  bvh_.findCollisions(other.bvh_, pairs);
+}
+
+void TriangleBVH::findCollisions(const TriangleBVH& other, float max_distance,
+                                 std::vector<CollisionPair>& pairs) const noexcept {
+  bvh_.findCollisions(other.bvh_, max_distance, pairs);
+}
+
+void TriangleBVH::findSelfCollisions(std::vector<CollisionPair>& pairs) const noexcept {
+  bvh_.findSelfCollisions(pairs);
+}
+
+bool TriangleBVH::findSweptCollision(const TriangleBVH& other, const Vec3& velocity,
+                                     SweptCollisionResult& result) const noexcept {
+  return bvh_.findSweptCollision(other.bvh_, velocity, result);
+}
+
+void TriangleBVH::findAllSweptCollisions(const TriangleBVH& other, const Vec3& velocity,
+                                         std::vector<SweptCollisionResult>& results) const noexcept {
+  bvh_.findAllSweptCollisions(other.bvh_, velocity, results);
+}
+
+bool TriangleBVH::hasCollision(const TriangleBVH& other) const noexcept {
+  return bvh_.hasCollision(other.bvh_);
+}
+
+bool TriangleBVH::hasSelfCollision() const noexcept {
+  return bvh_.hasSelfCollision();
 }
 
 // BVH Serialization format:

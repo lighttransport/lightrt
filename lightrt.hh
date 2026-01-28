@@ -555,6 +555,117 @@ struct alignas(16) AABB {
     }
     return dist_sq;
   }
+
+  // Swept AABB intersection (continuous collision detection)
+  // Tests if this AABB moving by velocity collides with static other AABB
+  // Returns true if collision occurs, with time of first contact in t_first
+  // and time of last contact in t_last (for the interval [0, 1])
+  bool intersectSwept(const AABB& other, const Vec3& velocity,
+                      float& t_first, float& t_last) const noexcept {
+    t_first = 0.0f;
+    t_last = 1.0f;
+
+    for (int i = 0; i < 3; i++) {
+      float v = velocity[i];
+      float a_min = min[i], a_max = max[i];
+      float b_min = other.min[i], b_max = other.max[i];
+
+      if (std::abs(v) < 1e-10f) {
+        // No movement on this axis - check static overlap
+        if (a_max < b_min || a_min > b_max) {
+          return false;  // No overlap, no collision possible
+        }
+      } else {
+        // Compute time intervals when AABBs overlap on this axis
+        float t0 = (b_min - a_max) / v;  // Time when A's max reaches B's min
+        float t1 = (b_max - a_min) / v;  // Time when A's min reaches B's max
+
+        if (t0 > t1) std::swap(t0, t1);
+
+        t_first = std::max(t_first, t0);
+        t_last = std::min(t_last, t1);
+
+        if (t_first > t_last || t_last < 0.0f || t_first > 1.0f) {
+          return false;
+        }
+      }
+    }
+
+    return t_first <= t_last && t_first <= 1.0f && t_last >= 0.0f;
+  }
+
+  // Minkowski sum of two AABBs (useful for collision detection)
+  AABB minkowskiSum(const AABB& other) const noexcept {
+    return AABB(
+      Vec3(min.x + other.min.x, min.y + other.min.y, min.z + other.min.z),
+      Vec3(max.x + other.max.x, max.y + other.max.y, max.z + other.max.z)
+    );
+  }
+
+  // Minkowski difference (this - other), useful for GJK-style collision
+  AABB minkowskiDifference(const AABB& other) const noexcept {
+    return AABB(
+      Vec3(min.x - other.max.x, min.y - other.max.y, min.z - other.max.z),
+      Vec3(max.x - other.min.x, max.y - other.min.y, max.z - other.min.z)
+    );
+  }
+
+  // Check if point is inside AABB
+  bool contains(const Vec3& point) const noexcept {
+    return point.x >= min.x && point.x <= max.x &&
+           point.y >= min.y && point.y <= max.y &&
+           point.z >= min.z && point.z <= max.z;
+  }
+
+  // Compute penetration depth and normal for overlapping AABBs
+  // Returns false if AABBs don't overlap
+  bool computePenetration(const AABB& other, Vec3& normal, float& depth) const noexcept {
+    if (!intersects(other)) {
+      return false;
+    }
+
+    // Compute overlap on each axis
+    float overlap_x = std::min(max.x, other.max.x) - std::max(min.x, other.min.x);
+    float overlap_y = std::min(max.y, other.max.y) - std::max(min.y, other.min.y);
+    float overlap_z = std::min(max.z, other.max.z) - std::max(min.z, other.min.z);
+
+    // Find minimum penetration axis
+    if (overlap_x <= overlap_y && overlap_x <= overlap_z) {
+      depth = overlap_x;
+      normal = (center().x < other.center().x) ? Vec3(-1, 0, 0) : Vec3(1, 0, 0);
+    } else if (overlap_y <= overlap_z) {
+      depth = overlap_y;
+      normal = (center().y < other.center().y) ? Vec3(0, -1, 0) : Vec3(0, 1, 0);
+    } else {
+      depth = overlap_z;
+      normal = (center().z < other.center().z) ? Vec3(0, 0, -1) : Vec3(0, 0, 1);
+    }
+    return true;
+  }
+};
+
+// ============================================================================
+// Collision Result Structures
+// ============================================================================
+
+// Result of a collision query between two primitives
+struct CollisionPair {
+  uint32_t prim_a;      // Primitive index from first BVH
+  uint32_t prim_b;      // Primitive index from second BVH
+  float distance_sq;    // Squared distance (0 if overlapping)
+
+  bool operator<(const CollisionPair& other) const noexcept {
+    return distance_sq < other.distance_sq;
+  }
+};
+
+// Result of swept collision detection
+struct SweptCollisionResult {
+  uint32_t prim_a;      // Primitive index from moving BVH
+  uint32_t prim_b;      // Primitive index from static BVH
+  float t_first;        // Time of first contact [0, 1]
+  float t_last;         // Time of last contact [0, 1]
+  Vec3 normal;          // Collision normal (points from B to A)
 };
 
 // ============================================================================
@@ -1448,6 +1559,37 @@ public:
   // Returns kInvalidIndex if BVH is empty
   uint32_t queryNearest(const Vec3& point, float& distance_sq) const noexcept;
 
+  // =========================================================================
+  // Collision Detection
+  // =========================================================================
+
+  // Find all colliding primitive pairs between this BVH and another
+  // Returns pairs where primitive AABBs overlap
+  void findCollisions(const BVH& other, std::vector<CollisionPair>& pairs) const noexcept;
+
+  // Find colliding pairs with distance threshold (broad-phase + narrow-phase)
+  // max_distance: maximum separation to consider as "near collision"
+  void findCollisions(const BVH& other, float max_distance,
+                      std::vector<CollisionPair>& pairs) const noexcept;
+
+  // Self-collision detection: find all overlapping primitive pairs within this BVH
+  void findSelfCollisions(std::vector<CollisionPair>& pairs) const noexcept;
+
+  // Swept collision: find first collision as this BVH moves by velocity
+  // Returns true if collision found, with result containing contact info
+  bool findSweptCollision(const BVH& other, const Vec3& velocity,
+                          SweptCollisionResult& result) const noexcept;
+
+  // Find all swept collisions (not just the first)
+  void findAllSweptCollisions(const BVH& other, const Vec3& velocity,
+                              std::vector<SweptCollisionResult>& results) const noexcept;
+
+  // Test if any collision exists (fast early-out)
+  bool hasCollision(const BVH& other) const noexcept;
+
+  // Test if any self-collision exists
+  bool hasSelfCollision() const noexcept;
+
   // Access to nodes (for serialization, etc.)
   const std::vector<BVHNode>& getNodes() const noexcept { return nodes_; }
   std::vector<BVHNode>& getMutableNodes() noexcept { return nodes_; }
@@ -1748,6 +1890,18 @@ public:
   void queryFrustum(const Frustum& frustum, std::vector<uint32_t>& triangle_indices) const noexcept;
   void queryKNN(const Vec3& point, uint32_t k, std::vector<KNNResult>& results) const noexcept;
   uint32_t queryNearest(const Vec3& point, float& distance_sq) const noexcept;
+
+  // Collision detection
+  void findCollisions(const TriangleBVH& other, std::vector<CollisionPair>& pairs) const noexcept;
+  void findCollisions(const TriangleBVH& other, float max_distance,
+                      std::vector<CollisionPair>& pairs) const noexcept;
+  void findSelfCollisions(std::vector<CollisionPair>& pairs) const noexcept;
+  bool findSweptCollision(const TriangleBVH& other, const Vec3& velocity,
+                          SweptCollisionResult& result) const noexcept;
+  void findAllSweptCollisions(const TriangleBVH& other, const Vec3& velocity,
+                              std::vector<SweptCollisionResult>& results) const noexcept;
+  bool hasCollision(const TriangleBVH& other) const noexcept;
+  bool hasSelfCollision() const noexcept;
 
   // Serialization - save/load BVH to binary format
   // Format version is embedded for forward compatibility
