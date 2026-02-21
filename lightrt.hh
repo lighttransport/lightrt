@@ -1712,13 +1712,16 @@ private:
   uint32_t buildRecursive(
     uint32_t* indices,
     uint32_t num_prims,
-    uint32_t depth) noexcept;
+    uint32_t depth,
+    const AABB* precomputed_bounds = nullptr) noexcept;
   
   // Split methods
   struct SplitResult {
     int axis;
     float pos;
     float cost;
+    AABB left_bounds;   // Precomputed left child bounds
+    AABB right_bounds;  // Precomputed right child bounds
   };
   
   SplitResult findBestSplit(

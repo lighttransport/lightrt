@@ -1378,16 +1378,20 @@ bool BVH::build(const std::vector<AABB>& prim_aabbs, const BVHBuildConfig& confi
   return true;
 }
 
-uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t depth) noexcept {
+uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t depth,
+                              const AABB* precomputed_bounds) noexcept {
   // Allocate new node (thread-safe)
   uint32_t node_idx = node_allocator_.fetch_add(1);
   BVHNode& node = nodes_[node_idx];
-  
-  // Compute bounds of all primitives
-  // Improvement: Parallelize reduction for large leaf? Probably overkill here.
+
+  // Use precomputed bounds if available, otherwise compute from scratch (root node)
   AABB bounds;
-  for (uint32_t i = 0; i < num_prims; i++) {
-    bounds.expand(prim_aabbs_[indices[i]]);
+  if (precomputed_bounds) {
+    bounds = *precomputed_bounds;
+  } else {
+    for (uint32_t i = 0; i < num_prims; i++) {
+      bounds.expand(prim_aabbs_[indices[i]]);
+    }
   }
   node.bounds = bounds;
   
@@ -1438,9 +1442,11 @@ uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t dep
   uint32_t left_count = static_cast<uint32_t>(mid - indices);
   
   // Handle degenerate case where all primitives go to one side
+  bool was_degenerate = false;
   if (left_count == 0 || left_count == num_prims) {
     left_count = num_prims / 2;
     mid = indices + left_count;
+    was_degenerate = true;
   }
   
   // Check if split is worth it (SAH cost)
@@ -1452,6 +1458,16 @@ uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t dep
     return node_idx;
   }
   
+  // Pass precomputed bounds to children when available from SAH split.
+  // Bounds are only valid when the partition wasn't adjusted for degenerate cases.
+  const AABB* left_bounds_ptr = nullptr;
+  const AABB* right_bounds_ptr = nullptr;
+
+  if (!was_degenerate && split.left_bounds.min.x <= split.left_bounds.max.x) {
+    left_bounds_ptr = &split.left_bounds;
+    right_bounds_ptr = &split.right_bounds;
+  }
+
   // Build children (Parallel)
   uint32_t left_child = kInvalidIndex;
   uint32_t right_child = kInvalidIndex;
@@ -1461,11 +1477,11 @@ uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t dep
     std::atomic<bool> done{false};
 
     TaskSystem::submit([&]() {
-      left_child = buildRecursive(indices, left_count, depth + 1);
+      left_child = buildRecursive(indices, left_count, depth + 1, left_bounds_ptr);
       done.store(true);
     });
 
-    right_child = buildRecursive(mid, num_prims - left_count, depth + 1);
+    right_child = buildRecursive(mid, num_prims - left_count, depth + 1, right_bounds_ptr);
 
     // Work-stealing wait: help process tasks instead of blocking
     while (!done.load()) {
@@ -1474,8 +1490,8 @@ uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t dep
       }
     }
   } else {
-    left_child = buildRecursive(indices, left_count, depth + 1);
-    right_child = buildRecursive(mid, num_prims - left_count, depth + 1);
+    left_child = buildRecursive(indices, left_count, depth + 1, left_bounds_ptr);
+    right_child = buildRecursive(mid, num_prims - left_count, depth + 1, right_bounds_ptr);
   }
   
   // Update node with split axis for front-to-back traversal ordering
@@ -1568,6 +1584,8 @@ BVH::SplitResult BVH::findBestSplit(
       if (cost < best.cost) {
         best.cost = cost;
         best.axis = axis;
+        best.left_bounds = left_prefix[i - 1];
+        best.right_bounds = right_bounds;
 
         // Split position is between primitives
         float c1 = centroids[sorted_indices[i - 1] * 3 + axis];
@@ -1592,6 +1610,28 @@ BVH::SplitResult BVH::findBestSplitBinned(
   best.pos = 0.0f;
 
   float inv_parent_area = (parent_area > kEpsilon) ? 1.0f / parent_area : 0.0f;
+
+  // Pre-extract centroids in SoA layout (computed once, reused across all 3 axes)
+  static constexpr uint32_t kBinnedStackLimit = 4096;
+  float stack_cx[kBinnedStackLimit], stack_cy[kBinnedStackLimit], stack_cz[kBinnedStackLimit];
+  float* cx = stack_cx;
+  float* cy = stack_cy;
+  float* cz = stack_cz;
+  std::vector<float> heap_cx, heap_cy, heap_cz;
+  if (num_prims > kBinnedStackLimit) {
+    heap_cx.resize(num_prims);
+    heap_cy.resize(num_prims);
+    heap_cz.resize(num_prims);
+    cx = heap_cx.data();
+    cy = heap_cy.data();
+    cz = heap_cz.data();
+  }
+  for (uint32_t i = 0; i < num_prims; i++) {
+    Vec3 c = prim_aabbs_[indices[i]].center();
+    cx[i] = c.x;
+    cy[i] = c.y;
+    cz[i] = c.z;
+  }
 
   // Try each axis
   for (int axis = 0; axis < 3; axis++) {
@@ -1621,6 +1661,9 @@ BVH::SplitResult BVH::findBestSplitBinned(
     // Reset bins for this axis
     for (uint32_t i = 0; i < nb; i++) bins[i] = Bin();
 
+    // Select centroid array for this axis
+    const float* centroid_vals = (axis == 0) ? cx : (axis == 1) ? cy : cz;
+
     // Put primitives into bins (Parallelizable)
     float scale = nb / (max_val - min_val);
     if (config_.use_parallel_build && num_prims > 4096) {
@@ -1629,8 +1672,7 @@ BVH::SplitResult BVH::findBestSplitBinned(
         Bin local_bins[kMaxBins];
         for (uint32_t b = 0; b < nb; b++) local_bins[b] = Bin();
         for (uint32_t i = start; i < end; i++) {
-          Vec3 centroid = prim_aabbs_[indices[i]].center();
-          float val = axis == 0 ? centroid.x : axis == 1 ? centroid.y : centroid.z;
+          float val = centroid_vals[i];
           uint32_t bin_idx = static_cast<uint32_t>((val - min_val) * scale);
           bin_idx = std::min(bin_idx, nb - 1);
           local_bins[bin_idx].bounds.expand(prim_aabbs_[indices[i]]);
@@ -1644,8 +1686,7 @@ BVH::SplitResult BVH::findBestSplitBinned(
       }, 1024);
     } else {
       for (uint32_t i = 0; i < num_prims; i++) {
-        Vec3 centroid = prim_aabbs_[indices[i]].center();
-        float val = axis == 0 ? centroid.x : axis == 1 ? centroid.y : centroid.z;
+        float val = centroid_vals[i];
 
         uint32_t bin_idx = static_cast<uint32_t>((val - min_val) * scale);
         bin_idx = std::min(bin_idx, nb - 1);
@@ -1686,10 +1727,12 @@ BVH::SplitResult BVH::findBestSplitBinned(
         best.cost = cost;
         best.axis = axis;
         best.pos = min_val + (max_val - min_val) * (static_cast<float>(i) / nb);
+        best.left_bounds = left_prefix_bounds[i - 1];
+        best.right_bounds = right_bounds;
       }
     }
   }
-  
+
   return best;
 }
 
@@ -7987,28 +8030,50 @@ AutoTuneResult AutoTuner::tune(
 
   std::vector<TestConfig> configs_to_test;
 
-  // Test TriangleBVH with different max_leaf_sizes
-  uint32_t leaf_sizes[] = {2, 4, 8, 16};
-  for (uint32_t leaf_size : leaf_sizes) {
-    TestConfig tc;
-    tc.method = BVHBuildMethod::TriangleBVH;
-    tc.bvh_config.max_leaf_size = leaf_size;
-    tc.bvh_config.use_sah = true;
-    configs_to_test.push_back(tc);
+  // Scene-aware config selection: prune configs based on scene characteristics
+  const auto& scene = result.scene_info;
+  const bool is_simple_scene = !scene.has_thin_triangles &&
+                                !scene.has_coplanar_regions &&
+                                scene.overlap_ratio < 0.2f;
+
+  if (is_simple_scene) {
+    // Simple scenes: test only 2 leaf sizes (4 and 8)
+    for (uint32_t leaf_size : {4u, 8u}) {
+      TestConfig tc;
+      tc.method = BVHBuildMethod::TriangleBVH;
+      tc.bvh_config.max_leaf_size = leaf_size;
+      tc.bvh_config.use_sah = true;
+      configs_to_test.push_back(tc);
+    }
+  } else {
+    // Complex scenes: test full range
+    for (uint32_t leaf_size : {2u, 4u, 8u, 16u}) {
+      TestConfig tc;
+      tc.method = BVHBuildMethod::TriangleBVH;
+      tc.bvh_config.max_leaf_size = leaf_size;
+      tc.bvh_config.use_sah = true;
+      configs_to_test.push_back(tc);
+    }
   }
 
-  // Test SBVH if enabled
+  // Test SBVH only when scene characteristics suggest benefit
   if (config.test_sbvh) {
-    float alphas[] = {1e-5f, 1e-4f, 1e-3f};
-    for (float alpha : alphas) {
-      for (uint32_t leaf_size : {4u, 8u}) {
-        TestConfig tc;
-        tc.method = BVHBuildMethod::SBVH;
-        tc.sbvh_config.max_leaf_size = leaf_size;
-        tc.sbvh_config.alpha = alpha;
-        configs_to_test.push_back(tc);
+    const bool sbvh_likely_beneficial = scene.has_thin_triangles ||
+                                        scene.overlap_ratio > 0.2f ||
+                                        scene.has_coplanar_regions;
+    if (sbvh_likely_beneficial) {
+      // Reduced alpha sweep: only test 1e-5 and 1e-3 (skip middle)
+      for (float alpha : {1e-5f, 1e-3f}) {
+        for (uint32_t leaf_size : {4u, 8u}) {
+          TestConfig tc;
+          tc.method = BVHBuildMethod::SBVH;
+          tc.sbvh_config.max_leaf_size = leaf_size;
+          tc.sbvh_config.alpha = alpha;
+          configs_to_test.push_back(tc);
+        }
       }
     }
+    // else: skip SBVH entirely for simple scenes
   }
 
   // Warmup phase
@@ -8108,11 +8173,15 @@ AutoTuneResult AutoTuner::tune(
       best_sbvh.build(sampled, result.best_sbvh_config);
     }
 
-    // Test different traversal configs
+    // Test different traversal configs with early termination.
+    // Test unlimited (0) first as baseline, then increasing limits.
+    // Stop testing larger limits when they don't improve over unlimited.
     uint32_t max_prim_tests_values[] = {0, 32, 64, 128, 256};
     bool mailboxing_values[] = {false, true};
 
     float best_trav_cost = kInfinity;
+    double baseline_time = 0.0;  // Time for unlimited (max_tests=0)
+    uint32_t plateau_count = 0;  // Count configs that didn't improve
 
     for (uint32_t max_tests : max_prim_tests_values) {
       for (bool mailbox : mailboxing_values) {
@@ -8132,6 +8201,11 @@ AutoTuneResult AutoTuner::tune(
           trav_time = measureTraversalTime(best_sbvh, test_rays, trav_cfg, config.timing_iterations);
         }
 
+        // Record baseline for unlimited tests
+        if (max_tests == 0 && !mailbox) {
+          baseline_time = trav_time;
+        }
+
         float trav_cost = static_cast<float>(trav_time);
 
         // Penalize unlimited tests slightly for pathological cases
@@ -8144,6 +8218,19 @@ AutoTuneResult AutoTuner::tune(
           best_trav_cost = trav_cost;
           result.best_traversal_config = trav_cfg;
           result.traversal_time_ns_per_ray = static_cast<float>(trav_time * 1000.0 / config.sample_ray_count);
+          plateau_count = 0;
+        } else {
+          plateau_count++;
+        }
+      }
+
+      // Early termination: if limited tests are within 5% of baseline
+      // and we haven't improved for 2+ configs, stop testing larger limits
+      if (max_tests > 0 && baseline_time > 0.0 && plateau_count >= 2) {
+        double best_actual = static_cast<double>(best_trav_cost);
+        if (best_actual >= baseline_time * 0.95) {
+          // Limited tests don't help — unlimited is near-optimal, stop
+          break;
         }
       }
     }
