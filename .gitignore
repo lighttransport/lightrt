@@ -9,7 +9,14 @@
 # Compiled executables
 lightrt_example
 lightrt_benchmark
+obj_bvh_bench
 viewer/viewer
+
+# Generated images
+*.bmp
+*.tga
+*.ppm
+*.png
 
 # Build directories
 build/
