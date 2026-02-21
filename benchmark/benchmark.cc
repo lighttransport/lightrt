@@ -1405,6 +1405,173 @@ void benchmarkPathologicalScenes(uint32_t num_triangles, uint32_t num_rays) {
 }
 
 // ============================================================================
+// OBB Leaf Filtering Benchmark
+// ============================================================================
+
+void benchmarkOBBFiltering(uint32_t num_triangles, uint32_t num_rays) {
+  std::cout << "\n========================================\n";
+  std::cout << "OBB Leaf Filtering Benchmark\n";
+  std::cout << "========================================\n";
+  std::cout << "\nOBB filtering adds a compact oriented bounding box test at each\n";
+  std::cout << "leaf node, rejecting leaves whose AABB passes but OBB fails.\n";
+  std::cout << "Most effective for diagonal/hair-like triangles where AABB is loose.\n";
+
+  struct SceneResult {
+    const char* name;
+    double build_ms_no_obb;
+    double build_ms_obb;
+    double trav_ms_no_obb;
+    double trav_ms_obb;
+    uint32_t hits_no_obb;
+    uint32_t hits_obb;
+    uint32_t num_obbs;
+    size_t obb_memory;
+  };
+
+  auto runScene = [&](const char* name, const std::vector<Triangle>& triangles,
+                       const std::vector<Ray>& rays) -> SceneResult {
+    SceneResult result;
+    result.name = name;
+
+    SBVHBuildConfig config;
+
+    // Build without OBB
+    SBVH sbvh_no_obb;
+    auto start = std::chrono::high_resolution_clock::now();
+    sbvh_no_obb.build(triangles, config);
+    auto end = std::chrono::high_resolution_clock::now();
+    result.build_ms_no_obb = std::chrono::duration<double, std::milli>(end - start).count();
+
+    // Build with OBB
+    config.compute_leaf_obbs = true;
+    config.obb_volume_threshold = 0.7f;
+    SBVH sbvh_obb;
+    start = std::chrono::high_resolution_clock::now();
+    sbvh_obb.build(triangles, config);
+    end = std::chrono::high_resolution_clock::now();
+    result.build_ms_obb = std::chrono::duration<double, std::milli>(end - start).count();
+
+    result.num_obbs = 0;
+    for (const auto& node : sbvh_obb.getNodes()) {
+      if (node.isLeaf() && node.padding != 0) result.num_obbs++;
+    }
+    result.obb_memory = result.num_obbs * sizeof(CompactOBB);
+
+    // Traverse without OBB
+    result.hits_no_obb = 0;
+    start = std::chrono::high_resolution_clock::now();
+    for (const auto& ray : rays) {
+      float t, u, v;
+      if (sbvh_no_obb.traverse(ray, t, u, v) != kInvalidIndex) {
+        result.hits_no_obb++;
+      }
+    }
+    end = std::chrono::high_resolution_clock::now();
+    result.trav_ms_no_obb = std::chrono::duration<double, std::milli>(end - start).count();
+
+    // Traverse with OBB
+    result.hits_obb = 0;
+    start = std::chrono::high_resolution_clock::now();
+    for (const auto& ray : rays) {
+      float t, u, v;
+      if (sbvh_obb.traverse(ray, t, u, v) != kInvalidIndex) {
+        result.hits_obb++;
+      }
+    }
+    end = std::chrono::high_resolution_clock::now();
+    result.trav_ms_obb = std::chrono::duration<double, std::milli>(end - start).count();
+
+    return result;
+  };
+
+  RNG rng(42);
+  std::vector<Ray> rays = generateRandomRays(num_rays, 10.0f, rng);
+
+  // Scene 1: Diagonal triangles (best case for OBB)
+  std::cout << "\n--- 1. Diagonal Triangles (best case for OBB) ---\n";
+  {
+    auto triangles = generateDiagonalTriangles(num_triangles, 10.0f, rng);
+    auto r = runScene("Diagonal", triangles, rays);
+    std::cout << "  Build: " << std::fixed << std::setprecision(2)
+              << r.build_ms_no_obb << " ms (no OBB) vs "
+              << r.build_ms_obb << " ms (OBB)\n";
+    std::cout << "  Traversal: " << r.trav_ms_no_obb << " ms (no OBB) vs "
+              << r.trav_ms_obb << " ms (OBB)\n";
+    double speedup = r.trav_ms_no_obb / std::max(r.trav_ms_obb, 0.001);
+    std::cout << "  Speedup: " << std::setprecision(2) << speedup << "x\n";
+    std::cout << "  OBBs: " << r.num_obbs << " (" << r.obb_memory << " bytes)\n";
+    std::cout << "  Hits: " << r.hits_no_obb << " (no OBB) vs " << r.hits_obb << " (OBB)\n";
+    if (r.hits_no_obb != r.hits_obb) {
+      std::cout << "  WARNING: Hit counts differ!\n";
+    }
+  }
+
+  // Scene 2: Hair-like triangles
+  std::cout << "\n--- 2. Hair-like Triangles ---\n";
+  {
+    auto triangles = generateHairTriangles(num_triangles, 10.0f, rng);
+    auto r = runScene("Hair", triangles, rays);
+    std::cout << "  Build: " << std::fixed << std::setprecision(2)
+              << r.build_ms_no_obb << " ms (no OBB) vs "
+              << r.build_ms_obb << " ms (OBB)\n";
+    std::cout << "  Traversal: " << r.trav_ms_no_obb << " ms (no OBB) vs "
+              << r.trav_ms_obb << " ms (OBB)\n";
+    double speedup = r.trav_ms_no_obb / std::max(r.trav_ms_obb, 0.001);
+    std::cout << "  Speedup: " << std::setprecision(2) << speedup << "x\n";
+    std::cout << "  OBBs: " << r.num_obbs << " (" << r.obb_memory << " bytes)\n";
+    std::cout << "  Hits: " << r.hits_no_obb << " (no OBB) vs " << r.hits_obb << " (OBB)\n";
+    if (r.hits_no_obb != r.hits_obb) {
+      std::cout << "  WARNING: Hit counts differ!\n";
+    }
+  }
+
+  // Scene 3: Random triangles (control - should show minimal change)
+  std::cout << "\n--- 3. Random Triangles (control) ---\n";
+  {
+    auto triangles = generateRandomTriangles(num_triangles, 10.0f, rng);
+    auto r = runScene("Random", triangles, rays);
+    std::cout << "  Build: " << std::fixed << std::setprecision(2)
+              << r.build_ms_no_obb << " ms (no OBB) vs "
+              << r.build_ms_obb << " ms (OBB)\n";
+    std::cout << "  Traversal: " << r.trav_ms_no_obb << " ms (no OBB) vs "
+              << r.trav_ms_obb << " ms (OBB)\n";
+    double speedup = r.trav_ms_no_obb / std::max(r.trav_ms_obb, 0.001);
+    std::cout << "  Speedup: " << std::setprecision(2) << speedup << "x\n";
+    std::cout << "  OBBs: " << r.num_obbs << " (" << r.obb_memory << " bytes)\n";
+    std::cout << "  Hits: " << r.hits_no_obb << " (no OBB) vs " << r.hits_obb << " (OBB)\n";
+    if (r.hits_no_obb != r.hits_obb) {
+      std::cout << "  WARNING: Hit counts differ!\n";
+    }
+  }
+
+  // Scene 4: Mixed (30% diagonal + 30% hair + 40% small random)
+  std::cout << "\n--- 4. Mixed Scene (30% diagonal + 30% hair + 40% random) ---\n";
+  {
+    std::vector<Triangle> triangles;
+    auto diag = generateDiagonalTriangles(num_triangles * 3 / 10, 10.0f, rng);
+    triangles.insert(triangles.end(), diag.begin(), diag.end());
+    auto hair = generateHairTriangles(num_triangles * 3 / 10, 10.0f, rng);
+    triangles.insert(triangles.end(), hair.begin(), hair.end());
+    auto small = generateRandomTriangles(num_triangles - num_triangles * 3 / 10 * 2, 10.0f, rng);
+    triangles.insert(triangles.end(), small.begin(), small.end());
+
+    auto r = runScene("Mixed", triangles, rays);
+    std::cout << "  Build: " << std::fixed << std::setprecision(2)
+              << r.build_ms_no_obb << " ms (no OBB) vs "
+              << r.build_ms_obb << " ms (OBB)\n";
+    std::cout << "  Traversal: " << r.trav_ms_no_obb << " ms (no OBB) vs "
+              << r.trav_ms_obb << " ms (OBB)\n";
+    double speedup = r.trav_ms_no_obb / std::max(r.trav_ms_obb, 0.001);
+    std::cout << "  Speedup: " << std::setprecision(2) << speedup << "x\n";
+    std::cout << "  OBBs: " << r.num_obbs << " (" << r.obb_memory << " bytes)\n";
+    std::cout << "  Hits: " << r.hits_no_obb << " (no OBB) vs " << r.hits_obb << " (OBB)\n";
+    if (r.hits_no_obb != r.hits_obb) {
+      std::cout << "  WARNING: Hit counts differ!\n";
+    }
+  }
+}
+
+// ============================================================================
 // Co-planar Triangle Benchmark with Max Prim Test Limits
 // ============================================================================
 
@@ -1953,6 +2120,9 @@ int main(int argc, char** argv) {
 
   // Pathological scenes for SBVH
   benchmarkPathologicalScenes(num_triangles, num_rays);
+
+  // OBB leaf filtering benchmark
+  benchmarkOBBFiltering(num_triangles, num_rays);
 
   // Co-planar triangle scenes with max prim test limits
   benchmarkCoplanarTriangles(num_triangles, num_rays);

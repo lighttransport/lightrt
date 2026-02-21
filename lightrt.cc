@@ -3919,6 +3919,376 @@ bool TriangleBVH::loadFromMemory(const uint8_t* data, size_t size) noexcept {
 }
 
 // ============================================================================
+// OBB (Oriented Bounding Box) Helpers for Leaf Filtering
+// ============================================================================
+
+namespace {
+
+// 3x3 symmetric eigendecomposition via Jacobi rotations.
+// Input: symmetric matrix a[3][3]. Output: eigenvalues d[3], eigenvectors in columns of v[3][3].
+inline void jacobi3x3(const float a[3][3], float d[3], float v[3][3]) noexcept {
+  // Initialize v = identity
+  for (int i = 0; i < 3; i++)
+    for (int j = 0; j < 3; j++)
+      v[i][j] = (i == j) ? 1.0f : 0.0f;
+
+  float work[3][3];
+  for (int i = 0; i < 3; i++)
+    for (int j = 0; j < 3; j++)
+      work[i][j] = a[i][j];
+
+  for (int sweep = 0; sweep < 8; sweep++) {
+    // Sum of off-diagonal elements
+    float off = std::fabs(work[0][1]) + std::fabs(work[0][2]) + std::fabs(work[1][2]);
+    if (off < 1e-12f) break;
+
+    for (int p = 0; p < 2; p++) {
+      for (int q = p + 1; q < 3; q++) {
+        float apq = work[p][q];
+        if (std::fabs(apq) < 1e-15f) continue;
+
+        float tau = (work[q][q] - work[p][p]) / (2.0f * apq);
+        float t;
+        if (std::fabs(tau) > 1e15f) {
+          t = 1.0f / (2.0f * tau);
+        } else {
+          t = 1.0f / (std::fabs(tau) + std::sqrt(1.0f + tau * tau));
+          if (tau < 0.0f) t = -t;
+        }
+
+        float c = 1.0f / std::sqrt(1.0f + t * t);
+        float s = t * c;
+
+        // Update matrix
+        float app = work[p][p] - t * apq;
+        float aqq = work[q][q] + t * apq;
+        work[p][p] = app;
+        work[q][q] = aqq;
+        work[p][q] = 0.0f;
+        work[q][p] = 0.0f;
+
+        for (int r = 0; r < 3; r++) {
+          if (r == p || r == q) continue;
+          float arp = work[r][p];
+          float arq = work[r][q];
+          work[r][p] = work[p][r] = c * arp - s * arq;
+          work[r][q] = work[q][r] = s * arp + c * arq;
+        }
+
+        // Update eigenvectors
+        for (int r = 0; r < 3; r++) {
+          float vrp = v[r][p];
+          float vrq = v[r][q];
+          v[r][p] = c * vrp - s * vrq;
+          v[r][q] = s * vrp + c * vrq;
+        }
+      }
+    }
+  }
+
+  d[0] = work[0][0];
+  d[1] = work[1][1];
+  d[2] = work[2][2];
+}
+
+// Rotation matrix (column-major) to unit quaternion (Shepperd's method).
+// Returns [w, x, y, z].
+inline void matToQuat(const float m[3][3], float q[4]) noexcept {
+  float tr = m[0][0] + m[1][1] + m[2][2];
+  if (tr > 0.0f) {
+    float s = std::sqrt(tr + 1.0f) * 2.0f;
+    q[0] = 0.25f * s;
+    q[1] = (m[2][1] - m[1][2]) / s;
+    q[2] = (m[0][2] - m[2][0]) / s;
+    q[3] = (m[1][0] - m[0][1]) / s;
+  } else if (m[0][0] > m[1][1] && m[0][0] > m[2][2]) {
+    float s = std::sqrt(1.0f + m[0][0] - m[1][1] - m[2][2]) * 2.0f;
+    q[0] = (m[2][1] - m[1][2]) / s;
+    q[1] = 0.25f * s;
+    q[2] = (m[0][1] + m[1][0]) / s;
+    q[3] = (m[0][2] + m[2][0]) / s;
+  } else if (m[1][1] > m[2][2]) {
+    float s = std::sqrt(1.0f + m[1][1] - m[0][0] - m[2][2]) * 2.0f;
+    q[0] = (m[0][2] - m[2][0]) / s;
+    q[1] = (m[0][1] + m[1][0]) / s;
+    q[2] = 0.25f * s;
+    q[3] = (m[1][2] + m[2][1]) / s;
+  } else {
+    float s = std::sqrt(1.0f + m[2][2] - m[0][0] - m[1][1]) * 2.0f;
+    q[0] = (m[1][0] - m[0][1]) / s;
+    q[1] = (m[0][2] + m[2][0]) / s;
+    q[2] = (m[1][2] + m[2][1]) / s;
+    q[3] = 0.25f * s;
+  }
+  // Normalize
+  float len = std::sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
+  if (len > 1e-10f) {
+    float inv = 1.0f / len;
+    q[0] *= inv; q[1] *= inv; q[2] *= inv; q[3] *= inv;
+  }
+  // Ensure w >= 0 for canonical form
+  if (q[0] < 0.0f) {
+    q[0] = -q[0]; q[1] = -q[1]; q[2] = -q[2]; q[3] = -q[3];
+  }
+}
+
+// Dequantize int8 quaternion to 3x3 rotation matrix (row-major).
+// Columns of the matrix are the OBB local axes.
+inline void quatToMat(const int8_t qn[4], float m[3][3]) noexcept {
+  float w = qn[0] / 127.0f;
+  float x = qn[1] / 127.0f;
+  float y = qn[2] / 127.0f;
+  float z = qn[3] / 127.0f;
+  // Normalize
+  float len = std::sqrt(w*w + x*x + y*y + z*z);
+  if (len > 1e-10f) {
+    float inv = 1.0f / len;
+    w *= inv; x *= inv; y *= inv; z *= inv;
+  }
+  m[0][0] = 1.0f - 2.0f*(y*y + z*z);
+  m[0][1] = 2.0f*(x*y - w*z);
+  m[0][2] = 2.0f*(x*z + w*y);
+  m[1][0] = 2.0f*(x*y + w*z);
+  m[1][1] = 1.0f - 2.0f*(x*x + z*z);
+  m[1][2] = 2.0f*(y*z - w*x);
+  m[2][0] = 2.0f*(x*z - w*y);
+  m[2][1] = 2.0f*(y*z + w*x);
+  m[2][2] = 1.0f - 2.0f*(x*x + y*y);
+}
+
+} // anonymous namespace
+
+bool CompactOBB::intersectRay(const Vec3& center, float aabb_half_diag,
+                               const Ray& ray, float t_limit) const noexcept {
+  // Dequantize rotation to 3x3 matrix
+  float m[3][3];
+  quatToMat(rotation, m);
+
+  // Dequantize half-extents
+  float he[3] = {
+    (half_extents[0] / 255.0f) * aabb_half_diag,
+    (half_extents[1] / 255.0f) * aabb_half_diag,
+    (half_extents[2] / 255.0f) * aabb_half_diag
+  };
+
+  // Transform ray origin and direction to OBB local frame
+  // OBB axes are columns of m; to project into local space, dot with columns = multiply by m^T
+  float ox = ray.origin.x - center.x;
+  float oy = ray.origin.y - center.y;
+  float oz = ray.origin.z - center.z;
+
+  float lo[3] = {
+    m[0][0]*ox + m[1][0]*oy + m[2][0]*oz,
+    m[0][1]*ox + m[1][1]*oy + m[2][1]*oz,
+    m[0][2]*ox + m[1][2]*oy + m[2][2]*oz
+  };
+  float ld[3] = {
+    m[0][0]*ray.direction.x + m[1][0]*ray.direction.y + m[2][0]*ray.direction.z,
+    m[0][1]*ray.direction.x + m[1][1]*ray.direction.y + m[2][1]*ray.direction.z,
+    m[0][2]*ray.direction.x + m[1][2]*ray.direction.y + m[2][2]*ray.direction.z
+  };
+
+  // Slab test in local space
+  float tmin = ray.tmin;
+  float tmax = t_limit;
+
+  for (int i = 0; i < 3; i++) {
+    if (std::fabs(ld[i]) < 1e-20f) {
+      // Ray parallel to slab
+      if (lo[i] < -he[i] || lo[i] > he[i]) return false;
+    } else {
+      float inv_d = 1.0f / ld[i];
+      float t0 = (-he[i] - lo[i]) * inv_d;
+      float t1 = ( he[i] - lo[i]) * inv_d;
+      if (t0 > t1) { float tmp = t0; t0 = t1; t1 = tmp; }
+      if (t0 > tmin) tmin = t0;
+      if (t1 < tmax) tmax = t1;
+      if (tmin > tmax) return false;
+    }
+  }
+
+  return true;
+}
+
+void SBVH::computeLeafOBBs(float volume_threshold) noexcept {
+  leaf_obbs_.clear();
+  use_obb_filtering_ = false;
+
+  if (nodes_.empty() || triangles_.empty()) return;
+
+  // Count leaves that benefit from OBBs (prim_count > 1)
+  uint32_t obb_count = 0;
+  for (auto& node : nodes_) {
+    if (node.isLeaf() && node.prim_count > 1) {
+      obb_count++;
+    }
+  }
+
+  if (obb_count == 0) return;
+
+  leaf_obbs_.resize(obb_count);
+  uint32_t obb_idx = 0;
+
+  for (auto& node : nodes_) {
+    if (!node.isLeaf() || node.prim_count <= 1) {
+      node.padding = 0;
+      continue;
+    }
+
+    // Gather unique triangle vertices from this leaf's PrimRefs
+    uint32_t unique_ids[32];  // max_leaf_size is typically 4, but be safe
+    uint32_t num_unique = 0;
+    for (uint32_t i = 0; i < node.prim_count && num_unique < 32; i++) {
+      uint32_t pid = refs_[node.prim_offset + i].prim_id;
+      bool found = false;
+      for (uint32_t j = 0; j < num_unique; j++) {
+        if (unique_ids[j] == pid) { found = true; break; }
+      }
+      if (!found) unique_ids[num_unique++] = pid;
+    }
+
+    // Collect vertices
+    Vec3 verts[96]; // 32 triangles * 3 vertices max
+    uint32_t nv = 0;
+    for (uint32_t i = 0; i < num_unique; i++) {
+      const Triangle& tri = triangles_[unique_ids[i]];
+      verts[nv++] = tri.v0;
+      verts[nv++] = tri.v1;
+      verts[nv++] = tri.v2;
+    }
+
+    // Compute centroid
+    Vec3 centroid(0, 0, 0);
+    for (uint32_t i = 0; i < nv; i++) {
+      centroid.x += verts[i].x;
+      centroid.y += verts[i].y;
+      centroid.z += verts[i].z;
+    }
+    float inv_n = 1.0f / static_cast<float>(nv);
+    centroid.x *= inv_n;
+    centroid.y *= inv_n;
+    centroid.z *= inv_n;
+
+    // Compute covariance matrix
+    float cov[3][3] = {};
+    for (uint32_t i = 0; i < nv; i++) {
+      float dx = verts[i].x - centroid.x;
+      float dy = verts[i].y - centroid.y;
+      float dz = verts[i].z - centroid.z;
+      cov[0][0] += dx*dx; cov[0][1] += dx*dy; cov[0][2] += dx*dz;
+      cov[1][1] += dy*dy; cov[1][2] += dy*dz;
+      cov[2][2] += dz*dz;
+    }
+    cov[1][0] = cov[0][1];
+    cov[2][0] = cov[0][2];
+    cov[2][1] = cov[1][2];
+
+    // Eigendecomposition -> PCA axes
+    float eigenvalues[3];
+    float eigenvectors[3][3]; // eigenvectors[row][col], columns are axes
+    jacobi3x3(cov, eigenvalues, eigenvectors);
+
+    // Eigenvectors are in columns of eigenvectors matrix.
+    // Build rotation matrix where columns = OBB axes.
+    // eigenvectors[row][col] = col-th eigenvector's row-th component
+    float rot[3][3];
+    for (int i = 0; i < 3; i++)
+      for (int j = 0; j < 3; j++)
+        rot[i][j] = eigenvectors[i][j];
+
+    // Ensure right-handed: if det < 0, flip third column
+    float det = rot[0][0]*(rot[1][1]*rot[2][2] - rot[1][2]*rot[2][1])
+              - rot[0][1]*(rot[1][0]*rot[2][2] - rot[1][2]*rot[2][0])
+              + rot[0][2]*(rot[1][0]*rot[2][1] - rot[1][1]*rot[2][0]);
+    if (det < 0.0f) {
+      rot[0][2] = -rot[0][2];
+      rot[1][2] = -rot[1][2];
+      rot[2][2] = -rot[2][2];
+    }
+
+    // Project all vertices onto OBB axes to find half-extents
+    // Also compute OBB center offset from AABB center
+    Vec3 aabb_center = node.bounds.center();
+    float min_proj[3] = { 1e30f,  1e30f,  1e30f};
+    float max_proj[3] = {-1e30f, -1e30f, -1e30f};
+
+    for (uint32_t i = 0; i < nv; i++) {
+      float dx = verts[i].x - aabb_center.x;
+      float dy = verts[i].y - aabb_center.y;
+      float dz = verts[i].z - aabb_center.z;
+      for (int a = 0; a < 3; a++) {
+        float proj = rot[0][a]*dx + rot[1][a]*dy + rot[2][a]*dz;
+        if (proj < min_proj[a]) min_proj[a] = proj;
+        if (proj > max_proj[a]) max_proj[a] = proj;
+      }
+    }
+
+    // Compute AABB half-diagonal for normalization (needed for margin)
+    Vec3 ext = node.bounds.extents();
+    float aabb_half_diag = std::sqrt(ext.x*ext.x + ext.y*ext.y + ext.z*ext.z) * 0.5f;
+
+    if (aabb_half_diag < 1e-10f) {
+      node.padding = 0;
+      continue;
+    }
+
+    float he[3];
+    for (int a = 0; a < 3; a++) {
+      // Half-extent includes the center offset from AABB center
+      float obb_center_offset = (min_proj[a] + max_proj[a]) * 0.5f;
+      he[a] = (max_proj[a] - min_proj[a]) * 0.5f + std::fabs(obb_center_offset);
+    }
+
+    // Add margin for quantization error (additive, proportional to AABB diagonal):
+    // - int8 quaternion: ~0.9° rotation error -> ~1.7% positional error at max distance
+    // - uint8 half-extents: ~0.4% quantization step per axis
+    // Additive margin is critical for thin OBBs where half-extents << aabb_half_diag
+    float margin = aabb_half_diag * 0.025f;
+    he[0] += margin;
+    he[1] += margin;
+    he[2] += margin;
+
+
+    // Compute volume ratio: OBB_vol / AABB_vol
+    float obb_vol = 8.0f * he[0] * he[1] * he[2];
+    float aabb_vol = ext.x * ext.y * ext.z;
+    float vol_ratio = (aabb_vol > 1e-20f) ? (obb_vol / aabb_vol) : 1.0f;
+    if (vol_ratio > 1.0f) vol_ratio = 1.0f;
+
+    // Skip OBB if it's not significantly tighter than AABB
+    if (vol_ratio > volume_threshold) {
+      node.padding = 0;
+      continue;
+    }
+
+    // Quantize quaternion
+    float quat[4];
+    matToQuat(rot, quat);
+
+    CompactOBB& obb = leaf_obbs_[obb_idx];
+    obb.rotation[0] = static_cast<int8_t>(std::max(-127.0f, std::min(127.0f, quat[0] * 127.0f)));
+    obb.rotation[1] = static_cast<int8_t>(std::max(-127.0f, std::min(127.0f, quat[1] * 127.0f)));
+    obb.rotation[2] = static_cast<int8_t>(std::max(-127.0f, std::min(127.0f, quat[2] * 127.0f)));
+    obb.rotation[3] = static_cast<int8_t>(std::max(-127.0f, std::min(127.0f, quat[3] * 127.0f)));
+
+    // Quantize half-extents relative to AABB half-diagonal
+    for (int a = 0; a < 3; a++) {
+      float norm = he[a] / aabb_half_diag;
+      obb.half_extents[a] = static_cast<uint8_t>(std::min(255.0f, norm * 255.0f + 0.5f));
+    }
+
+    obb.volume_ratio = static_cast<uint8_t>(vol_ratio * 255.0f + 0.5f);
+
+    node.padding = obb_idx + 1;  // 1-based index (0 = no OBB)
+    obb_idx++;
+  }
+
+  // Shrink to actual count
+  leaf_obbs_.resize(obb_idx);
+  use_obb_filtering_ = (obb_idx > 0);
+}
+
+// ============================================================================
 // SBVH Implementation
 // Reference: "Spatial Splits in Bounding Volume Hierarchies" (Stich et al., HPG 2009)
 // ============================================================================
@@ -3950,6 +4320,15 @@ bool SBVH::build(const std::vector<Triangle>& triangles, const SBVHBuildConfig& 
 
   // Build recursively
   buildRecursive(initial_refs, 0);
+
+  // Initialize timestamp mailbox
+  prim_timestamps_.assign(triangles_.size(), 0);
+  ray_counter_ = 0;
+
+  // Compute leaf OBBs if requested
+  if (config_.compute_leaf_obbs) {
+    computeLeafOBBs(config_.obb_volume_threshold);
+  }
 
   return true;
 }
@@ -4435,6 +4814,19 @@ uint32_t SBVH::traverse(const Ray& ray, float& hit_t, float& hit_u, float& hit_v
     }
 
     if (node.isLeaf()) {
+      // OBB leaf filter
+      if (use_obb_filtering_ && node.padding != 0) {
+        const CompactOBB& obb = leaf_obbs_[node.padding - 1];
+        if (obb.volume_ratio < 178) {
+          Vec3 c = node.bounds.center();
+          Vec3 e = node.bounds.extents();
+          float hd = std::sqrt(e.x*e.x + e.y*e.y + e.z*e.z) * 0.5f;
+          if (!obb.intersectRay(c, hd, ray, hit_t)) {
+            continue;
+          }
+        }
+      }
+
       // Test triangles in leaf (using references)
       for (uint32_t i = 0; i < node.prim_count; i++) {
         const PrimRef& ref = refs_[node.prim_offset + i];
@@ -4488,53 +4880,16 @@ uint32_t SBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hit_u, fl
   uint32_t prim_tests = 0;
   const uint32_t max_tests = config.max_prim_tests;
 
-  // Optional mailbox for avoiding duplicate tests
+  // Timestamp-based mailbox for avoiding duplicate tests
   // In SBVH, the same primitive can appear in multiple leaves
-  const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
-  const bool use_mailbox = config.use_mailboxing && num_prims > 0;
+  const bool use_mailbox = config.use_mailboxing && !prim_timestamps_.empty();
+  const uint32_t ray_id = use_mailbox ? ++ray_counter_ : 0;
 
-  // Stack-based bitset for small prim counts (8KB max), heap fallback for large
-  uint64_t mailbox_stack[1024];
-  uint64_t* mailbox_bitset = nullptr;
-  std::vector<uint64_t> mailbox_bitset_heap;
-  std::vector<uint32_t> mailbox_hash;
-
-  if (use_mailbox) {
-    if (num_prims <= 65536) {
-      const uint32_t words = (num_prims + 63) / 64;
-      mailbox_bitset = mailbox_stack;
-      std::memset(mailbox_bitset, 0, words * sizeof(uint64_t));
-    } else {
-      mailbox_hash.resize(std::max(num_prims / 4, 256u), kInvalidIndex);
-    }
+  // Handle overflow: if ray_counter wraps to 0, reset all timestamps
+  if (use_mailbox && ray_id == 0) {
+    std::memset(prim_timestamps_.data(), 0, prim_timestamps_.size() * sizeof(uint32_t));
+    ray_counter_ = 1;
   }
-
-  auto testAndMarkMailbox = [&](uint32_t prim_id) -> bool {
-    if (!use_mailbox) return false;
-
-    if (num_prims <= 65536) {
-      uint32_t word = prim_id / 64;
-      uint64_t bit = 1ULL << (prim_id % 64);
-      if (mailbox_bitset[word] & bit) {
-        return true;  // Already tested
-      }
-      mailbox_bitset[word] |= bit;
-      return false;
-    } else {
-      uint32_t idx = prim_id % mailbox_hash.size();
-      for (uint32_t i = 0; i < 16; i++) {  // Limited probing
-        uint32_t probe = (idx + i) % mailbox_hash.size();
-        if (mailbox_hash[probe] == prim_id) {
-          return true;  // Already tested
-        }
-        if (mailbox_hash[probe] == kInvalidIndex) {
-          mailbox_hash[probe] = prim_id;
-          return false;
-        }
-      }
-      return false;  // Probe limit reached, test anyway
-    }
-  };
 
   // Stack-based traversal
   uint32_t stack[64];
@@ -4559,6 +4914,19 @@ uint32_t SBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hit_u, fl
     }
 
     if (node.isLeaf()) {
+      // OBB leaf filter
+      if (use_obb_filtering_ && node.padding != 0) {
+        const CompactOBB& obb = leaf_obbs_[node.padding - 1];
+        if (obb.volume_ratio < 178) {
+          Vec3 c = node.bounds.center();
+          Vec3 e = node.bounds.extents();
+          float hd = std::sqrt(e.x*e.x + e.y*e.y + e.z*e.z) * 0.5f;
+          if (!obb.intersectRay(c, hd, ray, hit_t)) {
+            continue;
+          }
+        }
+      }
+
       // Test triangles in leaf (using references)
       for (uint32_t i = 0; i < node.prim_count; i++) {
         // Check limit before each test
@@ -4583,8 +4951,11 @@ uint32_t SBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hit_u, fl
         }
 
         // Mailboxing: skip if already tested (only after ref bounds pass)
-        if (testAndMarkMailbox(ref.prim_id)) {
+        if (use_mailbox && prim_timestamps_[ref.prim_id] == ray_id) {
           continue;
+        }
+        if (use_mailbox) {
+          prim_timestamps_[ref.prim_id] = ray_id;
         }
 
         prim_tests++;
@@ -4632,27 +5003,13 @@ bool SBVH::traverseAnyHit(const Ray& ray, uint32_t exclude_prim_id) const noexce
 
   const RayContext ctx(ray);
 
-  // Stack-based mailbox for duplicate avoidance
-  const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
-  const uint32_t mailbox_words = (num_prims + 63) / 64;
-  uint64_t mailbox_stack[1024];
-  std::vector<uint64_t> mailbox_heap;
-  uint64_t* mailbox;
-  if (num_prims <= 65536) {
-    mailbox = mailbox_stack;
-    std::memset(mailbox, 0, mailbox_words * sizeof(uint64_t));
-  } else {
-    mailbox_heap.resize(mailbox_words, 0);
-    mailbox = mailbox_heap.data();
+  // Timestamp-based mailbox for duplicate avoidance
+  const bool use_mailbox = !prim_timestamps_.empty();
+  const uint32_t ray_id = use_mailbox ? ++ray_counter_ : 0;
+  if (use_mailbox && ray_id == 0) {
+    std::memset(prim_timestamps_.data(), 0, prim_timestamps_.size() * sizeof(uint32_t));
+    ray_counter_ = 1;
   }
-
-  auto alreadyTested = [&](uint32_t prim_id) -> bool {
-    uint32_t word = prim_id / 64;
-    uint64_t bit = 1ULL << (prim_id % 64);
-    if (mailbox[word] & bit) return true;
-    mailbox[word] |= bit;
-    return false;
-  };
 
   uint32_t stack[64];
   int stack_ptr = 0;
@@ -4668,10 +5025,24 @@ bool SBVH::traverseAnyHit(const Ray& ray, uint32_t exclude_prim_id) const noexce
     }
 
     if (node.isLeaf()) {
+      // OBB leaf filter
+      if (use_obb_filtering_ && node.padding != 0) {
+        const CompactOBB& obb = leaf_obbs_[node.padding - 1];
+        if (obb.volume_ratio < 178) {
+          Vec3 c = node.bounds.center();
+          Vec3 e = node.bounds.extents();
+          float hd = std::sqrt(e.x*e.x + e.y*e.y + e.z*e.z) * 0.5f;
+          if (!obb.intersectRay(c, hd, ray, ray.tmax)) {
+            continue;
+          }
+        }
+      }
+
       for (uint32_t i = 0; i < node.prim_count; i++) {
         const PrimRef& ref = refs_[node.prim_offset + i];
         if (ref.prim_id == exclude_prim_id) continue;
-        if (alreadyTested(ref.prim_id)) continue;
+        if (use_mailbox && prim_timestamps_[ref.prim_id] == ray_id) continue;
+        if (use_mailbox) prim_timestamps_[ref.prim_id] = ray_id;
 
         float t, u, v;
         if (triangles_[ref.prim_id].intersect(ray, t, u, v)) {
@@ -4763,6 +5134,27 @@ void SBVH::traverse4(const Ray4& rays, HitResult4& results) const noexcept {
     if (hit_mask == 0) continue;
 
     if (node.isLeaf()) {
+      // OBB leaf filter: test OBB per active ray, update hit_mask
+      if (use_obb_filtering_ && node.padding != 0) {
+        const CompactOBB& obb = leaf_obbs_[node.padding - 1];
+        if (obb.volume_ratio < 178) {
+          Vec3 c = node.bounds.center();
+          Vec3 e = node.bounds.extents();
+          float hd = std::sqrt(e.x*e.x + e.y*e.y + e.z*e.z) * 0.5f;
+          uint32_t obb_mask = 0;
+          for (int i = 0; i < 4; i++) {
+            if (!(hit_mask & (1u << i))) continue;
+            Ray r = rays.getRay(i);
+            r.tmax = results.t[i];
+            if (obb.intersectRay(c, hd, r, results.t[i])) {
+              obb_mask |= (1u << i);
+            }
+          }
+          hit_mask = obb_mask;
+          if (hit_mask == 0) continue;
+        }
+      }
+
       for (uint32_t pi = 0; pi < node.prim_count; pi++) {
         const PrimRef& ref = refs_[node.prim_offset + pi];
         const Triangle& tri = triangles_[ref.prim_id];
@@ -4818,27 +5210,13 @@ uint32_t SBVH::traverse4AnyHit(const Ray4& rays, uint32_t exclude_prim_id) const
     first_ray.direction.z < 0.0f ? 1 : 0
   };
 
-  // Stack-based shared mailbox
-  const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
-  const uint32_t mailbox_words = (num_prims + 63) / 64;
-  uint64_t mailbox_stack[1024];
-  std::vector<uint64_t> mailbox_heap;
-  uint64_t* mailbox;
-  if (num_prims <= 65536) {
-    mailbox = mailbox_stack;
-    std::memset(mailbox, 0, mailbox_words * sizeof(uint64_t));
-  } else {
-    mailbox_heap.resize(mailbox_words, 0);
-    mailbox = mailbox_heap.data();
+  // Timestamp-based shared mailbox
+  const bool use_mailbox = !prim_timestamps_.empty();
+  const uint32_t ray_id = use_mailbox ? ++ray_counter_ : 0;
+  if (use_mailbox && ray_id == 0) {
+    std::memset(prim_timestamps_.data(), 0, prim_timestamps_.size() * sizeof(uint32_t));
+    ray_counter_ = 1;
   }
-
-  auto alreadyTested = [&](uint32_t prim_id) -> bool {
-    uint32_t word = prim_id / 64;
-    uint64_t bit = 1ULL << (prim_id % 64);
-    if (mailbox[word] & bit) return true;
-    mailbox[word] |= bit;
-    return false;
-  };
 
   uint32_t stack[64];
   int stack_ptr = 0;
@@ -4861,10 +5239,31 @@ uint32_t SBVH::traverse4AnyHit(const Ray4& rays, uint32_t exclude_prim_id) const
     if (node_hit == 0) continue;
 
     if (node.isLeaf()) {
+      // OBB leaf filter
+      if (use_obb_filtering_ && node.padding != 0) {
+        const CompactOBB& obb = leaf_obbs_[node.padding - 1];
+        if (obb.volume_ratio < 178) {
+          Vec3 c = node.bounds.center();
+          Vec3 e = node.bounds.extents();
+          float hd = std::sqrt(e.x*e.x + e.y*e.y + e.z*e.z) * 0.5f;
+          uint32_t obb_mask = 0;
+          for (int i = 0; i < 4; i++) {
+            if (!(node_hit & (1u << i))) continue;
+            Ray r = rays.getRay(i);
+            if (obb.intersectRay(c, hd, r, r.tmax)) {
+              obb_mask |= (1u << i);
+            }
+          }
+          node_hit = obb_mask;
+          if (node_hit == 0) continue;
+        }
+      }
+
       for (uint32_t pi = 0; pi < node.prim_count; pi++) {
         const PrimRef& ref = refs_[node.prim_offset + pi];
         if (ref.prim_id == exclude_prim_id) continue;
-        if (alreadyTested(ref.prim_id)) continue;
+        if (use_mailbox && prim_timestamps_[ref.prim_id] == ray_id) continue;
+        if (use_mailbox) prim_timestamps_[ref.prim_id] = ray_id;
 
         const Triangle& tri = triangles_[ref.prim_id];
 
@@ -4964,6 +5363,27 @@ void SBVH::traverse8(const Ray8& rays, HitResult8& results) const noexcept {
     if (hit_mask == 0) continue;
 
     if (node.isLeaf()) {
+      // OBB leaf filter
+      if (use_obb_filtering_ && node.padding != 0) {
+        const CompactOBB& obb = leaf_obbs_[node.padding - 1];
+        if (obb.volume_ratio < 178) {
+          Vec3 c = node.bounds.center();
+          Vec3 e = node.bounds.extents();
+          float hd = std::sqrt(e.x*e.x + e.y*e.y + e.z*e.z) * 0.5f;
+          uint32_t obb_mask = 0;
+          for (int i = 0; i < 8; i++) {
+            if (!(hit_mask & (1u << i))) continue;
+            Ray r = rays.getRay(i);
+            r.tmax = results.t[i];
+            if (obb.intersectRay(c, hd, r, results.t[i])) {
+              obb_mask |= (1u << i);
+            }
+          }
+          hit_mask = obb_mask;
+          if (hit_mask == 0) continue;
+        }
+      }
+
       for (uint32_t pi = 0; pi < node.prim_count; pi++) {
         const PrimRef& ref = refs_[node.prim_offset + pi];
         const Triangle& tri = triangles_[ref.prim_id];
@@ -5019,27 +5439,13 @@ uint32_t SBVH::traverse8AnyHit(const Ray8& rays, uint32_t exclude_prim_id) const
     first_ray.direction.z < 0.0f ? 1 : 0
   };
 
-  // Stack-based shared mailbox
-  const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
-  const uint32_t mailbox_words = (num_prims + 63) / 64;
-  uint64_t mailbox_stack[1024];
-  std::vector<uint64_t> mailbox_heap;
-  uint64_t* mailbox;
-  if (num_prims <= 65536) {
-    mailbox = mailbox_stack;
-    std::memset(mailbox, 0, mailbox_words * sizeof(uint64_t));
-  } else {
-    mailbox_heap.resize(mailbox_words, 0);
-    mailbox = mailbox_heap.data();
+  // Timestamp-based shared mailbox
+  const bool use_mailbox = !prim_timestamps_.empty();
+  const uint32_t ray_id = use_mailbox ? ++ray_counter_ : 0;
+  if (use_mailbox && ray_id == 0) {
+    std::memset(prim_timestamps_.data(), 0, prim_timestamps_.size() * sizeof(uint32_t));
+    ray_counter_ = 1;
   }
-
-  auto alreadyTested = [&](uint32_t prim_id) -> bool {
-    uint32_t word = prim_id / 64;
-    uint64_t bit = 1ULL << (prim_id % 64);
-    if (mailbox[word] & bit) return true;
-    mailbox[word] |= bit;
-    return false;
-  };
 
   uint32_t stack[64];
   int stack_ptr = 0;
@@ -5062,10 +5468,31 @@ uint32_t SBVH::traverse8AnyHit(const Ray8& rays, uint32_t exclude_prim_id) const
     if (node_hit == 0) continue;
 
     if (node.isLeaf()) {
+      // OBB leaf filter
+      if (use_obb_filtering_ && node.padding != 0) {
+        const CompactOBB& obb = leaf_obbs_[node.padding - 1];
+        if (obb.volume_ratio < 178) {
+          Vec3 c = node.bounds.center();
+          Vec3 e = node.bounds.extents();
+          float hd = std::sqrt(e.x*e.x + e.y*e.y + e.z*e.z) * 0.5f;
+          uint32_t obb_mask = 0;
+          for (int i = 0; i < 8; i++) {
+            if (!(node_hit & (1u << i))) continue;
+            Ray r = rays.getRay(i);
+            if (obb.intersectRay(c, hd, r, r.tmax)) {
+              obb_mask |= (1u << i);
+            }
+          }
+          node_hit = obb_mask;
+          if (node_hit == 0) continue;
+        }
+      }
+
       for (uint32_t pi = 0; pi < node.prim_count; pi++) {
         const PrimRef& ref = refs_[node.prim_offset + pi];
         if (ref.prim_id == exclude_prim_id) continue;
-        if (alreadyTested(ref.prim_id)) continue;
+        if (use_mailbox && prim_timestamps_[ref.prim_id] == ray_id) continue;
+        if (use_mailbox) prim_timestamps_[ref.prim_id] = ray_id;
 
         const Triangle& tri = triangles_[ref.prim_id];
 
@@ -5111,27 +5538,13 @@ uint32_t SBVH::traverseMultiHit(const Ray& ray, MultiHitResult& result,
 
   const RayContext ctx(ray);
 
-  // Stack-based mailbox to avoid duplicate hits from split primitives
-  const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
-  const uint32_t mailbox_words = (num_prims + 63) / 64;
-  uint64_t mailbox_stack[1024];
-  std::vector<uint64_t> mailbox_heap;
-  uint64_t* mailbox;
-  if (num_prims <= 65536) {
-    mailbox = mailbox_stack;
-    std::memset(mailbox, 0, mailbox_words * sizeof(uint64_t));
-  } else {
-    mailbox_heap.resize(mailbox_words, 0);
-    mailbox = mailbox_heap.data();
+  // Timestamp-based mailbox to avoid duplicate hits from split primitives
+  const bool use_mailbox = !prim_timestamps_.empty();
+  const uint32_t ray_id = use_mailbox ? ++ray_counter_ : 0;
+  if (use_mailbox && ray_id == 0) {
+    std::memset(prim_timestamps_.data(), 0, prim_timestamps_.size() * sizeof(uint32_t));
+    ray_counter_ = 1;
   }
-
-  auto alreadyTested = [&](uint32_t prim_id) -> bool {
-    uint32_t word = prim_id / 64;
-    uint64_t bit = 1ULL << (prim_id % 64);
-    if (mailbox[word] & bit) return true;
-    mailbox[word] |= bit;
-    return false;
-  };
 
   uint32_t stack[64];
   int stack_ptr = 0;
@@ -5152,6 +5565,19 @@ uint32_t SBVH::traverseMultiHit(const Ray& ray, MultiHitResult& result,
     }
 
     if (node.isLeaf()) {
+      // OBB leaf filter
+      if (use_obb_filtering_ && node.padding != 0) {
+        const CompactOBB& obb = leaf_obbs_[node.padding - 1];
+        if (obb.volume_ratio < 178) {
+          Vec3 c = node.bounds.center();
+          Vec3 e = node.bounds.extents();
+          float hd = std::sqrt(e.x*e.x + e.y*e.y + e.z*e.z) * 0.5f;
+          if (!obb.intersectRay(c, hd, ray, ray.tmax)) {
+            continue;
+          }
+        }
+      }
+
       for (uint32_t i = 0; i < node.prim_count; i++) {
         if (result.hits.size() >= max_hits) {
           result.terminated_early = true;
@@ -5160,7 +5586,8 @@ uint32_t SBVH::traverseMultiHit(const Ray& ray, MultiHitResult& result,
 
         const PrimRef& ref = refs_[node.prim_offset + i];
         if (ref.prim_id == exclude_prim_id) continue;
-        if (alreadyTested(ref.prim_id)) continue;
+        if (use_mailbox && prim_timestamps_[ref.prim_id] == ray_id) continue;
+        if (use_mailbox) prim_timestamps_[ref.prim_id] = ray_id;
 
         float t, u, v;
         if (triangles_[ref.prim_id].intersect(ray, t, u, v)) {
