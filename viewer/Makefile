@@ -1,9 +1,9 @@
 CXX = g++
-CXXFLAGS = -std=c++17 -O3 -Wall -Wextra -fno-rtti -fno-exceptions -I.. -I. -Ithird_party -mavx2 -mfma -DVK_NO_PROTOTYPES
+CXXFLAGS = -std=c++17 -O3 -Wall -Wextra -fno-rtti -fno-exceptions -I.. -I. -Ithird_party -Icommon -mavx2 -mfma -DVK_NO_PROTOTYPES
 LDFLAGS = -lglfw -ldl -lpthread
 
 TARGET = viewer
-SOURCES = viewer.cc vk_loader.cc ../lightrt.cc
+SOURCES = viewer.cc vk_loader.cc common/viewer_common.cc ../lightrt.cc
 OBJECTS = $(SOURCES:.cc=.o)
 
 all: $(TARGET)
