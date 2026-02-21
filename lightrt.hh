@@ -110,6 +110,21 @@ public:
     condition_.notify_one();
   }
 
+  // Try to dequeue and execute one task from the queue.
+  // Returns true if a task was executed, false if queue was empty.
+  // Used for work-stealing: threads waiting for children help process other tasks.
+  static bool tryProcessOne() {
+    std::function<void()> task;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (tasks_.empty()) return false;
+      task = std::move(tasks_.front());
+      tasks_.pop();
+    }
+    task();
+    return true;
+  }
+
   // Parallel For Loop
   // splits range [start, end) into chunks and runs them in parallel
   static void parallelFor(uint32_t start, uint32_t end, std::function<void(uint32_t, uint32_t)> body, uint32_t min_chunk_size = 1024) {
@@ -128,25 +143,24 @@ public:
 
     uint32_t num_tasks = (range + min_chunk_size - 1) / min_chunk_size;
     std::atomic<uint32_t> tasks_remaining(num_tasks);
-    std::mutex wait_mutex;
-    std::condition_variable wait_cv;
 
     for (uint32_t i = 0; i < num_tasks; ++i) {
       uint32_t chunk_start = start + i * min_chunk_size;
       uint32_t chunk_end = std::min(end, chunk_start + min_chunk_size);
 
-      submit([chunk_start, chunk_end, body, &tasks_remaining, &wait_cv]() {
+      submit([chunk_start, chunk_end, body, &tasks_remaining]() {
         body(chunk_start, chunk_end);
-        if (tasks_remaining.fetch_sub(1) == 1) {
-          wait_cv.notify_one();
-        }
+        tasks_remaining.fetch_sub(1);
       });
     }
 
-    // Wait for completion
-    // Improvement: Worker threads could help processing tasks instead of just waiting
-    std::unique_lock<std::mutex> lock(wait_mutex);
-    wait_cv.wait(lock, [&tasks_remaining] { return tasks_remaining == 0; });
+    // Help process tasks while waiting (work-stealing to prevent deadlock)
+    while (tasks_remaining.load() > 0) {
+      if (!tryProcessOne()) {
+        // No tasks available; yield briefly and retry
+        std::this_thread::yield();
+      }
+    }
   }
 
 private:
@@ -247,6 +261,56 @@ struct alignas(16) Ray {
 
   Vec3 at(float t) const noexcept {
     return origin + direction * t;
+  }
+};
+
+// Precomputed ray data for fast traversal (compute once per ray, reuse across all AABB tests)
+struct alignas(32) RayContext {
+  Vec3 origin;
+  Vec3 inv_dir;
+  float tmin;
+  float tmax;
+  int sign[3];  // 0 if dir >= 0, 1 if dir < 0 (for front-to-back ordering)
+#if defined(LIGHTRT_HAS_AVX) || defined(LIGHTRT_HAS_SSE2)
+  __m128 origin_simd;   // [ox, oy, oz, 0]
+  __m128 inv_dir_simd;  // [1/dx, 1/dy, 1/dz, 0]
+#endif
+
+  RayContext() noexcept = default;
+
+  explicit RayContext(const Ray& ray) noexcept
+    : origin(ray.origin), tmin(ray.tmin), tmax(ray.tmax) {
+    sign[0] = (ray.direction.x < 0.0f) ? 1 : 0;
+    sign[1] = (ray.direction.y < 0.0f) ? 1 : 0;
+    sign[2] = (ray.direction.z < 0.0f) ? 1 : 0;
+#if defined(LIGHTRT_HAS_AVX) || defined(LIGHTRT_HAS_SSE2)
+    origin_simd = _mm_set_ps(0.0f, ray.origin.z, ray.origin.y, ray.origin.x);
+    // Clamp near-zero direction components to avoid NaN from rcp(0)*NR
+    // IEEE754 div produces +-inf for 1/0 which slab tests handle, but rcp+NR does not
+    constexpr float kMinDir = 1e-20f;
+    float dx = (std::abs(ray.direction.x) < kMinDir)
+             ? std::copysign(kMinDir, ray.direction.x) : ray.direction.x;
+    float dy = (std::abs(ray.direction.y) < kMinDir)
+             ? std::copysign(kMinDir, ray.direction.y) : ray.direction.y;
+    float dz = (std::abs(ray.direction.z) < kMinDir)
+             ? std::copysign(kMinDir, ray.direction.z) : ray.direction.z;
+    // Fast reciprocal with Newton-Raphson refinement: ~22-bit precision, ~3x faster than _mm_div_ps
+    __m128 dir_simd = _mm_set_ps(1.0f, dz, dy, dx);
+    __m128 rcp = _mm_rcp_ps(dir_simd);
+    // One NR iteration: rcp = rcp * (2 - dir * rcp)
+    __m128 two = _mm_set1_ps(2.0f);
+    inv_dir_simd = _mm_mul_ps(rcp, _mm_sub_ps(two, _mm_mul_ps(dir_simd, rcp)));
+    // Store back for scalar access
+    alignas(16) float inv_arr[4];
+    _mm_store_ps(inv_arr, inv_dir_simd);
+    inv_dir.x = inv_arr[0];
+    inv_dir.y = inv_arr[1];
+    inv_dir.z = inv_arr[2];
+#else
+    inv_dir.x = 1.0f / ray.direction.x;
+    inv_dir.y = 1.0f / ray.direction.y;
+    inv_dir.z = 1.0f / ray.direction.z;
+#endif
   }
 };
 
@@ -535,6 +599,9 @@ struct alignas(16) AABB {
 
   // SIMD optimized intersection
   bool intersectSIMD(const Ray& ray, float& tmin_out, float& tmax_out) const noexcept;
+
+  // Fast AABB intersection using precomputed RayContext (no per-call reciprocal)
+  bool intersectFast(const RayContext& ctx, float t_limit, float& tmin_out) const noexcept;
 
   // AABB-AABB intersection test
   bool intersects(const AABB& other) const noexcept {
@@ -1181,9 +1248,7 @@ struct QuantizedAABB {
 // FP16 Support
 // ============================================================================
 
-#ifdef LIGHTRT_HAS_FP16
-
-// Convert float to FP16
+// Convert float to FP16 (always available with software fallback)
 inline uint16_t floatToFP16(float value) noexcept {
 #if defined(__F16C__)
   __m128 v = _mm_set_ss(value);
@@ -1252,8 +1317,6 @@ inline float fp16ToFloat(uint16_t value) noexcept {
 #endif
 }
 
-#endif // LIGHTRT_HAS_FP16
-
 // ============================================================================
 // BVH Node
 // ============================================================================
@@ -1275,26 +1338,30 @@ struct BVHNode {
     };
   };
   
-  // Flags: bit 0 = is_leaf
+  // Flags: bit 0 = is_leaf, bits 1-2 = split axis (0=x, 1=y, 2=z)
   uint32_t flags;
   uint32_t padding; // Ensure alignment
-  
+
   BVHNode() noexcept : left_child(0), right_child(0), flags(0), padding(0) {}
-  
+
   bool isLeaf() const noexcept {
     return (flags & 0x1) != 0;
   }
-  
+
+  uint32_t splitAxis() const noexcept {
+    return (flags >> 1) & 0x3;
+  }
+
   void setLeaf(uint32_t offset, uint32_t count) noexcept {
     prim_offset = offset;
     prim_count = count;
     flags |= 0x1;
   }
-  
-  void setInterior(uint32_t left, uint32_t right) noexcept {
+
+  void setInterior(uint32_t left, uint32_t right, uint32_t axis = 0) noexcept {
     left_child = left;
     right_child = right;
-    flags &= ~0x1;
+    flags = (axis & 0x3) << 1;  // Clear leaf bit, set axis
   }
 };
 

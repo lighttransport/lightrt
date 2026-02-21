@@ -61,6 +61,11 @@ EXAMPLE_OBJECTS = $(EXAMPLE_SOURCES:.cc=.o)
 BENCHMARK_SOURCES = benchmark/benchmark.cc
 BENCHMARK_OBJECTS = benchmark/benchmark.o
 
+# OBJ BVH benchmark
+OBJ_BENCH_TARGET = obj_bvh_bench
+OBJ_BENCH_SOURCES = benchmark/obj_bvh_bench.cc
+OBJ_BENCH_OBJECTS = benchmark/obj_bvh_bench.o
+
 # Default target
 all: $(TARGET_LIB) $(TARGET_EXAMPLE) $(TARGET_BENCHMARK)
 
@@ -79,6 +84,11 @@ $(TARGET_BENCHMARK): $(BENCHMARK_OBJECTS) $(TARGET_LIB)
 	$(CXX) $(CXXFLAGS) -o $@ $(BENCHMARK_OBJECTS) $(TARGET_LIB) $(LDFLAGS)
 	@echo "Built $(TARGET_BENCHMARK)"
 
+# Build OBJ BVH benchmark
+$(OBJ_BENCH_TARGET): $(OBJ_BENCH_OBJECTS) $(TARGET_LIB)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJ_BENCH_OBJECTS) $(TARGET_LIB) $(LDFLAGS) -lpthread
+	@echo "Built $(OBJ_BENCH_TARGET)"
+
 # Compile source files
 %.o: %.cc lightrt.hh
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
@@ -88,7 +98,7 @@ benchmark/%.o: benchmark/%.cc lightrt.hh
 
 # Clean build artifacts
 clean:
-	rm -f $(OBJECTS) $(EXAMPLE_OBJECTS) $(BENCHMARK_OBJECTS) $(TARGET_LIB) $(TARGET_EXAMPLE) $(TARGET_BENCHMARK)
+	rm -f $(OBJECTS) $(EXAMPLE_OBJECTS) $(BENCHMARK_OBJECTS) $(OBJ_BENCH_OBJECTS) $(TARGET_LIB) $(TARGET_EXAMPLE) $(TARGET_BENCHMARK) $(OBJ_BENCH_TARGET)
 	@echo "Cleaned build artifacts"
 
 # Run example
@@ -107,4 +117,6 @@ info:
 	@echo "INCLUDES: $(INCLUDES)"
 	@echo "LDFLAGS: $(LDFLAGS)"
 
-.PHONY: all clean run benchmark info
+obj_bench: $(OBJ_BENCH_TARGET)
+
+.PHONY: all clean run benchmark obj_bench info
