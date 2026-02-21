@@ -1135,6 +1135,75 @@ bool AABB::intersectSIMD(const Ray& ray, float& tmin_out, float& tmax_out) const
 #endif
 }
 
+// Fast AABB intersection using precomputed RayContext
+// - No per-call reciprocal (precomputed in RayContext via rcp+NR)
+// - Uses SSE2 slab test with precomputed SIMD inv_dir
+// - Only returns tmin (sufficient for traversal ordering and hit test)
+bool AABB::intersectFast(const RayContext& ctx, float t_limit, float& tmin_out) const noexcept {
+#if defined(LIGHTRT_HAS_SSE2) || defined(LIGHTRT_HAS_AVX)
+  __m128 box_min = _mm_set_ps(0.0f, min.z, min.y, min.x);
+  __m128 box_max = _mm_set_ps(0.0f, max.z, max.y, max.x);
+
+  __m128 t0 = _mm_mul_ps(_mm_sub_ps(box_min, ctx.origin_simd), ctx.inv_dir_simd);
+  __m128 t1 = _mm_mul_ps(_mm_sub_ps(box_max, ctx.origin_simd), ctx.inv_dir_simd);
+
+  __m128 tmin_v = _mm_min_ps(t0, t1);
+  __m128 tmax_v = _mm_max_ps(t0, t1);
+
+  // Horizontal reduction: max of tmin xyz, min of tmax xyz
+  // tmin_v = [tx_min, ty_min, tz_min, 0]
+  // tmax_v = [tx_max, ty_max, tz_max, inf]
+  alignas(16) float tmin_arr[4], tmax_arr[4];
+  _mm_store_ps(tmin_arr, tmin_v);
+  _mm_store_ps(tmax_arr, tmax_v);
+
+  float tmin = std::max(ctx.tmin, std::max(tmin_arr[0], std::max(tmin_arr[1], tmin_arr[2])));
+  float tmax = std::min(t_limit, std::min(tmax_arr[0], std::min(tmax_arr[1], tmax_arr[2])));
+
+  if (tmax < tmin) return false;
+  tmin_out = tmin;
+  return true;
+#elif defined(LIGHTRT_HAS_NEON)
+  float32x4_t box_min_v = {min.x, min.y, min.z, 0.0f};
+  float32x4_t box_max_v = {max.x, max.y, max.z, 0.0f};
+  float32x4_t orig = {ctx.origin.x, ctx.origin.y, ctx.origin.z, 0.0f};
+  float32x4_t inv = {ctx.inv_dir.x, ctx.inv_dir.y, ctx.inv_dir.z, 0.0f};
+
+  float32x4_t t0 = vmulq_f32(vsubq_f32(box_min_v, orig), inv);
+  float32x4_t t1 = vmulq_f32(vsubq_f32(box_max_v, orig), inv);
+
+  float32x4_t tmin_v = vminq_f32(t0, t1);
+  float32x4_t tmax_v = vmaxq_f32(t0, t1);
+
+  float tmin_arr[4], tmax_arr[4];
+  vst1q_f32(tmin_arr, tmin_v);
+  vst1q_f32(tmax_arr, tmax_v);
+
+  float tmin = std::max(ctx.tmin, std::max(tmin_arr[0], std::max(tmin_arr[1], tmin_arr[2])));
+  float tmax = std::min(t_limit, std::min(tmax_arr[0], std::min(tmax_arr[1], tmax_arr[2])));
+
+  if (tmax < tmin) return false;
+  tmin_out = tmin;
+  return true;
+#else
+  // Scalar fallback
+  float tx0 = (min.x - ctx.origin.x) * ctx.inv_dir.x;
+  float tx1 = (max.x - ctx.origin.x) * ctx.inv_dir.x;
+  if (tx0 > tx1) std::swap(tx0, tx1);
+  float ty0 = (min.y - ctx.origin.y) * ctx.inv_dir.y;
+  float ty1 = (max.y - ctx.origin.y) * ctx.inv_dir.y;
+  if (ty0 > ty1) std::swap(ty0, ty1);
+  float tz0 = (min.z - ctx.origin.z) * ctx.inv_dir.z;
+  float tz1 = (max.z - ctx.origin.z) * ctx.inv_dir.z;
+  if (tz0 > tz1) std::swap(tz0, tz1);
+  float tmin = std::max(ctx.tmin, std::max(tx0, std::max(ty0, tz0)));
+  float tmax = std::min(t_limit, std::min(tx1, std::min(ty1, tz1)));
+  if (tmax < tmin) return false;
+  tmin_out = tmin;
+  return true;
+#endif
+}
+
 // ============================================================================
 // BVH Builder Implementation
 // ============================================================================
@@ -1194,8 +1263,16 @@ bool BVH::build(const std::vector<AABB>& prim_aabbs, const BVHBuildConfig& confi
                 return a.morton_code < b.morton_code;
               });
 
+    // LBVH uses emplace_back (dynamic growth), so clear pre-allocated array
+    nodes_.clear();
+    // LBVH builds its own prim_indices_ via push_back
+    prim_indices_.clear();
+
     // Build tree top-down based on Morton code hierarchy
     buildLBVH(morton_prims.data(), static_cast<uint32_t>(morton_prims.size()), 29, scene_bounds);
+
+    // Sync node_allocator_ with actual node count so resize below is a no-op
+    node_allocator_ = static_cast<uint32_t>(nodes_.size());
   } else {
     // SAH-based build: Higher quality but slower
     buildRecursive(prim_indices_.data(), static_cast<uint32_t>(prim_aabbs.size()), 0);
@@ -1287,33 +1364,29 @@ uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t dep
 
   if (config_.use_parallel_build && num_prims > 1024) {
     // Spawn task for left, run right on current thread
-    std::mutex m;
-    std::condition_variable cv;
-    bool done = false;
+    std::atomic<bool> done{false};
 
     TaskSystem::submit([&]() {
       left_child = buildRecursive(indices, left_count, depth + 1);
-      {
-        std::lock_guard<std::mutex> lock(m);
-        done = true;
-      }
-      cv.notify_one();
+      done.store(true);
     });
 
     right_child = buildRecursive(mid, num_prims - left_count, depth + 1);
 
-    {
-      std::unique_lock<std::mutex> lock(m);
-      cv.wait(lock, [&] { return done; });
+    // Work-stealing wait: help process tasks instead of blocking
+    while (!done.load()) {
+      if (!TaskSystem::tryProcessOne()) {
+        std::this_thread::yield();
+      }
     }
   } else {
     left_child = buildRecursive(indices, left_count, depth + 1);
     right_child = buildRecursive(mid, num_prims - left_count, depth + 1);
   }
   
-  // Update node
-  nodes_[node_idx].setInterior(left_child, right_child);
-  
+  // Update node with split axis for front-to-back traversal ordering
+  nodes_[node_idx].setInterior(left_child, right_child, split.axis);
+
   return node_idx;
 }
 
@@ -1330,50 +1403,86 @@ BVH::SplitResult BVH::findBestSplit(
 
   float inv_parent_area = (parent_area > kEpsilon) ? 1.0f / parent_area : 0.0f;
 
+  // Use stack buffer for small sizes to avoid heap allocation
+  constexpr uint32_t kStackLimit = 128;
+  uint32_t stack_buf[kStackLimit];
+  uint32_t* sorted_indices;
+  std::vector<uint32_t> heap_buf;
+  if (num_prims <= kStackLimit) {
+    sorted_indices = stack_buf;
+  } else {
+    heap_buf.resize(num_prims);
+    sorted_indices = heap_buf.data();
+  }
+
+  // Pre-compute centroids to avoid redundant recomputation during sort
+  // Use stack allocation for the common small case
+  float stack_centroids[kStackLimit * 3];
+  float* centroids;
+  std::vector<float> heap_centroids;
+  if (num_prims <= kStackLimit) {
+    centroids = stack_centroids;
+  } else {
+    heap_centroids.resize(num_prims * 3);
+    centroids = heap_centroids.data();
+  }
+  for (uint32_t i = 0; i < num_prims; i++) {
+    Vec3 c = prim_aabbs_[indices[i]].center();
+    centroids[i * 3 + 0] = c.x;
+    centroids[i * 3 + 1] = c.y;
+    centroids[i * 3 + 2] = c.z;
+  }
+
+  // Prefix-sum bounds buffer (reused across axes)
+  AABB stack_prefix[kStackLimit];
+  AABB* left_prefix;
+  std::vector<AABB> heap_prefix;
+  if (num_prims <= kStackLimit) {
+    left_prefix = stack_prefix;
+  } else {
+    heap_prefix.resize(num_prims);
+    left_prefix = heap_prefix.data();
+  }
+
   // Try each axis
   for (int axis = 0; axis < 3; axis++) {
-    // Sort primitives by centroid along axis
-    std::vector<uint32_t> sorted_indices(indices, indices + num_prims);
+    // Initialize sorted index array
+    for (uint32_t i = 0; i < num_prims; i++) sorted_indices[i] = i;
 
-    std::sort(sorted_indices.begin(), sorted_indices.end(), [&](uint32_t a, uint32_t b) {
-      Vec3 ca = prim_aabbs_[a].center();
-      Vec3 cb = prim_aabbs_[b].center();
-      float va = axis == 0 ? ca.x : axis == 1 ? ca.y : ca.z;
-      float vb = axis == 0 ? cb.x : axis == 1 ? cb.y : cb.z;
-      return va < vb;
+    // Sort by pre-computed centroid along axis
+    std::sort(sorted_indices, sorted_indices + num_prims, [&](uint32_t a, uint32_t b) {
+      return centroids[a * 3 + axis] < centroids[b * 3 + axis];
     });
 
-    // Try splits between primitives
+    // Forward sweep: build prefix bounds left-to-right
+    left_prefix[0] = prim_aabbs_[indices[sorted_indices[0]]];
     for (uint32_t i = 1; i < num_prims; i++) {
-      // Compute bounds for left and right
-      AABB left_bounds, right_bounds;
+      left_prefix[i] = left_prefix[i - 1];
+      left_prefix[i].expand(prim_aabbs_[indices[sorted_indices[i]]]);
+    }
 
-      for (uint32_t j = 0; j < i; j++) {
-        left_bounds.expand(prim_aabbs_[sorted_indices[j]]);
-      }
+    // Backward sweep: accumulate right bounds and evaluate splits
+    AABB right_bounds;
+    for (uint32_t i = num_prims - 1; i >= 1; i--) {
+      right_bounds.expand(prim_aabbs_[indices[sorted_indices[i]]]);
 
-      for (uint32_t j = i; j < num_prims; j++) {
-        right_bounds.expand(prim_aabbs_[sorted_indices[j]]);
-      }
-
-      // Compute SAH cost (normalized by parent area)
-      float left_area = left_bounds.surfaceArea() * inv_parent_area;
+      float left_area = left_prefix[i - 1].surfaceArea() * inv_parent_area;
       float right_area = right_bounds.surfaceArea() * inv_parent_area;
       float cost = config_.traversal_cost +
                    config_.intersection_cost * (i * left_area + (num_prims - i) * right_area);
-      
+
       if (cost < best.cost) {
         best.cost = cost;
         best.axis = axis;
-        
+
         // Split position is between primitives
-        Vec3 c1 = prim_aabbs_[sorted_indices[i - 1]].center();
-        Vec3 c2 = prim_aabbs_[sorted_indices[i]].center();
-        best.pos = (axis == 0 ? (c1.x + c2.x) : axis == 1 ? (c1.y + c2.y) : (c1.z + c2.z)) * 0.5f;
+        float c1 = centroids[sorted_indices[i - 1] * 3 + axis];
+        float c2 = centroids[sorted_indices[i] * 3 + axis];
+        best.pos = (c1 + c2) * 0.5f;
       }
     }
   }
-  
+
   return best;
 }
 
@@ -1444,27 +1553,32 @@ BVH::SplitResult BVH::findBestSplitBinned(
       }
     }
 
-    // Compute costs for each split
-    for (uint32_t i = 1; i < config_.num_bins; i++) {
-      AABB left_bounds, right_bounds;
-      uint32_t left_count = 0, right_count = 0;
+    // Prefix-sum sweep: O(bins) instead of O(bins^2)
+    // Forward sweep: build left prefix bounds and counts
+    uint32_t nb = config_.num_bins;
+    std::vector<AABB> left_prefix_bounds(nb);
+    std::vector<uint32_t> left_prefix_count(nb);
+    left_prefix_bounds[0] = bins[0].bounds;
+    left_prefix_count[0] = bins[0].count;
+    for (uint32_t i = 1; i < nb; i++) {
+      left_prefix_bounds[i] = left_prefix_bounds[i - 1];
+      left_prefix_bounds[i].expand(bins[i].bounds);
+      left_prefix_count[i] = left_prefix_count[i - 1] + bins[i].count;
+    }
 
-      for (uint32_t j = 0; j < i; j++) {
-        left_bounds.expand(bins[j].bounds);
-        left_count += bins[j].count;
-      }
+    // Backward sweep: accumulate right bounds and evaluate splits
+    AABB right_bounds;
+    uint32_t right_count = 0;
+    for (uint32_t i = nb - 1; i >= 1; i--) {
+      right_bounds.expand(bins[i].bounds);
+      right_count += bins[i].count;
 
-      for (uint32_t j = i; j < config_.num_bins; j++) {
-        right_bounds.expand(bins[j].bounds);
-        right_count += bins[j].count;
-      }
-
+      uint32_t left_count = left_prefix_count[i - 1];
       if (left_count == 0 || right_count == 0) {
         continue;
       }
 
-      // Normalize by parent area for proper SAH comparison
-      float left_area = left_bounds.surfaceArea() * inv_parent_area;
+      float left_area = left_prefix_bounds[i - 1].surfaceArea() * inv_parent_area;
       float right_area = right_bounds.surfaceArea() * inv_parent_area;
       float cost = config_.traversal_cost +
                    config_.intersection_cost * (left_count * left_area + right_count * right_area);
@@ -1472,7 +1586,7 @@ BVH::SplitResult BVH::findBestSplitBinned(
       if (cost < best.cost) {
         best.cost = cost;
         best.axis = axis;
-        best.pos = min_val + (max_val - min_val) * (static_cast<float>(i) / config_.num_bins);
+        best.pos = min_val + (max_val - min_val) * (static_cast<float>(i) / nb);
       }
     }
   }
@@ -1541,52 +1655,54 @@ uint32_t BVH::traverseSIMD(const Ray& ray, float& hit_t) const noexcept {
   if (nodes_.empty()) {
     return kInvalidIndex;
   }
-  
+
+  const RayContext ctx(ray);
+
   uint32_t hit_prim = kInvalidIndex;
   hit_t = ray.tmax;
-  
-  // Stack-based traversal with SIMD intersection
-  struct StackEntry {
-    uint32_t node_idx;
-  };
-  
-  StackEntry stack[64];
+
+  // Stack-based traversal with precomputed inv_dir + front-to-back ordering
+  uint32_t stack[64];
   int stack_ptr = 0;
-  
-  stack[stack_ptr++].node_idx = 0;
-  
+
+  stack[stack_ptr++] = 0;
+
   while (stack_ptr > 0) {
-    uint32_t node_idx = stack[--stack_ptr].node_idx;
+    uint32_t node_idx = stack[--stack_ptr];
     const BVHNode& node = nodes_[node_idx];
-    
-    float tmin, tmax;
-    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > hit_t) {
+
+    float tmin;
+    if (!node.bounds.intersectFast(ctx, hit_t, tmin)) {
       continue;
     }
-    
+
     if (node.isLeaf()) {
       // Test primitives in leaf
       for (uint32_t i = 0; i < node.prim_count; i++) {
         uint32_t prim_idx = prim_indices_[node.prim_offset + i];
-        
-        // Simple AABB intersection as primitive test
-        float prim_tmin, prim_tmax;
-        if (prim_aabbs_[prim_idx].intersectSIMD(ray, prim_tmin, prim_tmax)) {
-          if (prim_tmin < hit_t && prim_tmin > ray.tmin) {
+
+        float prim_tmin;
+        if (prim_aabbs_[prim_idx].intersectFast(ctx, hit_t, prim_tmin)) {
+          if (prim_tmin < hit_t && prim_tmin > ctx.tmin) {
             hit_t = prim_tmin;
             hit_prim = prim_idx;
           }
         }
       }
     } else {
-      // Add children to stack
+      // Front-to-back ordering
       if (stack_ptr < 62) {
-        stack[stack_ptr++].node_idx = node.left_child;
-        stack[stack_ptr++].node_idx = node.right_child;
+        uint32_t near_child = node.left_child;
+        uint32_t far_child = node.right_child;
+        if (ctx.sign[node.splitAxis()]) {
+          std::swap(near_child, far_child);
+        }
+        stack[stack_ptr++] = far_child;
+        stack[stack_ptr++] = near_child;
       }
     }
   }
-  
+
   return hit_prim;
 }
 
@@ -2935,25 +3051,24 @@ uint32_t TriangleBVH::traverse(const Ray& ray, float& hit_t, float& hit_u, float
     return kInvalidIndex;
   }
 
+  // Precompute ray inverse direction once (rcp+NR on SSE2, scalar otherwise)
+  const RayContext ctx(ray);
+
   uint32_t hit_tri = kInvalidIndex;
   hit_t = ray.tmax;
 
-  // Stack-based traversal
-  struct StackEntry {
-    uint32_t node_idx;
-  };
-
-  StackEntry stack[64];
+  // Stack-based traversal with front-to-back ordering
+  uint32_t stack[64];
   int stack_ptr = 0;
 
-  stack[stack_ptr++].node_idx = 0;
+  stack[stack_ptr++] = 0;
 
   while (stack_ptr > 0) {
-    uint32_t node_idx = stack[--stack_ptr].node_idx;
+    uint32_t node_idx = stack[--stack_ptr];
     const BVHNode& node = nodes[node_idx];
 
-    float tmin, tmax;
-    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > hit_t) {
+    float tmin;
+    if (!node.bounds.intersectFast(ctx, hit_t, tmin)) {
       continue;
     }
 
@@ -2972,10 +3087,16 @@ uint32_t TriangleBVH::traverse(const Ray& ray, float& hit_t, float& hit_u, float
         }
       }
     } else {
-      // Add children to stack (front-to-back ordering)
+      // Front-to-back ordering: push far child first (popped last)
+      // Uses split axis + ray direction sign to determine near/far
       if (stack_ptr < 62) {
-        stack[stack_ptr++].node_idx = node.left_child;
-        stack[stack_ptr++].node_idx = node.right_child;
+        uint32_t near_child = node.left_child;
+        uint32_t far_child = node.right_child;
+        if (ctx.sign[node.splitAxis()]) {
+          std::swap(near_child, far_child);
+        }
+        stack[stack_ptr++] = far_child;   // Far child pushed first (popped last)
+        stack[stack_ptr++] = near_child;   // Near child pushed second (popped first)
       }
     }
   }
@@ -2993,6 +3114,8 @@ uint32_t TriangleBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hi
     return kInvalidIndex;
   }
 
+  const RayContext ctx(ray);
+
   uint32_t hit_tri = kInvalidIndex;
   hit_t = ray.tmax;
 
@@ -3001,14 +3124,10 @@ uint32_t TriangleBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hi
   const uint32_t max_tests = config.max_prim_tests;
 
   // Stack-based traversal
-  struct StackEntry {
-    uint32_t node_idx;
-  };
-
-  StackEntry stack[64];
+  uint32_t stack[64];
   int stack_ptr = 0;
 
-  stack[stack_ptr++].node_idx = 0;
+  stack[stack_ptr++] = 0;
 
   while (stack_ptr > 0) {
     // Check if we've hit the primitive test limit
@@ -3017,12 +3136,12 @@ uint32_t TriangleBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hi
       break;
     }
 
-    uint32_t node_idx = stack[--stack_ptr].node_idx;
+    uint32_t node_idx = stack[--stack_ptr];
     const BVHNode& node = nodes[node_idx];
     local_stats.nodes_visited++;
 
-    float tmin, tmax;
-    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > hit_t) {
+    float tmin;
+    if (!node.bounds.intersectFast(ctx, hit_t, tmin)) {
       continue;
     }
 
@@ -3063,10 +3182,15 @@ uint32_t TriangleBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hi
         }
       }
     } else {
-      // Add children to stack
+      // Front-to-back ordering
       if (stack_ptr < 62) {
-        stack[stack_ptr++].node_idx = node.left_child;
-        stack[stack_ptr++].node_idx = node.right_child;
+        uint32_t near_child = node.left_child;
+        uint32_t far_child = node.right_child;
+        if (ctx.sign[node.splitAxis()]) {
+          std::swap(near_child, far_child);
+        }
+        stack[stack_ptr++] = far_child;
+        stack[stack_ptr++] = near_child;
       }
     }
   }
@@ -3083,6 +3207,8 @@ bool TriangleBVH::traverseAnyHit(const Ray& ray, uint32_t exclude_prim_id) const
     return false;
   }
 
+  const RayContext ctx(ray);
+
   // Stack-based traversal
   uint32_t stack[64];
   int stack_ptr = 0;
@@ -3092,8 +3218,8 @@ bool TriangleBVH::traverseAnyHit(const Ray& ray, uint32_t exclude_prim_id) const
     uint32_t node_idx = stack[--stack_ptr];
     const BVHNode& node = nodes[node_idx];
 
-    float tmin, tmax;
-    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > ray.tmax) {
+    float tmin;
+    if (!node.bounds.intersectFast(ctx, ray.tmax, tmin)) {
       continue;
     }
 
@@ -3109,8 +3235,13 @@ bool TriangleBVH::traverseAnyHit(const Ray& ray, uint32_t exclude_prim_id) const
       }
     } else {
       if (stack_ptr < 62) {
-        stack[stack_ptr++] = node.left_child;
-        stack[stack_ptr++] = node.right_child;
+        uint32_t near_child = node.left_child;
+        uint32_t far_child = node.right_child;
+        if (ctx.sign[node.splitAxis()]) {
+          std::swap(near_child, far_child);
+        }
+        stack[stack_ptr++] = far_child;
+        stack[stack_ptr++] = near_child;
       }
     }
   }
@@ -3492,6 +3623,8 @@ uint32_t TriangleBVH::traverseMultiHit(const Ray& ray, MultiHitResult& result,
     return 0;
   }
 
+  const RayContext ctx(ray);
+
   // Mailbox to avoid duplicate hits
   const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
   std::vector<uint64_t> mailbox((num_prims + 63) / 64, 0);
@@ -3518,8 +3651,8 @@ uint32_t TriangleBVH::traverseMultiHit(const Ray& ray, MultiHitResult& result,
     uint32_t node_idx = stack[--stack_ptr];
     const BVHNode& node = nodes[node_idx];
 
-    float tmin, tmax;
-    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > ray.tmax) {
+    float tmin;
+    if (!node.bounds.intersectFast(ctx, ray.tmax, tmin)) {
       continue;
     }
 
@@ -3541,8 +3674,13 @@ uint32_t TriangleBVH::traverseMultiHit(const Ray& ray, MultiHitResult& result,
       }
     } else {
       if (stack_ptr < 62) {
-        stack[stack_ptr++] = node.left_child;
-        stack[stack_ptr++] = node.right_child;
+        uint32_t near_child = node.left_child;
+        uint32_t far_child = node.right_child;
+        if (ctx.sign[node.splitAxis()]) {
+          std::swap(near_child, far_child);
+        }
+        stack[stack_ptr++] = far_child;
+        stack[stack_ptr++] = near_child;
       }
     }
   }
@@ -3897,7 +4035,7 @@ uint32_t SBVH::buildRecursive(std::vector<PrimRef>& refs, uint32_t depth) noexce
   uint32_t left_child = buildRecursive(left_refs, depth + 1);
   uint32_t right_child = buildRecursive(right_refs, depth + 1);
 
-  nodes_[node_idx].setInterior(left_child, right_child);
+  nodes_[node_idx].setInterior(left_child, right_child, best_split.axis);
   return node_idx;
 }
 
@@ -4251,25 +4389,23 @@ uint32_t SBVH::traverse(const Ray& ray, float& hit_t, float& hit_u, float& hit_v
     return kInvalidIndex;
   }
 
+  const RayContext ctx(ray);
+
   uint32_t hit_tri = kInvalidIndex;
   hit_t = ray.tmax;
 
-  // Stack-based traversal
-  struct StackEntry {
-    uint32_t node_idx;
-  };
-
-  StackEntry stack[64];
+  // Stack-based traversal with front-to-back ordering
+  uint32_t stack[64];
   int stack_ptr = 0;
 
-  stack[stack_ptr++].node_idx = 0;
+  stack[stack_ptr++] = 0;
 
   while (stack_ptr > 0) {
-    uint32_t node_idx = stack[--stack_ptr].node_idx;
+    uint32_t node_idx = stack[--stack_ptr];
     const BVHNode& node = nodes_[node_idx];
 
-    float tmin, tmax;
-    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > hit_t) {
+    float tmin;
+    if (!node.bounds.intersectFast(ctx, hit_t, tmin)) {
       continue;
     }
 
@@ -4279,8 +4415,8 @@ uint32_t SBVH::traverse(const Ray& ray, float& hit_t, float& hit_u, float& hit_v
         const PrimRef& ref = refs_[node.prim_offset + i];
 
         // Early out: check if reference bounds are hit
-        float ref_tmin, ref_tmax;
-        if (!ref.bounds.intersect(ray, ref_tmin, ref_tmax) || ref_tmin > hit_t) {
+        float ref_tmin;
+        if (!ref.bounds.intersectFast(ctx, hit_t, ref_tmin)) {
           continue;
         }
 
@@ -4295,10 +4431,15 @@ uint32_t SBVH::traverse(const Ray& ray, float& hit_t, float& hit_u, float& hit_v
         }
       }
     } else {
-      // Add children to stack
+      // Front-to-back ordering: push far child first (popped last)
       if (stack_ptr < 62) {
-        stack[stack_ptr++].node_idx = node.left_child;
-        stack[stack_ptr++].node_idx = node.right_child;
+        uint32_t near_child = node.left_child;
+        uint32_t far_child = node.right_child;
+        if (ctx.sign[node.splitAxis()]) {
+          std::swap(near_child, far_child);
+        }
+        stack[stack_ptr++] = far_child;
+        stack[stack_ptr++] = near_child;
       }
     }
   }
@@ -5026,7 +5167,7 @@ uint32_t SBVHGeneric::buildRecursive(std::vector<PrimRef>& refs, uint32_t depth)
   uint32_t left_child = buildRecursive(left_refs, depth + 1);
   uint32_t right_child = buildRecursive(right_refs, depth + 1);
 
-  nodes_[node_idx].setInterior(left_child, right_child);
+  nodes_[node_idx].setInterior(left_child, right_child, best_split.axis);
   return node_idx;
 }
 

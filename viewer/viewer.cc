@@ -184,6 +184,7 @@ struct VulkanContext {
     void* mappedMemory;
 
     uint32_t width, height;
+    bool framebufferResized = false;
 
     void Check(VkResult result, const char* msg) {
         if (result != VK_SUCCESS) {
@@ -309,15 +310,92 @@ struct VulkanContext {
         vkMapMemory(device, stagingMemory, 0, memReq.size, 0, &mappedMemory);
     }
 
-    void Present(const std::vector<uint32_t>& pixels) {
+    uint32_t FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags properties) {
+        VkPhysicalDeviceMemoryProperties memProps;
+        vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
+        for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
+            if ((typeBits & (1 << i)) && (memProps.memoryTypes[i].propertyFlags & properties) == properties) {
+                return i;
+            }
+        }
+        return 0;
+    }
+
+    void RecreateSwapchain(uint32_t newWidth, uint32_t newHeight) {
+        vkDeviceWaitIdle(device);
+
+        // Destroy old staging buffer
+        vkUnmapMemory(device, stagingMemory);
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingMemory, nullptr);
+
+        // Destroy old swapchain
+        VkSwapchainKHR oldSwapchain = swapchain;
+
+        width = newWidth;
+        height = newHeight;
+
+        // Recreate swapchain
+        VkSwapchainCreateInfoKHR swapchainInfo = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+        swapchainInfo.surface = surface;
+        swapchainInfo.minImageCount = 2;
+        swapchainInfo.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
+        swapchainInfo.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        swapchainInfo.imageExtent = {width, height};
+        swapchainInfo.imageArrayLayers = 1;
+        swapchainInfo.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        swapchainInfo.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+        swapchainInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+        swapchainInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        swapchainInfo.clipped = VK_TRUE;
+        swapchainInfo.oldSwapchain = oldSwapchain;
+
+        Check(vkCreateSwapchainKHR(device, &swapchainInfo, nullptr, &swapchain), "Recreate Swapchain");
+        vkDestroySwapchainKHR(device, oldSwapchain, nullptr);
+
+        uint32_t count = 0;
+        vkGetSwapchainImagesKHR(device, swapchain, &count, nullptr);
+        swapchainImages.resize(count);
+        vkGetSwapchainImagesKHR(device, swapchain, &count, swapchainImages.data());
+
+        // Recreate staging buffer
+        VkBufferCreateInfo bufInfo = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bufInfo.size = width * height * 4;
+        bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        vkCreateBuffer(device, &bufInfo, nullptr, &stagingBuffer);
+
+        VkMemoryRequirements memReq;
+        vkGetBufferMemoryRequirements(device, stagingBuffer, &memReq);
+
+        VkMemoryAllocateInfo memAlloc = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        memAlloc.allocationSize = memReq.size;
+        memAlloc.memoryTypeIndex = FindMemoryType(memReq.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        vkAllocateMemory(device, &memAlloc, nullptr, &stagingMemory);
+        vkBindBufferMemory(device, stagingBuffer, stagingMemory, 0);
+        vkMapMemory(device, stagingMemory, 0, memReq.size, 0, &mappedMemory);
+    }
+
+    // Returns true if present succeeded, false if swapchain needs recreation
+    bool Present(const std::vector<uint32_t>& pixels) {
         vkWaitForFences(device, 1, &renderFence, VK_TRUE, UINT64_MAX);
         vkResetFences(device, 1, &renderFence);
 
         uint32_t imageIndex;
         VkResult res = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
-        if (res != VK_SUCCESS) return;
+        if (res == VK_ERROR_OUT_OF_DATE_KHR) {
+            // Fence was reset but no work submitted; re-signal it so next frame doesn't hang
+            VkSubmitInfo empty = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            vkQueueSubmit(queue, 1, &empty, renderFence);
+            return false;
+        }
+        if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) {
+            VkSubmitInfo empty = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            vkQueueSubmit(queue, 1, &empty, renderFence);
+            return false;
+        }
 
-        memcpy(mappedMemory, pixels.data(), pixels.size() * sizeof(uint32_t));
+        memcpy(mappedMemory, pixels.data(), width * height * sizeof(uint32_t));
 
         VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         vkBeginCommandBuffer(commandBuffer, &beginInfo);
@@ -371,7 +449,11 @@ struct VulkanContext {
         presentInfo.pSwapchains = &swapchain;
         presentInfo.pImageIndices = &imageIndex;
 
-        vkQueuePresentKHR(queue, &presentInfo);
+        res = vkQueuePresentKHR(queue, &presentInfo);
+        if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {
+            return false;
+        }
+        return true;
     }
 };
 
@@ -428,6 +510,12 @@ void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
     g_camera.forward = front.normalize();
     g_camera.right = g_camera.forward.cross(Vec3(0, 1, 0)).normalize();
     g_camera.up = g_camera.right.cross(g_camera.forward).normalize();
+}
+
+void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
+    (void)width; (void)height;
+    VulkanContext* vk = reinterpret_cast<VulkanContext*>(glfwGetWindowUserPointer(window));
+    if (vk) vk->framebufferResized = true;
 }
 
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
@@ -656,6 +744,8 @@ int main(int argc, char** argv) {
 
     VulkanContext vk;
     vk.Init(window, g_width, g_height);
+    glfwSetWindowUserPointer(window, &vk);
+    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
 
     std::vector<uint32_t> pixels(g_width * g_height);
 
@@ -667,6 +757,24 @@ int main(int argc, char** argv) {
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
+
+        // Handle window resize
+        {
+            int fw, fh;
+            glfwGetFramebufferSize(window, &fw, &fh);
+            if (fw > 0 && fh > 0 && (vk.framebufferResized || (uint32_t)fw != g_width || (uint32_t)fh != g_height)) {
+                g_width = (uint32_t)fw;
+                g_height = (uint32_t)fh;
+                vk.RecreateSwapchain(g_width, g_height);
+                pixels.resize(g_width * g_height);
+                vk.framebufferResized = false;
+            }
+            // Skip frame if minimized
+            if (fw == 0 || fh == 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+        }
 
         auto currentTime = std::chrono::high_resolution_clock::now();
         std::chrono::duration<float> dt = currentTime - lastTime;
@@ -703,7 +811,9 @@ int main(int argc, char** argv) {
         std::string help = "WASD Move, Click Mouse Capture, F: Mode [" + std::string(modeNames[g_renderMode]) + "]";
         DrawString(10, g_height - 20, help.c_str(), 0xFFFFFF00, pixels.data(), g_width, g_height);
 
-        vk.Present(pixels);
+        if (!vk.Present(pixels)) {
+            vk.framebufferResized = true;  // Trigger recreation next frame
+        }
         frameCount++;
     }
 
