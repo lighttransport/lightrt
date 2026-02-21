@@ -11,6 +11,7 @@ lightrt_example
 lightrt_benchmark
 obj_bvh_bench
 viewer/viewer
+viewer_windows/viewer_windows.exe
 
 # Generated images
 *.bmp
