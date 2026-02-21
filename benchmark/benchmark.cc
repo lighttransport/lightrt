@@ -737,6 +737,370 @@ std::vector<Triangle> generateLargeTriangles(uint32_t count, float scene_size, R
   return triangles;
 }
 
+// ============================================================================
+// Spanning Polygon Scene Generators
+// ============================================================================
+
+// Ground plane (1 large quad as 2 tris) + small random triangles above it
+std::vector<Triangle> generateGroundPlaneScene(uint32_t small_count, float scene_size, RNG& rng) {
+  std::vector<Triangle> triangles;
+  triangles.reserve(small_count + 2);
+
+  // Large ground quad at y=0 spanning [-scene_size, scene_size] in XZ
+  Vec3 g0(-scene_size, 0.0f, -scene_size);
+  Vec3 g1( scene_size, 0.0f, -scene_size);
+  Vec3 g2( scene_size, 0.0f,  scene_size);
+  Vec3 g3(-scene_size, 0.0f,  scene_size);
+  triangles.emplace_back(g0, g1, g2);
+  triangles.emplace_back(g0, g2, g3);
+
+  // Small random triangles scattered above the plane
+  for (uint32_t i = 0; i < small_count; i++) {
+    Vec3 center(rng.uniform(-scene_size, scene_size),
+                rng.uniform(0.1f, scene_size),
+                rng.uniform(-scene_size, scene_size));
+    float tri_size = rng.uniform(0.05f, 0.3f);
+    Vec3 v0 = center + rng.uniformVec3(-tri_size, tri_size);
+    Vec3 v1 = center + rng.uniformVec3(-tri_size, tri_size);
+    Vec3 v2 = center + rng.uniformVec3(-tri_size, tri_size);
+    triangles.emplace_back(v0, v1, v2);
+  }
+
+  return triangles;
+}
+
+// Room enclosure (floor + ceiling + 4 walls = 12 tris) + small triangles inside
+std::vector<Triangle> generateRoomScene(uint32_t small_count, float room_size, RNG& rng) {
+  std::vector<Triangle> triangles;
+  triangles.reserve(small_count + 12);
+
+  float s = room_size;
+  // Helper: add a quad as 2 triangles
+  auto addQuad = [&](Vec3 a, Vec3 b, Vec3 c, Vec3 d) {
+    triangles.emplace_back(a, b, c);
+    triangles.emplace_back(a, c, d);
+  };
+
+  // Floor (y = 0)
+  addQuad(Vec3(-s, 0, -s), Vec3( s, 0, -s), Vec3( s, 0,  s), Vec3(-s, 0,  s));
+  // Ceiling (y = 2*s)
+  addQuad(Vec3(-s, 2*s, -s), Vec3(-s, 2*s,  s), Vec3( s, 2*s,  s), Vec3( s, 2*s, -s));
+  // Back wall (z = -s)
+  addQuad(Vec3(-s, 0, -s), Vec3(-s, 2*s, -s), Vec3( s, 2*s, -s), Vec3( s, 0, -s));
+  // Front wall (z = s)
+  addQuad(Vec3(-s, 0,  s), Vec3( s, 0,  s), Vec3( s, 2*s,  s), Vec3(-s, 2*s,  s));
+  // Left wall (x = -s)
+  addQuad(Vec3(-s, 0, -s), Vec3(-s, 0,  s), Vec3(-s, 2*s,  s), Vec3(-s, 2*s, -s));
+  // Right wall (x = s)
+  addQuad(Vec3( s, 0, -s), Vec3( s, 2*s, -s), Vec3( s, 2*s,  s), Vec3( s, 0,  s));
+
+  // Small random triangles inside the room
+  for (uint32_t i = 0; i < small_count; i++) {
+    Vec3 center(rng.uniform(-s * 0.9f, s * 0.9f),
+                rng.uniform(0.1f, 2.0f * s * 0.9f),
+                rng.uniform(-s * 0.9f, s * 0.9f));
+    float tri_size = rng.uniform(0.05f, 0.3f);
+    Vec3 v0 = center + rng.uniformVec3(-tri_size, tri_size);
+    Vec3 v1 = center + rng.uniformVec3(-tri_size, tri_size);
+    Vec3 v2 = center + rng.uniformVec3(-tri_size, tri_size);
+    triangles.emplace_back(v0, v1, v2);
+  }
+
+  return triangles;
+}
+
+// Large partition-like triangles spanning 50-100% of scene + small triangles
+std::vector<Triangle> generateMixedSpanningScene(uint32_t num_large, uint32_t num_small,
+                                                   float scene_size, RNG& rng) {
+  std::vector<Triangle> triangles;
+  triangles.reserve(num_large + num_small);
+
+  // Large triangles spanning significant portion of scene
+  for (uint32_t i = 0; i < num_large; i++) {
+    float span_fraction = rng.uniform(0.5f, 1.0f);
+    float span = scene_size * span_fraction;
+
+    // Random axis-aligned orientation
+    int axis = static_cast<int>(rng.next() % 3);
+    float pos = rng.uniform(-scene_size * 0.5f, scene_size * 0.5f);
+
+    Vec3 v0, v1, v2;
+    if (axis == 0) {
+      // Spans YZ plane
+      v0 = Vec3(pos, -span, -span);
+      v1 = Vec3(pos,  span, -span);
+      v2 = Vec3(pos,  0.0f,  span);
+    } else if (axis == 1) {
+      // Spans XZ plane
+      v0 = Vec3(-span, pos, -span);
+      v1 = Vec3( span, pos, -span);
+      v2 = Vec3( 0.0f, pos,  span);
+    } else {
+      // Spans XY plane
+      v0 = Vec3(-span, -span, pos);
+      v1 = Vec3( span, -span, pos);
+      v2 = Vec3( 0.0f,  span, pos);
+    }
+
+    triangles.emplace_back(v0, v1, v2);
+  }
+
+  // Small random triangles scattered throughout
+  for (uint32_t i = 0; i < num_small; i++) {
+    Vec3 center = rng.uniformVec3(-scene_size, scene_size);
+    float tri_size = rng.uniform(0.05f, 0.3f);
+    Vec3 v0 = center + rng.uniformVec3(-tri_size, tri_size);
+    Vec3 v1 = center + rng.uniformVec3(-tri_size, tri_size);
+    Vec3 v2 = center + rng.uniformVec3(-tri_size, tri_size);
+    triangles.emplace_back(v0, v1, v2);
+  }
+
+  return triangles;
+}
+
+// ============================================================================
+// Spanning Polygon Benchmark (TriangleBVH vs SBVH)
+// ============================================================================
+
+void benchmarkSpanningPolygons(uint32_t num_triangles, uint32_t num_rays) {
+  std::cout << "\n========================================\n";
+  std::cout << "Spanning Polygon Scenes (TriangleBVH vs SBVH)\n";
+  std::cout << "========================================\n";
+  std::cout << "\nLarge spanning polygons cause BVH AABB overlap at every split.\n";
+  std::cout << "SBVH spatial splits clip these into tighter sub-references.\n";
+
+  RNG rng(42);
+  const float scene_size = 10.0f;
+
+  // Generate downward camera rays (hits ground plane / floor)
+  auto generateDownwardCameraRays = [&](uint32_t count, float sz) {
+    std::vector<Ray> rays;
+    rays.reserve(count);
+    for (uint32_t i = 0; i < count; i++) {
+      float x = rng.uniform(-sz, sz);
+      float z = rng.uniform(-sz, sz);
+      Vec3 origin(x, sz * 2.0f, z);
+      Vec3 dir(rng.uniform(-0.1f, 0.1f), -1.0f, rng.uniform(-0.1f, 0.1f));
+      float len = std::sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+      dir = dir * (1.0f / len);
+      rays.emplace_back(origin, dir);
+    }
+    return rays;
+  };
+
+  // Helper lambda to run TriangleBVH vs SBVH comparison on a scene
+  auto runComparison = [&](const char* scene_name, const std::vector<Triangle>& triangles,
+                            const std::vector<Ray>& rays) {
+    std::cout << "\n--- " << scene_name << " ---\n";
+    std::cout << "  Triangles: " << triangles.size() << ", Rays: " << rays.size() << "\n";
+
+    // TriangleBVH
+    double bvh_build_ms, bvh_traverse_ms;
+    uint32_t bvh_hits = 0;
+    uint64_t bvh_total_nodes = 0, bvh_total_prims = 0;
+    BVH::Stats bvh_stats;
+    {
+      TriangleBVH bvh;
+      BVHBuildConfig config;
+      config.use_sah = true;
+      config.use_binning = true;
+      config.max_leaf_size = 4;
+
+      bvh_build_ms = measureTime([&]() {
+        bvh.build(triangles, config);
+      });
+      bvh_stats = bvh.getStats();
+
+      bvh_traverse_ms = measureTime([&]() {
+        for (const auto& ray : rays) {
+          float t, u, v;
+          TraversalStats stats;
+          TraversalConfig cfg;
+          if (bvh.traverseWithConfig(ray, t, u, v, cfg, &stats) != kInvalidIndex) {
+            bvh_hits++;
+          }
+          bvh_total_nodes += stats.nodes_visited;
+          bvh_total_prims += stats.prims_tested;
+        }
+      });
+    }
+
+    double bvh_mrays = (rays.size() / 1e6) / (bvh_traverse_ms / 1000.0);
+    double bvh_avg_nodes = static_cast<double>(bvh_total_nodes) / rays.size();
+    double bvh_avg_prims = static_cast<double>(bvh_total_prims) / rays.size();
+
+    std::cout << "  TriangleBVH:\n";
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "    Build: " << bvh_build_ms << " ms, Traverse: " << bvh_traverse_ms
+              << " ms (" << bvh_mrays << " Mrays/s)\n";
+    std::cout << "    SAH: " << std::scientific << bvh_stats.sah_cost << std::fixed
+              << ", Nodes: " << bvh_stats.num_nodes << "\n";
+    std::cout << "    Avg nodes/ray: " << std::setprecision(1) << bvh_avg_nodes
+              << ", Avg prims/ray: " << bvh_avg_prims << "\n";
+    std::cout << "    Hits: " << bvh_hits << "\n";
+
+    // SBVH with default config (split_factor=1.5)
+    auto runSBVH = [&](const char* label, float max_split_factor, float alpha) {
+      double sbvh_build_ms, sbvh_traverse_ms;
+      uint32_t sbvh_hits = 0;
+      uint64_t sbvh_total_nodes = 0, sbvh_total_prims = 0;
+      SBVH::Stats sbvh_stats;
+      {
+        SBVH sbvh;
+        SBVHBuildConfig config;
+        config.max_leaf_size = 4;
+        config.num_spatial_bins = 256;
+        config.num_object_bins = 32;
+        config.alpha = alpha;
+        config.max_split_factor = max_split_factor;
+
+        sbvh_build_ms = measureTime([&]() {
+          sbvh.build(triangles, config);
+        });
+        sbvh_stats = sbvh.getStats();
+
+        sbvh_traverse_ms = measureTime([&]() {
+          for (const auto& ray : rays) {
+            float t, u, v;
+            TraversalStats stats;
+            TraversalConfig cfg;
+            cfg.use_mailboxing = true;
+            if (sbvh.traverseWithConfig(ray, t, u, v, cfg, &stats) != kInvalidIndex) {
+              sbvh_hits++;
+            }
+            sbvh_total_nodes += stats.nodes_visited;
+            sbvh_total_prims += stats.prims_tested;
+          }
+        });
+      }
+
+      double sbvh_mrays = (rays.size() / 1e6) / (sbvh_traverse_ms / 1000.0);
+      double sbvh_avg_nodes = static_cast<double>(sbvh_total_nodes) / rays.size();
+      double sbvh_avg_prims = static_cast<double>(sbvh_total_prims) / rays.size();
+      double speedup = bvh_traverse_ms / sbvh_traverse_ms;
+
+      std::cout << "  " << label << ":\n";
+      std::cout << std::fixed << std::setprecision(2);
+      std::cout << "    Build: " << sbvh_build_ms << " ms, Traverse: " << sbvh_traverse_ms
+                << " ms (" << sbvh_mrays << " Mrays/s)\n";
+      std::cout << "    SAH: " << std::scientific << sbvh_stats.sah_cost << std::fixed
+                << ", Split ratio: " << std::setprecision(2) << sbvh_stats.split_ratio << "x\n";
+      std::cout << "    Avg nodes/ray: " << std::setprecision(1) << sbvh_avg_nodes
+                << ", Avg prims/ray: " << sbvh_avg_prims << "\n";
+      std::cout << "    Hits: " << sbvh_hits
+                << ", Speedup: " << std::setprecision(2) << speedup << "x"
+                << (speedup > 1.0 ? " (SBVH faster)" : " (TriangleBVH faster)") << "\n";
+
+      if (sbvh_hits != bvh_hits) {
+        std::cout << "    WARNING: Hit count mismatch! (BVH=" << bvh_hits << " vs SBVH=" << sbvh_hits << ")\n";
+      }
+    };
+
+    runSBVH("SBVH (split_factor=1.5)", 1.5f, 1e-5f);
+    runSBVH("SBVH (split_factor=3.0, aggressive)", 3.0f, 1e-7f);
+  };
+
+  // ---- Scene A: Ground plane + small triangles ----
+  uint32_t small_count = num_triangles > 2 ? num_triangles - 2 : 1000;
+  {
+    auto triangles = generateGroundPlaneScene(small_count, scene_size, rng);
+    auto random_rays = generateRandomRays(num_rays, scene_size, rng);
+    runComparison("Ground Plane + random rays", triangles, random_rays);
+
+    auto downward_rays = generateDownwardCameraRays(num_rays, scene_size);
+    runComparison("Ground Plane + downward camera rays", triangles, downward_rays);
+  }
+
+  // ---- Scene B: Room enclosure + small triangles ----
+  {
+    auto triangles = generateRoomScene(small_count, scene_size, rng);
+    auto random_rays = generateRandomRays(num_rays, scene_size, rng);
+    runComparison("Room Enclosure + random rays", triangles, random_rays);
+  }
+
+  // ---- Scene C: Mixed spanning partitions ----
+  {
+    uint32_t num_large = 20;
+    uint32_t num_small = num_triangles > num_large ? num_triangles - num_large : 1000;
+    auto triangles = generateMixedSpanningScene(num_large, num_small, scene_size, rng);
+    auto random_rays = generateRandomRays(num_rays, scene_size, rng);
+    runComparison("Mixed Spanning (20 large + small)", triangles, random_rays);
+  }
+
+  // ---- Scaling test: Ground plane with varying small triangle counts ----
+  std::cout << "\n--- Scaling Test (Ground Plane) ---\n";
+  std::cout << std::setw(12) << "SmallTris"
+            << std::setw(14) << "BVH(ms)"
+            << std::setw(14) << "SBVH(ms)"
+            << std::setw(10) << "Speedup"
+            << std::setw(14) << "BVH nodes/r"
+            << std::setw(14) << "SBVH nodes/r" << "\n";
+  std::cout << std::string(78, '-') << "\n";
+
+  for (uint32_t sc : {1000u, 10000u, 100000u}) {
+    RNG scale_rng(123);
+    auto triangles = generateGroundPlaneScene(sc, scene_size, scale_rng);
+    auto rays = generateRandomRays(num_rays, scene_size, scale_rng);
+
+    // TriangleBVH
+    double bvh_ms;
+    uint64_t bvh_nodes_total = 0;
+    {
+      TriangleBVH bvh;
+      bvh.build(triangles);
+      bvh_ms = measureTime([&]() {
+        for (const auto& ray : rays) {
+          float t, u, v;
+          TraversalStats stats;
+          TraversalConfig cfg;
+          bvh.traverseWithConfig(ray, t, u, v, cfg, &stats);
+          bvh_nodes_total += stats.nodes_visited;
+        }
+      });
+    }
+
+    // SBVH
+    double sbvh_ms;
+    uint64_t sbvh_nodes_total = 0;
+    {
+      SBVH sbvh;
+      SBVHBuildConfig config;
+      config.max_split_factor = 2.0f;
+      sbvh.build(triangles, config);
+      sbvh_ms = measureTime([&]() {
+        for (const auto& ray : rays) {
+          float t, u, v;
+          TraversalStats stats;
+          TraversalConfig cfg;
+          cfg.use_mailboxing = true;
+          sbvh.traverseWithConfig(ray, t, u, v, cfg, &stats);
+          sbvh_nodes_total += stats.nodes_visited;
+        }
+      });
+    }
+
+    double speedup = bvh_ms / sbvh_ms;
+    double bvh_avg_nodes = static_cast<double>(bvh_nodes_total) / rays.size();
+    double sbvh_avg_nodes = static_cast<double>(sbvh_nodes_total) / rays.size();
+
+    std::cout << std::fixed << std::setprecision(2)
+              << std::setw(12) << sc
+              << std::setw(14) << bvh_ms
+              << std::setw(14) << sbvh_ms
+              << std::setw(10) << speedup << "x"
+              << std::setw(13) << std::setprecision(1) << bvh_avg_nodes
+              << std::setw(14) << sbvh_avg_nodes << "\n";
+  }
+
+  std::cout << "\n--- Analysis ---\n";
+  std::cout << "Large spanning polygons (ground planes, walls) have AABBs that\n";
+  std::cout << "overlap all children at every BVH split, degrading traversal.\n";
+  std::cout << "SBVH spatial splits clip these into tighter sub-references,\n";
+  std::cout << "reducing avg nodes/ray and prims/ray for better traversal.\n";
+  std::cout << "Aggressive split_factor=3.0 allows more duplication for\n";
+  std::cout << "potentially tighter bounds at the cost of longer build time.\n";
+}
+
 void benchmarkSBVHvsTriangleBVH(uint32_t num_triangles, uint32_t num_rays) {
   std::cout << "\n========================================\n";
   std::cout << "SBVH vs TriangleBVH Comparison\n";
@@ -1592,6 +1956,9 @@ int main(int argc, char** argv) {
 
   // Co-planar triangle scenes with max prim test limits
   benchmarkCoplanarTriangles(num_triangles, num_rays);
+
+  // Spanning polygon scenes (ground planes, rooms, partitions)
+  benchmarkSpanningPolygons(num_triangles, num_rays);
 
   // Auto-tuning benchmark
   benchmarkAutoTuning(num_triangles, num_rays);

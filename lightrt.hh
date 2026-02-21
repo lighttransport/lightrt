@@ -1428,7 +1428,7 @@ struct SBVHBuildConfig {
     : max_leaf_size(4)
     , traversal_cost(1.0f)
     , intersection_cost(1.0f)
-    , num_spatial_bins(256)
+    , num_spatial_bins(64)
     , num_object_bins(32)
     , alpha(1e-5f)
     , max_split_factor(1.5f) {}

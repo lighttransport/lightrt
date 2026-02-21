@@ -4144,6 +4144,13 @@ SBVH::SplitResult SBVH::findSpatialSplit(
 
   float inv_node_area = 1.0f / node_bounds.surfaceArea();
 
+  // Stack-based bin arrays (avoid heap allocation per recursive call)
+  constexpr uint32_t kMaxStackBins = 128;
+  const uint32_t num_bins = std::min(config_.num_spatial_bins, kMaxStackBins);
+  SpatialBin bins[kMaxStackBins];
+  AABB left_bounds_arr[kMaxStackBins];
+  uint32_t left_counts_arr[kMaxStackBins];
+
   // Try each axis
   for (int axis = 0; axis < 3; axis++) {
     float min_val = axis == 0 ? node_bounds.min.x :
@@ -4155,11 +4162,13 @@ SBVH::SplitResult SBVH::findSpatialSplit(
       continue;
     }
 
-    // Initialize spatial bins
-    std::vector<SpatialBin> bins(config_.num_spatial_bins);
-    float bin_size = (max_val - min_val) / config_.num_spatial_bins;
+    // Reset bins for this axis
+    for (uint32_t i = 0; i < num_bins; i++) {
+      bins[i] = SpatialBin();
+    }
+    float bin_size = (max_val - min_val) / num_bins;
 
-    // Fill bins with clipped triangle bounds
+    // Fill bins with clipped reference bounds
     for (const auto& ref : refs) {
       // Find bins this reference overlaps
       float ref_min = axis == 0 ? ref.bounds.min.x :
@@ -4169,19 +4178,17 @@ SBVH::SplitResult SBVH::findSpatialSplit(
 
       uint32_t first_bin = static_cast<uint32_t>((ref_min - min_val) / bin_size);
       uint32_t last_bin = static_cast<uint32_t>((ref_max - min_val) / bin_size);
-      first_bin = std::min(first_bin, config_.num_spatial_bins - 1);
-      last_bin = std::min(last_bin, config_.num_spatial_bins - 1);
+      first_bin = std::min(first_bin, num_bins - 1);
+      last_bin = std::min(last_bin, num_bins - 1);
 
       bins[first_bin].enter++;
       bins[last_bin].exit++;
 
-      // Clip triangle to each overlapping bin
-      const Triangle& tri = triangles_[ref.prim_id];
+      // Clip reference bounds to each overlapping bin (AABB-only, no triangle clipping)
       for (uint32_t b = first_bin; b <= last_bin; b++) {
         float plane_left = min_val + b * bin_size;
         float plane_right = min_val + (b + 1) * bin_size;
 
-        // Clip to left plane
         AABB clipped = ref.bounds;
         if (axis == 0) {
           clipped.min.x = std::max(clipped.min.x, plane_left);
@@ -4194,51 +4201,37 @@ SBVH::SplitResult SBVH::findSpatialSplit(
           clipped.max.z = std::min(clipped.max.z, plane_right);
         }
 
-        // Refine with actual triangle clipping for tighter bounds
-        AABB tri_clipped = clipTriangleToPlane(tri, axis, plane_left, false);
-        AABB tri_clipped2 = clipTriangleToPlane(tri, axis, plane_right, true);
-
-        // Intersect all bounds
-        clipped.min.x = std::max(clipped.min.x, std::max(tri_clipped.min.x, tri_clipped2.min.x));
-        clipped.min.y = std::max(clipped.min.y, std::max(tri_clipped.min.y, tri_clipped2.min.y));
-        clipped.min.z = std::max(clipped.min.z, std::max(tri_clipped.min.z, tri_clipped2.min.z));
-        clipped.max.x = std::min(clipped.max.x, std::min(tri_clipped.max.x, tri_clipped2.max.x));
-        clipped.max.y = std::min(clipped.max.y, std::min(tri_clipped.max.y, tri_clipped2.max.y));
-        clipped.max.z = std::min(clipped.max.z, std::min(tri_clipped.max.z, tri_clipped2.max.z));
-
         bins[b].bounds.expand(clipped);
       }
     }
 
     // Sweep from left
-    std::vector<AABB> left_bounds(config_.num_spatial_bins);
-    std::vector<uint32_t> left_counts(config_.num_spatial_bins);
     AABB running_bounds;
     uint32_t running_count = 0;
 
-    for (uint32_t i = 0; i < config_.num_spatial_bins - 1; i++) {
+    for (uint32_t i = 0; i < num_bins - 1; i++) {
       running_bounds.expand(bins[i].bounds);
       running_count += bins[i].enter;
-      left_bounds[i] = running_bounds;
-      left_counts[i] = running_count;
+      left_bounds_arr[i] = running_bounds;
+      left_counts_arr[i] = running_count;
     }
 
     // Sweep from right and compute costs
     running_bounds = AABB();
     running_count = 0;
 
-    for (uint32_t i = config_.num_spatial_bins - 1; i > 0; i--) {
+    for (uint32_t i = num_bins - 1; i > 0; i--) {
       running_count += bins[i].exit;
       running_bounds.expand(bins[i].bounds);
 
-      uint32_t left_count = left_counts[i - 1];
+      uint32_t left_count = left_counts_arr[i - 1];
       uint32_t right_count = running_count;
 
       if (left_count == 0 || right_count == 0) {
         continue;
       }
 
-      float left_area = left_bounds[i - 1].surfaceArea() * inv_node_area;
+      float left_area = left_bounds_arr[i - 1].surfaceArea() * inv_node_area;
       float right_area = running_bounds.surfaceArea() * inv_node_area;
 
       float cost = config_.traversal_cost +
@@ -4247,8 +4240,8 @@ SBVH::SplitResult SBVH::findSpatialSplit(
       if (cost < best.cost) {
         best.cost = cost;
         best.axis = axis;
-        best.pos = min_val + (max_val - min_val) * (static_cast<float>(i) / config_.num_spatial_bins);
-        best.left_bounds = left_bounds[i - 1];
+        best.pos = min_val + (max_val - min_val) * (static_cast<float>(i) / num_bins);
+        best.left_bounds = left_bounds_arr[i - 1];
         best.right_bounds = running_bounds;
         best.left_count = left_count;
         best.right_count = right_count;
@@ -4314,6 +4307,24 @@ void SBVH::performSpatialSplit(
     left_bounds.max.y = std::min(left_bounds.max.y, ref.bounds.max.y);
     left_bounds.max.z = std::min(left_bounds.max.z, ref.bounds.max.z);
 
+    // Expand clipped bounds by a relative epsilon to prevent intersectFast
+    // pre-test from rejecting valid ray-triangle hits due to FP precision.
+    // Use max extent of ref bounds to scale the epsilon appropriately.
+    // Don't re-clamp: the expansion must survive for thin/co-planar triangles
+    // where ref.bounds itself has near-zero extent in one axis.
+    {
+      float extent = std::max({ref.bounds.max.x - ref.bounds.min.x,
+                               ref.bounds.max.y - ref.bounds.min.y,
+                               ref.bounds.max.z - ref.bounds.min.z});
+      float eps = std::max(extent * 1e-5f, 1e-7f);
+      left_bounds.min.x -= eps;
+      left_bounds.min.y -= eps;
+      left_bounds.min.z -= eps;
+      left_bounds.max.x += eps;
+      left_bounds.max.y += eps;
+      left_bounds.max.z += eps;
+    }
+
     if (left_bounds.min.x <= left_bounds.max.x &&
         left_bounds.min.y <= left_bounds.max.y &&
         left_bounds.min.z <= left_bounds.max.z) {
@@ -4328,6 +4339,20 @@ void SBVH::performSpatialSplit(
     right_bounds.max.x = std::min(right_bounds.max.x, ref.bounds.max.x);
     right_bounds.max.y = std::min(right_bounds.max.y, ref.bounds.max.y);
     right_bounds.max.z = std::min(right_bounds.max.z, ref.bounds.max.z);
+
+    // Same relative epsilon expansion (no re-clamp)
+    {
+      float extent = std::max({ref.bounds.max.x - ref.bounds.min.x,
+                               ref.bounds.max.y - ref.bounds.min.y,
+                               ref.bounds.max.z - ref.bounds.min.z});
+      float eps = std::max(extent * 1e-5f, 1e-7f);
+      right_bounds.min.x -= eps;
+      right_bounds.min.y -= eps;
+      right_bounds.min.z -= eps;
+      right_bounds.max.x += eps;
+      right_bounds.max.y += eps;
+      right_bounds.max.z += eps;
+    }
 
     if (right_bounds.min.x <= right_bounds.max.x &&
         right_bounds.min.y <= right_bounds.max.y &&
@@ -4454,6 +4479,8 @@ uint32_t SBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hit_u, fl
     return kInvalidIndex;
   }
 
+  const RayContext ctx(ray);
+
   uint32_t hit_tri = kInvalidIndex;
   hit_t = ray.tmax;
 
@@ -4463,14 +4490,20 @@ uint32_t SBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hit_u, fl
 
   // Optional mailbox for avoiding duplicate tests
   // In SBVH, the same primitive can appear in multiple leaves
-  std::vector<uint64_t> mailbox_bitset;
-  std::vector<uint32_t> mailbox_hash;
   const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
   const bool use_mailbox = config.use_mailboxing && num_prims > 0;
 
+  // Stack-based bitset for small prim counts (8KB max), heap fallback for large
+  uint64_t mailbox_stack[1024];
+  uint64_t* mailbox_bitset = nullptr;
+  std::vector<uint64_t> mailbox_bitset_heap;
+  std::vector<uint32_t> mailbox_hash;
+
   if (use_mailbox) {
     if (num_prims <= 65536) {
-      mailbox_bitset.resize((num_prims + 63) / 64, 0);
+      const uint32_t words = (num_prims + 63) / 64;
+      mailbox_bitset = mailbox_stack;
+      std::memset(mailbox_bitset, 0, words * sizeof(uint64_t));
     } else {
       mailbox_hash.resize(std::max(num_prims / 4, 256u), kInvalidIndex);
     }
@@ -4504,14 +4537,10 @@ uint32_t SBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hit_u, fl
   };
 
   // Stack-based traversal
-  struct StackEntry {
-    uint32_t node_idx;
-  };
-
-  StackEntry stack[64];
+  uint32_t stack[64];
   int stack_ptr = 0;
 
-  stack[stack_ptr++].node_idx = 0;
+  stack[stack_ptr++] = 0;
 
   while (stack_ptr > 0) {
     // Check if we've hit the primitive test limit
@@ -4520,12 +4549,12 @@ uint32_t SBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hit_u, fl
       break;
     }
 
-    uint32_t node_idx = stack[--stack_ptr].node_idx;
+    uint32_t node_idx = stack[--stack_ptr];
     const BVHNode& node = nodes_[node_idx];
     local_stats.nodes_visited++;
 
-    float tmin, tmax;
-    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > hit_t) {
+    float tmin;
+    if (!node.bounds.intersectFast(ctx, hit_t, tmin)) {
       continue;
     }
 
@@ -4545,14 +4574,16 @@ uint32_t SBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hit_u, fl
           continue;
         }
 
-        // Mailboxing: skip if already tested
-        if (testAndMarkMailbox(ref.prim_id)) {
+        // Early out: check if reference bounds are hit
+        // Must be checked BEFORE mailbox to avoid marking a triangle as tested
+        // when its clipped bounds reject the ray (another ref may cover the hit)
+        float ref_tmin;
+        if (!ref.bounds.intersectFast(ctx, hit_t, ref_tmin)) {
           continue;
         }
 
-        // Early out: check if reference bounds are hit
-        float ref_tmin, ref_tmax;
-        if (!ref.bounds.intersect(ray, ref_tmin, ref_tmax) || ref_tmin > hit_t) {
+        // Mailboxing: skip if already tested (only after ref bounds pass)
+        if (testAndMarkMailbox(ref.prim_id)) {
           continue;
         }
 
@@ -4577,10 +4608,15 @@ uint32_t SBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hit_u, fl
         }
       }
     } else {
-      // Add children to stack
+      // Front-to-back ordering: push far child first (popped last)
       if (stack_ptr < 62) {
-        stack[stack_ptr++].node_idx = node.left_child;
-        stack[stack_ptr++].node_idx = node.right_child;
+        uint32_t near_child = node.left_child;
+        uint32_t far_child = node.right_child;
+        if (ctx.sign[node.splitAxis()]) {
+          std::swap(near_child, far_child);
+        }
+        stack[stack_ptr++] = far_child;
+        stack[stack_ptr++] = near_child;
       }
     }
   }
@@ -4594,9 +4630,21 @@ bool SBVH::traverseAnyHit(const Ray& ray, uint32_t exclude_prim_id) const noexce
     return false;
   }
 
-  // Simple mailbox for duplicate avoidance
+  const RayContext ctx(ray);
+
+  // Stack-based mailbox for duplicate avoidance
   const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
-  std::vector<uint64_t> mailbox((num_prims + 63) / 64, 0);
+  const uint32_t mailbox_words = (num_prims + 63) / 64;
+  uint64_t mailbox_stack[1024];
+  std::vector<uint64_t> mailbox_heap;
+  uint64_t* mailbox;
+  if (num_prims <= 65536) {
+    mailbox = mailbox_stack;
+    std::memset(mailbox, 0, mailbox_words * sizeof(uint64_t));
+  } else {
+    mailbox_heap.resize(mailbox_words, 0);
+    mailbox = mailbox_heap.data();
+  }
 
   auto alreadyTested = [&](uint32_t prim_id) -> bool {
     uint32_t word = prim_id / 64;
@@ -4614,8 +4662,8 @@ bool SBVH::traverseAnyHit(const Ray& ray, uint32_t exclude_prim_id) const noexce
     uint32_t node_idx = stack[--stack_ptr];
     const BVHNode& node = nodes_[node_idx];
 
-    float tmin, tmax;
-    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > ray.tmax) {
+    float tmin;
+    if (!node.bounds.intersectFast(ctx, ray.tmax, tmin)) {
       continue;
     }
 
@@ -4631,9 +4679,15 @@ bool SBVH::traverseAnyHit(const Ray& ray, uint32_t exclude_prim_id) const noexce
         }
       }
     } else {
+      // Front-to-back ordering: push far child first (popped last)
       if (stack_ptr < 62) {
-        stack[stack_ptr++] = node.left_child;
-        stack[stack_ptr++] = node.right_child;
+        uint32_t near_child = node.left_child;
+        uint32_t far_child = node.right_child;
+        if (ctx.sign[node.splitAxis()]) {
+          std::swap(near_child, far_child);
+        }
+        stack[stack_ptr++] = far_child;
+        stack[stack_ptr++] = near_child;
       }
     }
   }
@@ -4656,6 +4710,18 @@ void SBVH::traverse4(const Ray4& rays, HitResult4& results) const noexcept {
 
   uint32_t active = rays.active_mask & 0xF;
   if (active == 0) return;
+
+  // Use first active ray's direction for front-to-back ordering
+  int first_active = 0;
+  for (int i = 0; i < 4; i++) {
+    if (active & (1u << i)) { first_active = i; break; }
+  }
+  Ray first_ray = rays.getRay(first_active);
+  int dir_sign[3] = {
+    first_ray.direction.x < 0.0f ? 1 : 0,
+    first_ray.direction.y < 0.0f ? 1 : 0,
+    first_ray.direction.z < 0.0f ? 1 : 0
+  };
 
   // Per-ray mailbox for duplicate avoidance
   const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
@@ -4717,9 +4783,15 @@ void SBVH::traverse4(const Ray4& rays, HitResult4& results) const noexcept {
         }
       }
     } else {
+      // Front-to-back ordering using first active ray's direction
       if (stack_ptr < 62) {
-        stack[stack_ptr++] = node.left_child;
-        stack[stack_ptr++] = node.right_child;
+        uint32_t near_child = node.left_child;
+        uint32_t far_child = node.right_child;
+        if (dir_sign[node.splitAxis()]) {
+          std::swap(near_child, far_child);
+        }
+        stack[stack_ptr++] = far_child;
+        stack[stack_ptr++] = near_child;
       }
     }
   }
@@ -4734,9 +4806,31 @@ uint32_t SBVH::traverse4AnyHit(const Ray4& rays, uint32_t exclude_prim_id) const
   uint32_t active = rays.active_mask & 0xF;
   if (active == 0) return 0;
 
-  // Shared mailbox
+  // Use first active ray's direction for front-to-back ordering
+  int first_active = 0;
+  for (int i = 0; i < 4; i++) {
+    if (active & (1u << i)) { first_active = i; break; }
+  }
+  Ray first_ray = rays.getRay(first_active);
+  int dir_sign[3] = {
+    first_ray.direction.x < 0.0f ? 1 : 0,
+    first_ray.direction.y < 0.0f ? 1 : 0,
+    first_ray.direction.z < 0.0f ? 1 : 0
+  };
+
+  // Stack-based shared mailbox
   const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
-  std::vector<uint64_t> mailbox((num_prims + 63) / 64, 0);
+  const uint32_t mailbox_words = (num_prims + 63) / 64;
+  uint64_t mailbox_stack[1024];
+  std::vector<uint64_t> mailbox_heap;
+  uint64_t* mailbox;
+  if (num_prims <= 65536) {
+    mailbox = mailbox_stack;
+    std::memset(mailbox, 0, mailbox_words * sizeof(uint64_t));
+  } else {
+    mailbox_heap.resize(mailbox_words, 0);
+    mailbox = mailbox_heap.data();
+  }
 
   auto alreadyTested = [&](uint32_t prim_id) -> bool {
     uint32_t word = prim_id / 64;
@@ -4789,9 +4883,15 @@ uint32_t SBVH::traverse4AnyHit(const Ray4& rays, uint32_t exclude_prim_id) const
         if (active == 0) break;
       }
     } else {
+      // Front-to-back ordering using first active ray's direction
       if (stack_ptr < 62) {
-        stack[stack_ptr++] = node.left_child;
-        stack[stack_ptr++] = node.right_child;
+        uint32_t near_child = node.left_child;
+        uint32_t far_child = node.right_child;
+        if (dir_sign[node.splitAxis()]) {
+          std::swap(near_child, far_child);
+        }
+        stack[stack_ptr++] = far_child;
+        stack[stack_ptr++] = near_child;
       }
     }
   }
@@ -4813,6 +4913,18 @@ void SBVH::traverse8(const Ray8& rays, HitResult8& results) const noexcept {
 
   uint32_t active = rays.active_mask & 0xFF;
   if (active == 0) return;
+
+  // Use first active ray's direction for front-to-back ordering
+  int first_active = 0;
+  for (int i = 0; i < 8; i++) {
+    if (active & (1u << i)) { first_active = i; break; }
+  }
+  Ray first_ray = rays.getRay(first_active);
+  int dir_sign[3] = {
+    first_ray.direction.x < 0.0f ? 1 : 0,
+    first_ray.direction.y < 0.0f ? 1 : 0,
+    first_ray.direction.z < 0.0f ? 1 : 0
+  };
 
   const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
   std::vector<uint64_t> mailbox[8];
@@ -4872,9 +4984,15 @@ void SBVH::traverse8(const Ray8& rays, HitResult8& results) const noexcept {
         }
       }
     } else {
+      // Front-to-back ordering using first active ray's direction
       if (stack_ptr < 62) {
-        stack[stack_ptr++] = node.left_child;
-        stack[stack_ptr++] = node.right_child;
+        uint32_t near_child = node.left_child;
+        uint32_t far_child = node.right_child;
+        if (dir_sign[node.splitAxis()]) {
+          std::swap(near_child, far_child);
+        }
+        stack[stack_ptr++] = far_child;
+        stack[stack_ptr++] = near_child;
       }
     }
   }
@@ -4889,8 +5007,31 @@ uint32_t SBVH::traverse8AnyHit(const Ray8& rays, uint32_t exclude_prim_id) const
   uint32_t active = rays.active_mask & 0xFF;
   if (active == 0) return 0;
 
+  // Use first active ray's direction for front-to-back ordering
+  int first_active = 0;
+  for (int i = 0; i < 8; i++) {
+    if (active & (1u << i)) { first_active = i; break; }
+  }
+  Ray first_ray = rays.getRay(first_active);
+  int dir_sign[3] = {
+    first_ray.direction.x < 0.0f ? 1 : 0,
+    first_ray.direction.y < 0.0f ? 1 : 0,
+    first_ray.direction.z < 0.0f ? 1 : 0
+  };
+
+  // Stack-based shared mailbox
   const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
-  std::vector<uint64_t> mailbox((num_prims + 63) / 64, 0);
+  const uint32_t mailbox_words = (num_prims + 63) / 64;
+  uint64_t mailbox_stack[1024];
+  std::vector<uint64_t> mailbox_heap;
+  uint64_t* mailbox;
+  if (num_prims <= 65536) {
+    mailbox = mailbox_stack;
+    std::memset(mailbox, 0, mailbox_words * sizeof(uint64_t));
+  } else {
+    mailbox_heap.resize(mailbox_words, 0);
+    mailbox = mailbox_heap.data();
+  }
 
   auto alreadyTested = [&](uint32_t prim_id) -> bool {
     uint32_t word = prim_id / 64;
@@ -4943,9 +5084,15 @@ uint32_t SBVH::traverse8AnyHit(const Ray8& rays, uint32_t exclude_prim_id) const
         if (active == 0) break;
       }
     } else {
+      // Front-to-back ordering using first active ray's direction
       if (stack_ptr < 62) {
-        stack[stack_ptr++] = node.left_child;
-        stack[stack_ptr++] = node.right_child;
+        uint32_t near_child = node.left_child;
+        uint32_t far_child = node.right_child;
+        if (dir_sign[node.splitAxis()]) {
+          std::swap(near_child, far_child);
+        }
+        stack[stack_ptr++] = far_child;
+        stack[stack_ptr++] = near_child;
       }
     }
   }
@@ -4962,9 +5109,21 @@ uint32_t SBVH::traverseMultiHit(const Ray& ray, MultiHitResult& result,
     return 0;
   }
 
-  // Mailbox to avoid duplicate hits from split primitives
+  const RayContext ctx(ray);
+
+  // Stack-based mailbox to avoid duplicate hits from split primitives
   const uint32_t num_prims = static_cast<uint32_t>(triangles_.size());
-  std::vector<uint64_t> mailbox((num_prims + 63) / 64, 0);
+  const uint32_t mailbox_words = (num_prims + 63) / 64;
+  uint64_t mailbox_stack[1024];
+  std::vector<uint64_t> mailbox_heap;
+  uint64_t* mailbox;
+  if (num_prims <= 65536) {
+    mailbox = mailbox_stack;
+    std::memset(mailbox, 0, mailbox_words * sizeof(uint64_t));
+  } else {
+    mailbox_heap.resize(mailbox_words, 0);
+    mailbox = mailbox_heap.data();
+  }
 
   auto alreadyTested = [&](uint32_t prim_id) -> bool {
     uint32_t word = prim_id / 64;
@@ -4987,8 +5146,8 @@ uint32_t SBVH::traverseMultiHit(const Ray& ray, MultiHitResult& result,
     uint32_t node_idx = stack[--stack_ptr];
     const BVHNode& node = nodes_[node_idx];
 
-    float tmin, tmax;
-    if (!node.bounds.intersectSIMD(ray, tmin, tmax) || tmin > ray.tmax) {
+    float tmin;
+    if (!node.bounds.intersectFast(ctx, ray.tmax, tmin)) {
       continue;
     }
 
@@ -5009,9 +5168,15 @@ uint32_t SBVH::traverseMultiHit(const Ray& ray, MultiHitResult& result,
         }
       }
     } else {
+      // Front-to-back ordering: push far child first (popped last)
       if (stack_ptr < 62) {
-        stack[stack_ptr++] = node.left_child;
-        stack[stack_ptr++] = node.right_child;
+        uint32_t near_child = node.left_child;
+        uint32_t far_child = node.right_child;
+        if (ctx.sign[node.splitAxis()]) {
+          std::swap(near_child, far_child);
+        }
+        stack[stack_ptr++] = far_child;
+        stack[stack_ptr++] = near_child;
       }
     }
   }
