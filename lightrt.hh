@@ -862,6 +862,17 @@ struct alignas(16) Triangle {
   // Moller-Trumbore ray-triangle intersection
   // Returns true if hit, sets t, u, v (barycentric coordinates)
   bool intersect(const Ray& ray, float& t, float& u, float& v) const noexcept;
+
+  // SoA Moller-Trumbore: test one triangle against 4 rays simultaneously
+  // Input: SoA ray origins (ox,oy,oz) and directions (dx,dy,dz)
+  // hit_mask_in: which rays are active (bit i = ray i)
+  // Output: t_out, u_out, v_out for hits; hit_mask_out = rays that hit
+  static void intersect4(const Triangle& tri,
+                         const float ox[4], const float oy[4], const float oz[4],
+                         const float dx[4], const float dy[4], const float dz[4],
+                         const float tmin[4], const float tmax[4],
+                         float t_out[4], float u_out[4], float v_out[4],
+                         uint32_t hit_mask_in, uint32_t& hit_mask_out) noexcept;
 };
 
 // ============================================================================
@@ -1252,12 +1263,14 @@ struct CompactOBB {
   int8_t rotation[4];      // Quaternion (w,x,y,z) in [-127,127]
   uint8_t half_extents[3]; // Quantized to [0,255] relative to AABB half-diagonal
   uint8_t volume_ratio;    // OBB_vol / AABB_vol * 255 (0xff = skip test)
-  // 8 bytes total
+  float half_diag;         // Precomputed AABB half-diagonal length (avoids sqrt per leaf)
+  // 12 bytes total
 
   CompactOBB() noexcept
     : rotation{127, 0, 0, 0}
     , half_extents{255, 255, 255}
-    , volume_ratio(255) {}
+    , volume_ratio(255)
+    , half_diag(0.0f) {}
 
   // Test ray against OBB. center = AABB center, aabb_half_diag = half-diagonal length.
   // Returns true if ray potentially hits the OBB (conservative).
@@ -2005,6 +2018,17 @@ public:
   bool saveToMemory(std::vector<uint8_t>& buffer) const noexcept;
   bool loadFromMemory(const uint8_t* data, size_t size) noexcept;
 
+  // Batch traversal: trace many rays in parallel across threads
+  void traverseBatch(const Ray* rays, uint32_t num_rays,
+                     uint32_t* hit_prim_ids, float* hit_ts,
+                     float* hit_us, float* hit_vs,
+                     uint32_t num_threads = 0) const noexcept;
+
+  void traverseBatchAnyHit(const Ray* rays, uint32_t num_rays,
+                           bool* hit_results,
+                           uint32_t exclude_prim_id = kInvalidIndex,
+                           uint32_t num_threads = 0) const noexcept;
+
   // Access internals
   const BVH& getBVH() const noexcept { return bvh_; }
   const std::vector<Triangle>& getTriangles() const noexcept { return triangles_; }
@@ -2075,6 +2099,17 @@ public:
   uint32_t traverseMultiHit(const Ray& ray, MultiHitResult& result,
                             uint32_t max_hits = 16,
                             uint32_t exclude_prim_id = kInvalidIndex) const noexcept;
+
+  // Batch traversal: trace many rays in parallel across threads
+  void traverseBatch(const Ray* rays, uint32_t num_rays,
+                     uint32_t* hit_prim_ids, float* hit_ts,
+                     float* hit_us, float* hit_vs,
+                     uint32_t num_threads = 0) const noexcept;
+
+  void traverseBatchAnyHit(const Ray* rays, uint32_t num_rays,
+                           bool* hit_results,
+                           uint32_t exclude_prim_id = kInvalidIndex,
+                           uint32_t num_threads = 0) const noexcept;
 
   // Access internals
   const std::vector<BVHNode>& getNodes() const noexcept { return nodes_; }
@@ -2511,6 +2546,60 @@ private:
 
   uint32_t buildRecursive(uint32_t* indices, uint32_t num_prims,
                           uint32_t depth, const std::vector<AABB>& prim_bounds) noexcept;
+};
+
+// ============================================================================
+// TriangleBVH4 — Wide BVH for triangles (4-wide SIMD node testing)
+// Wraps BVH4 and adds Moller-Trumbore triangle intersection in leaves.
+// ============================================================================
+
+class TriangleBVH4 {
+public:
+  TriangleBVH4() noexcept = default;
+  ~TriangleBVH4() noexcept = default;
+
+  // Build from triangles: construct binary BVH -> collapse to BVH4
+  bool build(const std::vector<Triangle>& triangles,
+             BVH4Precision precision = BVH4Precision::FP32,
+             const BVHBuildConfig& config = BVHBuildConfig()) noexcept;
+
+  // Traverse and find closest triangle intersection
+  uint32_t traverse(const Ray& ray, float& hit_t,
+                    float& hit_u, float& hit_v) const noexcept;
+
+  uint32_t getNumPrimitives() const noexcept { return static_cast<uint32_t>(triangles_.size()); }
+
+private:
+  BVH4 bvh4_;
+  std::vector<Triangle> triangles_;
+};
+
+// ============================================================================
+// CompactTriangleBVH — L1-cache-friendly BVH using CompactBVHNode (24 bytes)
+// Uses 16-bit quantized bounds for ~57% memory savings vs standard BVHNode.
+// ============================================================================
+
+class CompactTriangleBVH {
+public:
+  CompactTriangleBVH() noexcept = default;
+  ~CompactTriangleBVH() noexcept = default;
+
+  // Build from triangles
+  bool build(const std::vector<Triangle>& triangles,
+             const BVHBuildConfig& config = BVHBuildConfig()) noexcept;
+
+  // Traverse and find closest triangle intersection
+  uint32_t traverse(const Ray& ray, float& hit_t,
+                    float& hit_u, float& hit_v) const noexcept;
+
+  uint32_t getNumPrimitives() const noexcept { return static_cast<uint32_t>(triangles_.size()); }
+  size_t getBVHMemoryUsage() const noexcept;
+
+private:
+  std::vector<CompactBVHNode> nodes_;
+  std::vector<Triangle> triangles_;
+  std::vector<uint32_t> prim_indices_;
+  AABB scene_bounds_;
 };
 
 // ============================================================================
