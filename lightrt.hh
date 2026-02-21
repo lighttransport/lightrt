@@ -1245,6 +1245,27 @@ struct QuantizedAABB {
 };
 
 // ============================================================================
+// Compact OBB (Oriented Bounding Box) for Leaf Filtering
+// ============================================================================
+
+struct CompactOBB {
+  int8_t rotation[4];      // Quaternion (w,x,y,z) in [-127,127]
+  uint8_t half_extents[3]; // Quantized to [0,255] relative to AABB half-diagonal
+  uint8_t volume_ratio;    // OBB_vol / AABB_vol * 255 (0xff = skip test)
+  // 8 bytes total
+
+  CompactOBB() noexcept
+    : rotation{127, 0, 0, 0}
+    , half_extents{255, 255, 255}
+    , volume_ratio(255) {}
+
+  // Test ray against OBB. center = AABB center, aabb_half_diag = half-diagonal length.
+  // Returns true if ray potentially hits the OBB (conservative).
+  bool intersectRay(const Vec3& center, float aabb_half_diag,
+                    const Ray& ray, float t_limit) const noexcept;
+};
+
+// ============================================================================
 // FP16 Support
 // ============================================================================
 
@@ -1424,6 +1445,9 @@ struct SBVHBuildConfig {
   float alpha;                   // Spatial split threshold (overlap ratio)
   float max_split_factor;        // Max reference count increase (e.g., 1.5 = 50% more)
 
+  bool compute_leaf_obbs;        // Compute OBBs for leaf filtering
+  float obb_volume_threshold;     // Skip OBB if volume_ratio > threshold
+
   SBVHBuildConfig() noexcept
     : max_leaf_size(4)
     , traversal_cost(1.0f)
@@ -1431,7 +1455,9 @@ struct SBVHBuildConfig {
     , num_spatial_bins(64)
     , num_object_bins(32)
     , alpha(1e-5f)
-    , max_split_factor(1.5f) {}
+    , max_split_factor(1.5f)
+    , compute_leaf_obbs(false)
+    , obb_volume_threshold(0.7f) {}
 };
 
 // ============================================================================
@@ -2055,12 +2081,24 @@ public:
   const std::vector<PrimRef>& getReferences() const noexcept { return refs_; }
   const std::vector<Triangle>& getTriangles() const noexcept { return triangles_; }
 
+  // OBB leaf filtering
+  void computeLeafOBBs(float volume_threshold = 0.7f) noexcept;
+  bool hasOBBFiltering() const noexcept { return use_obb_filtering_; }
+
 private:
   std::vector<BVHNode> nodes_;
   std::vector<PrimRef> refs_;          // Leaf references (may have duplicates)
   std::vector<Triangle> triangles_;    // Original triangles
   SBVHBuildConfig config_;
   AABB scene_bounds_;
+
+  // OBB leaf filtering data
+  std::vector<CompactOBB> leaf_obbs_;
+  bool use_obb_filtering_{false};
+
+  // Timestamp-based mailbox for duplicate avoidance in traversal
+  mutable std::vector<uint32_t> prim_timestamps_;  // Per-primitive last-tested ray ID
+  mutable uint32_t ray_counter_{0};                 // Monotonic ray counter
 
   // Split result types
   enum class SplitType { Object, Spatial };
