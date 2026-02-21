@@ -14,29 +14,28 @@ using namespace lightrt;
 // --- Key Indices (platform-independent) ---
 
 enum ViewerKey {
-    KEY_W = 0,
-    KEY_A,
+    KEY_F = 0,
     KEY_S,
-    KEY_D,
-    KEY_F,
     KEY_ESCAPE,
     KEY_COUNT
 };
 
-// --- Render Mode ---
-
-enum RenderMode {
-    RENDER_SOLID = 0,
-    RENDER_WIREFRAME = 1,
-    RENDER_OVERLAY = 2,
-    RENDER_MODE_COUNT = 3
-};
-
 // --- Data Structures ---
 
-struct SimpleMesh {
+struct SceneMesh {
+    std::string name;
     std::vector<Triangle> triangles;
+    Vec3 color{0.8f, 0.8f, 0.8f};
+};
+
+struct Scene {
+    std::vector<SceneMesh> meshes;
+    std::vector<Triangle> allTriangles;
+    std::vector<uint32_t> meshIdPerTri;
     TriangleBVH bvh;
+
+    void build();
+    Vec3 getMeshColor(uint32_t triIdx) const;
 };
 
 struct Camera {
@@ -47,10 +46,12 @@ struct Camera {
     float fov = 60.0f;
     float yaw = -90.0f;
     float pitch = 0.0f;
+    Vec3 orbitCenter{0, 0, 0};
+    float orbitDistance = 5.0f;
 };
 
 struct ViewerState {
-    SimpleMesh mesh;
+    Scene scene;
     Camera camera;
     uint32_t width = 1280;
     uint32_t height = 720;
@@ -58,12 +59,20 @@ struct ViewerState {
     // Input
     bool keys[KEY_COUNT] = {};
     bool fKeyWasPressed = false;
+    bool sKeyWasPressed = false;
+    bool altPressed = false;
+    bool shiftPressed = false;
+    bool ctrlPressed = false;
+    bool lmbPressed = false, mmbPressed = false, rmbPressed = false;
+    bool dragging = false;
     double lastX = 0, lastY = 0;
-    bool firstMouse = true;
-    bool mouseCaptured = false;
 
     // Rendering
-    RenderMode renderMode = RENDER_SOLID;
+    bool shadowsEnabled = true;
+    std::vector<float> accumBuffer;   // w*h*3 HDR floats
+    uint32_t sampleCount = 0;
+    bool cameraDirty = true;
+    Vec3 sunDirection;
     std::vector<uint32_t> pixels;
 
     // Stats
@@ -73,44 +82,43 @@ struct ViewerState {
 
 // --- Model Loading ---
 
-bool LoadOBJ(const std::string& filename, SimpleMesh& mesh);
-bool LoadGLTF(const std::string& filename, SimpleMesh& mesh);
-bool LoadModel(const std::string& filename, SimpleMesh& mesh);
+bool LoadOBJ(const std::string& filename, Scene& scene);
+bool LoadGLTF(const std::string& filename, Scene& scene);
+bool LoadModel(const std::string& filename, Scene& scene);
 
 // --- Input Processing ---
 // Returns true if the viewer should close (Escape pressed)
 bool ProcessInput(ViewerState& state, float dt);
 
-// Mouse movement callback - updates camera orientation
-void OnMouseMove(ViewerState& state, double xpos, double ypos);
+// --- Camera ---
 
-// Mouse button toggle - returns new capture state
-bool OnMouseButtonToggle(ViewerState& state);
+void UpdateCameraFromOrbit(Camera& cam);
+void FitToScene(ViewerState& state);
+void OrbitCamera(ViewerState& state, float dx, float dy);
+void PanCamera(ViewerState& state, float dx, float dy);
+void DollyCamera(ViewerState& state, float delta);
+void OnMouseDown(ViewerState& state, double x, double y);
+void OnMouseDrag(ViewerState& state, double x, double y);
 
 // --- Rendering ---
 
-void RayTrace(ViewerState& state);
+Vec3 SampleSky(const Vec3& dir, const Vec3& sun_dir);
+void PathTrace(ViewerState& state);
 
-void RenderWireframe(std::vector<uint32_t>& buffer, int width, int height,
-                     const std::vector<Triangle>& triangles,
-                     const Camera& cam, uint32_t edgeColor);
-
-// Full frame render: ray trace / wireframe + text overlay
+// Full frame render: path trace + text overlay
 void RenderFrame(ViewerState& state);
 
 // Resize framebuffer
 void ResizeFramebuffer(ViewerState& state, uint32_t w, uint32_t h);
 
-// --- Drawing Primitives ---
+// --- Procedural Primitives ---
 
-bool ProjectToScreen(const Vec3& worldPos, const Camera& cam,
-                     int width, int height, int& screenX, int& screenY);
-
-void DrawLine(std::vector<uint32_t>& buffer, int width, int height,
-              int x0, int y0, int x1, int y1, uint32_t color);
-
-// --- Render mode name ---
-
-const char* RenderModeName(RenderMode mode);
+void GeneratePlane(SceneMesh& out, Vec3 center, float halfSize);
+void GenerateUVSphere(SceneMesh& out, Vec3 center, float radius, int segments = 16, int rings = 8);
+void GenerateCube(SceneMesh& out, Vec3 center, float halfSize);
+void GenerateCone(SceneMesh& out, Vec3 center, float radius, float height, int segments = 16);
+void GenerateTube(SceneMesh& out, Vec3 center, float radius, float height, int segments = 16);
+void GenerateCapsule(SceneMesh& out, Vec3 center, float radius, float cylHeight, int segments = 16, int rings = 4);
+void CreateDefaultScene(Scene& scene);
 
 } // namespace lightrt_viewer

@@ -297,15 +297,33 @@ struct VulkanContext {
 
 // --- GLFW Callbacks ---
 
-static void mouse_callback(GLFWwindow*, double xpos, double ypos) {
-    OnMouseMove(g_state, xpos, ypos);
+static void cursor_pos_callback(GLFWwindow*, double xpos, double ypos) {
+    OnMouseDrag(g_state, xpos, ypos);
 }
 
 static void mouse_button_callback(GLFWwindow* window, int button, int action, int) {
-    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
-        bool captured = OnMouseButtonToggle(g_state);
-        glfwSetInputMode(window, GLFW_CURSOR,
-                         captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+    double x, y;
+    glfwGetCursorPos(window, &x, &y);
+
+    if (action == GLFW_PRESS) {
+        if (button == GLFW_MOUSE_BUTTON_LEFT) {
+            g_state.lmbPressed = true;
+            OnMouseDown(g_state, x, y);
+        } else if (button == GLFW_MOUSE_BUTTON_MIDDLE) {
+            g_state.mmbPressed = true;
+            OnMouseDown(g_state, x, y);
+        } else if (button == GLFW_MOUSE_BUTTON_RIGHT) {
+            g_state.rmbPressed = true;
+            OnMouseDown(g_state, x, y);
+        }
+    } else if (action == GLFW_RELEASE) {
+        if (button == GLFW_MOUSE_BUTTON_LEFT) g_state.lmbPressed = false;
+        else if (button == GLFW_MOUSE_BUTTON_MIDDLE) g_state.mmbPressed = false;
+        else if (button == GLFW_MOUSE_BUTTON_RIGHT) g_state.rmbPressed = false;
+
+        if (!g_state.lmbPressed && !g_state.mmbPressed && !g_state.rmbPressed) {
+            g_state.dragging = false;
+        }
     }
 }
 
@@ -318,27 +336,38 @@ static void framebuffer_size_callback(GLFWwindow* window, int, int) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <model.obj/gltf/glb>\n";
+        std::cout << "No model specified, using default scene.\n";
+        CreateDefaultScene(g_state.scene);
+    } else {
+        std::string path = argv[1];
+        std::cout << "Loading " << path << "...\n";
+
+        if (!LoadModel(path, g_state.scene)) {
+            std::cerr << "Failed to load model.\n";
+            return 1;
+        }
+    }
+
+    g_state.scene.build();
+
+    if (g_state.scene.allTriangles.empty()) {
+        std::cerr << "No triangles in scene.\n";
         return 1;
     }
 
-    std::string path = argv[1];
-    std::cout << "Loading " << path << "...\n";
+    std::cout << "Scene: " << g_state.scene.meshes.size() << " meshes, "
+              << g_state.scene.allTriangles.size() << " triangles.\n";
 
-    if (!LoadModel(path, g_state.mesh) || g_state.mesh.triangles.empty()) {
-        std::cerr << "Failed to load model or empty.\n";
-        return 1;
-    }
-
-    std::cout << "Building BVH for " << g_state.mesh.triangles.size() << " triangles...\n";
-    lightrt::BVHBuildConfig config;
-    g_state.mesh.bvh.build(g_state.mesh.triangles, config);
-    std::cout << "BVH Built.\n";
+    // Initialize sun direction and accumulation buffer
+    g_state.sunDirection = Vec3(1, 1, -0.5f).normalize();
+    g_state.pixels.resize(g_state.width * g_state.height);
+    g_state.accumBuffer.resize((size_t)g_state.width * g_state.height * 3, 0.0f);
+    FitToScene(g_state);
 
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     GLFWwindow* window = glfwCreateWindow(g_state.width, g_state.height, "LightRT Viewer", nullptr, nullptr);
-    glfwSetCursorPosCallback(window, mouse_callback);
+    glfwSetCursorPosCallback(window, cursor_pos_callback);
     glfwSetMouseButtonCallback(window, mouse_button_callback);
 
     VulkanContext vk;
@@ -346,11 +375,10 @@ int main(int argc, char** argv) {
     glfwSetWindowUserPointer(window, &vk);
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
 
-    g_state.pixels.resize(g_state.width * g_state.height);
-
     auto lastTime = std::chrono::high_resolution_clock::now();
 
-    std::cout << "Controls: WASD + Mouse (Click to capture/release)\n";
+    std::cout << "Controls: Alt+LMB/Shift+LMB Orbit, Alt+MMB/Ctrl+LMB Pan, Alt+RMB/Ctrl+Shift+LMB Dolly\n";
+    std::cout << "          F: Fit, S: Shadow\n";
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -379,13 +407,16 @@ int main(int argc, char** argv) {
             lastTime = currentTime;
         }
 
-        // Poll GLFW keys into platform-independent state
-        g_state.keys[KEY_W]      = glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS;
-        g_state.keys[KEY_A]      = glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS;
-        g_state.keys[KEY_S]      = glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS;
-        g_state.keys[KEY_D]      = glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS;
+        // Poll keys
         g_state.keys[KEY_F]      = glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS;
+        g_state.keys[KEY_S]      = glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS;
         g_state.keys[KEY_ESCAPE] = glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS;
+        g_state.altPressed = glfwGetKey(window, GLFW_KEY_LEFT_ALT) == GLFW_PRESS ||
+                             glfwGetKey(window, GLFW_KEY_RIGHT_ALT) == GLFW_PRESS;
+        g_state.shiftPressed = glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
+                               glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
+        g_state.ctrlPressed = glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
+                              glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
 
         if (ProcessInput(g_state, 0.016f)) {
             glfwSetWindowShouldClose(window, true);

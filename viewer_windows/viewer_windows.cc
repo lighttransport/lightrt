@@ -53,74 +53,96 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_KEYDOWN: {
         switch (wParam) {
-        case 'W':      g_state.keys[KEY_W] = true; break;
-        case 'A':      g_state.keys[KEY_A] = true; break;
-        case 'S':      g_state.keys[KEY_S] = true; break;
-        case 'D':      g_state.keys[KEY_D] = true; break;
         case 'F':      g_state.keys[KEY_F] = true; break;
+        case 'S':      g_state.keys[KEY_S] = true; break;
         case VK_ESCAPE: g_state.keys[KEY_ESCAPE] = true; break;
+        case VK_SHIFT:  g_state.shiftPressed = true; break;
+        case VK_CONTROL: g_state.ctrlPressed = true; break;
         }
         return 0;
     }
 
     case WM_KEYUP: {
         switch (wParam) {
-        case 'W':      g_state.keys[KEY_W] = false; break;
-        case 'A':      g_state.keys[KEY_A] = false; break;
-        case 'S':      g_state.keys[KEY_S] = false; break;
-        case 'D':      g_state.keys[KEY_D] = false; break;
         case 'F':      g_state.keys[KEY_F] = false; break;
+        case 'S':      g_state.keys[KEY_S] = false; break;
         case VK_ESCAPE: g_state.keys[KEY_ESCAPE] = false; break;
+        case VK_SHIFT:  g_state.shiftPressed = false; break;
+        case VK_CONTROL: g_state.ctrlPressed = false; break;
+        }
+        return 0;
+    }
+
+    // Alt key - must use WM_SYSKEYDOWN/UP because Alt doesn't fire WM_KEYDOWN
+    case WM_SYSKEYDOWN: {
+        if (wParam == VK_MENU) {
+            g_state.altPressed = true;
+        }
+        return 0;  // Eat it to prevent system menu activation
+    }
+
+    case WM_SYSKEYUP: {
+        if (wParam == VK_MENU) {
+            g_state.altPressed = false;
         }
         return 0;
     }
 
     case WM_LBUTTONDOWN: {
-        bool captured = OnMouseButtonToggle(g_state);
-        if (captured) {
-            SetCapture(hwnd);
-            ShowCursor(FALSE);
-            // Center cursor
-            RECT rc;
-            GetClientRect(hwnd, &rc);
-            POINT center = { (rc.right - rc.left) / 2, (rc.bottom - rc.top) / 2 };
-            ClientToScreen(hwnd, &center);
-            SetCursorPos(center.x, center.y);
-        } else {
+        g_state.lmbPressed = true;
+        double x = (double)LOWORD(lParam);
+        double y = (double)HIWORD(lParam);
+        OnMouseDown(g_state, x, y);
+        SetCapture(hwnd);
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        g_state.lmbPressed = false;
+        if (!g_state.mmbPressed && !g_state.rmbPressed) {
+            g_state.dragging = false;
             ReleaseCapture();
-            ShowCursor(TRUE);
+        }
+        return 0;
+    }
+
+    case WM_MBUTTONDOWN: {
+        g_state.mmbPressed = true;
+        double x = (double)LOWORD(lParam);
+        double y = (double)HIWORD(lParam);
+        OnMouseDown(g_state, x, y);
+        SetCapture(hwnd);
+        return 0;
+    }
+    case WM_MBUTTONUP: {
+        g_state.mmbPressed = false;
+        if (!g_state.lmbPressed && !g_state.rmbPressed) {
+            g_state.dragging = false;
+            ReleaseCapture();
+        }
+        return 0;
+    }
+
+    case WM_RBUTTONDOWN: {
+        g_state.rmbPressed = true;
+        double x = (double)LOWORD(lParam);
+        double y = (double)HIWORD(lParam);
+        OnMouseDown(g_state, x, y);
+        SetCapture(hwnd);
+        return 0;
+    }
+    case WM_RBUTTONUP: {
+        g_state.rmbPressed = false;
+        if (!g_state.lmbPressed && !g_state.mmbPressed) {
+            g_state.dragging = false;
+            ReleaseCapture();
         }
         return 0;
     }
 
     case WM_MOUSEMOVE: {
-        if (g_state.mouseCaptured) {
-            // Get current cursor position in screen coords
-            POINT pt;
-            GetCursorPos(&pt);
-
-            // Get window center in screen coords
-            RECT rc;
-            GetClientRect(hwnd, &rc);
-            POINT center = { (rc.right - rc.left) / 2, (rc.bottom - rc.top) / 2 };
-            POINT screenCenter = center;
-            ClientToScreen(hwnd, &screenCenter);
-
-            // Calculate delta from center
-            double dx = (double)(pt.x - screenCenter.x);
-            double dy = (double)(pt.y - screenCenter.y);
-
-            if (dx != 0.0 || dy != 0.0) {
-                // Feed absolute-style coords: accumulate from center
-                OnMouseMove(g_state, center.x + dx, center.y + dy);
-                // Reset mouse position state to center for next frame
-                g_state.lastX = (double)center.x;
-                g_state.lastY = (double)center.y;
-                g_state.firstMouse = false;
-                // Re-center the cursor
-                SetCursorPos(screenCenter.x, screenCenter.y);
-            }
-        }
+        double x = (double)LOWORD(lParam);
+        double y = (double)HIWORD(lParam);
+        OnMouseDrag(g_state, x, y);
         return 0;
     }
     }
@@ -133,39 +155,50 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     SetProcessDPIAware();
 
-    // Parse command line
-    int argc;
-    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-
-    if (argc < 2) {
-        MessageBoxW(nullptr, L"Usage: viewer_windows <model.obj/gltf/glb>", L"LightRT Viewer", MB_OK | MB_ICONERROR);
-        LocalFree(argv);
-        return 1;
-    }
-
-    // Convert wide string path to UTF-8
-    int pathLen = WideCharToMultiByte(CP_UTF8, 0, argv[1], -1, nullptr, 0, nullptr, nullptr);
-    std::string path(pathLen - 1, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, argv[1], -1, &path[0], pathLen, nullptr, nullptr);
-    LocalFree(argv);
-
     // Allocate console for debug output
     AllocConsole();
     FILE* dummy;
     freopen_s(&dummy, "CONOUT$", "w", stdout);
     freopen_s(&dummy, "CONOUT$", "w", stderr);
 
-    std::cout << "Loading " << path << "...\n";
+    // Parse command line
+    int argc;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 
-    if (!LoadModel(path, g_state.mesh) || g_state.mesh.triangles.empty()) {
-        std::cerr << "Failed to load model or empty.\n";
+    if (argc < 2) {
+        std::cout << "No model specified, using default scene.\n";
+        CreateDefaultScene(g_state.scene);
+    } else {
+        // Convert wide string path to UTF-8
+        int pathLen = WideCharToMultiByte(CP_UTF8, 0, argv[1], -1, nullptr, 0, nullptr, nullptr);
+        std::string path(pathLen - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, argv[1], -1, &path[0], pathLen, nullptr, nullptr);
+
+        std::cout << "Loading " << path << "...\n";
+
+        if (!LoadModel(path, g_state.scene)) {
+            std::cerr << "Failed to load model.\n";
+            LocalFree(argv);
+            return 1;
+        }
+    }
+    LocalFree(argv);
+
+    g_state.scene.build();
+
+    if (g_state.scene.allTriangles.empty()) {
+        std::cerr << "No triangles in scene.\n";
         return 1;
     }
 
-    std::cout << "Building BVH for " << g_state.mesh.triangles.size() << " triangles...\n";
-    lightrt::BVHBuildConfig config;
-    g_state.mesh.bvh.build(g_state.mesh.triangles, config);
-    std::cout << "BVH Built.\n";
+    std::cout << "Scene: " << g_state.scene.meshes.size() << " meshes, "
+              << g_state.scene.allTriangles.size() << " triangles.\n";
+
+    // Initialize sun direction and accumulation buffer
+    g_state.sunDirection = Vec3(1, 1, -0.5f).normalize();
+    g_state.pixels.resize(g_state.width * g_state.height);
+    g_state.accumBuffer.resize((size_t)g_state.width * g_state.height * 3, 0.0f);
+    FitToScene(g_state);
 
     // Register window class
     WNDCLASSEXW wc = {};
@@ -191,7 +224,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
-    g_state.pixels.resize(g_state.width * g_state.height);
     UpdateBitmapInfo();
 
     QueryPerformanceFrequency(&g_perfFreq);
@@ -200,7 +232,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     LARGE_INTEGER fpsTimer = g_lastTime;
     int fpsFrameCount = 0;
 
-    std::cout << "Controls: WASD + Mouse (Click to capture/release), F: Toggle render mode\n";
+    std::cout << "Controls: Alt+LMB/Shift+LMB Orbit, Alt+MMB/Ctrl+LMB Pan, Alt+RMB/Ctrl+Shift+LMB Dolly\n";
+    std::cout << "          F: Fit, S: Shadow\n";
 
     // Main loop
     while (g_running) {
