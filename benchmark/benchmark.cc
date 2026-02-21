@@ -2712,6 +2712,219 @@ int main(int argc, char** argv) {
     }
   }
 
+  // ========================================
+  // Batch Traversal API Benchmark
+  // ========================================
+  {
+    std::cout << "\n========================================\n";
+    std::cout << "Batch Traversal API\n";
+    std::cout << "========================================\n";
+
+    const uint32_t batch_num_tris = num_triangles;
+    const uint32_t batch_num_rays = num_rays;
+
+    // Generate scene
+    std::vector<Triangle> triangles(batch_num_tris);
+    RNG rng(42);
+    for (auto& tri : triangles) {
+      Vec3 c(rng.uniform() * 20 - 10, rng.uniform() * 20 - 10, rng.uniform() * 20 - 10);
+      float s = rng.uniform() * 0.5f + 0.1f;
+      tri.v0 = c + Vec3(rng.uniform() * s, rng.uniform() * s, rng.uniform() * s);
+      tri.v1 = c + Vec3(rng.uniform() * s, rng.uniform() * s, rng.uniform() * s);
+      tri.v2 = c + Vec3(rng.uniform() * s, rng.uniform() * s, rng.uniform() * s);
+    }
+
+    TriangleBVH bvh;
+    bvh.build(triangles);
+
+    // Generate rays
+    std::vector<Ray> rays(batch_num_rays);
+    for (auto& ray : rays) {
+      ray = Ray(
+        Vec3(rng.uniform() * 20 - 10, rng.uniform() * 20 - 10, rng.uniform() * 20 - 10),
+        Vec3(rng.uniform() * 2 - 1, rng.uniform() * 2 - 1, rng.uniform() * 2 - 1).normalize()
+      );
+    }
+
+    // Sequential
+    std::vector<uint32_t> hit_ids(batch_num_rays);
+    std::vector<float> hit_ts(batch_num_rays), hit_us(batch_num_rays), hit_vs(batch_num_rays);
+
+    auto start = std::chrono::high_resolution_clock::now();
+    for (uint32_t i = 0; i < batch_num_rays; i++) {
+      hit_ts[i] = rays[i].tmax;
+      hit_ids[i] = bvh.traverse(rays[i], hit_ts[i], hit_us[i], hit_vs[i]);
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    double seq_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    uint32_t seq_hits = 0;
+    for (uint32_t i = 0; i < batch_num_rays; i++) {
+      if (hit_ids[i] != kInvalidIndex) seq_hits++;
+    }
+
+    // Batch (multi-threaded)
+    std::vector<uint32_t> batch_ids(batch_num_rays);
+    std::vector<float> batch_ts(batch_num_rays), batch_us(batch_num_rays), batch_vs(batch_num_rays);
+
+    start = std::chrono::high_resolution_clock::now();
+    bvh.traverseBatch(rays.data(), batch_num_rays,
+                      batch_ids.data(), batch_ts.data(),
+                      batch_us.data(), batch_vs.data());
+    end = std::chrono::high_resolution_clock::now();
+    double batch_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    uint32_t batch_hits = 0;
+    for (uint32_t i = 0; i < batch_num_rays; i++) {
+      if (batch_ids[i] != kInvalidIndex) batch_hits++;
+    }
+
+    // Verify correctness
+    bool match = true;
+    for (uint32_t i = 0; i < batch_num_rays; i++) {
+      if (hit_ids[i] != batch_ids[i]) { match = false; break; }
+    }
+
+    std::cout << "  Sequential:  " << std::fixed << std::setprecision(2) << seq_ms
+              << " ms (" << seq_hits << " hits)\n";
+    std::cout << "  Batch:       " << batch_ms << " ms (" << batch_hits << " hits)\n";
+    std::cout << "  Speedup:     " << std::setprecision(2) << (seq_ms / batch_ms) << "x\n";
+    std::cout << "  Correctness: " << (match ? "PASS" : "FAIL") << "\n";
+  }
+
+  // ========================================
+  // CompactTriangleBVH Benchmark
+  // ========================================
+  {
+    std::cout << "\n========================================\n";
+    std::cout << "CompactTriangleBVH vs TriangleBVH\n";
+    std::cout << "========================================\n";
+
+    const uint32_t compact_tris = num_triangles;
+    const uint32_t compact_rays = num_rays;
+
+    std::vector<Triangle> triangles(compact_tris);
+    RNG rng(123);
+    for (auto& tri : triangles) {
+      Vec3 c(rng.uniform() * 20 - 10, rng.uniform() * 20 - 10, rng.uniform() * 20 - 10);
+      float s = rng.uniform() * 0.5f + 0.1f;
+      tri.v0 = c + Vec3(rng.uniform() * s, rng.uniform() * s, rng.uniform() * s);
+      tri.v1 = c + Vec3(rng.uniform() * s, rng.uniform() * s, rng.uniform() * s);
+      tri.v2 = c + Vec3(rng.uniform() * s, rng.uniform() * s, rng.uniform() * s);
+    }
+
+    // Build standard BVH
+    TriangleBVH std_bvh;
+    std_bvh.build(triangles);
+
+    // Build compact BVH
+    CompactTriangleBVH compact_bvh;
+    compact_bvh.build(triangles);
+
+    // Generate rays
+    std::vector<Ray> rays(compact_rays);
+    for (auto& ray : rays) {
+      ray = Ray(
+        Vec3(rng.uniform() * 20 - 10, rng.uniform() * 20 - 10, rng.uniform() * 20 - 10),
+        Vec3(rng.uniform() * 2 - 1, rng.uniform() * 2 - 1, rng.uniform() * 2 - 1).normalize()
+      );
+    }
+
+    // Standard BVH traversal
+    uint32_t std_hits = 0;
+    auto start = std::chrono::high_resolution_clock::now();
+    for (const auto& ray : rays) {
+      float t = ray.tmax, u, v;
+      if (std_bvh.traverse(ray, t, u, v) != kInvalidIndex) std_hits++;
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    double std_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    // Compact BVH traversal
+    uint32_t compact_hits = 0;
+    start = std::chrono::high_resolution_clock::now();
+    for (const auto& ray : rays) {
+      float t = ray.tmax, u, v;
+      if (compact_bvh.traverse(ray, t, u, v) != kInvalidIndex) compact_hits++;
+    }
+    end = std::chrono::high_resolution_clock::now();
+    double compact_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    size_t std_mem = std_bvh.getBVH().getStats().num_nodes * sizeof(BVHNode);
+    size_t compact_mem = compact_bvh.getBVHMemoryUsage();
+
+    std::cout << "  Standard BVH: " << std::fixed << std::setprecision(2) << std_ms
+              << " ms, " << std_hits << " hits, " << (std_mem / 1024) << " KB\n";
+    std::cout << "  Compact BVH:  " << compact_ms
+              << " ms, " << compact_hits << " hits, " << (compact_mem / 1024) << " KB\n";
+    std::cout << "  Memory savings: " << std::setprecision(1)
+              << (1.0 - static_cast<double>(compact_mem) / std_mem) * 100 << "%\n";
+    std::cout << "  Hit match: " << (std_hits == compact_hits ? "YES" : "NO") << "\n";
+  }
+
+  // ========================================
+  // TriangleBVH4 Benchmark
+  // ========================================
+  {
+    std::cout << "\n========================================\n";
+    std::cout << "TriangleBVH4 vs TriangleBVH\n";
+    std::cout << "========================================\n";
+
+    const uint32_t bvh4_tris = num_triangles;
+    const uint32_t bvh4_rays = num_rays;
+
+    std::vector<Triangle> triangles(bvh4_tris);
+    RNG rng(456);
+    for (auto& tri : triangles) {
+      Vec3 c(rng.uniform() * 20 - 10, rng.uniform() * 20 - 10, rng.uniform() * 20 - 10);
+      float s = rng.uniform() * 0.5f + 0.1f;
+      tri.v0 = c + Vec3(rng.uniform() * s, rng.uniform() * s, rng.uniform() * s);
+      tri.v1 = c + Vec3(rng.uniform() * s, rng.uniform() * s, rng.uniform() * s);
+      tri.v2 = c + Vec3(rng.uniform() * s, rng.uniform() * s, rng.uniform() * s);
+    }
+
+    // Build standard BVH
+    TriangleBVH std_bvh;
+    std_bvh.build(triangles);
+
+    // Build BVH4
+    TriangleBVH4 bvh4;
+    bvh4.build(triangles);
+
+    // Generate rays
+    std::vector<Ray> rays(bvh4_rays);
+    for (auto& ray : rays) {
+      ray = Ray(
+        Vec3(rng.uniform() * 20 - 10, rng.uniform() * 20 - 10, rng.uniform() * 20 - 10),
+        Vec3(rng.uniform() * 2 - 1, rng.uniform() * 2 - 1, rng.uniform() * 2 - 1).normalize()
+      );
+    }
+
+    // Standard BVH traversal
+    uint32_t std_hits = 0;
+    auto start = std::chrono::high_resolution_clock::now();
+    for (const auto& ray : rays) {
+      float t = ray.tmax, u, v;
+      if (std_bvh.traverse(ray, t, u, v) != kInvalidIndex) std_hits++;
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    double std_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    // BVH4 traversal
+    uint32_t bvh4_hits = 0;
+    start = std::chrono::high_resolution_clock::now();
+    for (const auto& ray : rays) {
+      float t = ray.tmax, u, v;
+      if (bvh4.traverse(ray, t, u, v) != kInvalidIndex) bvh4_hits++;
+    }
+    end = std::chrono::high_resolution_clock::now();
+    double bvh4_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    std::cout << "  Standard BVH: " << std::fixed << std::setprecision(2) << std_ms
+              << " ms, " << std_hits << " hits\n";
+    std::cout << "  BVH4:         " << bvh4_ms
+              << " ms, " << bvh4_hits << " hits\n";
+    std::cout << "  Speed ratio:  " << std::setprecision(2) << (std_ms / bvh4_ms) << "x\n";
+  }
+
   std::cout << "\n============================================\n";
   std::cout << "Benchmark Complete\n";
   std::cout << "============================================\n";
