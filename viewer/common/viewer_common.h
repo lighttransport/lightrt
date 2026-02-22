@@ -16,8 +16,19 @@ using namespace lightrt;
 enum ViewerKey {
     KEY_F = 0,
     KEY_S,
+    KEY_O,
     KEY_ESCAPE,
     KEY_COUNT
+};
+
+// --- Shadow Mode ---
+
+enum ShadowMode {
+    SHADOW_OFF = 0,
+    SHADOW_HARD,
+    SHADOW_SOFT,
+    SHADOW_STRONG_SOFT,
+    SHADOW_MODE_COUNT
 };
 
 // --- Data Structures ---
@@ -60,15 +71,18 @@ struct ViewerState {
     bool keys[KEY_COUNT] = {};
     bool fKeyWasPressed = false;
     bool sKeyWasPressed = false;
+    bool oKeyWasPressed = false;
     bool altPressed = false;
     bool shiftPressed = false;
     bool ctrlPressed = false;
+    bool tabPressed = false;
     bool lmbPressed = false, mmbPressed = false, rmbPressed = false;
     bool dragging = false;
     double lastX = 0, lastY = 0;
 
     // Rendering
-    bool shadowsEnabled = true;
+    int fontScale = 1;
+    ShadowMode shadowMode = SHADOW_SOFT;
     std::vector<float> accumBuffer;   // w*h*3 HDR floats
     uint32_t sampleCount = 0;
     bool cameraDirty = true;
