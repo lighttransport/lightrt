@@ -13,6 +13,8 @@ obj_bvh_bench
 viewer/viewer
 viewer_windows/viewer_windows.exe
 webgpu/webgpu_example
+webgpu/softrt.js
+webgpu/softrt.wasm
 
 # Generated images
 *.bmp

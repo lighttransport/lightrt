@@ -297,7 +297,11 @@ void GPUQueue::submit(GPUCommandBuffer* cmd) {
 
     // Build BVH
     lightrt::TriangleBVH bvh;
-    bvh.build(triangles);
+    lightrt::BVHBuildConfig build_config;
+#ifdef __EMSCRIPTEN__
+    build_config.use_parallel_build = false;
+#endif
+    bvh.build(triangles, build_config);
 
     // Generate rays — orthographic through NDC cube
     uint32_t num_pixels = w * h;
@@ -319,8 +323,13 @@ void GPUQueue::submit(GPUCommandBuffer* cmd) {
     std::vector<float> hit_us(num_pixels);
     std::vector<float> hit_vs(num_pixels);
 
+#ifdef __EMSCRIPTEN__
+    bvh.traverseBatch(rays.data(), num_pixels, hit_ids.data(), hit_ts.data(),
+                      hit_us.data(), hit_vs.data(), 1);
+#else
     bvh.traverseBatch(rays.data(), num_pixels, hit_ids.data(), hit_ts.data(),
                       hit_us.data(), hit_vs.data(), 0);
+#endif
 
     // Write hit pixels
     for (uint32_t i = 0; i < num_pixels; ++i) {

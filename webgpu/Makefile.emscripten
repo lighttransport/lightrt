@@ -1,0 +1,32 @@
+# Makefile.emscripten — Build softrt WebGPU API as WASM module for Node.js
+# Usage: cd webgpu && emmake make -f Makefile.emscripten
+
+EMCC ?= emcc
+
+CXXFLAGS = -std=c++17 -O2 -fno-rtti -fno-exceptions -DEMSCRIPTEN_HAS_UNBOUND_TYPE_NAMES=0
+
+LDFLAGS = -lembind \
+  -sNO_EXIT_RUNTIME=1 \
+  -sALLOW_MEMORY_GROWTH=1 \
+  -sMODULARIZE=1 \
+  -sEXPORT_NAME=createSoftRT \
+  -sENVIRONMENT=node \
+  -sFORCE_FILESYSTEM=1 \
+  -lnodefs.js \
+  "-sEXPORTED_RUNTIME_METHODS=['FS','HEAPU8']" \
+  "-sEXPORTED_FUNCTIONS=['_malloc','_free']"
+
+SOURCES = webgpu_lightrt.cc webgpu_embind.cc ../lightrt.cc
+INCLUDES = -I..
+
+TARGET_JS = softrt.js
+
+.PHONY: all clean
+
+all: $(TARGET_JS)
+
+$(TARGET_JS): $(SOURCES) webgpu_lightrt.hh ../lightrt.hh
+	$(EMCC) $(CXXFLAGS) $(INCLUDES) $(SOURCES) $(LDFLAGS) -o $@
+
+clean:
+	rm -f softrt.js softrt.wasm
