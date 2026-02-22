@@ -33,6 +33,12 @@ cmake-build-*/
 *.swo
 *~
 
+# wgpu_reference dependencies and build
+webgpu/wgpu_reference/build/
+webgpu/wgpu_reference/webgpu/
+webgpu/wgpu_reference/glfw/
+webgpu/wgpu_reference/glfw3webgpu/
+
 # OS files
 .DS_Store
 Thumbs.db
