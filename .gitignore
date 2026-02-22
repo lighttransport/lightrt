@@ -42,3 +42,6 @@ webgpu/wgpu_reference/glfw3webgpu/
 # OS files
 .DS_Store
 Thumbs.db
+
+# External dependencies
+deps/
