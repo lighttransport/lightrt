@@ -8355,6 +8355,159 @@ bool AutoTuner::buildOptimal(
 }
 
 // ============================================================================
+// Triangle Pre-Splitting Implementation
+// ============================================================================
+
+namespace {
+
+inline float edgeLengthSq(const Vec3& a, const Vec3& b) noexcept {
+  float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+  return dx * dx + dy * dy + dz * dz;
+}
+
+void splitTriangleRecursive(
+    const Triangle& tri,
+    uint32_t original_index,
+    uint32_t depth,
+    const PreSplitConfig& config,
+    uint32_t budget_remaining,
+    float min_aabb_sa,
+    std::vector<Triangle>& out_triangles,
+    std::vector<uint32_t>& out_indices) noexcept
+{
+  if (depth >= config.max_split_depth || budget_remaining <= 1) {
+    out_triangles.push_back(tri);
+    out_indices.push_back(original_index);
+    return;
+  }
+
+  // Skip small triangles whose AABB doesn't significantly impact the scene
+  float aabb_sa = tri.bounds().surfaceArea();
+  if (aabb_sa < min_aabb_sa) {
+    out_triangles.push_back(tri);
+    out_indices.push_back(original_index);
+    return;
+  }
+
+  // Compute edge lengths squared
+  float e01_sq = edgeLengthSq(tri.v0, tri.v1);
+  float e12_sq = edgeLengthSq(tri.v1, tri.v2);
+  float e20_sq = edgeLengthSq(tri.v2, tri.v0);
+
+  float max_sq = std::max({e01_sq, e12_sq, e20_sq});
+  float min_sq = std::min({e01_sq, e12_sq, e20_sq});
+
+  // Check edge ratio (squared comparison avoids sqrt)
+  bool high_edge_ratio = false;
+  float ratio_threshold_sq = config.max_edge_ratio * config.max_edge_ratio;
+  if (min_sq > 0.0f && max_sq > min_sq * ratio_threshold_sq) {
+    high_edge_ratio = true;
+  }
+
+  // Check AABB looseness: if AABB SA >> triangle SA, the AABB is a poor fit
+  // (e.g., diagonal triangles spanning all 3 axes)
+  bool loose_aabb = false;
+  if (config.max_aabb_looseness > 0.0f) {
+    Vec3 e1(tri.v1.x - tri.v0.x, tri.v1.y - tri.v0.y, tri.v1.z - tri.v0.z);
+    Vec3 e2(tri.v2.x - tri.v0.x, tri.v2.y - tri.v0.y, tri.v2.z - tri.v0.z);
+    // Cross product for triangle area: 0.5 * |e1 x e2|
+    float cx = e1.y * e2.z - e1.z * e2.y;
+    float cy = e1.z * e2.x - e1.x * e2.z;
+    float cz = e1.x * e2.y - e1.y * e2.x;
+    float tri_area = 0.5f * std::sqrt(cx * cx + cy * cy + cz * cz);
+    if (tri_area > 0.0f && aabb_sa > tri_area * config.max_aabb_looseness) {
+      loose_aabb = true;
+    }
+  }
+
+  if (!high_edge_ratio && !loose_aabb) {
+    out_triangles.push_back(tri);
+    out_indices.push_back(original_index);
+    return;
+  }
+
+  // Find longest edge and split at midpoint
+  Vec3 va, vb, vc;
+  if (e01_sq >= e12_sq && e01_sq >= e20_sq) {
+    va = tri.v0; vb = tri.v1; vc = tri.v2;  // Split edge v0-v1
+  } else if (e12_sq >= e01_sq && e12_sq >= e20_sq) {
+    va = tri.v1; vb = tri.v2; vc = tri.v0;  // Split edge v1-v2
+  } else {
+    va = tri.v2; vb = tri.v0; vc = tri.v1;  // Split edge v2-v0
+  }
+
+  Vec3 mid((va.x + vb.x) * 0.5f, (va.y + vb.y) * 0.5f, (va.z + vb.z) * 0.5f);
+
+  // Check surface area reduction (reuse aabb_sa computed above)
+  Triangle child1(va, mid, vc);
+  Triangle child2(mid, vb, vc);
+  if (aabb_sa > 0.0f) {
+    float child_sa = child1.bounds().surfaceArea() + child2.bounds().surfaceArea();
+    if (child_sa >= aabb_sa * config.sa_reduction_threshold) {
+      // SA reduction insufficient — not worth splitting
+      out_triangles.push_back(tri);
+      out_indices.push_back(original_index);
+      return;
+    }
+  }
+
+  // Recurse on both children
+  uint32_t half_budget = budget_remaining / 2;
+  splitTriangleRecursive(child1, original_index, depth + 1, config,
+                         half_budget, min_aabb_sa, out_triangles, out_indices);
+  splitTriangleRecursive(child2, original_index, depth + 1, config,
+                         budget_remaining - half_budget, min_aabb_sa, out_triangles, out_indices);
+}
+
+} // anonymous namespace
+
+PreSplitResult preSplitTriangles(const std::vector<Triangle>& triangles,
+                                  const PreSplitConfig& config) noexcept {
+  PreSplitResult result;
+  result.num_original = static_cast<uint32_t>(triangles.size());
+  result.num_split = 0;
+
+  if (triangles.empty()) return result;
+
+  uint32_t n = static_cast<uint32_t>(triangles.size());
+  uint32_t max_output = static_cast<uint32_t>(static_cast<float>(n) * config.max_output_factor);
+  // Fair per-triangle budget: distribute evenly so no single triangle hogs the budget
+  uint32_t per_tri_budget = std::max(1u, max_output / n);
+  result.triangles.reserve(std::min(max_output, n * 2u));
+  result.original_indices.reserve(std::min(max_output, n * 2u));
+
+  // Compute scene bounding box for min_aabb_sa_fraction filtering
+  AABB scene_bounds;
+  for (const auto& tri : triangles) {
+    scene_bounds.expand(tri.bounds());
+  }
+  float scene_sa = scene_bounds.surfaceArea();
+  float min_aabb_sa = scene_sa * config.min_aabb_sa_fraction;
+
+  for (uint32_t i = 0; i < n; i++) {
+    uint32_t global_remaining = max_output > static_cast<uint32_t>(result.triangles.size())
+                                  ? max_output - static_cast<uint32_t>(result.triangles.size())
+                                  : 0;
+    uint32_t budget = std::min(per_tri_budget, global_remaining);
+    if (budget <= 1) {
+      // Budget exhausted — output remaining triangles as-is
+      result.triangles.push_back(triangles[i]);
+      result.original_indices.push_back(i);
+      continue;
+    }
+
+    size_t before = result.triangles.size();
+    splitTriangleRecursive(triangles[i], i, 0, config, budget,
+                           min_aabb_sa, result.triangles, result.original_indices);
+    if (result.triangles.size() - before > 1) {
+      result.num_split++;
+    }
+  }
+
+  return result;
+}
+
+// ============================================================================
 // Profiled Traversal Implementation
 // ============================================================================
 

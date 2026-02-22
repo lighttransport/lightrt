@@ -2925,6 +2925,135 @@ int main(int argc, char** argv) {
     std::cout << "  Speed ratio:  " << std::setprecision(2) << (std_ms / bvh4_ms) << "x\n";
   }
 
+  // ==========================================================================
+  // Pre-Split Benchmark: diagonal, hair-like, random
+  // ==========================================================================
+  {
+    std::cout << "\n============================================\n";
+    std::cout << "Pre-Split Triangle Benchmark\n";
+    std::cout << "============================================\n";
+    std::cout << "Comparing: TriangleBVH (no split) vs TriangleBVH (pre-split) vs SBVH\n";
+    std::cout << "Triangles: " << num_triangles << ", Rays: " << num_rays << "\n\n";
+
+    RNG rng_ps(777);
+    const float scene_size = 10.0f;
+    std::vector<Ray> rays = generateRandomRays(num_rays, scene_size, rng_ps);
+
+    struct SceneDesc {
+      const char* name;
+      std::vector<Triangle> triangles;
+    };
+
+    std::vector<SceneDesc> scenes;
+    {
+      SceneDesc s;
+      s.name = "Diagonal (span all 3 axes)";
+      s.triangles = generateDiagonalTriangles(num_triangles, scene_size, rng_ps);
+      scenes.push_back(std::move(s));
+    }
+    {
+      SceneDesc s;
+      s.name = "Hair-like (thin elongated)";
+      s.triangles = generateHairTriangles(num_triangles, scene_size, rng_ps);
+      scenes.push_back(std::move(s));
+    }
+    {
+      SceneDesc s;
+      s.name = "Random (small triangles)";
+      s.triangles = generateRandomTriangles(num_triangles, scene_size, rng_ps);
+      scenes.push_back(std::move(s));
+    }
+
+    for (const auto& scene : scenes) {
+      std::cout << "--- " << scene.name << " ---\n";
+      const auto& tris = scene.triangles;
+
+      // 1. TriangleBVH (no pre-split)
+      TriangleBVH bvh_nosplit;
+      auto t0 = std::chrono::high_resolution_clock::now();
+      bvh_nosplit.build(tris);
+      auto t1 = std::chrono::high_resolution_clock::now();
+      double build_nosplit = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+      uint32_t hits_nosplit = 0;
+      t0 = std::chrono::high_resolution_clock::now();
+      for (const auto& ray : rays) {
+        float t = ray.tmax, u, v;
+        if (bvh_nosplit.traverse(ray, t, u, v) != kInvalidIndex) hits_nosplit++;
+      }
+      t1 = std::chrono::high_resolution_clock::now();
+      double trav_nosplit = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+      // 2. TriangleBVH (with pre-split)
+      PreSplitConfig ps_cfg = PreSplitConfig::aggressive();
+      auto ps_result = preSplitTriangles(tris, ps_cfg);
+
+      TriangleBVH bvh_split;
+      t0 = std::chrono::high_resolution_clock::now();
+      bvh_split.build(ps_result.triangles);
+      t1 = std::chrono::high_resolution_clock::now();
+      double build_split = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+      uint32_t hits_split = 0;
+      t0 = std::chrono::high_resolution_clock::now();
+      for (const auto& ray : rays) {
+        float t = ray.tmax, u, v;
+        if (bvh_split.traverse(ray, t, u, v) != kInvalidIndex) hits_split++;
+      }
+      t1 = std::chrono::high_resolution_clock::now();
+      double trav_split = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+      // 3. SBVH (no pre-split)
+      SBVH sbvh;
+      SBVHBuildConfig sbvh_cfg;
+      t0 = std::chrono::high_resolution_clock::now();
+      sbvh.build(tris, sbvh_cfg);
+      t1 = std::chrono::high_resolution_clock::now();
+      double build_sbvh = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+      uint32_t hits_sbvh = 0;
+      TraversalConfig trav_cfg;
+      trav_cfg.use_mailboxing = true;
+      t0 = std::chrono::high_resolution_clock::now();
+      for (const auto& ray : rays) {
+        float t = ray.tmax, u, v;
+        if (sbvh.traverseWithConfig(ray, t, u, v, trav_cfg) != kInvalidIndex) hits_sbvh++;
+      }
+      t1 = std::chrono::high_resolution_clock::now();
+      double trav_sbvh = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+      float split_ratio = static_cast<float>(ps_result.triangles.size()) /
+                           static_cast<float>(tris.size());
+
+      std::cout << std::fixed << std::setprecision(2);
+      std::cout << "  Pre-split: " << ps_result.num_split << "/" << ps_result.num_original
+                << " triangles split, ratio " << std::setprecision(2) << split_ratio
+                << "x (" << ps_result.triangles.size() << " output)\n";
+      std::cout << "  TriangleBVH (no split): build " << build_nosplit << " ms, traverse "
+                << trav_nosplit << " ms, " << hits_nosplit << " hits\n";
+      std::cout << "  TriangleBVH (pre-split): build " << build_split << " ms, traverse "
+                << trav_split << " ms, " << hits_split << " hits\n";
+      std::cout << "  SBVH:                    build " << build_sbvh << " ms, traverse "
+                << trav_sbvh << " ms, " << hits_sbvh << " hits\n";
+
+      if (trav_nosplit > 0.01) {
+        std::cout << "  Speedup (pre-split vs no-split): "
+                  << std::setprecision(1) << (trav_nosplit / trav_split) << "x\n";
+      }
+      if (trav_split > 0.01) {
+        std::cout << "  Speedup (SBVH vs pre-split):     "
+                  << std::setprecision(1) << (trav_split / trav_sbvh) << "x\n";
+      }
+
+      // Verify hit counts: pre-split should find >= no-split hits
+      if (hits_split < hits_nosplit) {
+        std::cout << "  WARNING: pre-split found fewer hits (" << hits_split
+                  << " < " << hits_nosplit << ")!\n";
+      }
+      std::cout << "\n";
+    }
+  }
+
   std::cout << "\n============================================\n";
   std::cout << "Benchmark Complete\n";
   std::cout << "============================================\n";

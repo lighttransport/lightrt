@@ -1474,6 +1474,59 @@ struct SBVHBuildConfig {
 };
 
 // ============================================================================
+// Triangle Pre-Splitting Configuration
+// ============================================================================
+
+struct PreSplitConfig {
+  float max_edge_ratio;           // Split if longest/shortest edge > this
+  float max_aabb_looseness;       // Split if AABB SA / triangle SA > this (loose fit)
+  float min_aabb_sa_fraction;     // Only split if tri AABB SA > scene AABB SA * this
+  uint32_t max_split_depth;       // Max recursion depth (up to 2^depth sub-triangles)
+  float max_output_factor;        // Budget cap: output <= input * this
+  float sa_reduction_threshold;   // Only split if child SA sum < parent SA * this
+
+  PreSplitConfig() noexcept
+    : max_edge_ratio(10.0f)
+    , max_aabb_looseness(20.0f)
+    , min_aabb_sa_fraction(0.05f)
+    , max_split_depth(5)
+    , max_output_factor(4.0f)
+    , sa_reduction_threshold(1.8f) {}
+
+  static PreSplitConfig aggressive() noexcept {
+    PreSplitConfig cfg;
+    cfg.max_edge_ratio = 4.0f;
+    cfg.max_aabb_looseness = 8.0f;
+    cfg.min_aabb_sa_fraction = 0.01f;
+    cfg.max_split_depth = 6;
+    cfg.max_output_factor = 16.0f;
+    cfg.sa_reduction_threshold = 1.8f;
+    return cfg;
+  }
+
+  static PreSplitConfig conservative() noexcept {
+    PreSplitConfig cfg;
+    cfg.max_edge_ratio = 20.0f;
+    cfg.max_aabb_looseness = 40.0f;
+    cfg.min_aabb_sa_fraction = 0.1f;
+    cfg.max_split_depth = 3;
+    cfg.max_output_factor = 2.0f;
+    cfg.sa_reduction_threshold = 1.8f;
+    return cfg;
+  }
+};
+
+struct PreSplitResult {
+  std::vector<Triangle> triangles;
+  std::vector<uint32_t> original_indices;  // new_id -> original_id mapping
+  uint32_t num_split;                      // How many originals were subdivided
+  uint32_t num_original;
+};
+
+PreSplitResult preSplitTriangles(const std::vector<Triangle>& triangles,
+                                  const PreSplitConfig& config = PreSplitConfig()) noexcept;
+
+// ============================================================================
 // Traversal Configuration (for limiting primitive tests)
 // ============================================================================
 
