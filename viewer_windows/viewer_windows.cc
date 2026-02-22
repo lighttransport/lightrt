@@ -55,7 +55,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         switch (wParam) {
         case 'F':      g_state.keys[KEY_F] = true; break;
         case 'S':      g_state.keys[KEY_S] = true; break;
+        case 'O':      g_state.keys[KEY_O] = true; break;
         case VK_ESCAPE: g_state.keys[KEY_ESCAPE] = true; break;
+        case VK_TAB:   g_state.tabPressed = true; break;
         case VK_SHIFT:  g_state.shiftPressed = true; break;
         case VK_CONTROL: g_state.ctrlPressed = true; break;
         }
@@ -66,7 +68,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         switch (wParam) {
         case 'F':      g_state.keys[KEY_F] = false; break;
         case 'S':      g_state.keys[KEY_S] = false; break;
+        case 'O':      g_state.keys[KEY_O] = false; break;
         case VK_ESCAPE: g_state.keys[KEY_ESCAPE] = false; break;
+        case VK_TAB:   g_state.tabPressed = false; break;
         case VK_SHIFT:  g_state.shiftPressed = false; break;
         case VK_CONTROL: g_state.ctrlPressed = false; break;
         }
@@ -232,8 +236,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     LARGE_INTEGER fpsTimer = g_lastTime;
     int fpsFrameCount = 0;
 
-    std::cout << "Controls: Alt+LMB/Shift+LMB Orbit, Alt+MMB/Ctrl+LMB Pan, Alt+RMB/Ctrl+Shift+LMB Dolly\n";
-    std::cout << "          F: Fit, S: Shadow\n";
+    std::cout << "Controls: Alt+LMB/Shift+LMB Orbit, Alt+MMB/Ctrl+LMB Pan, Alt+RMB/Ctrl+Shift+LMB/Tab+LMB Dolly\n";
+    std::cout << "          F: Fit, S: Shadow, O: Font 2x\n";
 
     // Main loop
     while (g_running) {

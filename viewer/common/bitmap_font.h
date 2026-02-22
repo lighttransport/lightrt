@@ -102,31 +102,37 @@ static const uint8_t font8x8_basic[95][8] = {
     {0x00,0x32,0x4C,0x00,0x00,0x00,0x00,0x00}, // ~
 };
 
-inline void DrawChar(int x, int y, char c, uint32_t color, uint32_t* buffer, int width, int height) {
+inline void DrawChar(int x, int y, char c, uint32_t color, uint32_t* buffer, int width, int height, int scale = 1) {
     if (c < 32 || c > 126) return;
     const uint8_t* glyph = font8x8_basic[c - 32];
     for (int r = 0; r < 8; ++r) {
-        if (y + r >= height || y + r < 0) continue;
         uint8_t row = glyph[r];
         for (int col = 0; col < 8; ++col) {
-            if (x + col >= width || x + col < 0) continue;
             if (row & (0x80 >> col)) {
-                buffer[(y + r) * width + (x + col)] = color;
+                for (int sy = 0; sy < scale; ++sy) {
+                    int py = y + r * scale + sy;
+                    if (py < 0 || py >= height) continue;
+                    for (int sx = 0; sx < scale; ++sx) {
+                        int px = x + col * scale + sx;
+                        if (px < 0 || px >= width) continue;
+                        buffer[py * width + px] = color;
+                    }
+                }
             }
         }
     }
 }
 
-inline void DrawString(int x, int y, const char* text, uint32_t color, uint32_t* buffer, int width, int height) {
+inline void DrawString(int x, int y, const char* text, uint32_t color, uint32_t* buffer, int width, int height, int scale = 1) {
     int cur_x = x;
     int cur_y = y;
     while (*text) {
         if (*text == '\n') {
-            cur_y += 10;
+            cur_y += 10 * scale;
             cur_x = x;
         } else {
-            DrawChar(cur_x, cur_y, *text, color, buffer, width, height);
-            cur_x += 8;
+            DrawChar(cur_x, cur_y, *text, color, buffer, width, height, scale);
+            cur_x += 8 * scale;
         }
         text++;
     }

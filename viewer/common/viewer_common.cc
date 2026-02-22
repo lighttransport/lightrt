@@ -276,11 +276,12 @@ void OnMouseDrag(ViewerState& state, double x, double y) {
     // Ctrl+LMB: pan (touchpad-friendly)
     // Ctrl+Shift+LMB: dolly (touchpad-friendly)
     bool wantOrbit = (state.altPressed && state.lmbPressed) ||
-                     (state.shiftPressed && !state.ctrlPressed && state.lmbPressed);
+                     (state.shiftPressed && !state.ctrlPressed && !state.tabPressed && state.lmbPressed);
     bool wantPan   = (state.altPressed && state.mmbPressed) ||
-                     (state.ctrlPressed && !state.shiftPressed && state.lmbPressed);
+                     (state.ctrlPressed && !state.shiftPressed && !state.tabPressed && state.lmbPressed);
     bool wantDolly = (state.altPressed && state.rmbPressed) ||
-                     (state.ctrlPressed && state.shiftPressed && state.lmbPressed);
+                     (state.ctrlPressed && state.shiftPressed && state.lmbPressed) ||
+                     (state.tabPressed && state.lmbPressed);
 
     if (wantOrbit) {
         OrbitCamera(state, dx, dy);
@@ -303,13 +304,20 @@ bool ProcessInput(ViewerState& state, float /*dt*/) {
     }
     state.fKeyWasPressed = fKeyPressed;
 
-    // S key - toggle shadows (edge-triggered)
+    // S key - cycle shadow mode (edge-triggered)
     bool sKeyPressed = state.keys[KEY_S];
     if (sKeyPressed && !state.sKeyWasPressed) {
-        state.shadowsEnabled = !state.shadowsEnabled;
+        state.shadowMode = (ShadowMode)(((int)state.shadowMode + 1) % SHADOW_MODE_COUNT);
         state.cameraDirty = true;
     }
     state.sKeyWasPressed = sKeyPressed;
+
+    // O key - toggle 2x font scale (edge-triggered)
+    bool oKeyPressed = state.keys[KEY_O];
+    if (oKeyPressed && !state.oKeyWasPressed) {
+        state.fontScale = (state.fontScale == 1) ? 2 : 1;
+    }
+    state.oKeyWasPressed = oKeyPressed;
 
     return false;
 }
@@ -376,6 +384,29 @@ static Vec3 cosine_hemisphere(float u1, float u2, const Vec3& normal) {
     return (tangent * x + bitangent * y + normal * z).normalize();
 }
 
+// Jitter direction within a cone of given half-angle (radians)
+static Vec3 jitter_direction(const Vec3& dir, float half_angle, uint32_t& seed) {
+    float u1 = rand_float(seed);
+    float u2 = rand_float(seed);
+    // Uniform sample within cone
+    float cos_max = cosf(half_angle);
+    float cos_theta = 1.0f - u1 * (1.0f - cos_max);
+    float sin_theta = sqrtf(std::max(0.0f, 1.0f - cos_theta * cos_theta));
+    float phi = 2.0f * kPi * u2;
+
+    // Build tangent frame around dir
+    Vec3 tangent;
+    if (fabsf(dir.x) > 0.9f)
+        tangent = Vec3(0, 1, 0).cross(dir).normalize();
+    else
+        tangent = Vec3(1, 0, 0).cross(dir).normalize();
+    Vec3 bitangent = dir.cross(tangent);
+
+    return (tangent * (sin_theta * cosf(phi)) +
+            bitangent * (sin_theta * sinf(phi)) +
+            dir * cos_theta).normalize();
+}
+
 void PathTrace(ViewerState& state) {
     int width = (int)state.width;
     int height = (int)state.height;
@@ -394,14 +425,20 @@ void PathTrace(ViewerState& state) {
 
     uint32_t sampleIdx = state.sampleCount;
     Vec3 sunDir = state.sunDirection;
-    bool shadows = state.shadowsEnabled;
+    ShadowMode shadowMode = state.shadowMode;
+
+    // Soft shadow cone half-angles (radians)
+    // ~2 degrees for soft, ~5 degrees for strong soft
+    float shadowConeAngle = 0.0f;
+    if (shadowMode == SHADOW_SOFT) shadowConeAngle = 0.035f;
+    else if (shadowMode == SHADOW_STRONG_SOFT) shadowConeAngle = 0.087f;
 
     int num_threads = std::max(1, (int)std::thread::hardware_concurrency());
     std::vector<std::thread> threads;
     int rows_per_thread = height / num_threads;
 
     for (int t = 0; t < num_threads; ++t) {
-        threads.emplace_back([&, t, sampleIdx, sunDir, shadows]() {
+        threads.emplace_back([&, t, sampleIdx, sunDir, shadowMode, shadowConeAngle]() {
             int start_y = t * rows_per_thread;
             int end_y = (t == num_threads - 1) ? height : (t + 1) * rows_per_thread;
 
@@ -438,13 +475,17 @@ void PathTrace(ViewerState& state) {
                         Vec3 hitPos = ray.at(t_hit);
                         Vec3 albedo = state.scene.getMeshColor(hit_prim);
 
-                        // Direct lighting
-                        float NdotL = std::max(0.0f, normal.dot(sunDir));
+                        // Direct lighting (with optional soft shadow)
+                        Vec3 shadowDir = sunDir;
+                        if (shadowConeAngle > 0.0f)
+                            shadowDir = jitter_direction(sunDir, shadowConeAngle, seed);
+
+                        float NdotL = std::max(0.0f, normal.dot(shadowDir));
                         float directLight = 0.0f;
                         if (NdotL > 0.0f) {
                             bool occluded = false;
-                            if (shadows) {
-                                Ray shadowRay(hitPos + normal * 0.001f, sunDir, 0.0f, 1e10f);
+                            if (shadowMode != SHADOW_OFF) {
+                                Ray shadowRay(hitPos + normal * 0.001f, shadowDir, 0.0f, 1e10f);
                                 occluded = state.scene.bvh.traverseAnyHit(shadowRay, hit_prim);
                             }
                             if (!occluded) {
@@ -479,12 +520,16 @@ void PathTrace(ViewerState& state) {
                                 if (bnorm.dot(bounceDir) > 0.0f) bnorm = bnorm * -1.0f;
 
                                 Vec3 bHitPos = bounceRay.at(bt);
-                                float bNdotL = std::max(0.0f, bnorm.dot(sunDir));
+                                Vec3 bShadowDir = sunDir;
+                                if (shadowConeAngle > 0.0f)
+                                    bShadowDir = jitter_direction(sunDir, shadowConeAngle, seed);
+
+                                float bNdotL = std::max(0.0f, bnorm.dot(bShadowDir));
                                 float bDirect = 0.0f;
                                 if (bNdotL > 0.0f) {
                                     bool bOcc = false;
-                                    if (shadows) {
-                                        Ray bShadow(bHitPos + bnorm * 0.001f, sunDir, 0.0f, 1e10f);
+                                    if (shadowMode != SHADOW_OFF) {
+                                        Ray bShadow(bHitPos + bnorm * 0.001f, bShadowDir, 0.0f, 1e10f);
                                         bOcc = state.scene.bvh.traverseAnyHit(bShadow, bhit);
                                     }
                                     if (!bOcc) bDirect = bNdotL;
@@ -548,23 +593,27 @@ void RenderFrame(ViewerState& state) {
     PathTrace(state);
 
     // Text overlay
+    int fs = state.fontScale;
+    int lineH = 10 * fs;
+
     std::string stats = "FPS: " + std::to_string((int)state.fps);
-    DrawString(10, 10, stats.c_str(), 0xFFFFFFFF, state.pixels.data(), w, h);
+    DrawString(10, 10, stats.c_str(), 0xFFFFFFFF, state.pixels.data(), w, h, fs);
 
     std::string tris = "Tris: " + std::to_string(state.scene.allTriangles.size());
-    DrawString(10, 25, tris.c_str(), 0xFFFFFFFF, state.pixels.data(), w, h);
+    DrawString(10, 10 + lineH, tris.c_str(), 0xFFFFFFFF, state.pixels.data(), w, h, fs);
 
     std::string meshCount = "Meshes: " + std::to_string(state.scene.meshes.size());
-    DrawString(10, 40, meshCount.c_str(), 0xFFFFFFFF, state.pixels.data(), w, h);
+    DrawString(10, 10 + lineH * 2, meshCount.c_str(), 0xFFFFFFFF, state.pixels.data(), w, h, fs);
 
     std::string samples = "Samples: " + std::to_string(state.sampleCount);
-    DrawString(10, 55, samples.c_str(), 0xFFFFFFFF, state.pixels.data(), w, h);
+    DrawString(10, 10 + lineH * 3, samples.c_str(), 0xFFFFFFFF, state.pixels.data(), w, h, fs);
 
-    std::string help = "Alt+LMB/Shift+LMB Orbit, Alt+MMB/Ctrl+LMB Pan, Alt+RMB/Ctrl+Shift+LMB Dolly";
-    DrawString(10, h - 30, help.c_str(), 0xFFFFFF00, state.pixels.data(), w, h);
+    std::string help = "Alt+LMB/Shift+LMB Orbit, Alt+MMB/Ctrl+LMB Pan, Alt+RMB/Ctrl+Shift+LMB/Tab+LMB Dolly";
+    DrawString(10, h - lineH * 3, help.c_str(), 0xFFFFFF00, state.pixels.data(), w, h, fs);
 
-    std::string help2 = "F: Fit, S: Shadow [" + std::string(state.shadowsEnabled ? "ON" : "OFF") + "]";
-    DrawString(10, h - 17, help2.c_str(), 0xFFFFFF00, state.pixels.data(), w, h);
+    static const char* shadowModeNames[] = {"OFF", "HARD", "SOFT", "STRONG_SOFT"};
+    std::string help2 = "F: Fit, S: Shadow [" + std::string(shadowModeNames[state.shadowMode]) + "], O: Font 2x [" + std::string(fs == 2 ? "ON" : "OFF") + "]";
+    DrawString(10, h - lineH * 2, help2.c_str(), 0xFFFFFF00, state.pixels.data(), w, h, fs);
 }
 
 void ResizeFramebuffer(ViewerState& state, uint32_t w, uint32_t h) {
