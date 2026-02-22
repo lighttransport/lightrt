@@ -12,6 +12,7 @@ lightrt_benchmark
 obj_bvh_bench
 viewer/viewer
 viewer_windows/viewer_windows.exe
+webgpu/webgpu_example
 
 # Generated images
 *.bmp
