@@ -1442,11 +1442,9 @@ uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t dep
   uint32_t left_count = static_cast<uint32_t>(mid - indices);
   
   // Handle degenerate case where all primitives go to one side
-  bool was_degenerate = false;
   if (left_count == 0 || left_count == num_prims) {
     left_count = num_prims / 2;
     mid = indices + left_count;
-    was_degenerate = true;
   }
   
   // Check if split is worth it (SAH cost)
@@ -1458,15 +1456,20 @@ uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t dep
     return node_idx;
   }
   
-  // Pass precomputed bounds to children when available from SAH split.
-  // Bounds are only valid when the partition wasn't adjusted for degenerate cases.
-  const AABB* left_bounds_ptr = nullptr;
-  const AABB* right_bounds_ptr = nullptr;
-
-  if (!was_degenerate && split.left_bounds.min.x <= split.left_bounds.max.x) {
-    left_bounds_ptr = &split.left_bounds;
-    right_bounds_ptr = &split.right_bounds;
+  // Compute exact child bounds from the actual partition result.
+  // We can't use the precomputed split bounds from findBestSplitBinned because
+  // floating-point precision differences between bin assignment and std::partition
+  // can cause a primitive to be partitioned differently than binned, making the
+  // binned bounds too tight (missing prims that crossed the boundary).
+  AABB left_bounds_actual, right_bounds_actual;
+  for (uint32_t i = 0; i < left_count; i++) {
+    left_bounds_actual.expand(prim_aabbs_[indices[i]]);
   }
+  for (uint32_t i = 0; i < num_prims - left_count; i++) {
+    right_bounds_actual.expand(prim_aabbs_[mid[i]]);
+  }
+  const AABB* left_bounds_ptr = &left_bounds_actual;
+  const AABB* right_bounds_ptr = &right_bounds_actual;
 
   // Build children (Parallel)
   uint32_t left_child = kInvalidIndex;
