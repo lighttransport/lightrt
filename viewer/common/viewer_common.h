@@ -100,6 +100,9 @@ struct ViewerState {
 
 bool LoadOBJ(const std::string& filename, Scene& scene);
 bool LoadGLTF(const std::string& filename, Scene& scene);
+#ifdef LIGHTRT_HAS_TINYUSDZ
+bool LoadUSD(const std::string& filename, Scene& scene);
+#endif
 bool LoadModel(const std::string& filename, Scene& scene);
 
 // --- Input Processing ---

@@ -5,6 +5,17 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# TinyUSDZ (optional)
+set(TINYUSDZ_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../deps/tinyusdz")
+if(EXISTS "${TINYUSDZ_DIR}/CMakeLists.txt")
+    set(LIGHTRT_HAS_TINYUSDZ ON)
+    set(TINYUSDZ_NO_WERROR ON CACHE BOOL "" FORCE)
+    add_subdirectory("${TINYUSDZ_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/tinyusdz")
+else()
+    set(LIGHTRT_HAS_TINYUSDZ OFF)
+    message(STATUS "TinyUSDZ not found at ${TINYUSDZ_DIR} - USD loading disabled")
+endif()
+
 # Sources
 set(SOURCES
     viewer_windows.cc
@@ -20,6 +31,15 @@ target_include_directories(viewer_windows PRIVATE
     ../viewer/third_party
     ../viewer/common
 )
+
+if(LIGHTRT_HAS_TINYUSDZ)
+    target_compile_definitions(viewer_windows PRIVATE LIGHTRT_HAS_TINYUSDZ)
+    target_include_directories(viewer_windows PRIVATE
+        "${TINYUSDZ_DIR}/src"
+        "${TINYUSDZ_DIR}/src/external"
+    )
+    target_link_libraries(viewer_windows PRIVATE tinyusdz_static)
+endif()
 
 # MSVC-specific flags
 if(MSVC)
@@ -49,6 +69,7 @@ target_link_libraries(viewer_windows PRIVATE
     user32
     kernel32
     shell32
+    comdlg32
 )
 
 # Threads
