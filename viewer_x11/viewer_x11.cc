@@ -1,8 +1,9 @@
 // Pure X11 viewer — no GLFW, no Vulkan, no external deps beyond lightrt + X11
+// X11 loaded at runtime via dlopen — no libx11-dev needed at compile time.
 
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
-#include <X11/keysym.h>
+#include "x11/lightrt_x11.h"
+#define LIGHTRT_X11_IMPLEMENTATION
+#include "x11/lightrt_x11_loader.h"
 
 #include "common/viewer_common.h"
 
@@ -59,10 +60,17 @@ int main(int argc, char* argv[]) {
     g_state.accumBuffer.resize((size_t)g_state.width * g_state.height * 3, 0.0f);
     FitToScene(g_state);
 
+    // Load X11 at runtime
+    if (lightrt_x11_load(&g_x11_) != 0) {
+        std::cerr << "Failed to load libX11.so.6 — is X11 installed?\n";
+        return 1;
+    }
+
     // Open X11 display
     Display* dpy = XOpenDisplay(nullptr);
     if (!dpy) {
         std::cerr << "Cannot open X display.\n";
+        lightrt_x11_unload(&g_x11_);
         return 1;
     }
 
@@ -307,6 +315,7 @@ int main(int argc, char* argv[]) {
     XFreeGC(dpy, gc);
     XDestroyWindow(dpy, win);
     XCloseDisplay(dpy);
+    lightrt_x11_unload(&g_x11_);
 
     return 0;
 }
