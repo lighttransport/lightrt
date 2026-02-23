@@ -14,6 +14,12 @@
 
 #include "viewer_common.h"
 
+#ifdef LIGHTRT_HAS_TINYUSDZ
+#include "tinyusdz.hh"
+#include "tydra/render-data.hh"
+#include "tydra/scene-access.hh"
+#endif
+
 #include <iostream>
 #include <thread>
 #include <algorithm>
@@ -187,12 +193,99 @@ bool LoadGLTF(const std::string& filename, Scene& scene) {
     return true;
 }
 
-bool LoadModel(const std::string& filename, Scene& scene) {
-    if (filename.find(".obj") != std::string::npos) {
-        return LoadOBJ(filename, scene);
-    } else {
-        return LoadGLTF(filename, scene);
+#ifdef LIGHTRT_HAS_TINYUSDZ
+bool LoadUSD(const std::string& filename, Scene& scene) {
+    std::string warn, err;
+    tinyusdz::Stage stage;
+
+    bool ret = tinyusdz::LoadUSDFromFile(filename, &stage, &warn, &err);
+    if (!warn.empty()) std::cerr << "USD warn: " << warn << "\n";
+    if (!ret) {
+        std::cerr << "USD load error: " << err << "\n";
+        return false;
     }
+
+    tinyusdz::tydra::RenderScene render_scene;
+    tinyusdz::tydra::RenderSceneConverter converter;
+    tinyusdz::tydra::RenderSceneConverterEnv env(stage);
+    env.mesh_config.triangulate = true;
+    env.timecode = stage.metas().startTimeCode.get_value();
+
+    ret = converter.ConvertToRenderScene(env, &render_scene);
+    if (!ret) {
+        std::cerr << "Failed to convert USD to render scene\n";
+        return false;
+    }
+
+    // Z-up to Y-up: rotate -90 degrees around X => (x, y, z) -> (x, z, -y)
+    bool zUp = (render_scene.meta.upAxis == "Z" || render_scene.meta.upAxis == "z");
+    if (zUp) {
+        std::cout << "USD upAxis is Z — converting to Y-up\n";
+    }
+
+    for (size_t mi = 0; mi < render_scene.meshes.size(); mi++) {
+        const auto& mesh = render_scene.meshes[mi];
+        const auto& pts = mesh.points;
+        const auto& idx = mesh.faceVertexIndices();
+
+        if (idx.size() % 3 != 0) {
+            std::cerr << "Warning: non-triangulated mesh " << mi << ", skipping\n";
+            continue;
+        }
+
+        SceneMesh sm;
+        sm.name = mesh.prim_name.empty() ? ("mesh_" + std::to_string(mi)) : mesh.prim_name;
+        sm.color = hashColor(sm.name);
+
+        for (size_t i = 0; i + 2 < idx.size(); i += 3) {
+            uint32_t i0 = idx[i], i1 = idx[i + 1], i2 = idx[i + 2];
+            if (i0 >= pts.size() || i1 >= pts.size() || i2 >= pts.size()) continue;
+            Triangle tri;
+            tri.v0 = Vec3(pts[i0][0], pts[i0][1], pts[i0][2]);
+            tri.v1 = Vec3(pts[i1][0], pts[i1][1], pts[i1][2]);
+            tri.v2 = Vec3(pts[i2][0], pts[i2][1], pts[i2][2]);
+
+            if (zUp) {
+                // (x, y, z) -> (x, z, -y)
+                tri.v0 = Vec3(tri.v0.x, tri.v0.z, -tri.v0.y);
+                tri.v1 = Vec3(tri.v1.x, tri.v1.z, -tri.v1.y);
+                tri.v2 = Vec3(tri.v2.x, tri.v2.z, -tri.v2.y);
+                // Swap v1/v2 to restore CCW winding
+                std::swap(tri.v1, tri.v2);
+            }
+
+            sm.triangles.push_back(tri);
+        }
+
+        if (!sm.triangles.empty()) {
+            scene.meshes.push_back(std::move(sm));
+        }
+    }
+    return true;
+}
+#endif
+
+static bool hasExtension(const std::string& filename, const std::string& ext) {
+    if (filename.size() < ext.size()) return false;
+    std::string lower;
+    lower.reserve(ext.size());
+    for (size_t i = filename.size() - ext.size(); i < filename.size(); i++) {
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(filename[i]))));
+    }
+    return lower == ext;
+}
+
+bool LoadModel(const std::string& filename, Scene& scene) {
+    if (hasExtension(filename, ".obj")) {
+        return LoadOBJ(filename, scene);
+    }
+#ifdef LIGHTRT_HAS_TINYUSDZ
+    if (hasExtension(filename, ".usd") || hasExtension(filename, ".usda") ||
+        hasExtension(filename, ".usdc") || hasExtension(filename, ".usdz")) {
+        return LoadUSD(filename, scene);
+    }
+#endif
+    return LoadGLTF(filename, scene);
 }
 
 // --- Camera ---
@@ -226,8 +319,8 @@ void FitToScene(ViewerState& state) {
     state.camera.orbitCenter = center;
     float halfFovRad = state.camera.fov * 0.5f * kPi / 180.0f;
     state.camera.orbitDistance = radius * 1.2f / tanf(halfFovRad);
-    state.camera.yaw = -90.0f;
-    state.camera.pitch = 15.0f;
+    state.camera.yaw = 90.0f;
+    state.camera.pitch = 25.0f;
     UpdateCameraFromOrbit(state.camera);
     state.cameraDirty = true;
 }

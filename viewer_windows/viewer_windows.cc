@@ -5,6 +5,7 @@
 #endif
 #include <windows.h>
 #include <shellapi.h>
+#include <commdlg.h>
 
 #include "common/viewer_common.h"
 
@@ -21,6 +22,90 @@ static LARGE_INTEGER g_perfFreq;
 static LARGE_INTEGER g_lastTime;
 
 // --- Helpers ---
+
+static void LoadAndReplaceScene(HWND hwnd, const std::string& path) {
+    std::cout << "Loading " << path << "...\n";
+
+    Scene newScene;
+    if (!LoadModel(path, newScene)) {
+        std::cerr << "Failed to load: " << path << "\n";
+        MessageBoxA(hwnd, ("Failed to load:\n" + path).c_str(), "Load Error", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    newScene.build();
+    if (newScene.allTriangles.empty()) {
+        std::cerr << "No triangles in: " << path << "\n";
+        MessageBoxA(hwnd, "File contains no triangles.", "Load Error", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    g_state.scene = std::move(newScene);
+    FitToScene(g_state);
+
+    std::cout << "Scene: " << g_state.scene.meshes.size() << " meshes, "
+              << g_state.scene.allTriangles.size() << " triangles.\n";
+
+    // Update window title
+    std::wstring title = L"LightRT Viewer - ";
+    // Extract filename from path
+    size_t sep = path.find_last_of("/\\");
+    std::string fname = (sep != std::string::npos) ? path.substr(sep + 1) : path;
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, fname.c_str(), -1, nullptr, 0);
+    std::wstring wfname(wlen - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, fname.c_str(), -1, &wfname[0], wlen);
+    title += wfname;
+    SetWindowTextW(hwnd, title.c_str());
+}
+
+static void ShowOpenFileDialog(HWND hwnd) {
+    wchar_t filePath[MAX_PATH] = {};
+
+    // Build filter string (double-null terminated)
+    std::wstring filter;
+    filter += L"All Supported";
+    filter.push_back(L'\0');
+#ifdef LIGHTRT_HAS_TINYUSDZ
+    filter += L"*.obj;*.gltf;*.glb;*.usd;*.usda;*.usdc;*.usdz";
+#else
+    filter += L"*.obj;*.gltf;*.glb";
+#endif
+    filter.push_back(L'\0');
+    filter += L"OBJ (*.obj)";
+    filter.push_back(L'\0');
+    filter += L"*.obj";
+    filter.push_back(L'\0');
+    filter += L"glTF (*.gltf;*.glb)";
+    filter.push_back(L'\0');
+    filter += L"*.gltf;*.glb";
+    filter.push_back(L'\0');
+#ifdef LIGHTRT_HAS_TINYUSDZ
+    filter += L"USD (*.usd;*.usda;*.usdc;*.usdz)";
+    filter.push_back(L'\0');
+    filter += L"*.usd;*.usda;*.usdc;*.usdz";
+    filter.push_back(L'\0');
+#endif
+    filter += L"All Files (*.*)";
+    filter.push_back(L'\0');
+    filter += L"*.*";
+    filter.push_back(L'\0');
+    filter.push_back(L'\0'); // final double-null
+
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner   = hwnd;
+    ofn.lpstrFilter  = filter.c_str();
+    ofn.lpstrFile    = filePath;
+    ofn.nMaxFile     = MAX_PATH;
+    ofn.Flags        = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+
+    if (GetOpenFileNameW(&ofn)) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, filePath, -1, nullptr, 0, nullptr, nullptr);
+        std::string utf8Path(len - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, filePath, -1, &utf8Path[0], len, nullptr, nullptr);
+        LoadAndReplaceScene(hwnd, utf8Path);
+    }
+}
 
 static void UpdateBitmapInfo() {
     memset(&g_bmi, 0, sizeof(g_bmi));
@@ -55,7 +140,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         switch (wParam) {
         case 'F':      g_state.keys[KEY_F] = true; break;
         case 'S':      g_state.keys[KEY_S] = true; break;
-        case 'O':      g_state.keys[KEY_O] = true; break;
+        case 'O':
+            if (GetKeyState(VK_CONTROL) & 0x8000) {
+                ShowOpenFileDialog(hwnd);
+            } else {
+                g_state.keys[KEY_O] = true;
+            }
+            break;
         case VK_ESCAPE: g_state.keys[KEY_ESCAPE] = true; break;
         case VK_TAB:   g_state.tabPressed = true; break;
         case VK_SHIFT:  g_state.shiftPressed = true; break;
@@ -149,6 +240,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         OnMouseDrag(g_state, x, y);
         return 0;
     }
+
+    case WM_DROPFILES: {
+        HDROP hDrop = (HDROP)wParam;
+        wchar_t wpath[MAX_PATH] = {};
+        if (DragQueryFileW(hDrop, 0, wpath, MAX_PATH)) {
+            int len = WideCharToMultiByte(CP_UTF8, 0, wpath, -1, nullptr, 0, nullptr, nullptr);
+            std::string utf8Path(len - 1, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, wpath, -1, &utf8Path[0], len, nullptr, nullptr);
+            LoadAndReplaceScene(hwnd, utf8Path);
+        }
+        DragFinish(hDrop);
+        return 0;
+    }
     }
 
     return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -227,6 +331,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
+    DragAcceptFiles(hwnd, TRUE);
 
     UpdateBitmapInfo();
 
@@ -237,7 +342,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     int fpsFrameCount = 0;
 
     std::cout << "Controls: Alt+LMB/Shift+LMB Orbit, Alt+MMB/Ctrl+LMB Pan, Alt+RMB/Ctrl+Shift+LMB/Tab+LMB Dolly\n";
-    std::cout << "          F: Fit, S: Shadow, O: Font 2x\n";
+    std::cout << "          F: Fit, S: Shadow, O: Font 2x, Ctrl+O: Open file, Drag&Drop: Load file\n";
 
     // Main loop
     while (g_running) {
