@@ -108,6 +108,11 @@ target_link_libraries(lightrt_benchmark
     lightrt
 )
 
+option(LIGHTRT_BUILD_WEBGPU "Build WebGPU software backend targets" ON)
+if(LIGHTRT_BUILD_WEBGPU)
+    add_subdirectory(webgpu)
+endif()
+
 # Installation
 install(TARGETS lightrt
     ARCHIVE DESTINATION lib
@@ -125,4 +130,5 @@ message(STATUS "  Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Compiler flags: ${CMAKE_CXX_FLAGS}")
 message(STATUS "  System processor: ${CMAKE_SYSTEM_PROCESSOR}")
+message(STATUS "  Build WebGPU: ${LIGHTRT_BUILD_WEBGPU}")
 message(STATUS "")
