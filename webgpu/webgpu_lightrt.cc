@@ -4,9 +4,15 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 
 #include "../lightrt.hh"
+
+#ifdef SOFTRT_ENABLE_CLAIR
+#include "wgsl-ast.hh"
+#include "wgsl-jit-compiler.hh"
+#endif
 
 namespace softrt {
 
@@ -19,6 +25,149 @@ GPUTextureView* GPUTexture::createView() {
     view_ = std::make_unique<GPUTextureView>(this);
   }
   return view_.get();
+}
+
+#ifdef SOFTRT_ENABLE_CLAIR
+struct GPUShaderModule::JITState {
+  clair::wgsl::WGSLJITCompiler compiler;
+  clair::wgsl::CompiledShader* compiled_shader = nullptr;
+  std::string entry_point;
+
+  JITState() {
+    const char* cache_dir = std::getenv("SOFTRT_CLAIR_CACHE_DIR");
+    compiler.setCacheDirectory((cache_dir && cache_dir[0] != '\0')
+                                   ? cache_dir
+                                   : "/tmp/clair-wgsl-cache");
+
+    clair::wgsl::TargetBackend backend = clair::wgsl::TargetBackend::CPU_JIT;
+    if (const char* backend_env = std::getenv("SOFTRT_CLAIR_BACKEND")) {
+      if (std::strcmp(backend_env, "CPU") == 0) {
+        backend = clair::wgsl::TargetBackend::CPU;
+      } else if (std::strcmp(backend_env, "SPIRV") == 0) {
+        backend = clair::wgsl::TargetBackend::SPIRV;
+      } else if (std::strcmp(backend_env, "SPIRV_JIT") == 0) {
+        backend = clair::wgsl::TargetBackend::SPIRV;
+      } else if (std::strcmp(backend_env, "CPU_JIT") == 0) {
+        backend = clair::wgsl::TargetBackend::CPU_JIT;
+      }
+    }
+    compiler.setTargetBackend(backend);
+
+    int opt_level = 0;
+    if (const char* opt_env = std::getenv("SOFTRT_CLAIR_OPT_LEVEL")) {
+      opt_level = std::atoi(opt_env);
+      if (opt_level < 0) opt_level = 0;
+      if (opt_level > 3) opt_level = 3;
+    }
+    compiler.setOptimizationLevel(opt_level);
+
+    uint64_t opt_timeout_ms = 30000;  // 30s default
+    if (const char* timeout_ms_env = std::getenv("SOFTRT_CLAIR_OPT_TIMEOUT_MS")) {
+      char* end = nullptr;
+      unsigned long long v = std::strtoull(timeout_ms_env, &end, 10);
+      if (end != timeout_ms_env) {
+        opt_timeout_ms = static_cast<uint64_t>(v);
+      }
+    } else if (const char* timeout_s_env = std::getenv("SOFTRT_CLAIR_OPT_TIMEOUT_SECS")) {
+      char* end = nullptr;
+      unsigned long long v = std::strtoull(timeout_s_env, &end, 10);
+      if (end != timeout_s_env) {
+        opt_timeout_ms = static_cast<uint64_t>(v * 1000ull);
+      }
+    }
+    compiler.setOptimizationTimeoutMs(opt_timeout_ms);
+
+    bool fusion_enabled = true;
+    if (const char* fusion_env = std::getenv("SOFTRT_CLAIR_FUSION")) {
+      if (std::strcmp(fusion_env, "0") == 0 ||
+          std::strcmp(fusion_env, "false") == 0 ||
+          std::strcmp(fusion_env, "FALSE") == 0) {
+        fusion_enabled = false;
+      }
+    }
+    compiler.setFusionEnabled(fusion_enabled);
+  }
+};
+#endif
+
+GPUShaderModule::GPUShaderModule(const std::string& code) : code_(code) {
+#ifdef SOFTRT_ENABLE_CLAIR
+  jit_state_ = std::make_unique<JITState>();
+#endif
+}
+
+GPUShaderModule::~GPUShaderModule() = default;
+
+bool GPUShaderModule::compileComputeShader(const std::string& entry_point) {
+#ifdef SOFTRT_ENABLE_CLAIR
+  if (!jit_state_) {
+    jit_state_ = std::make_unique<JITState>();
+  }
+
+  auto result = jit_state_->compiler.compileShader(
+      code_, entry_point, clair::wgsl::ShaderStage::COMPUTE);
+  if (!result) {
+    jit_state_->compiled_shader = nullptr;
+    last_error_ = result.error();
+    return false;
+  }
+
+  jit_state_->compiled_shader = result.value();
+  jit_state_->entry_point = entry_point;
+  last_error_.clear();
+  return true;
+#else
+  (void)entry_point;
+  last_error_ = "SOFTRT_ENABLE_CLAIR is disabled";
+  return false;
+#endif
+}
+
+bool GPUShaderModule::dispatchCompute(
+    const std::array<uint32_t, 3>& num_workgroups,
+    const std::vector<GPUBufferBindingInfo>& buffer_bindings) {
+#ifdef SOFTRT_ENABLE_CLAIR
+  if (!jit_state_ || !jit_state_->compiled_shader) {
+    last_error_ = "Compute shader is not compiled";
+    return false;
+  }
+
+  std::vector<clair::wgsl::BufferBindingInfo> bindings;
+  bindings.reserve(buffer_bindings.size());
+
+  for (const auto& binding : buffer_bindings) {
+    if (!binding.buffer) {
+      last_error_ = "Null GPUBuffer in compute binding";
+      return false;
+    }
+    bindings.emplace_back(static_cast<void*>(binding.buffer->data()),
+                          static_cast<size_t>(binding.buffer->size()),
+                          binding.readonly);
+  }
+
+  auto result = jit_state_->compiler.executeComputeShader(
+      jit_state_->compiled_shader, num_workgroups, bindings);
+  if (!result) {
+    last_error_ = result.error();
+    return false;
+  }
+
+  last_error_.clear();
+  return true;
+#else
+  (void)num_workgroups;
+  (void)buffer_bindings;
+  last_error_ = "SOFTRT_ENABLE_CLAIR is disabled";
+  return false;
+#endif
+}
+
+bool GPUShaderModule::isComputeShaderReady() const {
+#ifdef SOFTRT_ENABLE_CLAIR
+  return jit_state_ && jit_state_->compiled_shader;
+#else
+  return false;
+#endif
 }
 
 // ============================================================================
