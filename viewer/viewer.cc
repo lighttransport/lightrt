@@ -53,7 +53,8 @@ struct VulkanContext {
         uint32_t glfwExtCount = 0;
         const char** glfwExts = glfwGetRequiredInstanceExtensions(&glfwExtCount);
 
-        VkInstanceCreateInfo createInfo = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+        VkInstanceCreateInfo createInfo = {};
+        createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         createInfo.pApplicationInfo = &appInfo;
         createInfo.enabledExtensionCount = glfwExtCount;
         createInfo.ppEnabledExtensionNames = glfwExts;
@@ -72,13 +73,15 @@ struct VulkanContext {
         physicalDevice = devices[0];
 
         float queuePriority = 1.0f;
-        VkDeviceQueueCreateInfo queueInfo = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+        VkDeviceQueueCreateInfo queueInfo = {};
+        queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
         queueInfo.queueFamilyIndex = 0;
         queueInfo.queueCount = 1;
         queueInfo.pQueuePriorities = &queuePriority;
 
         const char* deviceExts[] = { "VK_KHR_swapchain" };
-        VkDeviceCreateInfo devInfo = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+        VkDeviceCreateInfo devInfo = {};
+        devInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         devInfo.pQueueCreateInfos = &queueInfo;
         devInfo.queueCreateInfoCount = 1;
         devInfo.enabledExtensionCount = 1;
@@ -88,7 +91,8 @@ struct VulkanContext {
         LoadDeviceFunctions(device);
         vkGetDeviceQueue(device, 0, 0, &queue);
 
-        VkSwapchainCreateInfoKHR swapchainInfo = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+        VkSwapchainCreateInfoKHR swapchainInfo = {};
+        swapchainInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
         swapchainInfo.surface = surface;
         swapchainInfo.minImageCount = 2;
         swapchainInfo.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
@@ -107,26 +111,31 @@ struct VulkanContext {
         swapchainImages.resize(count);
         vkGetSwapchainImagesKHR(device, swapchain, &count, swapchainImages.data());
 
-        VkCommandPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        VkCommandPoolCreateInfo poolInfo = {};
+        poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         poolInfo.queueFamilyIndex = 0;
         poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool);
 
-        VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        VkCommandBufferAllocateInfo allocInfo = {};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         allocInfo.commandPool = commandPool;
         allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         allocInfo.commandBufferCount = 1;
         vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
 
-        VkSemaphoreCreateInfo semInfo = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        VkSemaphoreCreateInfo semInfo = {};
+        semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         vkCreateSemaphore(device, &semInfo, nullptr, &imageAvailableSemaphore);
         vkCreateSemaphore(device, &semInfo, nullptr, &renderFinishedSemaphore);
 
-        VkFenceCreateInfo fenceInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VkFenceCreateInfo fenceInfo = {};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         vkCreateFence(device, &fenceInfo, nullptr, &renderFence);
 
-        VkBufferCreateInfo bufInfo = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        VkBufferCreateInfo bufInfo = {};
+        bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         bufInfo.size = width * height * 4;
         bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         vkCreateBuffer(device, &bufInfo, nullptr, &stagingBuffer);
@@ -146,7 +155,8 @@ struct VulkanContext {
             }
         }
 
-        VkMemoryAllocateInfo memAlloc = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        VkMemoryAllocateInfo memAlloc = {};
+        memAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         memAlloc.allocationSize = memReq.size;
         memAlloc.memoryTypeIndex = memTypeIndex;
         vkAllocateMemory(device, &memAlloc, nullptr, &stagingMemory);
@@ -177,7 +187,8 @@ struct VulkanContext {
         width = newWidth;
         height = newHeight;
 
-        VkSwapchainCreateInfoKHR swapchainInfo = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+        VkSwapchainCreateInfoKHR swapchainInfo = {};
+        swapchainInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
         swapchainInfo.surface = surface;
         swapchainInfo.minImageCount = 2;
         swapchainInfo.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
@@ -199,7 +210,8 @@ struct VulkanContext {
         swapchainImages.resize(count);
         vkGetSwapchainImagesKHR(device, swapchain, &count, swapchainImages.data());
 
-        VkBufferCreateInfo bufInfo = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        VkBufferCreateInfo bufInfo = {};
+        bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         bufInfo.size = width * height * 4;
         bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         vkCreateBuffer(device, &bufInfo, nullptr, &stagingBuffer);
@@ -207,7 +219,8 @@ struct VulkanContext {
         VkMemoryRequirements memReq;
         vkGetBufferMemoryRequirements(device, stagingBuffer, &memReq);
 
-        VkMemoryAllocateInfo memAlloc = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        VkMemoryAllocateInfo memAlloc = {};
+        memAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         memAlloc.allocationSize = memReq.size;
         memAlloc.memoryTypeIndex = FindMemoryType(memReq.memoryTypeBits,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -223,22 +236,26 @@ struct VulkanContext {
         uint32_t imageIndex;
         VkResult res = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
         if (res == VK_ERROR_OUT_OF_DATE_KHR) {
-            VkSubmitInfo empty = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            VkSubmitInfo empty = {};
+            empty.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             vkQueueSubmit(queue, 1, &empty, renderFence);
             return false;
         }
         if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) {
-            VkSubmitInfo empty = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            VkSubmitInfo empty = {};
+            empty.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             vkQueueSubmit(queue, 1, &empty, renderFence);
             return false;
         }
 
         memcpy(mappedMemory, pixels.data(), width * height * sizeof(uint32_t));
 
-        VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        VkCommandBufferBeginInfo beginInfo = {};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         vkBeginCommandBuffer(commandBuffer, &beginInfo);
 
-        VkImageMemoryBarrier barrier1 = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        VkImageMemoryBarrier barrier1 = {};
+        barrier1.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         barrier1.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         barrier1.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         barrier1.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -268,7 +285,8 @@ struct VulkanContext {
 
         vkEndCommandBuffer(commandBuffer);
 
-        VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        VkSubmitInfo submitInfo = {};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
         submitInfo.waitSemaphoreCount = 1;
         submitInfo.pWaitSemaphores = &imageAvailableSemaphore;
@@ -280,7 +298,8 @@ struct VulkanContext {
 
         vkQueueSubmit(queue, 1, &submitInfo, renderFence);
 
-        VkPresentInfoKHR presentInfo = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        VkPresentInfoKHR presentInfo = {};
+        presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         presentInfo.waitSemaphoreCount = 1;
         presentInfo.pWaitSemaphores = &renderFinishedSemaphore;
         presentInfo.swapchainCount = 1;
