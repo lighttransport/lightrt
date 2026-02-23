@@ -21,9 +21,6 @@ target_include_directories(viewer_x11 PRIVATE
     ../viewer/common
 )
 
-# Find X11
-find_package(X11 REQUIRED)
-
 # Compiler flags
 target_compile_options(viewer_x11 PRIVATE
     -O3 -Wall -Wextra -fno-rtti -fno-exceptions
@@ -36,10 +33,9 @@ if(HAS_AVX2)
     target_compile_options(viewer_x11 PRIVATE -mavx2 -mfma)
 endif()
 
-# Link X11 and threads
+# Link dl (for dlopen/dlsym) and threads — no X11 dev headers needed
 find_package(Threads REQUIRED)
 target_link_libraries(viewer_x11 PRIVATE
-    ${X11_LIBRARIES}
+    ${CMAKE_DL_LIBS}
     Threads::Threads
 )
-target_include_directories(viewer_x11 PRIVATE ${X11_INCLUDE_DIR})
