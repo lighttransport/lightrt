@@ -1,19 +1,41 @@
 // Scene graph for CLI renderer
-// Provides per-instance transforms, motion blur, and USD camera support
+// Provides per-instance transforms, motion blur, USD camera support,
+// materials, lights, environment maps, and PBR shading
 #pragma once
 
 #include "lightrt.hh"
+#include "common/transforms.hh"
+#include "common/materials.hh"
+#include "common/shading.hh"
 #include <vector>
 #include <string>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <algorithm>
+#include <numeric>
 
 namespace scene {
+
+// Re-export common types into scene namespace for backward compatibility
+using MaterialData = lightrt_common::MaterialData;
+using LightData = lightrt_common::LightData;
+using EnvmapData = lightrt_common::EnvmapData;
+
+// Re-export transform utilities
+using lightrt_common::matrix4dTo3x4;
+using lightrt_common::invert3x4;
+using lightrt_common::lerp3x4;
+using lightrt_common::transformPoint;
+using lightrt_common::transformDir;
+using lightrt_common::transformNormal;
+using lightrt_common::transformAABB;
 
 struct MeshBLAS {
   lightrt::TriangleBVH bvh;
   lightrt::AABB local_bounds;
+  std::vector<int32_t> tri_material_ids;
+  int32_t default_material_id = -1;
 };
 
 struct Instance {
@@ -48,85 +70,11 @@ struct Scene {
   std::vector<MeshBLAS> meshes;
   std::vector<Instance> instances;
   std::vector<Camera> cameras;
+  std::vector<MaterialData> materials;
+  std::vector<LightData> lights;
+  EnvmapData envmap;
   lightrt::AABB scene_bounds;
 };
-
-// --- Transform utilities ---
-
-inline void matrix4dTo3x4(const double m[4][4], float out[12]) {
-  for (int r = 0; r < 3; r++)
-    for (int c = 0; c < 4; c++)
-      out[r * 4 + c] = static_cast<float>(m[r][c]);
-}
-
-inline bool invert3x4(const float m[12], float inv[12]) {
-  // Extract 3x3 rotation/scale part
-  float a00 = m[0], a01 = m[1], a02 = m[2];
-  float a10 = m[4], a11 = m[5], a12 = m[6];
-  float a20 = m[8], a21 = m[9], a22 = m[10];
-
-  float det = a00 * (a11 * a22 - a12 * a21)
-            - a01 * (a10 * a22 - a12 * a20)
-            + a02 * (a10 * a21 - a11 * a20);
-
-  if (std::fabs(det) < 1e-12f) return false;
-
-  float inv_det = 1.0f / det;
-
-  // Inverse of 3x3
-  float i00 = (a11 * a22 - a12 * a21) * inv_det;
-  float i01 = (a02 * a21 - a01 * a22) * inv_det;
-  float i02 = (a01 * a12 - a02 * a11) * inv_det;
-  float i10 = (a12 * a20 - a10 * a22) * inv_det;
-  float i11 = (a00 * a22 - a02 * a20) * inv_det;
-  float i12 = (a02 * a10 - a00 * a12) * inv_det;
-  float i20 = (a10 * a21 - a11 * a20) * inv_det;
-  float i21 = (a01 * a20 - a00 * a21) * inv_det;
-  float i22 = (a00 * a11 - a01 * a10) * inv_det;
-
-  inv[0] = i00; inv[1] = i01; inv[2] = i02;
-  inv[4] = i10; inv[5] = i11; inv[6] = i12;
-  inv[8] = i20; inv[9] = i21; inv[10] = i22;
-
-  // Translation: -R^-1 * t
-  float tx = m[3], ty = m[7], tz = m[11];
-  inv[3]  = -(i00 * tx + i01 * ty + i02 * tz);
-  inv[7]  = -(i10 * tx + i11 * ty + i12 * tz);
-  inv[11] = -(i20 * tx + i21 * ty + i22 * tz);
-
-  return true;
-}
-
-inline void lerp3x4(const float a[12], const float b[12], float t, float out[12]) {
-  for (int i = 0; i < 12; i++)
-    out[i] = a[i] + (b[i] - a[i]) * t;
-}
-
-inline lightrt::Vec3 transformPoint(const float m[12], const lightrt::Vec3& p) {
-  return lightrt::Vec3(
-    m[0] * p.x + m[1] * p.y + m[2]  * p.z + m[3],
-    m[4] * p.x + m[5] * p.y + m[6]  * p.z + m[7],
-    m[8] * p.x + m[9] * p.y + m[10] * p.z + m[11]);
-}
-
-inline lightrt::Vec3 transformDir(const float m[12], const lightrt::Vec3& d) {
-  return lightrt::Vec3(
-    m[0] * d.x + m[1] * d.y + m[2]  * d.z,
-    m[4] * d.x + m[5] * d.y + m[6]  * d.z,
-    m[8] * d.x + m[9] * d.y + m[10] * d.z);
-}
-
-inline lightrt::AABB transformAABB(const lightrt::AABB& box, const float m[12]) {
-  lightrt::AABB result;
-  for (int i = 0; i < 8; i++) {
-    lightrt::Vec3 corner(
-      (i & 1) ? box.max.x : box.min.x,
-      (i & 2) ? box.max.y : box.min.y,
-      (i & 4) ? box.max.z : box.min.z);
-    result.expand(transformPoint(m, corner));
-  }
-  return result;
-}
 
 // --- Scene traversal ---
 
@@ -137,11 +85,9 @@ inline HitInfo traceScene(const Scene& scene, const lightrt::Ray& ray, float ray
   for (uint32_t i = 0; i < static_cast<uint32_t>(scene.instances.size()); i++) {
     const Instance& inst = scene.instances[i];
 
-    // AABB culling
     if (!inst.world_bounds.intersect(ray, tmin_out, tmax_out)) continue;
     if (tmin_out > best.t) continue;
 
-    // Get transform (interpolated for motion blur)
     float inv_m[12];
     if (inst.has_motion && ray_time > 0.0f && ray_time < 1.0f) {
       float blended[12];
@@ -153,7 +99,6 @@ inline HitInfo traceScene(const Scene& scene, const lightrt::Ray& ray, float ray
       std::memcpy(inv_m, inst.inv_transform, sizeof(inv_m));
     }
 
-    // Transform ray to local space
     lightrt::Vec3 local_o = transformPoint(inv_m, ray.origin);
     lightrt::Vec3 local_d = transformDir(inv_m, ray.direction);
     float dir_len = local_d.length();
@@ -215,5 +160,10 @@ inline bool traceSceneAnyHit(const Scene& scene, const lightrt::Ray& ray,
   }
   return false;
 }
+
+// Re-export shading namespace for backward compatibility
+namespace shading {
+  using namespace lightrt_common::shading;
+} // namespace shading
 
 } // namespace scene
