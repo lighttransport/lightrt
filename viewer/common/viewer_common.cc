@@ -21,7 +21,7 @@
 
 namespace lightrt_viewer {
 
-static constexpr float kPi = 3.14159265358979323846f;
+static constexpr float kPi = lightrt_common::shading::kPi;
 
 // Component-wise Vec3 multiply (Vec3 only has operator*(float))
 static Vec3 vmul(const Vec3& a, const Vec3& b) {
@@ -364,24 +364,9 @@ static float rand_float(uint32_t& seed) {
     return (float)(seed & 0xFFFFFFu) / (float)0x1000000u;
 }
 
-// Cosine-weighted hemisphere sample
+// Cosine-weighted hemisphere sample (delegates to shared implementation)
 static Vec3 cosine_hemisphere(float u1, float u2, const Vec3& normal) {
-    // Build tangent frame
-    Vec3 tangent;
-    if (fabsf(normal.x) > 0.9f) {
-        tangent = Vec3(0, 1, 0).cross(normal).normalize();
-    } else {
-        tangent = Vec3(1, 0, 0).cross(normal).normalize();
-    }
-    Vec3 bitangent = normal.cross(tangent);
-
-    float r = sqrtf(u1);
-    float theta = 2.0f * kPi * u2;
-    float x = r * cosf(theta);
-    float y = r * sinf(theta);
-    float z = sqrtf(std::max(0.0f, 1.0f - u1));
-
-    return (tangent * x + bitangent * y + normal * z).normalize();
+    return lightrt_common::shading::cosineHemisphere(u1, u2, normal);
 }
 
 // Jitter direction within a cone of given half-angle (radians)
@@ -557,24 +542,19 @@ void PathTrace(ViewerState& state) {
 
     state.sampleCount++;
 
-    // Tonemap + gamma: accum/sampleCount -> Reinhard -> gamma 2.2 -> pixels
+    // Tonemap + gamma: accum/sampleCount -> Reinhard -> sRGB -> pixels
+    using lightrt_common::shading::reinhardTonemap;
+    using lightrt_common::shading::linearToSRGB;
     float invSamples = 1.0f / (float)state.sampleCount;
-    float invGamma = 1.0f / 2.2f;
 
     for (int i = 0; i < width * height; ++i) {
-        float r = state.accumBuffer[i * 3 + 0] * invSamples;
-        float g = state.accumBuffer[i * 3 + 1] * invSamples;
-        float b = state.accumBuffer[i * 3 + 2] * invSamples;
+        float r = reinhardTonemap(state.accumBuffer[i * 3 + 0] * invSamples);
+        float g = reinhardTonemap(state.accumBuffer[i * 3 + 1] * invSamples);
+        float b = reinhardTonemap(state.accumBuffer[i * 3 + 2] * invSamples);
 
-        // Reinhard tonemap
-        r = r / (1.0f + r);
-        g = g / (1.0f + g);
-        b = b / (1.0f + b);
-
-        // Gamma
-        r = powf(std::max(0.0f, r), invGamma);
-        g = powf(std::max(0.0f, g), invGamma);
-        b = powf(std::max(0.0f, b), invGamma);
+        r = linearToSRGB(r);
+        g = linearToSRGB(g);
+        b = linearToSRGB(b);
 
         int ir = std::min(255, (int)(r * 255.0f + 0.5f));
         int ig = std::min(255, (int)(g * 255.0f + 0.5f));

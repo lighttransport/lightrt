@@ -1,6 +1,8 @@
 #pragma once
 
 #include "../../lightrt.hh"
+#include "../../common/materials.hh"
+#include "../../common/shading.hh"
 #include "bitmap_font.h"
 
 #include <vector>

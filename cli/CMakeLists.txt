@@ -37,6 +37,7 @@ add_executable(lightrt_cli main.cc stb_image_write_impl.cc "${LIGHTRT_DIR}/light
 
 target_include_directories(lightrt_cli PRIVATE
   "${LIGHTRT_DIR}"
+  "${LIGHTRT_DIR}/common"
   "${TINYUSDZ_DIR}/src"
   "${TINYUSDZ_DIR}/src/external"
 )
