@@ -22,6 +22,10 @@ add_executable(headless_triangle headless_triangle.c)
 target_link_libraries(headless_triangle PRIVATE webgpu)
 target_copy_webgpu_binaries(headless_triangle)
 
+add_executable(headless_triangle_dump headless_triangle_dump.c)
+target_link_libraries(headless_triangle_dump PRIVATE webgpu)
+target_copy_webgpu_binaries(headless_triangle_dump)
+
 # --- Windowed example ---
 add_executable(windowed_triangle windowed_triangle.c)
 target_link_libraries(windowed_triangle PRIVATE webgpu glfw glfw3webgpu)

@@ -67,6 +67,25 @@ cmake -DNO_SVE=ON ..  # ARM only
 ./lightrt_example
 ```
 
+## WebGPU Verification
+
+Build and run the WGSL/WebGPU verification baseline:
+
+```bash
+./scripts/verify_webgpu_conformance.sh
+```
+
+For setup details and external conformance integration (GPUWeb CTS, Dawn runner, optional naga/spirv-val), see:
+
+- `docs/WEBGPU_VERIFICATION_FOUNDATION.md`
+
+CTS WGSL adapter (extract + compile through Clair path):
+
+```bash
+./scripts/download_webgpu_cts.sh --dest ./third_party/webgpu-cts
+./scripts/run_cts_wgsl_adapter.sh --cts-root /path/to/webgpu-cts --limit 200
+```
+
 ## Quick Start
 
 ```cpp
@@ -258,4 +277,3 @@ Performance test with 10000 rays...
   Hit rate: 69.16%
   Rays/second: 22075.1
 ```
-

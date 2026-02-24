@@ -45,6 +45,8 @@ endif ()
 add_library(softrt_webgpu STATIC
   webgpu_lightrt.cc
   webgpu_lightrt.hh
+  wgsl_clair_adapter.cc
+  wgsl_clair_adapter.hh
 )
 
 target_compile_features(softrt_webgpu PUBLIC cxx_std_17)
@@ -69,6 +71,9 @@ endif ()
 add_executable(webgpu_example webgpu_example.cc)
 target_link_libraries(webgpu_example PRIVATE softrt_webgpu)
 
+add_executable(webgpu_headless_triangle_dump webgpu_headless_triangle_dump.cc)
+target_link_libraries(webgpu_headless_triangle_dump PRIVATE softrt_webgpu)
+
 add_executable(webgpu_wgsl_jit_minimal webgpu_wgsl_jit_minimal.cc)
 target_link_libraries(webgpu_wgsl_jit_minimal PRIVATE softrt_webgpu)
 
@@ -86,3 +91,31 @@ target_link_libraries(webgpu_wgsl_jit_heavy_expr PRIVATE softrt_webgpu)
 
 add_executable(webgpu_wgsl_jit_control_flow webgpu_wgsl_jit_control_flow.cc)
 target_link_libraries(webgpu_wgsl_jit_control_flow PRIVATE softrt_webgpu)
+
+if (SOFTRT_WEBGPU_HAVE_CLAIR)
+  add_executable(webgpu_wgsl_compile_file webgpu_wgsl_compile_file.cc)
+  target_link_libraries(webgpu_wgsl_compile_file PRIVATE softrt_webgpu)
+endif ()
+
+if (BUILD_TESTING AND SOFTRT_WEBGPU_HAVE_CLAIR)
+  set(SOFTRT_WGSL_JIT_TEST_TARGETS
+      webgpu_wgsl_jit_minimal
+      webgpu_wgsl_jit_storage_minimal
+      webgpu_wgsl_jit_indexed_write
+      webgpu_wgsl_jit_complex
+      webgpu_wgsl_jit_heavy_expr
+      webgpu_wgsl_jit_control_flow)
+
+  foreach(_mode IN ITEMS SPIRV CPU_JIT)
+    foreach(_opt IN ITEMS 0 2)
+      foreach(_target IN LISTS SOFTRT_WGSL_JIT_TEST_TARGETS)
+        set(_test_name "${_target}_${_mode}_O${_opt}")
+        add_test(NAME "${_test_name}" COMMAND $<TARGET_FILE:${_target}>)
+        set_tests_properties("${_test_name}" PROPERTIES
+          LABELS "WebGPUWGSL;${_mode};opt${_opt}"
+          ENVIRONMENT
+            "SOFTRT_CLAIR_EXECUTION_MODE=${_mode};SOFTRT_CLAIR_OPT_LEVEL=${_opt}")
+      endforeach ()
+    endforeach ()
+  endforeach ()
+endif ()

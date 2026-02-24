@@ -1,5 +1,6 @@
 // webgpu_lightrt.cc — Implementation of minimal WebGPU API using LightRT
 #include "webgpu_lightrt.hh"
+#include "wgsl_clair_adapter.hh"
 
 #include <algorithm>
 #include <cmath>
@@ -104,8 +105,9 @@ bool GPUShaderModule::compileComputeShader(const std::string& entry_point) {
     jit_state_ = std::make_unique<JITState>();
   }
 
+  const std::string normalized_wgsl = normalizeWGSLForClair(code_);
   auto result = jit_state_->compiler.compileShader(
-      code_, entry_point, clair::wgsl::ShaderStage::COMPUTE);
+      normalized_wgsl, entry_point, clair::wgsl::ShaderStage::COMPUTE);
   if (!result) {
     jit_state_->compiled_shader = nullptr;
     last_error_ = result.error();
