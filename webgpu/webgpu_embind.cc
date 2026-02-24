@@ -195,6 +195,7 @@ EMSCRIPTEN_BINDINGS(softrt) {
   constant("GPUBufferUsage_VERTEX", (uint32_t)GPUBufferUsage_VERTEX);
   constant("GPUBufferUsage_INDEX", (uint32_t)GPUBufferUsage_INDEX);
   constant("GPUBufferUsage_COPY_DST", (uint32_t)GPUBufferUsage_COPY_DST);
+  constant("GPUBufferUsage_STORAGE", (uint32_t)GPUBufferUsage_STORAGE);
 
   // --- Classes ---
 
