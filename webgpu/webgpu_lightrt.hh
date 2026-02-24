@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -18,6 +19,7 @@ enum GPUBufferUsage : uint32_t {
   GPUBufferUsage_VERTEX = 0x0020,
   GPUBufferUsage_INDEX = 0x0010,
   GPUBufferUsage_COPY_DST = 0x0008,
+  GPUBufferUsage_STORAGE = 0x0080,
 };
 
 enum class GPUTextureFormat : uint8_t {
@@ -102,6 +104,11 @@ struct GPURenderPassDescriptor {
   GPURenderPassColorAttachment colorAttachment;
 };
 
+struct GPUBufferBindingInfo {
+  GPUBuffer* buffer = nullptr;
+  bool readonly = false;
+};
+
 // ============================================================================
 // Resource Classes
 // ============================================================================
@@ -152,10 +159,21 @@ class GPUTextureView {
 
 class GPUShaderModule {
  public:
-  explicit GPUShaderModule(const std::string& code) : code_(code) {}
+  explicit GPUShaderModule(const std::string& code);
+  ~GPUShaderModule();
+
+  bool compileComputeShader(const std::string& entry_point = "main");
+  bool dispatchCompute(const std::array<uint32_t, 3>& num_workgroups,
+                       const std::vector<GPUBufferBindingInfo>& buffer_bindings);
+  bool isComputeShaderReady() const;
+  const std::string& lastError() const { return last_error_; }
 
  private:
+  struct JITState;
+
   std::string code_;
+  std::string last_error_;
+  std::unique_ptr<JITState> jit_state_;
 };
 
 class GPURenderPipeline {
