@@ -18,7 +18,8 @@ echo "[wgpu-setup] configuring ${BUILD_DIR}"
 cmake -S "${REF_DIR}" -B "${BUILD_DIR}"
 
 echo "[wgpu-setup] building headless targets"
-cmake --build "${BUILD_DIR}" -j"${JOBS}" --target headless_triangle headless_triangle_dump
+cmake --build "${BUILD_DIR}" -j"${JOBS}" \
+  --target headless_triangle headless_triangle_dump wgpu_wgsl_compile_file
 
 echo "[wgpu-setup] done"
 echo "  build dir: ${BUILD_DIR}"
