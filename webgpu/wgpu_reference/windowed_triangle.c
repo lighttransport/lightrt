@@ -92,15 +92,16 @@ int main(void) {
     if (!g_adapter) { fprintf(stderr, "No adapter\n"); return 1; }
 
     /* 4. Device */
-    wgpuAdapterRequestDevice(g_adapter, NULL,
+    WGPUDeviceDescriptor device_desc = {0};
+    device_desc.uncapturedErrorCallbackInfo =
+        (WGPUUncapturedErrorCallbackInfo){
+            .callback = on_device_error,
+        };
+    wgpuAdapterRequestDevice(g_adapter, &device_desc,
         (WGPURequestDeviceCallbackInfo){
             .callback = on_device,
         });
     if (!g_device) { fprintf(stderr, "No device\n"); return 1; }
-    wgpuDeviceSetUncapturedErrorCallback(g_device,
-        (WGPUUncapturedErrorCallbackInfo){
-            .callback = on_device_error,
-        });
     WGPUQueue queue = wgpuDeviceGetQueue(g_device);
 
     /* 5. Configure surface */
