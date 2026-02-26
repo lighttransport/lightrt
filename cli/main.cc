@@ -9,11 +9,12 @@
 #include "common/sss.hh"
 
 #if defined(LIGHTRT_USE_LIGHTUSD_C)
-// lightusd-c is a C11 handle-based API (Vulkan-style).
-// lydra provides C++ mesh geometry utilities (triangulation, normals, etc.).
-// The C headers are self-guarded with LUSD_EXTERN_C_BEGIN/END.
+// lightusd-c Layer API + lydra-c pure-C mesh utilities.
+// Bypasses the Stage API (stubbed) and reads prims directly from the Layer.
 #include "lightusd/lightusd-c.h"
-#include "lydra_mesh.hh"
+#include "internal/lusd_layer_internal.h"
+#include "lydra_c_scene.h"
+#include "lydra_c_mesh.h"
 #else
 // tinyusdz + tydra backend (default)
 #include "tinyusdz.hh"
@@ -120,132 +121,100 @@ static CentroidKey makeCentroidKey(const lightrt::Triangle& tri) {
 
 #if defined(LIGHTRT_USE_LIGHTUSD_C)
 // =========================================================================
-// lightusd-c + lydra backend
+// lightusd-c + lydra backend (Layer API, bypasses Stage)
 //
-// lightusd-c: C11 handle-based API (Vulkan-style).
-//   - LusdInstance / LusdStage / LusdPrim / LusdValue are opaque handles.
-//   - Scene traversal via lusdStageTraverse() callback.
-//   - Attribute data extracted with lusdPrimGetAttributeDefault() +
-//     lusdValueGetArrayPtr*() (zero-copy).
-// lydra: C++ mesh utility library.
-//   - lydra::triangulate() converts polygon soup to triangle indices.
-//   - No RenderScene / RenderSceneConverter equivalent (not yet implemented).
-//
-// NOTE: lusdLoadStage() is currently stubbed and returns
-//       LUSD_ERROR_FEATURE_NOT_PRESENT.  Stage loading will work once the
-//       parser backend is wired in the lightusd branch.
+// Uses lusdCreateLayer() to parse USDC/USDA into flat prim tables, then
+// walks the prim tree directly via LusdLayer_T/LusdPrim_T internals.
+// lydra::extract_mesh() materializes mesh data from the layer fields.
 // =========================================================================
 
-// Traversal callback context
-struct LusdMeshCtx {
-  LusdInstance    instance;
-  scene::Scene*   out_scene;
-};
+// Recursive DFS over prim tree, extracting Mesh prims
+static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
+                      scene::Scene& out_scene) {
+  // Check if this prim is a Mesh
+  if (P->type_name && strcmp(P->type_name, "Mesh") == 0) {
+    LydraCMeshData mesh_data_c;
+    LusdResult r = lydra_c_extract_mesh(
+        reinterpret_cast<LusdLayer>(L),
+        reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
+        &mesh_data_c);
+    if (r == LUSD_SUCCESS) {
+      // Triangulate
+      uint32_t* tri_idx = nullptr;
+      uint32_t  tri_idx_count = 0;
+      bool owns_tri_idx = false;
 
-static LusdTraversalAction lusdMeshCallback(
-    LusdPrim prim, LusdPath /*path*/, uint32_t /*depth*/, void* pUserData)
-{
-  auto* ctx = static_cast<LusdMeshCtx*>(pUserData);
+      if (mesh_data_c.fvc_count > 0) {
+        if (lydra_c_triangulate(mesh_data_c.face_vertex_indices,
+                                mesh_data_c.fvi_count,
+                                mesh_data_c.face_vertex_counts,
+                                mesh_data_c.fvc_count,
+                                &tri_idx, &tri_idx_count) != 0) {
+          lydra_c_free_mesh_data(&mesh_data_c);
+          goto recurse;
+        }
+        owns_tri_idx = true;
+      } else {
+        // Already triangulated — cast int32_t* to uint32_t*
+        tri_idx = reinterpret_cast<uint32_t*>(mesh_data_c.face_vertex_indices);
+        tri_idx_count = mesh_data_c.fvi_count;
+      }
 
-  const char* typeName = lusdPrimGetTypeName(prim);
-  if (!typeName || strcmp(typeName, "Mesh") != 0)
-    return LUSD_TRAVERSAL_CONTINUE;
+      // Build lightrt triangles
+      uint32_t pt_count = mesh_data_c.point_count;
+      std::vector<lightrt::Triangle> triangles;
+      triangles.reserve(tri_idx_count / 3);
+      for (uint32_t i = 0; i + 2 < tri_idx_count; i += 3) {
+        uint32_t i0 = tri_idx[i], i1 = tri_idx[i + 1], i2 = tri_idx[i + 2];
+        if (i0 >= pt_count || i1 >= pt_count || i2 >= pt_count) continue;
+        lightrt::Triangle tri;
+        tri.v0 = lightrt::Vec3(mesh_data_c.points[i0*3], mesh_data_c.points[i0*3+1], mesh_data_c.points[i0*3+2]);
+        tri.v1 = lightrt::Vec3(mesh_data_c.points[i1*3], mesh_data_c.points[i1*3+1], mesh_data_c.points[i1*3+2]);
+        tri.v2 = lightrt::Vec3(mesh_data_c.points[i2*3], mesh_data_c.points[i2*3+1], mesh_data_c.points[i2*3+2]);
+        triangles.push_back(tri);
+      }
 
-  // --- points (float3[]) ---
-  LusdValue pts_val = LUSD_NULL_HANDLE;
-  if (lusdPrimGetAttributeDefault(prim, "points", &pts_val) != LUSD_SUCCESS)
-    return LUSD_TRAVERSAL_CONTINUE;
+      if (owns_tri_idx) free(tri_idx);
 
-  uint64_t pt_count = 0;
-  const LusdFloat3* pts = nullptr;
-  if (lusdValueGetArrayPtrFloat3(pts_val, &pt_count, &pts) != LUSD_SUCCESS || pt_count == 0) {
-    lusdDestroyValue(ctx->instance, pts_val);
-    return LUSD_TRAVERSAL_CONTINUE;
+      if (!triangles.empty()) {
+        size_t mi = out_scene.meshes.size();
+        out_scene.meshes.emplace_back();
+        auto& md = out_scene.meshes.back();
+        md.default_material_id = -1;
+        md.tri_material_ids.assign(triangles.size(), -1);
+
+        lightrt::AABB& lb = md.local_bounds;
+        for (const auto& tri : triangles) {
+          lb.expand(tri.v0); lb.expand(tri.v1); lb.expand(tri.v2);
+        }
+        md.bvh.build(triangles);
+
+        // Identity transform (xform not yet extracted from layer)
+        scene::Instance inst;
+        inst.mesh_id = static_cast<uint32_t>(mi);
+        std::memset(inst.transform, 0, sizeof(inst.transform));
+        inst.transform[0] = 1.0f; inst.transform[5] = 1.0f; inst.transform[10] = 1.0f;
+        std::memcpy(inst.inv_transform,       inst.transform, sizeof(inst.transform));
+        std::memcpy(inst.transform_close,     inst.transform, sizeof(inst.transform));
+        std::memcpy(inst.inv_transform_close, inst.transform, sizeof(inst.transform));
+        inst.has_motion  = false;
+        inst.world_bounds = md.local_bounds;
+        out_scene.scene_bounds.expand(inst.world_bounds);
+        out_scene.instances.push_back(inst);
+      }
+
+      lydra_c_free_mesh_data(&mesh_data_c);
+    }
   }
 
-  // --- faceVertexIndices (int[]) ---
-  LusdValue idx_val = LUSD_NULL_HANDLE;
-  uint64_t idx_count = 0;
-  const int32_t* raw_idx = nullptr;
-  if (lusdPrimGetAttributeDefault(prim, "faceVertexIndices", &idx_val) == LUSD_SUCCESS)
-    lusdValueGetArrayPtrInt32(idx_val, &idx_count, &raw_idx);
-
-  // --- faceVertexCounts (int[]) ---
-  LusdValue cnt_val = LUSD_NULL_HANDLE;
-  uint64_t cnt_count = 0;
-  const int32_t* raw_cnt = nullptr;
-  if (lusdPrimGetAttributeDefault(prim, "faceVertexCounts", &cnt_val) == LUSD_SUCCESS)
-    lusdValueGetArrayPtrInt32(cnt_val, &cnt_count, &raw_cnt);
-
-  // Convert raw int arrays to uint32 for lydra
-  std::vector<uint32_t> fvi, fvc;
-  fvi.reserve(idx_count);
-  for (uint64_t i = 0; i < idx_count; i++)
-    fvi.push_back(static_cast<uint32_t>(raw_idx ? raw_idx[i] : 0));
-  fvc.reserve(cnt_count);
-  for (uint64_t i = 0; i < cnt_count; i++)
-    fvc.push_back(static_cast<uint32_t>(raw_cnt ? raw_cnt[i] : 3));
-
-  lusdDestroyValue(ctx->instance, idx_val);
-  lusdDestroyValue(ctx->instance, cnt_val);
-
-  // Triangulate with lydra (handles arbitrary polygon fans)
-  std::vector<uint32_t> tri_idx;
-  if (!fvc.empty()) {
-    tri_idx = lydra::triangulate(
-        lydra::Span<const uint32_t>(fvi.data(), fvi.size()),
-        lydra::Span<const uint32_t>(fvc.data(), fvc.size()));
-  } else {
-    tri_idx = fvi; // assume already triangulated
+recurse:
+  // Recurse into children
+  for (uint32_t j = 0; j < P->child_count; j++) {
+    walk_prim(L, &L->prim_nodes[P->child_spec_indices[j]], out_scene);
   }
-
-  // Build lightrt triangles
-  std::vector<lightrt::Triangle> triangles;
-  triangles.reserve(tri_idx.size() / 3);
-  for (size_t i = 0; i + 2 < tri_idx.size(); i += 3) {
-    uint32_t i0 = tri_idx[i], i1 = tri_idx[i + 1], i2 = tri_idx[i + 2];
-    if (i0 >= pt_count || i1 >= pt_count || i2 >= pt_count) continue;
-    lightrt::Triangle tri;
-    tri.v0 = lightrt::Vec3(pts[i0].x, pts[i0].y, pts[i0].z);
-    tri.v1 = lightrt::Vec3(pts[i1].x, pts[i1].y, pts[i1].z);
-    tri.v2 = lightrt::Vec3(pts[i2].x, pts[i2].y, pts[i2].z);
-    triangles.push_back(tri);
-  }
-  lusdDestroyValue(ctx->instance, pts_val);
-
-  if (triangles.empty())
-    return LUSD_TRAVERSAL_CONTINUE;
-
-  // Register mesh + identity instance
-  size_t mi = ctx->out_scene->meshes.size();
-  ctx->out_scene->meshes.emplace_back();
-  auto& mesh_data = ctx->out_scene->meshes.back();
-  mesh_data.default_material_id = -1;
-  mesh_data.tri_material_ids.assign(triangles.size(), -1);
-
-  lightrt::AABB& lb = mesh_data.local_bounds;
-  for (const auto& tri : triangles) {
-    lb.expand(tri.v0); lb.expand(tri.v1); lb.expand(tri.v2);
-  }
-  mesh_data.bvh.build(triangles);
-
-  // lightusd-c does not yet expose xform data, so use identity
-  scene::Instance inst;
-  inst.mesh_id = static_cast<uint32_t>(mi);
-  std::memset(inst.transform, 0, sizeof(inst.transform));
-  inst.transform[0] = 1.0f; inst.transform[5] = 1.0f; inst.transform[10] = 1.0f;
-  std::memcpy(inst.inv_transform,       inst.transform, sizeof(inst.transform));
-  std::memcpy(inst.transform_close,     inst.transform, sizeof(inst.transform));
-  std::memcpy(inst.inv_transform_close, inst.transform, sizeof(inst.transform));
-  inst.has_motion  = false;
-  inst.world_bounds = mesh_data.local_bounds;
-  ctx->out_scene->scene_bounds.expand(inst.world_bounds);
-  ctx->out_scene->instances.push_back(inst);
-
-  return LUSD_TRAVERSAL_CONTINUE;
 }
 
-static bool loadUSDScene(const std::string& filename, double timecode,
+static bool loadUSDScene(const std::string& filename, double /*timecode*/,
                          scene::Scene& out_scene) {
   // Create lightusd-c instance
   LusdInstanceCreateInfo inst_info = {};
@@ -263,139 +232,32 @@ static bool loadUSDScene(const std::string& filename, double timecode,
     return false;
   }
 
-  // Load stage
-  LusdStageLoadInfo load_info = {};
-  load_info.sType        = LUSD_STRUCTURE_TYPE_STAGE_LOAD_INFO;
-  load_info.pNext        = nullptr;
-  load_info.pFilePath    = filename.c_str();
-  load_info.format       = LUSD_FORMAT_AUTO;
-  load_info.pLoadOptions = nullptr;
+  // Create layer (parses USDC/USDA into flat tables)
+  LusdLayerCreateInfo ci = {};
+  ci.sType     = LUSD_STRUCTURE_TYPE_LAYER_CREATE_INFO;
+  ci.pNext     = nullptr;
+  ci.pIdentifier = filename.c_str();
 
-  LusdStage stage = LUSD_NULL_HANDLE;
-  r = lusdLoadStage(instance, &load_info, &stage);
+  LusdLayer layer = LUSD_NULL_HANDLE;
+  r = lusdCreateLayer(instance, &ci, &layer);
   if (r != LUSD_SUCCESS) {
-    fprintf(stderr, "lightusd-c: lusdLoadStage failed: %s (%s)\n",
+    fprintf(stderr, "lightusd-c: lusdCreateLayer failed: %s (%s)\n",
             lusdResultToString(r), lusdGetLastError(instance));
     lusdDestroyInstance(instance, nullptr);
     return false;
   }
 
-  // Read start timecode if not specified
-  if (timecode < -1e29)
-    lusdStageGetStartTimeCode(stage, &timecode);
-
-  // Walk all prims and extract Mesh geometry
-  LusdMeshCtx ctx;
-  ctx.instance  = instance;
-  ctx.out_scene = &out_scene;
-
-  r = lusdStageTraverse(stage, lusdMeshCallback, &ctx,
-                        LUSD_TRAVERSAL_FLAG_DEPTH_FIRST);
-  if (r != LUSD_SUCCESS) {
-    fprintf(stderr, "lightusd-c: lusdStageTraverse failed: %s\n",
-            lusdResultToString(r));
+  // Walk prim tree via internal Layer/Prim structs
+  LusdLayer_T* L = reinterpret_cast<LusdLayer_T*>(layer);
+  for (uint32_t i = 0; i < L->root_spec_count; i++) {
+    walk_prim(L, &L->prim_nodes[L->root_spec_indices[i]], out_scene);
   }
 
-  // Extract materials via the material API
-  uint32_t mat_count = 0;
-  lusdStageGetMaterialCount(stage, &mat_count);
-  if (mat_count > 0) {
-    std::vector<LusdOpenPBRMaterial> lusd_mats(mat_count);
-    lusdStageGetMaterials(stage, mat_count, lusd_mats.data());
-    out_scene.materials.resize(mat_count);
-    for (uint32_t mi = 0; mi < mat_count; mi++) {
-      const LusdOpenPBRMaterial& src = lusd_mats[mi];
-      scene::MaterialData&       dst = out_scene.materials[mi];
-      dst.base_weight            = src.base_weight;
-      dst.base_color             = lightrt::Vec3(src.base_color[0], src.base_color[1], src.base_color[2]);
-      dst.base_roughness         = src.base_roughness;
-      dst.base_metalness         = src.base_metalness;
-      dst.base_diffuse_roughness = src.base_diffuse_roughness;
-      dst.specular_weight        = src.specular_weight;
-      dst.specular_color         = lightrt::Vec3(src.specular_color[0], src.specular_color[1], src.specular_color[2]);
-      dst.specular_roughness     = src.specular_roughness;
-      dst.specular_ior           = src.specular_ior;
-      dst.specular_ior_level     = src.specular_ior_level;
-      dst.specular_anisotropy    = src.specular_anisotropy;
-      dst.specular_rotation      = src.specular_rotation;
-      dst.transmission_weight    = src.transmission_weight;
-      dst.transmission_color     = lightrt::Vec3(src.transmission_color[0], src.transmission_color[1], src.transmission_color[2]);
-      dst.transmission_depth     = src.transmission_depth;
-      dst.transmission_scatter   = lightrt::Vec3(src.transmission_scatter[0], src.transmission_scatter[1], src.transmission_scatter[2]);
-      dst.transmission_scatter_anisotropy = src.transmission_scatter_anisotropy;
-      dst.transmission_dispersion = src.transmission_dispersion;
-      dst.subsurface_weight      = src.subsurface_weight;
-      dst.subsurface_color       = lightrt::Vec3(src.subsurface_color[0], src.subsurface_color[1], src.subsurface_color[2]);
-      dst.subsurface_radius      = src.subsurface_radius;
-      dst.subsurface_radius_scale = lightrt::Vec3(src.subsurface_radius_scale[0], src.subsurface_radius_scale[1], src.subsurface_radius_scale[2]);
-      dst.subsurface_scale       = src.subsurface_scale;
-      dst.subsurface_anisotropy  = src.subsurface_anisotropy;
-      dst.sheen_weight           = src.sheen_weight;
-      dst.sheen_color            = lightrt::Vec3(src.sheen_color[0], src.sheen_color[1], src.sheen_color[2]);
-      dst.sheen_roughness        = src.sheen_roughness;
-      dst.fuzz_weight            = src.fuzz_weight;
-      dst.fuzz_color             = lightrt::Vec3(src.fuzz_color[0], src.fuzz_color[1], src.fuzz_color[2]);
-      dst.fuzz_roughness         = src.fuzz_roughness;
-      dst.thin_film_weight       = src.thin_film_weight;
-      dst.thin_film_thickness    = src.thin_film_thickness;
-      dst.thin_film_ior          = src.thin_film_ior;
-      dst.coat_weight            = src.coat_weight;
-      dst.coat_color             = lightrt::Vec3(src.coat_color[0], src.coat_color[1], src.coat_color[2]);
-      dst.coat_roughness         = src.coat_roughness;
-      dst.coat_anisotropy        = src.coat_anisotropy;
-      dst.coat_rotation          = src.coat_rotation;
-      dst.coat_ior               = src.coat_ior;
-      dst.coat_affect_color      = lightrt::Vec3(src.coat_affect_color[0], src.coat_affect_color[1], src.coat_affect_color[2]);
-      dst.coat_affect_roughness  = src.coat_affect_roughness;
-      dst.emission_luminance     = src.emission_luminance;
-      dst.emission_color         = lightrt::Vec3(src.emission_color[0], src.emission_color[1], src.emission_color[2]);
-      dst.opacity                = src.opacity;
-    }
-    printf("Extracted %u materials (lightusd-c)\n", mat_count);
-    // Assign material 0 to any mesh that has no binding yet
-    for (auto& mesh : out_scene.meshes) {
-      if (mesh.default_material_id < 0) {
-        mesh.default_material_id = 0;
-        for (auto& id : mesh.tri_material_ids) id = 0;
-      }
-    }
-  }
-
-  // Extract lights via light API
-  uint32_t light_count = 0;
-  lusdStageGetLightCount(stage, &light_count);
-  if (light_count > 0) {
-    std::vector<LusdLight> lusd_lights(light_count);
-    lusdStageGetLights(stage, light_count, lusd_lights.data());
-    for (const auto& ll : lusd_lights) {
-      if (ll.type == LUSD_LIGHT_TYPE_DOME) continue;
-      scene::LightData ld;
-      ld.color = lightrt::Vec3(ll.color[0], ll.color[1], ll.color[2]);
-      if (ll.type == LUSD_LIGHT_TYPE_DISTANT) {
-        ld.type      = scene::LightData::Distant;
-        ld.direction = lightrt::Vec3(ll.direction[0], ll.direction[1], ll.direction[2]).normalize();
-      } else if (ll.type == LUSD_LIGHT_TYPE_RECT) {
-        ld.type             = scene::LightData::Rect;
-        ld.position         = lightrt::Vec3(ll.position[0], ll.position[1], ll.position[2]);
-        ld.direction        = lightrt::Vec3(ll.direction[0], ll.direction[1], ll.direction[2]).normalize();
-        ld.rect_axis_u      = lightrt::Vec3(ll.rect_axis_u[0], ll.rect_axis_u[1], ll.rect_axis_u[2]).normalize();
-        ld.rect_axis_v      = lightrt::Vec3(ll.rect_axis_v[0], ll.rect_axis_v[1], ll.rect_axis_v[2]).normalize();
-        ld.rect_half_width  = ll.rect_half_width;
-        ld.rect_half_height = ll.rect_half_height;
-      } else {
-        ld.type     = scene::LightData::Point;
-        ld.position = lightrt::Vec3(ll.position[0], ll.position[1], ll.position[2]);
-      }
-      out_scene.lights.push_back(ld);
-    }
-    printf("Extracted %zu lights (lightusd-c)\n", out_scene.lights.size());
-  }
-
-  lusdDestroyStage(instance, stage);
+  lusdDestroyLayer(instance, layer);
   lusdDestroyInstance(instance, nullptr);
 
-  printf("Loaded %zu meshes, %zu instances (timecode=%.1f)\n",
-         out_scene.meshes.size(), out_scene.instances.size(), timecode);
+  printf("Loaded %zu meshes, %zu instances (lightusd-c layer)\n",
+         out_scene.meshes.size(), out_scene.instances.size());
   return !out_scene.instances.empty();
 }
 
