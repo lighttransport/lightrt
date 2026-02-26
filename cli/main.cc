@@ -352,6 +352,35 @@ static bool loadUSDScene(const std::string& filename, double timecode,
       dst.opacity                = src.opacity;
     }
     printf("Extracted %u materials (lightusd-c)\n", mat_count);
+    // Assign material 0 to any mesh that has no binding yet
+    for (auto& mesh : out_scene.meshes) {
+      if (mesh.default_material_id < 0) {
+        mesh.default_material_id = 0;
+        for (auto& id : mesh.tri_material_ids) id = 0;
+      }
+    }
+  }
+
+  // Extract lights via light API
+  uint32_t light_count = 0;
+  lusdStageGetLightCount(stage, &light_count);
+  if (light_count > 0) {
+    std::vector<LusdLight> lusd_lights(light_count);
+    lusdStageGetLights(stage, light_count, lusd_lights.data());
+    for (const auto& ll : lusd_lights) {
+      if (ll.type == LUSD_LIGHT_TYPE_DOME) continue;
+      scene::LightData ld;
+      ld.color = lightrt::Vec3(ll.color[0], ll.color[1], ll.color[2]);
+      if (ll.type == LUSD_LIGHT_TYPE_DISTANT) {
+        ld.type      = scene::LightData::Distant;
+        ld.direction = lightrt::Vec3(ll.direction[0], ll.direction[1], ll.direction[2]).normalize();
+      } else {
+        ld.type     = scene::LightData::Point;
+        ld.position = lightrt::Vec3(ll.position[0], ll.position[1], ll.position[2]);
+      }
+      out_scene.lights.push_back(ld);
+    }
+    printf("Extracted %zu lights (lightusd-c)\n", out_scene.lights.size());
   }
 
   lusdDestroyStage(instance, stage);
@@ -430,6 +459,12 @@ static void extractMaterials(const tinyusdz::tydra::RenderScene& render_scene,
     scene::MaterialData& mat = out_scene.materials[i];
 
     if (rm.hasOpenPBR()) {
+      printf("  mat[%zu]: OpenPBR (sss_w=%.3f sss_r=%.3f base_color=(%.2f,%.2f,%.2f))\n",
+             i, rm.openPBRShader->subsurface_weight.value,
+             rm.openPBRShader->subsurface_radius.value,
+             rm.openPBRShader->base_color.value[0],
+             rm.openPBRShader->base_color.value[1],
+             rm.openPBRShader->base_color.value[2]);
       const auto& p = rm.openPBRShader.value();
       mat.base_weight            = p.base_weight.value;
       mat.base_color             = v3(p.base_color.value);
@@ -484,6 +519,10 @@ static void extractMaterials(const tinyusdz::tydra::RenderScene& render_scene,
       mat.emission_color         = v3(p.emission_color.value);
       mat.opacity                = p.opacity.value;
     } else if (rm.hasUsdPreviewSurface()) {
+      printf("  mat[%zu]: UsdPreviewSurface (diffuse=(%.2f,%.2f,%.2f))\n",
+             i, rm.surfaceShader->diffuseColor.value[0],
+             rm.surfaceShader->diffuseColor.value[1],
+             rm.surfaceShader->diffuseColor.value[2]);
       const auto& ps = rm.surfaceShader.value();
       mat.base_weight            = 1.0f;
       mat.base_color             = v3(ps.diffuseColor.value);
@@ -534,9 +573,9 @@ static void extractLights(const tinyusdz::tydra::RenderScene& render_scene,
                rl.type == tinyusdz::tydra::RenderLight::Type::Sphere) {
       light.type = scene::LightData::Point;
       light.position = lightrt::Vec3(
-        static_cast<float>(rl.transform.m[0][3]),
-        static_cast<float>(rl.transform.m[1][3]),
-        static_cast<float>(rl.transform.m[2][3]));
+        static_cast<float>(rl.transform.m[3][0]),
+        static_cast<float>(rl.transform.m[3][1]),
+        static_cast<float>(rl.transform.m[3][2]));
     } else {
       continue; // skip unsupported light types
     }
