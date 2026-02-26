@@ -1,13 +1,25 @@
-// LightRT CLI renderer with USD loading via TinyUSDZ
+// LightRT CLI renderer with USD loading via TinyUSDZ or lightusd-c
 // Usage: lightrt_cli input.usd [-o output.png] [-w 800] [-h 600] [-t timecode]
 //        [--time-range start end step] [--camera name_or_index]
 //        [--mblur-samples N] [--spp N]
+//
+// Build with -DLIGHTRT_USE_LIGHTUSD_C=ON to use lightusd-c + lydra backend.
 
 #include "scene.hh"
+#include "common/sss.hh"
 
+#if defined(LIGHTRT_USE_LIGHTUSD_C)
+// lightusd-c is a C11 handle-based API (Vulkan-style).
+// lydra provides C++ mesh geometry utilities (triangulation, normals, etc.).
+// The C headers are self-guarded with LUSD_EXTERN_C_BEGIN/END.
+#include "lightusd/lightusd-c.h"
+#include "lydra_mesh.hh"
+#else
+// tinyusdz + tydra backend (default)
 #include "tinyusdz.hh"
 #include "tydra/render-data.hh"
 #include "tydra/scene-access.hh"
+#endif
 
 #include "stb_image_write.h"
 
@@ -83,6 +95,284 @@ static bool parseArgs(int argc, char** argv, Options& opts) {
   return true;
 }
 
+// Centroid key for triangle remapping after BVH reorder
+struct CentroidKey {
+  int32_t cx, cy, cz;
+  bool operator<(const CentroidKey& o) const {
+    return std::tie(cx, cy, cz) < std::tie(o.cx, o.cy, o.cz);
+  }
+};
+
+static CentroidKey makeCentroidKey(const lightrt::Triangle& tri) {
+  float x = (tri.v0.x + tri.v1.x + tri.v2.x) * (1.0f / 3.0f);
+  float y = (tri.v0.y + tri.v1.y + tri.v2.y) * (1.0f / 3.0f);
+  float z = (tri.v0.z + tri.v1.z + tri.v2.z) * (1.0f / 3.0f);
+  // Quantize to avoid floating point comparison issues
+  return {static_cast<int32_t>(x * 1e4f), static_cast<int32_t>(y * 1e4f), static_cast<int32_t>(z * 1e4f)};
+}
+
+// ---------------------------------------------------------------------------
+// Backend: shared helpers (BVH build + instance creation from render scene)
+// ---------------------------------------------------------------------------
+
+// Build BVH meshes and instances from a generic render scene representation.
+// Called by both backends after they fill in a tydra/lydra RenderScene.
+
+#if defined(LIGHTRT_USE_LIGHTUSD_C)
+// =========================================================================
+// lightusd-c + lydra backend
+//
+// lightusd-c: C11 handle-based API (Vulkan-style).
+//   - LusdInstance / LusdStage / LusdPrim / LusdValue are opaque handles.
+//   - Scene traversal via lusdStageTraverse() callback.
+//   - Attribute data extracted with lusdPrimGetAttributeDefault() +
+//     lusdValueGetArrayPtr*() (zero-copy).
+// lydra: C++ mesh utility library.
+//   - lydra::triangulate() converts polygon soup to triangle indices.
+//   - No RenderScene / RenderSceneConverter equivalent (not yet implemented).
+//
+// NOTE: lusdLoadStage() is currently stubbed and returns
+//       LUSD_ERROR_FEATURE_NOT_PRESENT.  Stage loading will work once the
+//       parser backend is wired in the lightusd branch.
+// =========================================================================
+
+// Traversal callback context
+struct LusdMeshCtx {
+  LusdInstance    instance;
+  scene::Scene*   out_scene;
+};
+
+static LusdTraversalAction lusdMeshCallback(
+    LusdPrim prim, LusdPath /*path*/, uint32_t /*depth*/, void* pUserData)
+{
+  auto* ctx = static_cast<LusdMeshCtx*>(pUserData);
+
+  const char* typeName = lusdPrimGetTypeName(prim);
+  if (!typeName || strcmp(typeName, "Mesh") != 0)
+    return LUSD_TRAVERSAL_CONTINUE;
+
+  // --- points (float3[]) ---
+  LusdValue pts_val = LUSD_NULL_HANDLE;
+  if (lusdPrimGetAttributeDefault(prim, "points", &pts_val) != LUSD_SUCCESS)
+    return LUSD_TRAVERSAL_CONTINUE;
+
+  uint64_t pt_count = 0;
+  const LusdFloat3* pts = nullptr;
+  if (lusdValueGetArrayPtrFloat3(pts_val, &pt_count, &pts) != LUSD_SUCCESS || pt_count == 0) {
+    lusdDestroyValue(ctx->instance, pts_val);
+    return LUSD_TRAVERSAL_CONTINUE;
+  }
+
+  // --- faceVertexIndices (int[]) ---
+  LusdValue idx_val = LUSD_NULL_HANDLE;
+  uint64_t idx_count = 0;
+  const int32_t* raw_idx = nullptr;
+  if (lusdPrimGetAttributeDefault(prim, "faceVertexIndices", &idx_val) == LUSD_SUCCESS)
+    lusdValueGetArrayPtrInt32(idx_val, &idx_count, &raw_idx);
+
+  // --- faceVertexCounts (int[]) ---
+  LusdValue cnt_val = LUSD_NULL_HANDLE;
+  uint64_t cnt_count = 0;
+  const int32_t* raw_cnt = nullptr;
+  if (lusdPrimGetAttributeDefault(prim, "faceVertexCounts", &cnt_val) == LUSD_SUCCESS)
+    lusdValueGetArrayPtrInt32(cnt_val, &cnt_count, &raw_cnt);
+
+  // Convert raw int arrays to uint32 for lydra
+  std::vector<uint32_t> fvi, fvc;
+  fvi.reserve(idx_count);
+  for (uint64_t i = 0; i < idx_count; i++)
+    fvi.push_back(static_cast<uint32_t>(raw_idx ? raw_idx[i] : 0));
+  fvc.reserve(cnt_count);
+  for (uint64_t i = 0; i < cnt_count; i++)
+    fvc.push_back(static_cast<uint32_t>(raw_cnt ? raw_cnt[i] : 3));
+
+  lusdDestroyValue(ctx->instance, idx_val);
+  lusdDestroyValue(ctx->instance, cnt_val);
+
+  // Triangulate with lydra (handles arbitrary polygon fans)
+  std::vector<uint32_t> tri_idx;
+  if (!fvc.empty()) {
+    tri_idx = lydra::triangulate(
+        lydra::Span<const uint32_t>(fvi.data(), fvi.size()),
+        lydra::Span<const uint32_t>(fvc.data(), fvc.size()));
+  } else {
+    tri_idx = fvi; // assume already triangulated
+  }
+
+  // Build lightrt triangles
+  std::vector<lightrt::Triangle> triangles;
+  triangles.reserve(tri_idx.size() / 3);
+  for (size_t i = 0; i + 2 < tri_idx.size(); i += 3) {
+    uint32_t i0 = tri_idx[i], i1 = tri_idx[i + 1], i2 = tri_idx[i + 2];
+    if (i0 >= pt_count || i1 >= pt_count || i2 >= pt_count) continue;
+    lightrt::Triangle tri;
+    tri.v0 = lightrt::Vec3(pts[i0].x, pts[i0].y, pts[i0].z);
+    tri.v1 = lightrt::Vec3(pts[i1].x, pts[i1].y, pts[i1].z);
+    tri.v2 = lightrt::Vec3(pts[i2].x, pts[i2].y, pts[i2].z);
+    triangles.push_back(tri);
+  }
+  lusdDestroyValue(ctx->instance, pts_val);
+
+  if (triangles.empty())
+    return LUSD_TRAVERSAL_CONTINUE;
+
+  // Register mesh + identity instance
+  size_t mi = ctx->out_scene->meshes.size();
+  ctx->out_scene->meshes.emplace_back();
+  auto& mesh_data = ctx->out_scene->meshes.back();
+  mesh_data.default_material_id = -1;
+  mesh_data.tri_material_ids.assign(triangles.size(), -1);
+
+  lightrt::AABB& lb = mesh_data.local_bounds;
+  for (const auto& tri : triangles) {
+    lb.expand(tri.v0); lb.expand(tri.v1); lb.expand(tri.v2);
+  }
+  mesh_data.bvh.build(triangles);
+
+  // lightusd-c does not yet expose xform data, so use identity
+  scene::Instance inst;
+  inst.mesh_id = static_cast<uint32_t>(mi);
+  std::memset(inst.transform, 0, sizeof(inst.transform));
+  inst.transform[0] = 1.0f; inst.transform[5] = 1.0f; inst.transform[10] = 1.0f;
+  std::memcpy(inst.inv_transform,       inst.transform, sizeof(inst.transform));
+  std::memcpy(inst.transform_close,     inst.transform, sizeof(inst.transform));
+  std::memcpy(inst.inv_transform_close, inst.transform, sizeof(inst.transform));
+  inst.has_motion  = false;
+  inst.world_bounds = mesh_data.local_bounds;
+  ctx->out_scene->scene_bounds.expand(inst.world_bounds);
+  ctx->out_scene->instances.push_back(inst);
+
+  return LUSD_TRAVERSAL_CONTINUE;
+}
+
+static bool loadUSDScene(const std::string& filename, double timecode,
+                         scene::Scene& out_scene) {
+  // Create lightusd-c instance
+  LusdInstanceCreateInfo inst_info = {};
+  inst_info.sType          = LUSD_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+  inst_info.pNext          = nullptr;
+  inst_info.apiVersion     = 1;
+  inst_info.pApplicationName   = "lightrt_cli";
+  inst_info.applicationVersion = 1;
+
+  LusdInstance instance = LUSD_NULL_HANDLE;
+  LusdResult r = lusdCreateInstance(&inst_info, nullptr, &instance);
+  if (r != LUSD_SUCCESS) {
+    fprintf(stderr, "lightusd-c: lusdCreateInstance failed: %s\n",
+            lusdResultToString(r));
+    return false;
+  }
+
+  // Load stage
+  LusdStageLoadInfo load_info = {};
+  load_info.sType        = LUSD_STRUCTURE_TYPE_STAGE_LOAD_INFO;
+  load_info.pNext        = nullptr;
+  load_info.pFilePath    = filename.c_str();
+  load_info.format       = LUSD_FORMAT_AUTO;
+  load_info.pLoadOptions = nullptr;
+
+  LusdStage stage = LUSD_NULL_HANDLE;
+  r = lusdLoadStage(instance, &load_info, &stage);
+  if (r != LUSD_SUCCESS) {
+    fprintf(stderr, "lightusd-c: lusdLoadStage failed: %s (%s)\n",
+            lusdResultToString(r), lusdGetLastError(instance));
+    lusdDestroyInstance(instance, nullptr);
+    return false;
+  }
+
+  // Read start timecode if not specified
+  if (timecode < -1e29)
+    lusdStageGetStartTimeCode(stage, &timecode);
+
+  // Walk all prims and extract Mesh geometry
+  LusdMeshCtx ctx;
+  ctx.instance  = instance;
+  ctx.out_scene = &out_scene;
+
+  r = lusdStageTraverse(stage, lusdMeshCallback, &ctx,
+                        LUSD_TRAVERSAL_FLAG_DEPTH_FIRST);
+  if (r != LUSD_SUCCESS) {
+    fprintf(stderr, "lightusd-c: lusdStageTraverse failed: %s\n",
+            lusdResultToString(r));
+  }
+
+  // Extract materials via the material API
+  uint32_t mat_count = 0;
+  lusdStageGetMaterialCount(stage, &mat_count);
+  if (mat_count > 0) {
+    std::vector<LusdOpenPBRMaterial> lusd_mats(mat_count);
+    lusdStageGetMaterials(stage, mat_count, lusd_mats.data());
+    out_scene.materials.resize(mat_count);
+    for (uint32_t mi = 0; mi < mat_count; mi++) {
+      const LusdOpenPBRMaterial& src = lusd_mats[mi];
+      scene::MaterialData&       dst = out_scene.materials[mi];
+      dst.base_weight            = src.base_weight;
+      dst.base_color             = lightrt::Vec3(src.base_color[0], src.base_color[1], src.base_color[2]);
+      dst.base_roughness         = src.base_roughness;
+      dst.base_metalness         = src.base_metalness;
+      dst.base_diffuse_roughness = src.base_diffuse_roughness;
+      dst.specular_weight        = src.specular_weight;
+      dst.specular_color         = lightrt::Vec3(src.specular_color[0], src.specular_color[1], src.specular_color[2]);
+      dst.specular_roughness     = src.specular_roughness;
+      dst.specular_ior           = src.specular_ior;
+      dst.specular_ior_level     = src.specular_ior_level;
+      dst.specular_anisotropy    = src.specular_anisotropy;
+      dst.specular_rotation      = src.specular_rotation;
+      dst.transmission_weight    = src.transmission_weight;
+      dst.transmission_color     = lightrt::Vec3(src.transmission_color[0], src.transmission_color[1], src.transmission_color[2]);
+      dst.transmission_depth     = src.transmission_depth;
+      dst.transmission_scatter   = lightrt::Vec3(src.transmission_scatter[0], src.transmission_scatter[1], src.transmission_scatter[2]);
+      dst.transmission_scatter_anisotropy = src.transmission_scatter_anisotropy;
+      dst.transmission_dispersion = src.transmission_dispersion;
+      dst.subsurface_weight      = src.subsurface_weight;
+      dst.subsurface_color       = lightrt::Vec3(src.subsurface_color[0], src.subsurface_color[1], src.subsurface_color[2]);
+      dst.subsurface_radius      = src.subsurface_radius;
+      dst.subsurface_radius_scale = lightrt::Vec3(src.subsurface_radius_scale[0], src.subsurface_radius_scale[1], src.subsurface_radius_scale[2]);
+      dst.subsurface_scale       = src.subsurface_scale;
+      dst.subsurface_anisotropy  = src.subsurface_anisotropy;
+      dst.sheen_weight           = src.sheen_weight;
+      dst.sheen_color            = lightrt::Vec3(src.sheen_color[0], src.sheen_color[1], src.sheen_color[2]);
+      dst.sheen_roughness        = src.sheen_roughness;
+      dst.fuzz_weight            = src.fuzz_weight;
+      dst.fuzz_color             = lightrt::Vec3(src.fuzz_color[0], src.fuzz_color[1], src.fuzz_color[2]);
+      dst.fuzz_roughness         = src.fuzz_roughness;
+      dst.thin_film_weight       = src.thin_film_weight;
+      dst.thin_film_thickness    = src.thin_film_thickness;
+      dst.thin_film_ior          = src.thin_film_ior;
+      dst.coat_weight            = src.coat_weight;
+      dst.coat_color             = lightrt::Vec3(src.coat_color[0], src.coat_color[1], src.coat_color[2]);
+      dst.coat_roughness         = src.coat_roughness;
+      dst.coat_anisotropy        = src.coat_anisotropy;
+      dst.coat_rotation          = src.coat_rotation;
+      dst.coat_ior               = src.coat_ior;
+      dst.coat_affect_color      = lightrt::Vec3(src.coat_affect_color[0], src.coat_affect_color[1], src.coat_affect_color[2]);
+      dst.coat_affect_roughness  = src.coat_affect_roughness;
+      dst.emission_luminance     = src.emission_luminance;
+      dst.emission_color         = lightrt::Vec3(src.emission_color[0], src.emission_color[1], src.emission_color[2]);
+      dst.opacity                = src.opacity;
+    }
+    printf("Extracted %u materials (lightusd-c)\n", mat_count);
+  }
+
+  lusdDestroyStage(instance, stage);
+  lusdDestroyInstance(instance, nullptr);
+
+  printf("Loaded %zu meshes, %zu instances (timecode=%.1f)\n",
+         out_scene.meshes.size(), out_scene.instances.size(), timecode);
+  return !out_scene.instances.empty();
+}
+
+// Motion blur: xform time-sample API not yet implemented in lightusd-c.
+static void applyMotionBlur(const std::string& /*filename*/,
+                            double /*timecode*/,
+                            double /*shutter_close_offset*/,
+                            scene::Scene& /*scene*/) {}
+
+#else
+// =========================================================================
+// tinyusdz + tydra backend (default)
+// =========================================================================
+
 // Walk node tree recursively to create instances
 static void walkNodes(const tinyusdz::tydra::RenderScene& render_scene,
                       const tinyusdz::tydra::Node& node,
@@ -126,36 +416,91 @@ static void walkNodes(const tinyusdz::tydra::RenderScene& render_scene,
   }
 }
 
-// Extract materials from RenderScene
+// Extract materials from RenderScene (full OpenPBR field mapping)
 static void extractMaterials(const tinyusdz::tydra::RenderScene& render_scene,
                              scene::Scene& out_scene) {
+  using V3 = lightrt::Vec3;
+  auto v3 = [](const tinyusdz::value::float3& f) {
+    return V3(f[0], f[1], f[2]);
+  };
+
   out_scene.materials.resize(render_scene.materials.size());
   for (size_t i = 0; i < render_scene.materials.size(); i++) {
     const auto& rm = render_scene.materials[i];
     scene::MaterialData& mat = out_scene.materials[i];
 
     if (rm.hasOpenPBR()) {
-      const auto& pbr = rm.openPBRShader.value();
-      mat.base_color = lightrt::Vec3(pbr.base_color.value[0], pbr.base_color.value[1], pbr.base_color.value[2]);
-      mat.metalness = pbr.base_metalness.value;
-      mat.roughness = pbr.specular_roughness.value;
-      mat.specular_color = lightrt::Vec3(pbr.specular_color.value[0], pbr.specular_color.value[1], pbr.specular_color.value[2]);
-      mat.ior = pbr.specular_ior.value;
-      mat.emission_color = lightrt::Vec3(pbr.emission_color.value[0], pbr.emission_color.value[1], pbr.emission_color.value[2]);
-      mat.emission_luminance = pbr.emission_luminance.value;
-      mat.opacity = pbr.opacity.value;
+      const auto& p = rm.openPBRShader.value();
+      mat.base_weight            = p.base_weight.value;
+      mat.base_color             = v3(p.base_color.value);
+      mat.base_roughness         = p.base_roughness.value;
+      mat.base_metalness         = p.base_metalness.value;
+      mat.base_diffuse_roughness = p.base_diffuse_roughness.value;
+
+      mat.specular_weight        = p.specular_weight.value;
+      mat.specular_color         = v3(p.specular_color.value);
+      mat.specular_roughness     = p.specular_roughness.value;
+      mat.specular_ior           = p.specular_ior.value;
+      mat.specular_ior_level     = p.specular_ior_level.value;
+      mat.specular_anisotropy    = p.specular_anisotropy.value;
+      mat.specular_rotation      = p.specular_rotation.value;
+
+      mat.transmission_weight    = p.transmission_weight.value;
+      mat.transmission_color     = v3(p.transmission_color.value);
+      mat.transmission_depth     = p.transmission_depth.value;
+      mat.transmission_scatter   = v3(p.transmission_scatter.value);
+      mat.transmission_scatter_anisotropy = p.transmission_scatter_anisotropy.value;
+      mat.transmission_dispersion = p.transmission_dispersion.value;
+
+      mat.subsurface_weight      = p.subsurface_weight.value;
+      mat.subsurface_color       = v3(p.subsurface_color.value);
+      mat.subsurface_radius      = p.subsurface_radius.value;
+      mat.subsurface_radius_scale = v3(p.subsurface_radius_scale.value);
+      mat.subsurface_scale       = p.subsurface_scale.value;
+      mat.subsurface_anisotropy  = p.subsurface_anisotropy.value;
+
+      mat.sheen_weight           = p.sheen_weight.value;
+      mat.sheen_color            = v3(p.sheen_color.value);
+      mat.sheen_roughness        = p.sheen_roughness.value;
+
+      mat.fuzz_weight            = p.fuzz_weight.value;
+      mat.fuzz_color             = v3(p.fuzz_color.value);
+      mat.fuzz_roughness         = p.fuzz_roughness.value;
+
+      mat.thin_film_weight       = p.thin_film_weight.value;
+      mat.thin_film_thickness    = p.thin_film_thickness.value;
+      mat.thin_film_ior          = p.thin_film_ior.value;
+
+      mat.coat_weight            = p.coat_weight.value;
+      mat.coat_color             = v3(p.coat_color.value);
+      mat.coat_roughness         = p.coat_roughness.value;
+      mat.coat_anisotropy        = p.coat_anisotropy.value;
+      mat.coat_rotation          = p.coat_rotation.value;
+      mat.coat_ior               = p.coat_ior.value;
+      mat.coat_affect_color      = v3(p.coat_affect_color.value);
+      mat.coat_affect_roughness  = p.coat_affect_roughness.value;
+
+      mat.emission_luminance     = p.emission_luminance.value;
+      mat.emission_color         = v3(p.emission_color.value);
+      mat.opacity                = p.opacity.value;
     } else if (rm.hasUsdPreviewSurface()) {
       const auto& ps = rm.surfaceShader.value();
-      mat.base_color = lightrt::Vec3(ps.diffuseColor.value[0], ps.diffuseColor.value[1], ps.diffuseColor.value[2]);
-      mat.metalness = ps.metallic.value;
-      mat.roughness = ps.roughness.value;
-      mat.specular_color = lightrt::Vec3(ps.specularColor.value[0], ps.specularColor.value[1], ps.specularColor.value[2]);
-      mat.ior = ps.ior.value;
-      mat.emission_color = lightrt::Vec3(ps.emissiveColor.value[0], ps.emissiveColor.value[1], ps.emissiveColor.value[2]);
-      mat.emission_luminance = (ps.emissiveColor.value[0] + ps.emissiveColor.value[1] + ps.emissiveColor.value[2] > 0.0f) ? 1.0f : 0.0f;
-      mat.opacity = ps.opacity.value;
+      mat.base_weight            = 1.0f;
+      mat.base_color             = v3(ps.diffuseColor.value);
+      mat.base_metalness         = ps.metallic.value;
+      mat.specular_weight        = 1.0f;
+      mat.specular_color         = v3(ps.specularColor.value);
+      mat.specular_roughness     = ps.roughness.value;
+      mat.specular_ior           = ps.ior.value;
+      mat.coat_weight            = ps.clearcoat.value;
+      mat.coat_roughness         = ps.clearcoatRoughness.value;
+      mat.emission_color         = v3(ps.emissiveColor.value);
+      float esum = ps.emissiveColor.value[0] + ps.emissiveColor.value[1]
+                 + ps.emissiveColor.value[2];
+      mat.emission_luminance     = (esum > 0.0f) ? 1.0f : 0.0f;
+      mat.opacity                = ps.opacity.value;
     }
-    // else: default grey material
+    // else: default OpenPBR material (grey dielectric from struct defaults)
   }
   if (!out_scene.materials.empty())
     printf("Extracted %zu materials\n", out_scene.materials.size());
@@ -259,22 +604,6 @@ static void loadEnvmap(const tinyusdz::tydra::RenderScene& render_scene,
     printf("Loaded envmap %dx%d from dome light\n", w, h);
     break; // use first dome light
   }
-}
-
-// Centroid key for triangle remapping after BVH reorder
-struct CentroidKey {
-  int32_t cx, cy, cz;
-  bool operator<(const CentroidKey& o) const {
-    return std::tie(cx, cy, cz) < std::tie(o.cx, o.cy, o.cz);
-  }
-};
-
-static CentroidKey makeCentroidKey(const lightrt::Triangle& tri) {
-  float x = (tri.v0.x + tri.v1.x + tri.v2.x) * (1.0f / 3.0f);
-  float y = (tri.v0.y + tri.v1.y + tri.v2.y) * (1.0f / 3.0f);
-  float z = (tri.v0.z + tri.v1.z + tri.v2.z) * (1.0f / 3.0f);
-  // Quantize to avoid floating point comparison issues
-  return {static_cast<int32_t>(x * 1e4f), static_cast<int32_t>(y * 1e4f), static_cast<int32_t>(z * 1e4f)};
 }
 
 static bool loadUSDScene(const std::string& filename, double timecode,
@@ -467,6 +796,8 @@ static void applyMotionBlur(const std::string& filename, double timecode,
   for (const auto& root_node : render_scene.nodes) walkClose(root_node);
 }
 
+#endif // LIGHTRT_USE_LIGHTUSD_C
+
 static bool writeImage(const std::string& path, const std::vector<lightrt::RGB8>& image,
                        uint32_t w, uint32_t h) {
   std::string ext;
@@ -514,6 +845,197 @@ static const scene::MaterialData& resolveMaterial(const scene::Scene& scene,
     return scene.materials[static_cast<size_t>(mesh.default_material_id)];
   return kDefaultMat;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Random-Walk Subsurface Scattering
+//
+// Algorithm:  Chiang, Kutz, Burley — SIGGRAPH 2016, with:
+//   • Henyey-Greenstein anisotropic phase function  (g = subsurface_anisotropy)
+//   • Luminance-weighted spectral channel MIS       (lower variance for chromatic)
+//   • Correct throughput accounting for HG PDF      (see inline comments)
+//   • Thin-shape guard via initial thickness probe
+// ─────────────────────────────────────────────────────────────────────────────
+struct SSSResult {
+    lightrt::Vec3  exit_pos;           // world-space exit point
+    lightrt::Vec3  exit_normal;        // world-space outward normal at exit
+    lightrt::Vec3  throughput;         // spectral transport weight
+    uint32_t       exit_instance_id;
+    uint32_t       exit_triangle_id;
+    bool           success;
+};
+
+// Compute the outward world-space normal for triangle `tri_id` in instance `inst`.
+static lightrt::Vec3 computeWorldNormal(const scene::Scene& scene,
+                                         uint32_t inst_id, uint32_t tri_id) {
+    const auto& inst = scene.instances[inst_id];
+    const auto& tris = scene.meshes[inst.mesh_id].bvh.getTriangles();
+    const auto& tri  = tris[tri_id];
+    lightrt::Vec3 local_n = (tri.v1 - tri.v0).cross(tri.v2 - tri.v0).normalize();
+    return scene::transformNormal(inst.inv_transform, local_n).normalize();
+}
+
+static SSSResult randomWalkSSS(
+        const scene::Scene&       scene,
+        const lightrt::Vec3&      entry_pos,        // world entry point
+        const lightrt::Vec3&      entry_N,           // outward normal at entry
+        uint32_t                  entry_instance_id,
+        const scene::MaterialData& mat,
+        std::mt19937&             rng,
+        std::uniform_real_distribution<float>& dist01)
+{
+    using namespace lightrt_common::sss;
+    SSSResult result{};
+    result.success = false;
+
+    // ── 1. Compute volume coefficients ────────────────────────────────────────
+    const SSSCoeffs c = computeCoeffsFromMaterial(mat);
+
+    // If all channels are nearly opaque, fall back to surface shading.
+    if (c.sigma_t.x > 1e14f && c.sigma_t.y > 1e14f && c.sigma_t.z > 1e14f)
+        return result;
+
+    float g = std::max(-0.99f, std::min(0.99f, mat.subsurface_anisotropy));
+
+    // ── 2. Thin-shape thickness probe ─────────────────────────────────────────
+    // Cast a probe ray along the inward normal to estimate the local slab
+    // thickness.  This caps the first free-path sample and avoids spending
+    // budget on nearly-transparent thick shapes.
+    float thickness = kInfThickness;
+    {
+        lightrt::Vec3 inward = entry_N * -1.0f;
+        lightrt::Ray probe(entry_pos + inward * 1e-3f, inward, 0.0f, 1000.0f);
+        scene::HitInfo probe_hit = scene::traceScene(scene, probe);
+        if (probe_hit.instance_id == entry_instance_id)
+            thickness = probe_hit.t + 1e-3f;   // include the entry offset
+    }
+
+    // ── 3. Sample entry direction (Lambertian BTDF into the medium) ───────────
+    lightrt::Vec3 inward_N = entry_N * -1.0f;   // points into the surface
+    lightrt::Vec3 ray_dir  = sampleCosineHemisphere(inward_N,
+                                                     dist01(rng), dist01(rng));
+    // Ensure direction is into the surface
+    if (ray_dir.dot(inward_N) <= 0.0f) ray_dir = ray_dir * -1.0f;
+
+    lightrt::Vec3 ray_pos   = entry_pos + inward_N * 1e-3f;
+    lightrt::Vec3 throughput(1.0f, 1.0f, 1.0f);
+
+    constexpr int kMaxBounces = 512;
+
+    // ── 4. Random walk ────────────────────────────────────────────────────────
+    for (int bounce = 0; bounce < kMaxBounces; ++bounce) {
+
+        // Channel selection + free-path sampling
+        lightrt::Vec3 ch_pdf;
+        int ch = sampleChannel(throughput, c.sigma_s, dist01(rng), ch_pdf);
+
+        float t_max  = sampleFreePath(c.sigma_t, ch, dist01(rng));
+
+        // On the first bounce, clamp to estimated thickness to avoid wasted
+        // traversal deep inside thick shapes that are effectively opaque.
+        if (bounce == 0) t_max = std::min(t_max, thickness);
+
+        // Trace limited ray
+        lightrt::Ray walk_ray(ray_pos, ray_dir, 1e-4f, t_max);
+        scene::HitInfo hit = scene::traceScene(scene, walk_ray);
+
+        if (hit.instance_id != lightrt::kInvalidIndex &&
+            hit.instance_id == entry_instance_id)
+        {
+            // ── Exit surface found on the same object ─────────────────────────
+            float t       = hit.t;
+            lightrt::Vec3 tau = transmittance(c.sigma_t, t);
+
+            // MIS weight:  balance estimator over the three channel PDFs
+            float pdf_sum = ch_pdf.x * tau.x * c.sigma_t.x   // would use ch0
+                          + ch_pdf.y * tau.y * c.sigma_t.y   // ch1
+                          + ch_pdf.z * tau.z * c.sigma_t.z;  // ch2
+            // For a surface event the PDF is transmittance (no sigma_t factor):
+            float exit_pdf = ch_pdf.x * tau.x
+                           + ch_pdf.y * tau.y
+                           + ch_pdf.z * tau.z;
+            if (exit_pdf < 1e-16f) break;
+
+            throughput.x *= tau.x / exit_pdf;
+            throughput.y *= tau.y / exit_pdf;
+            throughput.z *= tau.z / exit_pdf;
+            (void)pdf_sum;
+
+            // Compute exit normal (world-space, oriented outward).
+            // computeWorldNormal returns the geometric (winding-order) normal.
+            // For a closed mesh the geometric normal points outward.  When the
+            // walk exits from inside, ray_dir and the outward normal are in the
+            // same hemisphere.  If they aren't (re-entrant geometry, degenerate
+            // triangle), flip so exit_N always faces the same side as ray_dir
+            // (i.e. outward from the surface toward the exterior world).
+            lightrt::Vec3 exit_N = computeWorldNormal(scene,
+                                                       hit.instance_id,
+                                                       hit.triangle_id);
+            if (exit_N.dot(ray_dir) < 0.0f) exit_N = exit_N * -1.0f;
+
+            // Clamp throughput components: individual channels can grow before
+            // Russian roulette suppresses them; cap to avoid firefly blowout.
+            constexpr float kMaxTp = 1e4f;
+            throughput.x = std::max(0.0f, std::min(throughput.x, kMaxTp));
+            throughput.y = std::max(0.0f, std::min(throughput.y, kMaxTp));
+            throughput.z = std::max(0.0f, std::min(throughput.z, kMaxTp));
+
+            result.exit_pos          = ray_pos + ray_dir * t;
+            result.exit_normal       = exit_N;
+            result.throughput        = throughput;
+            result.exit_instance_id  = hit.instance_id;
+            result.exit_triangle_id  = hit.triangle_id;
+            result.success           = true;
+            return result;
+        }
+
+        // ── No surface hit: scatter inside the medium ─────────────────────────
+        float t        = t_max;
+        lightrt::Vec3 tau = transmittance(c.sigma_t, t);
+
+        // Throughput update for a scatter event [Chiang16 §3]:
+        //   weight *= (sigma_s * tau) / pdf_scatter
+        // where pdf_scatter = sum_ch(ch_pdf[ch] * sigma_t[ch] * tau[ch])
+        float pdf_scatter = ch_pdf.x * c.sigma_t.x * tau.x
+                          + ch_pdf.y * c.sigma_t.y * tau.y
+                          + ch_pdf.z * c.sigma_t.z * tau.z;
+        if (pdf_scatter < 1e-16f) break;
+
+        throughput.x *= c.sigma_s.x * tau.x / pdf_scatter;
+        throughput.y *= c.sigma_s.y * tau.y / pdf_scatter;
+        throughput.z *= c.sigma_s.z * tau.z / pdf_scatter;
+
+        // Guard against nan/inf produced by a degenerate sigma_s or tau value.
+        if (!std::isfinite(throughput.x) || !std::isfinite(throughput.y) ||
+            !std::isfinite(throughput.z)) break;
+
+        // Advance position
+        ray_pos = ray_pos + ray_dir * t;
+
+        // ── Russian roulette ──────────────────────────────────────────────────
+        float lum = 0.2126f * throughput.x
+                  + 0.7152f * throughput.y
+                  + 0.0722f * throughput.z;
+        lum = std::max(0.0f, std::min(1.0f, lum));
+        if (dist01(rng) >= lum) break;
+        throughput.x /= lum;
+        throughput.y /= lum;
+        throughput.z /= lum;
+
+        // ── Sample new direction via Henyey-Greenstein ────────────────────────
+        // Build ONB around current ray_dir (forward = ray_dir)
+        lightrt::Vec3 T, B;
+        buildONB(ray_dir, T, B);
+        lightrt::Vec3 local_scatter = sampleHGLocal(g, dist01(rng), dist01(rng));
+        ray_dir = toWorld(local_scatter, T, B, ray_dir).normalize();
+
+        // Note: for HG, pdf(omega) == p(omega) (phase function = its own PDF),
+        // so the direction weight = p / pdf = 1. No extra factor needed.
+    }
+
+    return result;   // absorbed or max bounces exceeded
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 static void renderFrame(const scene::Scene& scene, const Options& opts,
                         const lightrt::Vec3& cam_pos,
@@ -593,6 +1115,14 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
             color = color + mat.emission_color * mat.emission_luminance;
           }
 
+          // SSS: subsurface_weight blends BRDF ↔ random-walk SSS.
+          // brdf_scale  = fraction of direct lighting from the surface BRDF.
+          // sss_weight  = fraction routed through the subsurface walk.
+          const float sss_weight  = (mat.subsurface_radius > 1e-8f)
+                                      ? std::max(0.0f, std::min(1.0f, mat.subsurface_weight))
+                                      : 0.0f;
+          const float brdf_scale  = 1.0f - sss_weight;
+
           if (use_fallback) {
             // Backward compatible fallback: hardcoded directional + ambient
             float ndl = std::max(0.0f, N.dot(fallback_light_dir));
@@ -605,15 +1135,13 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
             float shade = std::min(1.0f, ambient + diffuse);
             color = color + mat.base_color * shade;
           } else {
-            // Analytic light loop
+            // ── Analytic light loop ─────────────────────────────────────────────
             for (const auto& light : scene.lights) {
               lightrt::Vec3 L;
               float light_dist = 1e20f;
 
               if (light.type == scene::LightData::Distant) {
-                L = light.direction * -1.0f; // light.direction points from light
-                // Actually for distant lights, direction is where the light points
-                // We want L = direction toward light = -light.direction
+                L = light.direction * -1.0f;
               } else if (light.type == scene::LightData::Point) {
                 lightrt::Vec3 to_light = light.position - hit_pos;
                 light_dist = to_light.length();
@@ -641,12 +1169,12 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
               color = color + lightrt::Vec3(
                 brdf_ndl.x * light_contribution.x,
                 brdf_ndl.y * light_contribution.y,
-                brdf_ndl.z * light_contribution.z);
+                brdf_ndl.z * light_contribution.z) * brdf_scale;
             }
 
-            // Envmap MIS (if dome light exists)
+            // ── Envmap MIS (if dome light exists) ───────────────────────────────
             if (has_envmap) {
-              float alpha = std::max(0.001f, mat.roughness * mat.roughness);
+              float alpha = std::max(0.001f, mat.specular_roughness * mat.specular_roughness);
               lightrt::Vec3 T, B;
               buildONB(N, T, B);
 
@@ -661,30 +1189,26 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
                                                hit.triangle_id, ray_time)) {
                     lightrt::Vec3 brdf_ndl = evalBRDF(N, V, L, mat);
                     lightrt::Vec3 env_col = evalEnvmap(scene.envmap, L);
-                    // BRDF PDF for this direction
                     lightrt::Vec3 H = (V + L).normalize();
                     float NdotH = std::max(0.0f, N.dot(H));
                     float VdotH = std::max(0.0f, V.dot(H));
                     float brdf_pdf = pdfGGX(NdotH, VdotH, alpha);
-                    // Add diffuse PDF component
                     float combined_brdf_pdf = 0.5f * brdf_pdf + 0.5f * NdotL * kInvPi;
                     float w = misBalance(env_pdf, combined_brdf_pdf);
                     lightrt::Vec3 contrib(
                       brdf_ndl.x * env_col.x * w / env_pdf,
                       brdf_ndl.y * env_col.y * w / env_pdf,
                       brdf_ndl.z * env_col.z * w / env_pdf);
-                    color = color + contrib;
+                    color = color + contrib * brdf_scale;
                   }
                 }
               }
 
               // 2) BRDF sample
               {
-                // Choose diffuse or specular sampling
                 bool sample_diffuse = dist01(rng) < 0.5f;
                 lightrt::Vec3 L;
                 if (sample_diffuse) {
-                  // Cosine-weighted hemisphere
                   float r1 = dist01(rng), r2 = dist01(rng);
                   float cos_theta = std::sqrt(1.0f - r1);
                   float sin_theta = std::sqrt(r1);
@@ -692,10 +1216,9 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
                   lightrt::Vec3 local(sin_theta * std::cos(phi), sin_theta * std::sin(phi), cos_theta);
                   L = toWorld(local, N, T, B);
                 } else {
-                  // GGX importance sampling
                   lightrt::Vec3 H_local = sampleGGX(dist01(rng), dist01(rng), alpha);
                   lightrt::Vec3 H = toWorld(H_local, N, T, B);
-                  L = V * -1.0f + H * (2.0f * V.dot(H)); // reflect
+                  L = V * -1.0f + H * (2.0f * V.dot(H));
                   L = L.normalize();
                 }
 
@@ -718,7 +1241,112 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
                         brdf_ndl.x * env_col.x * w / combined_brdf_pdf,
                         brdf_ndl.y * env_col.y * w / combined_brdf_pdf,
                         brdf_ndl.z * env_col.z * w / combined_brdf_pdf);
-                      color = color + contrib;
+                      color = color + contrib * brdf_scale;
+                    }
+                  }
+                }
+              }
+            }
+
+            // ── Random-Walk Subsurface Scattering ───────────────────────────────
+            if (sss_weight > 1e-4f) {
+              SSSResult sss_r = randomWalkSSS(scene, hit_pos, N,
+                                              hit.instance_id, mat, rng, dist01);
+              if (sss_r.success) {
+                const lightrt::Vec3& eN      = sss_r.exit_normal;
+                const lightrt::Vec3& eP      = sss_r.exit_pos;
+                const lightrt::Vec3& tp      = sss_r.throughput;
+
+                // At the exit surface use a Lambertian BRDF:
+                //   f_exit = base_color * NdotL / π
+                // The SSS walk's throughput already accounts for volume transport.
+
+                // 1) Analytic lights at exit
+                for (const auto& light : scene.lights) {
+                  lightrt::Vec3 Lex;
+                  float ld = 1e20f;
+                  if (light.type == scene::LightData::Distant) {
+                    Lex = light.direction * -1.0f;
+                  } else if (light.type == scene::LightData::Point) {
+                    lightrt::Vec3 tl = light.position - eP;
+                    ld = tl.length();
+                    if (ld < 1e-6f) continue;
+                    Lex = tl * (1.0f / ld);
+                  } else { continue; }
+
+                  float NdotL_ex = std::max(0.0f, eN.dot(Lex));
+                  if (NdotL_ex <= 0.0f) continue;
+
+                  lightrt::Ray sh(eP + eN * bias, Lex, 0.0f, ld - bias);
+                  if (scene::traceSceneAnyHit(scene, sh,
+                        sss_r.exit_instance_id, sss_r.exit_triangle_id,
+                        ray_time)) continue;
+
+                  lightrt::Vec3 lc = light.color;
+                  if (light.type == scene::LightData::Point)
+                    lc = lc * (1.0f / (ld * ld));
+
+                  // Lambert at exit ⊗ sss throughput ⊗ base_color
+                  float lambert = NdotL_ex * kInvPi;
+                  color = color + lightrt::Vec3(
+                    lc.x * mat.base_color.x * lambert * tp.x,
+                    lc.y * mat.base_color.y * lambert * tp.y,
+                    lc.z * mat.base_color.z * lambert * tp.z) * sss_weight;
+                }
+
+                // 2) Envmap at exit (one sample, cosine-weighted)
+                if (has_envmap) {
+                  // Envmap importance sample
+                  float env_pdf = 0.0f;
+                  lightrt::Vec3 Lex = sampleEnvmap(scene.envmap,
+                                                    dist01(rng), dist01(rng),
+                                                    env_pdf);
+                  float NdotL_ex = std::max(0.0f, eN.dot(Lex));
+                  if (NdotL_ex > 0.0f && env_pdf > 1e-8f) {
+                    lightrt::Ray sh(eP + eN * bias, Lex);
+                    if (!scene::traceSceneAnyHit(scene, sh,
+                          sss_r.exit_instance_id, sss_r.exit_triangle_id,
+                          ray_time)) {
+                      lightrt::Vec3 env_col = evalEnvmap(scene.envmap, Lex);
+                      float lambert = NdotL_ex * kInvPi;
+                      // MIS: combine envmap PDF with Lambert PDF
+                      float lam_pdf = NdotL_ex * kInvPi;
+                      float wm = misBalance(env_pdf, lam_pdf);
+                      color = color + lightrt::Vec3(
+                        env_col.x * mat.base_color.x * lambert * tp.x * wm / env_pdf,
+                        env_col.y * mat.base_color.y * lambert * tp.y * wm / env_pdf,
+                        env_col.z * mat.base_color.z * lambert * tp.z * wm / env_pdf) * sss_weight;
+                    }
+                  }
+
+                  // BRDF sample (cosine-weighted hemisphere at exit)
+                  {
+                    lightrt::Vec3 eT, eB;
+                    buildONB(eN, eT, eB);
+                    float r1 = dist01(rng), r2 = dist01(rng);
+                    float cos_t = std::sqrt(1.0f - r1);
+                    float sin_t = std::sqrt(r1);
+                    float phi   = 2.0f * kPi * r2;
+                    lightrt::Vec3 local(sin_t * std::cos(phi), sin_t * std::sin(phi), cos_t);
+                    lightrt::Vec3 Lex2 = toWorld(local, eN, eT, eB);
+                    float NdotL2 = std::max(0.0f, eN.dot(Lex2));
+                    if (NdotL2 > 0.0f) {
+                      lightrt::Ray sh2(eP + eN * bias, Lex2);
+                      if (!scene::traceSceneAnyHit(scene, sh2,
+                            sss_r.exit_instance_id, sss_r.exit_triangle_id,
+                            ray_time)) {
+                        lightrt::Vec3 env_col2 = evalEnvmap(scene.envmap, Lex2);
+                        float lam_pdf2 = NdotL2 * kInvPi;
+                        float env_pdf2 = envmapPDF(scene.envmap, Lex2);
+                        float wm2 = misBalance(lam_pdf2, env_pdf2);
+                        if (lam_pdf2 > 1e-8f) {
+                          float lambert2 = NdotL2 * kInvPi;
+                          color = color + lightrt::Vec3(
+                            env_col2.x * mat.base_color.x * lambert2 * tp.x * wm2 / lam_pdf2,
+                            env_col2.y * mat.base_color.y * lambert2 * tp.y * wm2 / lam_pdf2,
+                            env_col2.z * mat.base_color.z * lambert2 * tp.z * wm2 / lam_pdf2) * sss_weight;
+                        }
+                      }
                     }
                   }
                 }

@@ -56,15 +56,15 @@ inline lightrt::Vec3 evalBRDF(const lightrt::Vec3& N, const lightrt::Vec3& V,
   float NdotH = std::max(0.0f, N.dot(H));
   float VdotH = std::max(0.0f, V.dot(H));
 
-  float alpha = std::max(0.001f, mat.roughness * mat.roughness);
+  float alpha = std::max(0.001f, mat.specular_roughness * mat.specular_roughness);
 
   // F0: blend between dielectric (from IOR) and metallic (base_color)
-  float f0_dielectric = ((mat.ior - 1.0f) * (mat.ior - 1.0f)) /
-                        ((mat.ior + 1.0f) * (mat.ior + 1.0f));
+  float f0_dielectric = ((mat.specular_ior - 1.0f) * (mat.specular_ior - 1.0f)) /
+                        ((mat.specular_ior + 1.0f) * (mat.specular_ior + 1.0f));
   lightrt::Vec3 F0(
-    f0_dielectric * (1.0f - mat.metalness) + mat.base_color.x * mat.metalness,
-    f0_dielectric * (1.0f - mat.metalness) + mat.base_color.y * mat.metalness,
-    f0_dielectric * (1.0f - mat.metalness) + mat.base_color.z * mat.metalness);
+    f0_dielectric * (1.0f - mat.base_metalness) + mat.base_color.x * mat.base_metalness,
+    f0_dielectric * (1.0f - mat.base_metalness) + mat.base_color.y * mat.base_metalness,
+    f0_dielectric * (1.0f - mat.base_metalness) + mat.base_color.z * mat.base_metalness);
 
   lightrt::Vec3 F = fresnelSchlick(VdotH, F0);
   float D = ggxD(NdotH, alpha);
@@ -75,15 +75,122 @@ inline lightrt::Vec3 evalBRDF(const lightrt::Vec3& N, const lightrt::Vec3& V,
 
   // Diffuse (energy-conserving: scale by (1-F)(1-metalness))
   lightrt::Vec3 kd(
-    (1.0f - F.x) * (1.0f - mat.metalness),
-    (1.0f - F.y) * (1.0f - mat.metalness),
-    (1.0f - F.z) * (1.0f - mat.metalness));
+    (1.0f - F.x) * (1.0f - mat.base_metalness),
+    (1.0f - F.y) * (1.0f - mat.base_metalness),
+    (1.0f - F.z) * (1.0f - mat.base_metalness));
   lightrt::Vec3 diffuse(
     kd.x * mat.base_color.x * kInvPi,
     kd.y * mat.base_color.y * kInvPi,
     kd.z * mat.base_color.z * kInvPi);
 
   return (diffuse + spec) * NdotL;
+}
+
+// --- Coat lobe (GGX specular) ---
+
+inline lightrt::Vec3 evalCoat(const lightrt::Vec3& N, const lightrt::Vec3& V,
+                               const lightrt::Vec3& L,
+                               const OpenPBRMaterial& mat) {
+  if (mat.coat_weight <= 0.0f) return lightrt::Vec3(0.0f, 0.0f, 0.0f);
+  float NdotL = std::max(0.0f, N.dot(L));
+  if (NdotL <= 0.0f) return lightrt::Vec3(0.0f, 0.0f, 0.0f);
+  float NdotV = std::max(0.001f, N.dot(V));
+  lightrt::Vec3 H = (V + L).normalize();
+  float NdotH = std::max(0.0f, N.dot(H));
+  float VdotH = std::max(0.0f, V.dot(H));
+  float alpha = std::max(0.001f, mat.coat_roughness * mat.coat_roughness);
+  float f0_coat = ((mat.coat_ior - 1.0f) * (mat.coat_ior - 1.0f)) /
+                  ((mat.coat_ior + 1.0f) * (mat.coat_ior + 1.0f));
+  lightrt::Vec3 F0c(f0_coat, f0_coat, f0_coat);
+  lightrt::Vec3 F = fresnelSchlick(VdotH, F0c);
+  float D = ggxD(NdotH, alpha);
+  float G = ggxG(NdotV, NdotL, alpha);
+  float brdf_scalar = D * G / (4.0f * NdotV * NdotL + 1e-7f);
+  lightrt::Vec3 coat_spec(
+    mat.coat_color.x * F.x * brdf_scalar,
+    mat.coat_color.y * F.y * brdf_scalar,
+    mat.coat_color.z * F.z * brdf_scalar);
+  return coat_spec * (mat.coat_weight * NdotL);
+}
+
+// --- Sheen / Fuzz lobe (Charlie distribution approximation) ---
+
+inline float charlieD(float NdotH, float alpha) {
+  float inv_a = 1.0f / (alpha * alpha);
+  float cos2   = NdotH * NdotH;
+  float sin2   = 1.0f - cos2;
+  return (2.0f + inv_a) * std::pow(std::max(0.0f, sin2), inv_a * 0.5f) / (2.0f * kPi);
+}
+
+inline lightrt::Vec3 evalSheen(const lightrt::Vec3& N, const lightrt::Vec3& V,
+                                const lightrt::Vec3& L,
+                                const OpenPBRMaterial& mat) {
+  if (mat.sheen_weight <= 0.0f) return lightrt::Vec3(0.0f, 0.0f, 0.0f);
+  float NdotL = std::max(0.0f, N.dot(L));
+  if (NdotL <= 0.0f) return lightrt::Vec3(0.0f, 0.0f, 0.0f);
+  float NdotV = std::max(0.001f, N.dot(V));
+  lightrt::Vec3 H = (V + L).normalize();
+  float NdotH = std::max(0.001f, N.dot(H));
+  float alpha = std::max(0.01f, mat.sheen_roughness);
+  float D   = charlieD(NdotH, alpha);
+  float Vis = 1.0f / (4.0f * (NdotV + NdotL - NdotV * NdotL) + 1e-7f);
+  return mat.sheen_color * (mat.sheen_weight * D * Vis * NdotL);
+}
+
+inline lightrt::Vec3 evalFuzz(const lightrt::Vec3& N, const lightrt::Vec3& V,
+                               const lightrt::Vec3& L,
+                               const OpenPBRMaterial& mat) {
+  if (mat.fuzz_weight <= 0.0f) return lightrt::Vec3(0.0f, 0.0f, 0.0f);
+  float NdotL = std::max(0.0f, N.dot(L));
+  if (NdotL <= 0.0f) return lightrt::Vec3(0.0f, 0.0f, 0.0f);
+  float NdotV = std::max(0.001f, N.dot(V));
+  lightrt::Vec3 H = (V + L).normalize();
+  float NdotH = std::max(0.001f, N.dot(H));
+  float alpha = std::max(0.01f, mat.fuzz_roughness);
+  float D   = charlieD(NdotH, alpha);
+  float Vis = 1.0f / (4.0f * (NdotV + NdotL - NdotV * NdotL) + 1e-7f);
+  return mat.fuzz_color * (mat.fuzz_weight * D * Vis * NdotL);
+}
+
+// --- Subsurface lobe (wrapped-diffuse approximation) ---
+
+inline lightrt::Vec3 evalSubsurface(const lightrt::Vec3& N, const lightrt::Vec3& V,
+                                     const lightrt::Vec3& L,
+                                     const OpenPBRMaterial& mat) {
+  if (mat.subsurface_weight <= 0.0f) return lightrt::Vec3(0.0f, 0.0f, 0.0f);
+  (void)V;
+  float NdotL_wrap = (N.dot(L) + 0.5f) / 1.5f;
+  float wrapped    = std::max(0.0f, NdotL_wrap);
+  lightrt::Vec3 scat_color(
+    mat.base_color.x * mat.subsurface_radius_scale.x,
+    mat.base_color.y * mat.subsurface_radius_scale.y,
+    mat.base_color.z * mat.subsurface_radius_scale.z);
+  return scat_color * (mat.subsurface_weight * wrapped * kInvPi);
+}
+
+// --- Transmission refraction direction helper ---
+// Returns refracted ray direction; zero-vector on total internal reflection.
+inline lightrt::Vec3 refractionDir(const lightrt::Vec3& I, const lightrt::Vec3& N,
+                                    float ior_ratio) {
+  float cos_i = -I.dot(N);
+  float sin2t = ior_ratio * ior_ratio * (1.0f - cos_i * cos_i);
+  if (sin2t > 1.0f) return lightrt::Vec3(0.0f, 0.0f, 0.0f);
+  float cos_t = std::sqrt(1.0f - sin2t);
+  return I * ior_ratio + N * (ior_ratio * cos_i - cos_t);
+}
+
+// --- Combined OpenPBR evaluation (all direct-lighting lobes) ---
+// Transmission requires separate refracted-ray handling by the caller.
+inline lightrt::Vec3 evalOpenPBR(const lightrt::Vec3& N, const lightrt::Vec3& V,
+                                  const lightrt::Vec3& L,
+                                  const OpenPBRMaterial& mat) {
+  lightrt::Vec3 base = evalBRDF(N, V, L, mat);
+  float coat_atten   = 1.0f - mat.coat_weight * 0.5f;
+  lightrt::Vec3 coat = evalCoat(N, V, L, mat);
+  lightrt::Vec3 sheen = evalSheen(N, V, L, mat);
+  lightrt::Vec3 fuzz  = evalFuzz(N, V, L, mat);
+  lightrt::Vec3 sss   = evalSubsurface(N, V, L, mat);
+  return base * coat_atten + coat + sheen + fuzz + sss;
 }
 
 // --- ONB / hemisphere sampling ---

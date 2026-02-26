@@ -7,16 +7,76 @@
 
 namespace lightrt_common {
 
-struct MaterialData {
-  lightrt::Vec3 base_color{0.5f, 0.5f, 0.5f};
-  float metalness = 0.0f;
-  float roughness = 0.5f;
-  lightrt::Vec3 specular_color{1.0f, 1.0f, 1.0f};
-  float ior = 1.5f;
-  lightrt::Vec3 emission_color{0.0f, 0.0f, 0.0f};
-  float emission_luminance = 0.0f;
-  float opacity = 1.0f;
+struct OpenPBRMaterial {
+  // --- Base ---
+  float          base_weight           = 1.0f;
+  lightrt::Vec3  base_color            = {0.8f, 0.8f, 0.8f};
+  float          base_roughness        = 0.0f;
+  float          base_metalness        = 0.0f;
+  float          base_diffuse_roughness= 0.0f;
+
+  // --- Specular ---
+  float          specular_weight       = 1.0f;
+  lightrt::Vec3  specular_color        = {1.0f, 1.0f, 1.0f};
+  float          specular_roughness    = 0.3f;
+  float          specular_ior          = 1.5f;
+  float          specular_ior_level    = 0.5f;
+  float          specular_anisotropy   = 0.0f;
+  float          specular_rotation     = 0.0f;
+
+  // --- Transmission ---
+  float          transmission_weight   = 0.0f;
+  lightrt::Vec3  transmission_color    = {1.0f, 1.0f, 1.0f};
+  float          transmission_depth    = 0.0f;
+  lightrt::Vec3  transmission_scatter  = {0.0f, 0.0f, 0.0f};
+  float          transmission_scatter_anisotropy = 0.0f;
+  float          transmission_dispersion = 0.0f;
+
+  // --- Subsurface ---
+  float          subsurface_weight     = 0.0f;
+  lightrt::Vec3  subsurface_color      = {0.8f, 0.8f, 0.8f};
+  float          subsurface_radius     = 1.0f;
+  lightrt::Vec3  subsurface_radius_scale = {1.0f, 1.0f, 1.0f};
+  float          subsurface_scale      = 1.0f;
+  float          subsurface_anisotropy = 0.0f;
+
+  // --- Sheen ---
+  float          sheen_weight          = 0.0f;
+  lightrt::Vec3  sheen_color           = {1.0f, 1.0f, 1.0f};
+  float          sheen_roughness       = 0.3f;
+
+  // --- Fuzz ---
+  float          fuzz_weight           = 0.0f;
+  lightrt::Vec3  fuzz_color            = {1.0f, 1.0f, 1.0f};
+  float          fuzz_roughness        = 0.5f;
+
+  // --- Thin Film ---
+  float          thin_film_weight      = 0.0f;
+  float          thin_film_thickness   = 0.5f;
+  float          thin_film_ior         = 1.5f;
+
+  // --- Coat ---
+  float          coat_weight           = 0.0f;
+  lightrt::Vec3  coat_color            = {1.0f, 1.0f, 1.0f};
+  float          coat_roughness        = 0.1f;
+  float          coat_anisotropy       = 0.0f;
+  float          coat_rotation         = 0.0f;
+  float          coat_ior              = 1.6f;
+  lightrt::Vec3  coat_affect_color     = {0.0f, 0.0f, 0.0f};
+  float          coat_affect_roughness = 0.0f;
+
+  // --- Emission ---
+  float          emission_luminance    = 0.0f;
+  lightrt::Vec3  emission_color        = {1.0f, 1.0f, 1.0f};
+
+  // --- Geometry ---
+  float          opacity               = 1.0f;
 };
+
+// Backward-compatibility alias.
+// Note: old fields .metalness, .roughness, .ior no longer exist.
+// Use .base_metalness, .specular_roughness, .specular_ior instead.
+using MaterialData = OpenPBRMaterial;
 
 struct LightData {
   enum Type { Distant, Point, Dome };
