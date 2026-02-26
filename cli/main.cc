@@ -374,6 +374,14 @@ static bool loadUSDScene(const std::string& filename, double timecode,
       if (ll.type == LUSD_LIGHT_TYPE_DISTANT) {
         ld.type      = scene::LightData::Distant;
         ld.direction = lightrt::Vec3(ll.direction[0], ll.direction[1], ll.direction[2]).normalize();
+      } else if (ll.type == LUSD_LIGHT_TYPE_RECT) {
+        ld.type             = scene::LightData::Rect;
+        ld.position         = lightrt::Vec3(ll.position[0], ll.position[1], ll.position[2]);
+        ld.direction        = lightrt::Vec3(ll.direction[0], ll.direction[1], ll.direction[2]).normalize();
+        ld.rect_axis_u      = lightrt::Vec3(ll.rect_axis_u[0], ll.rect_axis_u[1], ll.rect_axis_u[2]).normalize();
+        ld.rect_axis_v      = lightrt::Vec3(ll.rect_axis_v[0], ll.rect_axis_v[1], ll.rect_axis_v[2]).normalize();
+        ld.rect_half_width  = ll.rect_half_width;
+        ld.rect_half_height = ll.rect_half_height;
       } else {
         ld.type     = scene::LightData::Point;
         ld.position = lightrt::Vec3(ll.position[0], ll.position[1], ll.position[2]);
@@ -576,6 +584,27 @@ static void extractLights(const tinyusdz::tydra::RenderScene& render_scene,
         static_cast<float>(rl.transform.m[3][0]),
         static_cast<float>(rl.transform.m[3][1]),
         static_cast<float>(rl.transform.m[3][2]));
+    } else if (rl.type == tinyusdz::tydra::RenderLight::Type::Rect) {
+      light.type     = scene::LightData::Rect;
+      light.position = lightrt::Vec3(
+        static_cast<float>(rl.transform.m[3][0]),
+        static_cast<float>(rl.transform.m[3][1]),
+        static_cast<float>(rl.transform.m[3][2]));
+      // matrix4f: m[row][col]. Local axis j = col j = (m[0][j], m[1][j], m[2][j]).
+      light.rect_axis_u = lightrt::Vec3(           // col 0 = local +X
+        static_cast<float>(rl.transform.m[0][0]),
+        static_cast<float>(rl.transform.m[1][0]),
+        static_cast<float>(rl.transform.m[2][0])).normalize();
+      light.rect_axis_v = lightrt::Vec3(           // col 1 = local +Y
+        static_cast<float>(rl.transform.m[0][1]),
+        static_cast<float>(rl.transform.m[1][1]),
+        static_cast<float>(rl.transform.m[2][1])).normalize();
+      light.direction = lightrt::Vec3(             // -(col 2) = outward normal
+        -static_cast<float>(rl.transform.m[0][2]),
+        -static_cast<float>(rl.transform.m[1][2]),
+        -static_cast<float>(rl.transform.m[2][2])).normalize();
+      light.rect_half_width  = rl.width  * 0.5f;
+      light.rect_half_height = rl.height * 0.5f;
     } else {
       continue; // skip unsupported light types
     }
@@ -1179,6 +1208,9 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
               lightrt::Vec3 L;
               float light_dist = 1e20f;
 
+              // Geometry factor for area lights (one-sided: front only)
+              float geom_factor = 1.0f;
+
               if (light.type == scene::LightData::Distant) {
                 L = light.direction * -1.0f;
               } else if (light.type == scene::LightData::Point) {
@@ -1186,6 +1218,25 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
                 light_dist = to_light.length();
                 if (light_dist < 1e-6f) continue;
                 L = to_light * (1.0f / light_dist);
+              } else if (light.type == scene::LightData::Rect) {
+                // Sample a random point on the rect surface
+                float u = dist01(rng) * 2.0f - 1.0f; // [-1, 1]
+                float v = dist01(rng) * 2.0f - 1.0f;
+                lightrt::Vec3 sample_pos =
+                  light.position
+                  + light.rect_axis_u * (u * light.rect_half_width)
+                  + light.rect_axis_v * (v * light.rect_half_height);
+                lightrt::Vec3 to_light = sample_pos - hit_pos;
+                light_dist = to_light.length();
+                if (light_dist < 1e-6f) continue;
+                L = to_light * (1.0f / light_dist);
+                // Reject if shading point is behind the rect
+                float cos_emit = light.direction.dot(L * -1.0f);
+                if (cos_emit <= 0.0f) continue;
+                // Geometry term: (1/r^2) * cos_emit * rect_area / pdf
+                // pdf = 1/(width*height), area = width*height → area/pdf = 1
+                float rect_area = (light.rect_half_width * 2.0f) * (light.rect_half_height * 2.0f);
+                geom_factor = cos_emit * rect_area / (light_dist * light_dist);
               } else {
                 continue;
               }
@@ -1203,6 +1254,8 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
               if (light.type == scene::LightData::Point) {
                 float inv_r2 = 1.0f / (light_dist * light_dist);
                 light_contribution = light_contribution * inv_r2;
+              } else if (light.type == scene::LightData::Rect) {
+                light_contribution = light_contribution * geom_factor;
               }
 
               color = color + lightrt::Vec3(
@@ -1304,6 +1357,7 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
                 for (const auto& light : scene.lights) {
                   lightrt::Vec3 Lex;
                   float ld = 1e20f;
+                  float sss_geom = 1.0f;
                   if (light.type == scene::LightData::Distant) {
                     Lex = light.direction * -1.0f;
                   } else if (light.type == scene::LightData::Point) {
@@ -1311,6 +1365,20 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
                     ld = tl.length();
                     if (ld < 1e-6f) continue;
                     Lex = tl * (1.0f / ld);
+                  } else if (light.type == scene::LightData::Rect) {
+                    float u = dist01(rng) * 2.0f - 1.0f;
+                    float v = dist01(rng) * 2.0f - 1.0f;
+                    lightrt::Vec3 sp = light.position
+                      + light.rect_axis_u * (u * light.rect_half_width)
+                      + light.rect_axis_v * (v * light.rect_half_height);
+                    lightrt::Vec3 tl = sp - eP;
+                    ld = tl.length();
+                    if (ld < 1e-6f) continue;
+                    Lex = tl * (1.0f / ld);
+                    float cos_emit = light.direction.dot(Lex * -1.0f);
+                    if (cos_emit <= 0.0f) continue;
+                    float rect_area = (light.rect_half_width*2.0f)*(light.rect_half_height*2.0f);
+                    sss_geom = cos_emit * rect_area / (ld * ld);
                   } else { continue; }
 
                   float NdotL_ex = std::max(0.0f, eN.dot(Lex));
@@ -1324,6 +1392,8 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
                   lightrt::Vec3 lc = light.color;
                   if (light.type == scene::LightData::Point)
                     lc = lc * (1.0f / (ld * ld));
+                  else if (light.type == scene::LightData::Rect)
+                    lc = lc * sss_geom;
 
                   // Lambert at exit ⊗ sss throughput ⊗ base_color
                   float lambert = NdotL_ex * kInvPi;
