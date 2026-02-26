@@ -12,8 +12,8 @@ TINYUSDZ_DIR="$DEPS_DIR/tinyusdz"
 if [ -d "$TINYUSDZ_DIR" ]; then
   echo "tinyusdz already cloned at $TINYUSDZ_DIR"
 else
-  echo "Cloning tinyusdz (mtlx-nodegraph branch)..."
-  git clone --branch mtlx-nodegraph --depth 1 \
+  echo "Cloning tinyusdz (lightusd branch)..."
+  git clone --branch lightusd --depth 1 \
     https://github.com/syoyo/tinyusdz.git "$TINYUSDZ_DIR"
 fi
 
