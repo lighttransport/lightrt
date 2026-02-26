@@ -54,7 +54,7 @@ target_include_directories(lightrt_cli PRIVATE
 )
 
 if(LIGHTRT_USE_LIGHTUSD_C)
-  # lightusd-c + lydra backend
+  # lightusd-c + lydra backend (no tinyusdz dependency)
   set(LIGHTUSD_C_DIR "${TINYUSDZ_DIR}/sandbox/lightusd-c")
   if(NOT EXISTS "${LIGHTUSD_C_DIR}")
     message(FATAL_ERROR
@@ -62,37 +62,37 @@ if(LIGHTRT_USE_LIGHTUSD_C)
       "Make sure tinyusdz is on the 'lightusd' branch: bash scripts/setup_deps.sh")
   endif()
 
-  # Build tinyusdz_static first — lightusd-c uses it as its USD parsing backend.
-  set(TINYUSDZ_NO_WERROR ON CACHE BOOL "" FORCE)
-  set(TINYUSDZ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-  set(TINYUSDZ_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-  add_subdirectory("${TINYUSDZ_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/tinyusdz")
-
-  # Tell lightusd-c's CMakeLists.txt to use the tinyusdz backend.
-  set(LUSD_TINYUSDZ_DIR "${TINYUSDZ_DIR}" CACHE PATH
-    "tinyusdz source dir for lightusd-c backend" FORCE)
-
   # Build lightusd-c (C11) + lydra (C++) as a subdirectory.
-  # The lightusd-c CMakeLists.txt defines both the 'lightusd-c' and 'lydra' targets.
+  # No LUSD_TINYUSDZ_DIR set — builds with pure-C stubs only.
   if(EXISTS "${LIGHTUSD_C_DIR}/CMakeLists.txt")
     add_subdirectory("${LIGHTUSD_C_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/lightusd-c")
   else()
     message(FATAL_ERROR "lightusd-c has no CMakeLists.txt at ${LIGHTUSD_C_DIR}")
   endif()
 
-  # Include: C public headers from include/, lydra C++ headers from lydra/
+  # Include: C public headers, internal headers (for LusdLayer_T/LusdPrim_T),
+  # lydra-c pure-C headers, and lydra C++ headers (kept for reference)
   target_include_directories(lightrt_cli PRIVATE
     "${LIGHTUSD_C_DIR}/include"
+    "${LIGHTUSD_C_DIR}/src"
+    "${LIGHTUSD_C_DIR}/lydra/lydra-c"
     "${LIGHTUSD_C_DIR}/lydra"
   )
-  # Link both the C runtime library and the C++ mesh utility library
-  target_link_libraries(lightrt_cli PRIVATE lightusd-c lydra)
+  # Link lightusd-c and lydra-c (pure C) — no C++ lydra needed
+  target_link_libraries(lightrt_cli PRIVATE lightusd-c lydra-c)
   target_compile_definitions(lightrt_cli PRIVATE LIGHTRT_USE_LIGHTUSD_C)
-  message(STATUS "USD backend: lightusd-c + lydra + tinyusdz (${LIGHTUSD_C_DIR})")
+  message(STATUS "USD backend: lightusd-c + lydra-c (${LIGHTUSD_C_DIR})")
 else()
   # tinyusdz + tydra backend (default)
+  # Build tinyusdz with MinSizeRel to reduce library size.
+  set(_saved_build_type "${CMAKE_BUILD_TYPE}")
+  set(CMAKE_BUILD_TYPE MinSizeRel)
+
   set(TINYUSDZ_NO_WERROR ON CACHE BOOL "" FORCE)
   add_subdirectory("${TINYUSDZ_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/tinyusdz")
+
+  # Restore original build type for lightrt_cli itself.
+  set(CMAKE_BUILD_TYPE "${_saved_build_type}")
 
   target_include_directories(lightrt_cli PRIVATE
     "${TINYUSDZ_DIR}/src"
