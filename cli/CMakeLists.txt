@@ -44,7 +44,7 @@ endif()
 set(LIGHTRT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/..")
 
 # CLI executable
-add_executable(lightrt_cli main.cc stb_image_write_impl.cc "${LIGHTRT_DIR}/lightrt.cc")
+add_executable(lightrt_cli main.cc stb_image_write_impl.cc stb_image_impl.cc "${LIGHTRT_DIR}/lightrt.cc")
 
 target_include_directories(lightrt_cli PRIVATE
   "${LIGHTRT_DIR}"
