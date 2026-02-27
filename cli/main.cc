@@ -24,6 +24,10 @@
 
 #include "stb_image_write.h"
 
+#if defined(LIGHTRT_USE_LIGHTUSD_C)
+#include "stb_image.h"
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -177,9 +181,50 @@ static void collect_materials(LusdLayer_T* L, const LusdPrim_T* P,
 }
 
 // Recursive DFS over prim tree, extracting Mesh prims
+// 4x4 row-major double matrix multiply: C = A * B
+static void mat4d_mul(const double A[16], const double B[16], double C[16]) {
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 4; c++) {
+      double s = 0.0;
+      for (int k = 0; k < 4; k++) s += A[r*4+k] * B[k*4+c];
+      C[r*4+c] = s;
+    }
+}
+
+// Convert row-major double[16] 4x4 to float[12] 3x4 (top 3 rows)
+static void mat4d_to_3x4f(const double m[16], float out[12]) {
+  for (int r = 0; r < 3; r++)
+    for (int c = 0; c < 4; c++)
+      out[r*4+c] = static_cast<float>(m[r*4+c]);
+}
+
+// Convert row-major double[16] 4x4 to float[16] 4x4
+static void mat4d_to_4x4f(const double m[16], float out[16]) {
+  for (int i = 0; i < 16; i++) out[i] = static_cast<float>(m[i]);
+}
+
+static const double kIdentity4d[16] = {
+  1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1
+};
+
 static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
                       scene::Scene& out_scene,
-                      const std::map<std::string, int>& mat_map) {
+                      const std::map<std::string, int>& mat_map,
+                      const double parent_xform[16],
+                      const std::string& usd_base_dir) {
+  // Compute world transform: parent * local
+  double local_xform[16];
+  double world_xform[16];
+  int has_local = lydra_c_extract_xform(
+      reinterpret_cast<LusdLayer>(L),
+      reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
+      local_xform);
+  if (has_local == 0) {
+    mat4d_mul(parent_xform, local_xform, world_xform);
+  } else {
+    std::memcpy(world_xform, parent_xform, sizeof(world_xform));
+  }
+
   // Check if this prim is a Mesh
   if (P->type_name && strcmp(P->type_name, "Mesh") == 0) {
     LydraCMeshData mesh_data_c;
@@ -290,16 +335,14 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
         }
         md.bvh.build(triangles);
 
-        // Identity transform (xform not yet extracted from layer)
         scene::Instance inst;
         inst.mesh_id = static_cast<uint32_t>(mi);
-        std::memset(inst.transform, 0, sizeof(inst.transform));
-        inst.transform[0] = 1.0f; inst.transform[5] = 1.0f; inst.transform[10] = 1.0f;
-        std::memcpy(inst.inv_transform,       inst.transform, sizeof(inst.transform));
-        std::memcpy(inst.transform_close,     inst.transform, sizeof(inst.transform));
-        std::memcpy(inst.inv_transform_close, inst.transform, sizeof(inst.transform));
+        mat4d_to_3x4f(world_xform, inst.transform);
+        scene::invert3x4(inst.transform, inst.inv_transform);
+        std::memcpy(inst.transform_close, inst.transform, sizeof(inst.transform));
+        std::memcpy(inst.inv_transform_close, inst.inv_transform, sizeof(inst.inv_transform));
         inst.has_motion  = false;
-        inst.world_bounds = md.local_bounds;
+        inst.world_bounds = scene::transformAABB(md.local_bounds, inst.transform);
         out_scene.scene_bounds.expand(inst.world_bounds);
         out_scene.instances.push_back(inst);
       }
@@ -308,10 +351,135 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
     }
   }
 
+  // Camera detection
+  if (P->type_name && strcmp(P->type_name, "Camera") == 0) {
+    LydraCCameraData cam_data;
+    lydra_c_extract_camera(
+        reinterpret_cast<LusdLayer>(L),
+        reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
+        &cam_data);
+    scene::Camera cam;
+    cam.name = P->name ? P->name : "";
+    cam.fov_y_rad = 2.0f * std::atan(0.5f * cam_data.vertical_aperture / cam_data.focal_length);
+    cam.znear = cam_data.znear;
+    cam.zfar = cam_data.zfar;
+    mat4d_to_4x4f(world_xform, cam.transform);
+    out_scene.cameras.push_back(cam);
+  }
+
+  // Light detection
+  if (P->type_name && (strcmp(P->type_name, "DistantLight") == 0 ||
+                        strcmp(P->type_name, "SphereLight") == 0 ||
+                        strcmp(P->type_name, "RectLight") == 0)) {
+    LydraCLightData ld;
+    lydra_c_extract_light(
+        reinterpret_cast<LusdLayer>(L),
+        reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
+        &ld);
+    float multiplier = ld.intensity * std::pow(2.0f, ld.exposure);
+    scene::LightData light;
+    light.color = lightrt::Vec3(ld.color[0] * multiplier,
+                                ld.color[1] * multiplier,
+                                ld.color[2] * multiplier);
+
+    if (ld.type == LYDRA_C_LIGHT_DISTANT) {
+      light.type = scene::LightData::Distant;
+      // Direction = -(column 2 of world_xform), normalized
+      float dir_x = -static_cast<float>(world_xform[0*4+2]);
+      float dir_y = -static_cast<float>(world_xform[1*4+2]);
+      float dir_z = -static_cast<float>(world_xform[2*4+2]);
+      float len = std::sqrt(dir_x*dir_x + dir_y*dir_y + dir_z*dir_z);
+      if (len > 1e-8f)
+        light.direction = lightrt::Vec3(dir_x/len, dir_y/len, dir_z/len);
+    } else if (ld.type == LYDRA_C_LIGHT_SPHERE) {
+      light.type = scene::LightData::Point;
+      light.position = lightrt::Vec3(
+          static_cast<float>(world_xform[3*4+0]),
+          static_cast<float>(world_xform[3*4+1]),
+          static_cast<float>(world_xform[3*4+2]));
+    } else if (ld.type == LYDRA_C_LIGHT_RECT) {
+      light.type = scene::LightData::Rect;
+      light.position = lightrt::Vec3(
+          static_cast<float>(world_xform[3*4+0]),
+          static_cast<float>(world_xform[3*4+1]),
+          static_cast<float>(world_xform[3*4+2]));
+      // Column 0 = local +X, Column 1 = local +Y, -(Column 2) = outward normal
+      light.rect_axis_u = lightrt::Vec3(
+          static_cast<float>(world_xform[0*4+0]),
+          static_cast<float>(world_xform[1*4+0]),
+          static_cast<float>(world_xform[2*4+0])).normalize();
+      light.rect_axis_v = lightrt::Vec3(
+          static_cast<float>(world_xform[0*4+1]),
+          static_cast<float>(world_xform[1*4+1]),
+          static_cast<float>(world_xform[2*4+1])).normalize();
+      light.direction = lightrt::Vec3(
+          -static_cast<float>(world_xform[0*4+2]),
+          -static_cast<float>(world_xform[1*4+2]),
+          -static_cast<float>(world_xform[2*4+2])).normalize();
+      light.rect_half_width  = ld.width  * 0.5f;
+      light.rect_half_height = ld.height * 0.5f;
+    }
+    out_scene.lights.push_back(light);
+  }
+
+  // DomeLight detection
+  if (P->type_name && strcmp(P->type_name, "DomeLight") == 0) {
+    LydraCDomeLightData dome;
+    lydra_c_extract_dome_light(
+        reinterpret_cast<LusdLayer>(L),
+        reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
+        &dome);
+    if (dome.texture_file && !out_scene.envmap.valid()) {
+      // Resolve relative path against input USD directory
+      std::string tex_path(dome.texture_file);
+      // Get the prim path for diagnostic
+      const char* prim_path = P->name ? P->name : "DomeLight";
+
+      // If relative, resolve against USD file directory
+      // We need to find the USD base dir - stored in walk context
+      // For now, store texture_file path and resolve later in loadUSDScene
+      // Store dome light info in scene for deferred loading
+      float multiplier = dome.intensity * std::pow(2.0f, dome.exposure);
+      // Try to load the texture file
+      // tex_path may be relative to USD file or absolute
+      int w = 0, h = 0, ch = 0;
+      float* hdr_data = stbi_loadf(tex_path.c_str(), &w, &h, &ch, 0);
+      if (!hdr_data && !usd_base_dir.empty() && tex_path[0] != '/') {
+        // Try relative to USD file directory
+        std::string resolved = usd_base_dir + "/" + tex_path;
+        hdr_data = stbi_loadf(resolved.c_str(), &w, &h, &ch, 0);
+        if (hdr_data) tex_path = resolved;
+      }
+      if (!hdr_data) {
+        printf("  DomeLight \"%s\": texture not found at \"%s\"\n", prim_path, tex_path.c_str());
+      }
+      if (hdr_data && w > 0 && h > 0) {
+        scene::EnvmapData& env = out_scene.envmap;
+        env.width = w;
+        env.height = h;
+        env.pixels.resize(static_cast<size_t>(w) * static_cast<size_t>(h) * 3);
+        for (int y = 0; y < h; y++) {
+          for (int x = 0; x < w; x++) {
+            size_t si = (static_cast<size_t>(y) * w + x) * ch;
+            size_t di = (static_cast<size_t>(y) * w + x) * 3;
+            for (int c = 0; c < 3; c++) {
+              float v = (c < ch) ? hdr_data[si + c] : 0.0f;
+              env.pixels[di + c] = v * multiplier * dome.color[c];
+            }
+          }
+        }
+        stbi_image_free(hdr_data);
+        scene::shading::buildEnvmapCDF(env);
+        printf("  DomeLight \"%s\": loaded envmap %dx%d from \"%s\"\n",
+               prim_path, w, h, tex_path.c_str());
+      }
+    }
+  }
+
 recurse:
   // Recurse into children
   for (uint32_t j = 0; j < P->child_count; j++) {
-    walk_prim(L, &L->prim_nodes[P->child_spec_indices[j]], out_scene, mat_map);
+    walk_prim(L, &L->prim_nodes[P->child_spec_indices[j]], out_scene, mat_map, world_xform, usd_base_dir);
   }
 }
 
@@ -357,25 +525,125 @@ static bool loadUSDScene(const std::string& filename, double /*timecode*/,
     collect_materials(L, &L->prim_nodes[L->root_spec_indices[i]], out_scene, mat_map);
   }
 
-  // Pass 2: Extract meshes with material binding
+  // Compute base directory for relative asset path resolution
+  std::string usd_base_dir;
+  {
+    size_t slash_pos = filename.find_last_of("/\\");
+    if (slash_pos != std::string::npos)
+      usd_base_dir = filename.substr(0, slash_pos);
+  }
+
+  // Pass 2: Extract meshes, cameras, lights with xform accumulation
   for (uint32_t i = 0; i < L->root_spec_count; i++) {
-    walk_prim(L, &L->prim_nodes[L->root_spec_indices[i]], out_scene, mat_map);
+    walk_prim(L, &L->prim_nodes[L->root_spec_indices[i]], out_scene, mat_map, kIdentity4d, usd_base_dir);
   }
 
   lusdDestroyLayer(instance, layer);
   lusdDestroyInstance(instance, nullptr);
 
-  printf("Loaded %zu meshes, %zu instances, %zu materials (lightusd-c layer)\n",
+  printf("Loaded %zu meshes, %zu instances, %zu materials, %zu cameras, %zu lights (lightusd-c layer)\n",
          out_scene.meshes.size(), out_scene.instances.size(),
-         out_scene.materials.size());
+         out_scene.materials.size(), out_scene.cameras.size(),
+         out_scene.lights.size());
   return !out_scene.instances.empty();
 }
 
-// Motion blur: xform time-sample API not yet implemented in lightusd-c.
-static void applyMotionBlur(const std::string& /*filename*/,
-                            double /*timecode*/,
-                            double /*shutter_close_offset*/,
-                            scene::Scene& /*scene*/) {}
+// Recursive walk for motion blur: compute close-shutter transforms
+static void walk_prim_mblur(LusdLayer_T* L, const LusdPrim_T* P,
+                             scene::Scene& out_scene,
+                             const double parent_xform[16],
+                             double time_code,
+                             uint32_t& instance_idx) {
+  double local_xform[16];
+  double world_xform[16];
+  int has_local = lydra_c_extract_xform_at(
+      reinterpret_cast<LusdLayer>(L),
+      reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
+      time_code, local_xform);
+  if (has_local == 0) {
+    mat4d_mul(parent_xform, local_xform, world_xform);
+  } else {
+    std::memcpy(world_xform, parent_xform, sizeof(world_xform));
+  }
+
+  if (P->type_name && strcmp(P->type_name, "Mesh") == 0) {
+    if (instance_idx < out_scene.instances.size()) {
+      auto& inst = out_scene.instances[instance_idx];
+      float close_xform[12];
+      mat4d_to_3x4f(world_xform, close_xform);
+
+      // Compare with open transform
+      bool differs = false;
+      for (int k = 0; k < 12; k++) {
+        if (std::abs(close_xform[k] - inst.transform[k]) > 1e-7f) {
+          differs = true;
+          break;
+        }
+      }
+      if (differs) {
+        std::memcpy(inst.transform_close, close_xform, sizeof(close_xform));
+        scene::invert3x4(inst.transform_close, inst.inv_transform_close);
+        inst.has_motion = true;
+        lightrt::AABB close_bounds = scene::transformAABB(
+            out_scene.meshes[inst.mesh_id].local_bounds, inst.transform_close);
+        inst.world_bounds.expand(close_bounds);
+        out_scene.scene_bounds.expand(close_bounds);
+      }
+      instance_idx++;
+    }
+  }
+
+  for (uint32_t j = 0; j < P->child_count; j++) {
+    walk_prim_mblur(L, &L->prim_nodes[P->child_spec_indices[j]],
+                    out_scene, world_xform, time_code, instance_idx);
+  }
+}
+
+static void applyMotionBlur(const std::string& filename,
+                            double timecode,
+                            double shutter_close_offset,
+                            scene::Scene& scene) {
+  if (shutter_close_offset == 0.0) return;
+
+  // Re-open the layer for time-sampled xform reading
+  LusdInstanceCreateInfo inst_info = {};
+  inst_info.sType = LUSD_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+  inst_info.apiVersion = 1;
+  inst_info.pApplicationName = "lightrt_cli";
+  inst_info.applicationVersion = 1;
+
+  LusdInstance instance = LUSD_NULL_HANDLE;
+  if (lusdCreateInstance(&inst_info, nullptr, &instance) != LUSD_SUCCESS) return;
+
+  LusdLayerCreateInfo ci = {};
+  ci.sType = LUSD_STRUCTURE_TYPE_LAYER_CREATE_INFO;
+  ci.pIdentifier = filename.c_str();
+
+  LusdLayer layer = LUSD_NULL_HANDLE;
+  if (lusdCreateLayer(instance, &ci, &layer) != LUSD_SUCCESS) {
+    lusdDestroyInstance(instance, nullptr);
+    return;
+  }
+
+  LusdLayer_T* L = reinterpret_cast<LusdLayer_T*>(layer);
+  double close_time = timecode + shutter_close_offset;
+
+  uint32_t instance_idx = 0;
+  for (uint32_t i = 0; i < L->root_spec_count; i++) {
+    walk_prim_mblur(L, &L->prim_nodes[L->root_spec_indices[i]],
+                    scene, kIdentity4d, close_time, instance_idx);
+  }
+
+  uint32_t motion_count = 0;
+  for (const auto& inst : scene.instances)
+    if (inst.has_motion) motion_count++;
+  if (motion_count > 0)
+    printf("Motion blur: %u/%zu instances have different close-shutter transforms\n",
+           motion_count, scene.instances.size());
+
+  lusdDestroyLayer(instance, layer);
+  lusdDestroyInstance(instance, nullptr);
+}
 
 #else
 // =========================================================================
