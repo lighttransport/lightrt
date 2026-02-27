@@ -193,6 +193,10 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
       uint32_t  tri_idx_count = 0;
       bool owns_tri_idx = false;
 
+      // Build face_to_tri_start mapping for GeomSubset support
+      // face_to_tri_start[fi] = index of first triangle produced by face fi
+      std::vector<uint32_t> face_to_tri_start;
+
       if (mesh_data_c.fvc_count > 0) {
         if (lydra_c_triangulate(mesh_data_c.face_vertex_indices,
                                 mesh_data_c.fvi_count,
@@ -203,6 +207,15 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
           goto recurse;
         }
         owns_tri_idx = true;
+
+        // Compute face-to-triangle start indices
+        face_to_tri_start.resize(mesh_data_c.fvc_count);
+        uint32_t tri_offset = 0;
+        for (uint32_t fi = 0; fi < mesh_data_c.fvc_count; fi++) {
+          face_to_tri_start[fi] = tri_offset;
+          int32_t fvc = mesh_data_c.face_vertex_counts[fi];
+          if (fvc >= 3) tri_offset += static_cast<uint32_t>(fvc - 2);
+        }
       } else {
         // Already triangulated — cast int32_t* to uint32_t*
         tri_idx = reinterpret_cast<uint32_t*>(mesh_data_c.face_vertex_indices);
@@ -240,6 +253,36 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
         }
         md.default_material_id = mat_id;
         md.tri_material_ids.assign(triangles.size(), mat_id);
+
+        // GeomSubset per-face material assignment
+        LydraCGeomSubset* subsets = nullptr;
+        uint32_t subset_count = lydra_c_extract_geom_subsets(
+            reinterpret_cast<LusdLayer>(L),
+            reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
+            &subsets);
+        if (subset_count > 0 && !face_to_tri_start.empty()) {
+          for (uint32_t si = 0; si < subset_count; si++) {
+            int32_t subset_mat_id = -1;
+            if (subsets[si].material_path) {
+              auto it = mat_map.find(subsets[si].material_path);
+              if (it != mat_map.end()) subset_mat_id = it->second;
+            }
+            if (subset_mat_id < 0) continue;
+            for (uint32_t fi_idx = 0; fi_idx < subsets[si].face_count; fi_idx++) {
+              uint32_t fi = static_cast<uint32_t>(subsets[si].face_indices[fi_idx]);
+              if (fi >= face_to_tri_start.size()) continue;
+              int32_t fvc = mesh_data_c.face_vertex_counts[fi];
+              uint32_t tri_start = face_to_tri_start[fi];
+              uint32_t tri_count = (fvc >= 3) ? static_cast<uint32_t>(fvc - 2) : 0;
+              for (uint32_t t = 0; t < tri_count; t++) {
+                uint32_t tri_id = tri_start + t;
+                if (tri_id < md.tri_material_ids.size())
+                  md.tri_material_ids[tri_id] = subset_mat_id;
+              }
+            }
+          }
+          lydra_c_free_geom_subsets(subsets, subset_count);
+        }
 
         lightrt::AABB& lb = md.local_bounds;
         for (const auto& tri : triangles) {
