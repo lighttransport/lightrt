@@ -128,9 +128,58 @@ static CentroidKey makeCentroidKey(const lightrt::Triangle& tri) {
 // lydra::extract_mesh() materializes mesh data from the layer fields.
 // =========================================================================
 
+// Collect all Material prims and extract UsdPreviewSurface data.
+// Builds path→index map for material:binding resolution.
+static void collect_materials(LusdLayer_T* L, const LusdPrim_T* P,
+                              scene::Scene& out_scene,
+                              std::map<std::string, int>& mat_map) {
+  if (P->type_name && strcmp(P->type_name, "Material") == 0) {
+    LydraCMaterialData mat_c;
+    LusdResult r = lydra_c_extract_material(
+        reinterpret_cast<LusdLayer>(L),
+        reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
+        &mat_c);
+    if (r == LUSD_SUCCESS) {
+      // Get prim path for map lookup
+      const char* prim_path = nullptr;
+      if (P->spec_index < L->spec_count) {
+        uint32_t pi = L->specs[P->spec_index].path_index;
+        if (pi < L->path_count) prim_path = L->paths[pi];
+      }
+      if (prim_path) {
+        int idx = static_cast<int>(out_scene.materials.size());
+        mat_map[prim_path] = idx;
+
+        scene::MaterialData mat;
+        mat.base_weight     = 1.0f;
+        mat.base_color      = lightrt::Vec3(mat_c.diffuse_color[0], mat_c.diffuse_color[1], mat_c.diffuse_color[2]);
+        mat.base_metalness  = mat_c.metallic;
+        mat.specular_weight = 1.0f;
+        mat.specular_color  = lightrt::Vec3(mat_c.specular_color[0], mat_c.specular_color[1], mat_c.specular_color[2]);
+        mat.specular_roughness = mat_c.roughness;
+        mat.specular_ior    = mat_c.ior;
+        mat.coat_weight     = mat_c.clearcoat;
+        mat.coat_roughness  = mat_c.clearcoat_roughness;
+        mat.emission_luminance = (mat_c.emissive_color[0] + mat_c.emissive_color[1] + mat_c.emissive_color[2] > 0.0f) ? 1.0f : 0.0f;
+        mat.emission_color  = lightrt::Vec3(mat_c.emissive_color[0], mat_c.emissive_color[1], mat_c.emissive_color[2]);
+        mat.opacity         = mat_c.opacity;
+
+        out_scene.materials.push_back(mat);
+        printf("  Material[%d]: \"%s\" diffuse=(%.2f,%.2f,%.2f) metallic=%.2f roughness=%.2f\n",
+               idx, prim_path,
+               mat_c.diffuse_color[0], mat_c.diffuse_color[1], mat_c.diffuse_color[2],
+               mat_c.metallic, mat_c.roughness);
+      }
+    }
+  }
+  for (uint32_t j = 0; j < P->child_count; j++)
+    collect_materials(L, &L->prim_nodes[P->child_spec_indices[j]], out_scene, mat_map);
+}
+
 // Recursive DFS over prim tree, extracting Mesh prims
 static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
-                      scene::Scene& out_scene) {
+                      scene::Scene& out_scene,
+                      const std::map<std::string, int>& mat_map) {
   // Check if this prim is a Mesh
   if (P->type_name && strcmp(P->type_name, "Mesh") == 0) {
     LydraCMeshData mesh_data_c;
@@ -180,8 +229,17 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
         size_t mi = out_scene.meshes.size();
         out_scene.meshes.emplace_back();
         auto& md = out_scene.meshes.back();
-        md.default_material_id = -1;
-        md.tri_material_ids.assign(triangles.size(), -1);
+        // Resolve material:binding
+        int32_t mat_id = -1;
+        const char* mat_path = lydra_c_resolve_material_binding(
+            reinterpret_cast<LusdLayer>(L),
+            reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)));
+        if (mat_path) {
+          auto it = mat_map.find(mat_path);
+          if (it != mat_map.end()) mat_id = it->second;
+        }
+        md.default_material_id = mat_id;
+        md.tri_material_ids.assign(triangles.size(), mat_id);
 
         lightrt::AABB& lb = md.local_bounds;
         for (const auto& tri : triangles) {
@@ -210,7 +268,7 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
 recurse:
   // Recurse into children
   for (uint32_t j = 0; j < P->child_count; j++) {
-    walk_prim(L, &L->prim_nodes[P->child_spec_indices[j]], out_scene);
+    walk_prim(L, &L->prim_nodes[P->child_spec_indices[j]], out_scene, mat_map);
   }
 }
 
@@ -249,15 +307,24 @@ static bool loadUSDScene(const std::string& filename, double /*timecode*/,
 
   // Walk prim tree via internal Layer/Prim structs
   LusdLayer_T* L = reinterpret_cast<LusdLayer_T*>(layer);
+
+  // Pass 1: Collect materials
+  std::map<std::string, int> mat_map;
   for (uint32_t i = 0; i < L->root_spec_count; i++) {
-    walk_prim(L, &L->prim_nodes[L->root_spec_indices[i]], out_scene);
+    collect_materials(L, &L->prim_nodes[L->root_spec_indices[i]], out_scene, mat_map);
+  }
+
+  // Pass 2: Extract meshes with material binding
+  for (uint32_t i = 0; i < L->root_spec_count; i++) {
+    walk_prim(L, &L->prim_nodes[L->root_spec_indices[i]], out_scene, mat_map);
   }
 
   lusdDestroyLayer(instance, layer);
   lusdDestroyInstance(instance, nullptr);
 
-  printf("Loaded %zu meshes, %zu instances (lightusd-c layer)\n",
-         out_scene.meshes.size(), out_scene.instances.size());
+  printf("Loaded %zu meshes, %zu instances, %zu materials (lightusd-c layer)\n",
+         out_scene.meshes.size(), out_scene.instances.size(),
+         out_scene.materials.size());
   return !out_scene.instances.empty();
 }
 
