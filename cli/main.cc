@@ -136,7 +136,9 @@ static CentroidKey makeCentroidKey(const lightrt::Triangle& tri) {
 // Builds path→index map for material:binding resolution.
 static void collect_materials(LusdLayer_T* L, const LusdPrim_T* P,
                               scene::Scene& out_scene,
-                              std::map<std::string, int>& mat_map) {
+                              std::map<std::string, int>& mat_map,
+                              const std::string& usd_base_dir,
+                              std::map<std::string, int>& tex_map) {
   if (P->type_name && strcmp(P->type_name, "Material") == 0) {
     LydraCOpenPBRData pbr;
     LusdResult r = lydra_c_extract_openpbr(
@@ -209,6 +211,42 @@ static void collect_materials(LusdLayer_T* L, const LusdPrim_T* P,
         // Geometry
         mat.opacity                = pbr.opacity;
 
+        // Load textures referenced by this material
+        auto load_tex = [&](const char* tex_path, int32_t& tex_id) {
+          if (!tex_path) return;
+          char resolved[1024];
+          const char* rp = lydra_c_resolve_asset_path(
+              usd_base_dir.c_str(), tex_path, resolved, sizeof(resolved));
+          if (!rp) return;
+          std::string rpath(rp);
+          auto tex_it = tex_map.find(rpath);
+          if (tex_it != tex_map.end()) { tex_id = tex_it->second; return; }
+          int tw = 0, th = 0, tch = 0;
+          unsigned char* pixels = stbi_load(rpath.c_str(), &tw, &th, &tch, 4);
+          if (!pixels) return;
+          int img_idx = static_cast<int>(out_scene.images.size());
+          out_scene.images.emplace_back();
+          auto& img = out_scene.images.back();
+          img.width = tw; img.height = th;
+          img.pixels.resize(static_cast<size_t>(tw) * th * 4);
+          bool is_hdr = stbi_is_hdr(rpath.c_str());
+          for (size_t pi = 0; pi < static_cast<size_t>(tw) * th * 4; pi++) {
+            float v = pixels[pi] / 255.0f;
+            if (!is_hdr && (pi % 4) < 3) v = std::pow(v, 2.2f); // sRGB→linear (RGB only)
+            img.pixels[pi] = v;
+          }
+          stbi_image_free(pixels);
+          tex_map[rpath] = img_idx;
+          tex_id = img_idx;
+          printf("    Texture[%d]: \"%s\" %dx%d\n", img_idx, rpath.c_str(), tw, th);
+        };
+        load_tex(pbr.base_color_tex, mat.base_color_tex_id);
+        load_tex(pbr.metalness_tex, mat.metalness_tex_id);
+        load_tex(pbr.roughness_tex, mat.roughness_tex_id);
+        load_tex(pbr.normal_tex, mat.normal_tex_id);
+        load_tex(pbr.emissive_tex, mat.emissive_tex_id);
+        load_tex(pbr.opacity_tex, mat.opacity_tex_id);
+
         out_scene.materials.push_back(mat);
         printf("  Material[%d]: \"%s\" base=(%.2f,%.2f,%.2f) metallic=%.2f roughness=%.2f%s\n",
                idx, prim_path,
@@ -219,7 +257,7 @@ static void collect_materials(LusdLayer_T* L, const LusdPrim_T* P,
     }
   }
   for (uint32_t j = 0; j < P->child_count; j++)
-    collect_materials(L, &L->prim_nodes[P->child_spec_indices[j]], out_scene, mat_map);
+    collect_materials(L, &L->prim_nodes[P->child_spec_indices[j]], out_scene, mat_map, usd_base_dir, tex_map);
 }
 
 // Recursive DFS over prim tree, extracting Mesh prims
@@ -309,10 +347,33 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
         tri_idx_count = mesh_data_c.fvi_count;
       }
 
-      // Build lightrt triangles
+      // Build lightrt triangles + per-triangle UVs and normals (pre-BVH order)
       uint32_t pt_count = mesh_data_c.point_count;
       std::vector<lightrt::Triangle> triangles;
+      std::vector<float> pre_uvs;     // 6 floats per tri
+      std::vector<float> pre_normals; // 9 floats per tri
       triangles.reserve(tri_idx_count / 3);
+
+      // Compute smooth normals if no authored normals
+      float* smooth_norms = nullptr;
+      bool has_authored_normals = (mesh_data_c.normals != nullptr && mesh_data_c.normal_count > 0);
+      bool normals_facevarying = false;
+      if (has_authored_normals) {
+        // Determine interpolation: facevarying if count matches fvi, vertex if matches points
+        normals_facevarying = (mesh_data_c.normal_count == mesh_data_c.fvi_count);
+      } else {
+        // Compute area-weighted smooth normals per vertex
+        lydra_c_compute_smooth_normals(
+            mesh_data_c.points, pt_count,
+            reinterpret_cast<uint32_t*>(mesh_data_c.face_vertex_indices),
+            mesh_data_c.fvi_count,
+            &smooth_norms);
+      }
+
+      // Determine UV interpolation mode
+      bool has_uvs = (mesh_data_c.uvs != nullptr && mesh_data_c.uv_count > 0);
+      bool uvs_facevarying = has_uvs && (mesh_data_c.uv_count == mesh_data_c.fvi_count);
+
       for (uint32_t i = 0; i + 2 < tri_idx_count; i += 3) {
         uint32_t i0 = tri_idx[i], i1 = tri_idx[i + 1], i2 = tri_idx[i + 2];
         if (i0 >= pt_count || i1 >= pt_count || i2 >= pt_count) continue;
@@ -321,8 +382,43 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
         tri.v1 = lightrt::Vec3(mesh_data_c.points[i1*3], mesh_data_c.points[i1*3+1], mesh_data_c.points[i1*3+2]);
         tri.v2 = lightrt::Vec3(mesh_data_c.points[i2*3], mesh_data_c.points[i2*3+1], mesh_data_c.points[i2*3+2]);
         triangles.push_back(tri);
+
+        // Per-triangle UVs
+        if (has_uvs) {
+          if (uvs_facevarying) {
+            pre_uvs.push_back(mesh_data_c.uvs[i*2+0]); pre_uvs.push_back(mesh_data_c.uvs[i*2+1]);
+            pre_uvs.push_back(mesh_data_c.uvs[(i+1)*2+0]); pre_uvs.push_back(mesh_data_c.uvs[(i+1)*2+1]);
+            pre_uvs.push_back(mesh_data_c.uvs[(i+2)*2+0]); pre_uvs.push_back(mesh_data_c.uvs[(i+2)*2+1]);
+          } else {
+            // Vertex-indexed
+            pre_uvs.push_back(mesh_data_c.uvs[i0*2+0]); pre_uvs.push_back(mesh_data_c.uvs[i0*2+1]);
+            pre_uvs.push_back(mesh_data_c.uvs[i1*2+0]); pre_uvs.push_back(mesh_data_c.uvs[i1*2+1]);
+            pre_uvs.push_back(mesh_data_c.uvs[i2*2+0]); pre_uvs.push_back(mesh_data_c.uvs[i2*2+1]);
+          }
+        }
+
+        // Per-triangle normals
+        if (has_authored_normals) {
+          const float* n = mesh_data_c.normals;
+          if (normals_facevarying) {
+            pre_normals.push_back(n[i*3+0]); pre_normals.push_back(n[i*3+1]); pre_normals.push_back(n[i*3+2]);
+            pre_normals.push_back(n[(i+1)*3+0]); pre_normals.push_back(n[(i+1)*3+1]); pre_normals.push_back(n[(i+1)*3+2]);
+            pre_normals.push_back(n[(i+2)*3+0]); pre_normals.push_back(n[(i+2)*3+1]); pre_normals.push_back(n[(i+2)*3+2]);
+          } else {
+            // Vertex-indexed
+            pre_normals.push_back(n[i0*3+0]); pre_normals.push_back(n[i0*3+1]); pre_normals.push_back(n[i0*3+2]);
+            pre_normals.push_back(n[i1*3+0]); pre_normals.push_back(n[i1*3+1]); pre_normals.push_back(n[i1*3+2]);
+            pre_normals.push_back(n[i2*3+0]); pre_normals.push_back(n[i2*3+1]); pre_normals.push_back(n[i2*3+2]);
+          }
+        } else if (smooth_norms) {
+          // Smooth normals are always vertex-indexed
+          pre_normals.push_back(smooth_norms[i0*3+0]); pre_normals.push_back(smooth_norms[i0*3+1]); pre_normals.push_back(smooth_norms[i0*3+2]);
+          pre_normals.push_back(smooth_norms[i1*3+0]); pre_normals.push_back(smooth_norms[i1*3+1]); pre_normals.push_back(smooth_norms[i1*3+2]);
+          pre_normals.push_back(smooth_norms[i2*3+0]); pre_normals.push_back(smooth_norms[i2*3+1]); pre_normals.push_back(smooth_norms[i2*3+2]);
+        }
       }
 
+      if (smooth_norms) free(smooth_norms);
       if (owns_tri_idx) free(tri_idx);
 
       if (!triangles.empty()) {
@@ -339,7 +435,9 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
           if (it != mat_map.end()) mat_id = it->second;
         }
         md.default_material_id = mat_id;
-        md.tri_material_ids.assign(triangles.size(), mat_id);
+
+        // Build pre-BVH material IDs, UVs, normals
+        std::vector<int32_t> pre_mat_ids(triangles.size(), mat_id);
 
         // GeomSubset per-face material assignment
         LydraCGeomSubset* subsets = nullptr;
@@ -363,19 +461,44 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
               uint32_t tri_count = (fvc >= 3) ? static_cast<uint32_t>(fvc - 2) : 0;
               for (uint32_t t = 0; t < tri_count; t++) {
                 uint32_t tri_id = tri_start + t;
-                if (tri_id < md.tri_material_ids.size())
-                  md.tri_material_ids[tri_id] = subset_mat_id;
+                if (tri_id < pre_mat_ids.size())
+                  pre_mat_ids[tri_id] = subset_mat_id;
               }
             }
           }
           lydra_c_free_geom_subsets(subsets, subset_count);
         }
 
+        // Build centroid map for BVH reorder remapping
+        std::multimap<CentroidKey, size_t> centroid_map;
+        for (size_t ti = 0; ti < triangles.size(); ti++)
+          centroid_map.insert({makeCentroidKey(triangles[ti]), ti});
+
         lightrt::AABB& lb = md.local_bounds;
         for (const auto& tri : triangles) {
           lb.expand(tri.v0); lb.expand(tri.v1); lb.expand(tri.v2);
         }
         md.bvh.build(triangles);
+
+        // Remap material IDs, UVs, normals to match BVH triangle order
+        const auto& reordered = md.bvh.getTriangles();
+        size_t num_tris = reordered.size();
+        md.tri_material_ids.resize(num_tris);
+        if (!pre_uvs.empty()) md.tri_uvs.resize(num_tris * 6);
+        if (!pre_normals.empty()) md.tri_normals.resize(num_tris * 9);
+
+        for (size_t ti = 0; ti < num_tris; ti++) {
+          CentroidKey key = makeCentroidKey(reordered[ti]);
+          auto range = centroid_map.equal_range(key);
+          size_t orig = (range.first != range.second) ? range.first->second : ti;
+          if (range.first != range.second) centroid_map.erase(range.first);
+
+          md.tri_material_ids[ti] = (orig < pre_mat_ids.size()) ? pre_mat_ids[orig] : mat_id;
+          if (!pre_uvs.empty() && orig * 6 + 5 < pre_uvs.size())
+            std::memcpy(&md.tri_uvs[ti * 6], &pre_uvs[orig * 6], 6 * sizeof(float));
+          if (!pre_normals.empty() && orig * 9 + 8 < pre_normals.size())
+            std::memcpy(&md.tri_normals[ti * 9], &pre_normals[orig * 9], 9 * sizeof(float));
+        }
 
         scene::Instance inst;
         inst.mesh_id = static_cast<uint32_t>(mi);
@@ -568,18 +691,19 @@ static bool loadUSDScene(const std::string& filename, double /*timecode*/,
   // Walk prim tree via internal Layer/Prim structs
   LusdLayer_T* L = reinterpret_cast<LusdLayer_T*>(layer);
 
-  // Pass 1: Collect materials
-  std::map<std::string, int> mat_map;
-  for (uint32_t i = 0; i < L->root_spec_count; i++) {
-    collect_materials(L, &L->prim_nodes[L->root_spec_indices[i]], out_scene, mat_map);
-  }
-
   // Compute base directory for relative asset path resolution
   std::string usd_base_dir;
   {
     size_t slash_pos = filename.find_last_of("/\\");
     if (slash_pos != std::string::npos)
       usd_base_dir = filename.substr(0, slash_pos);
+  }
+
+  // Pass 1: Collect materials (needs usd_base_dir for texture loading)
+  std::map<std::string, int> mat_map;
+  std::map<std::string, int> tex_map;
+  for (uint32_t i = 0; i < L->root_spec_count; i++) {
+    collect_materials(L, &L->prim_nodes[L->root_spec_indices[i]], out_scene, mat_map, usd_base_dir, tex_map);
   }
 
   // Pass 2: Extract meshes, cameras, lights with xform accumulation
@@ -1203,6 +1327,76 @@ static const scene::MaterialData& resolveMaterial(const scene::Scene& scene,
   return kDefaultMat;
 }
 
+// Bilinear image sample with repeat wrap
+static lightrt::Vec3 sampleImage(const scene::ImageData& img, float u, float v) {
+  // Repeat wrap
+  u = u - std::floor(u);
+  v = v - std::floor(v);
+  float fx = u * img.width - 0.5f;
+  float fy = v * img.height - 0.5f;
+  int x0 = static_cast<int>(std::floor(fx));
+  int y0 = static_cast<int>(std::floor(fy));
+  float sx = fx - x0;
+  float sy = fy - y0;
+  auto fetch = [&](int x, int y) -> lightrt::Vec3 {
+    x = ((x % img.width) + img.width) % img.width;
+    y = ((y % img.height) + img.height) % img.height;
+    size_t idx = (static_cast<size_t>(y) * img.width + x) * 4;
+    return lightrt::Vec3(img.pixels[idx], img.pixels[idx+1], img.pixels[idx+2]);
+  };
+  lightrt::Vec3 c00 = fetch(x0, y0), c10 = fetch(x0+1, y0);
+  lightrt::Vec3 c01 = fetch(x0, y0+1), c11 = fetch(x0+1, y0+1);
+  return (c00 * (1-sx) + c10 * sx) * (1-sy) + (c01 * (1-sx) + c11 * sx) * sy;
+}
+
+static float sampleImageChannel(const scene::ImageData& img, float u, float v, int ch) {
+  u = u - std::floor(u);
+  v = v - std::floor(v);
+  float fx = u * img.width - 0.5f;
+  float fy = v * img.height - 0.5f;
+  int x0 = static_cast<int>(std::floor(fx));
+  int y0 = static_cast<int>(std::floor(fy));
+  float sx = fx - x0;
+  float sy = fy - y0;
+  auto fetch = [&](int x, int y) -> float {
+    x = ((x % img.width) + img.width) % img.width;
+    y = ((y % img.height) + img.height) % img.height;
+    return img.pixels[(static_cast<size_t>(y) * img.width + x) * 4 + ch];
+  };
+  return (fetch(x0,y0)*(1-sx) + fetch(x0+1,y0)*sx) * (1-sy)
+       + (fetch(x0,y0+1)*(1-sx) + fetch(x0+1,y0+1)*sx) * sy;
+}
+
+// Resolve material with texture overrides at hit UV
+static scene::MaterialData resolveMaterialTextured(const scene::Scene& scene,
+                                                    const scene::HitInfo& hit) {
+  scene::MaterialData mat = resolveMaterial(scene, hit);
+
+  const auto& mesh = scene.meshes[scene.instances[hit.instance_id].mesh_id];
+  if (mesh.tri_uvs.empty()) return mat;
+  if (hit.triangle_id * 6 + 5 >= mesh.tri_uvs.size()) return mat;
+
+  // Interpolate UV
+  float w = 1.0f - hit.u - hit.v;
+  size_t uv_base = hit.triangle_id * 6;
+  float tex_u = mesh.tri_uvs[uv_base+0]*w + mesh.tri_uvs[uv_base+2]*hit.u + mesh.tri_uvs[uv_base+4]*hit.v;
+  float tex_v = mesh.tri_uvs[uv_base+1]*w + mesh.tri_uvs[uv_base+3]*hit.u + mesh.tri_uvs[uv_base+5]*hit.v;
+
+  // Override material fields from textures
+  if (mat.base_color_tex_id >= 0 && static_cast<size_t>(mat.base_color_tex_id) < scene.images.size())
+    mat.base_color = sampleImage(scene.images[mat.base_color_tex_id], tex_u, tex_v);
+  if (mat.metalness_tex_id >= 0 && static_cast<size_t>(mat.metalness_tex_id) < scene.images.size())
+    mat.base_metalness = sampleImageChannel(scene.images[mat.metalness_tex_id], tex_u, tex_v, 0);
+  if (mat.roughness_tex_id >= 0 && static_cast<size_t>(mat.roughness_tex_id) < scene.images.size())
+    mat.specular_roughness = sampleImageChannel(scene.images[mat.roughness_tex_id], tex_u, tex_v, 0);
+  if (mat.emissive_tex_id >= 0 && static_cast<size_t>(mat.emissive_tex_id) < scene.images.size())
+    mat.emission_color = sampleImage(scene.images[mat.emissive_tex_id], tex_u, tex_v);
+  if (mat.opacity_tex_id >= 0 && static_cast<size_t>(mat.opacity_tex_id) < scene.images.size())
+    mat.opacity = sampleImageChannel(scene.images[mat.opacity_tex_id], tex_u, tex_v, 0);
+
+  return mat;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Random-Walk Subsurface Scattering
 //
@@ -1222,12 +1416,26 @@ struct SSSResult {
 };
 
 // Compute the outward world-space normal for triangle `tri_id` in instance `inst`.
+// Uses smooth normals at barycentric (u,v) if available.
 static lightrt::Vec3 computeWorldNormal(const scene::Scene& scene,
-                                         uint32_t inst_id, uint32_t tri_id) {
+                                         uint32_t inst_id, uint32_t tri_id,
+                                         float u = 0.333f, float v = 0.333f) {
     const auto& inst = scene.instances[inst_id];
-    const auto& tris = scene.meshes[inst.mesh_id].bvh.getTriangles();
-    const auto& tri  = tris[tri_id];
-    lightrt::Vec3 local_n = (tri.v1 - tri.v0).cross(tri.v2 - tri.v0).normalize();
+    const auto& mesh = scene.meshes[inst.mesh_id];
+    lightrt::Vec3 local_n;
+    if (!mesh.tri_normals.empty() && tri_id * 9 + 8 < mesh.tri_normals.size()) {
+        size_t nb = tri_id * 9;
+        float w = 1.0f - u - v;
+        local_n = lightrt::Vec3(
+            mesh.tri_normals[nb+0]*w + mesh.tri_normals[nb+3]*u + mesh.tri_normals[nb+6]*v,
+            mesh.tri_normals[nb+1]*w + mesh.tri_normals[nb+4]*u + mesh.tri_normals[nb+7]*v,
+            mesh.tri_normals[nb+2]*w + mesh.tri_normals[nb+5]*u + mesh.tri_normals[nb+8]*v
+        ).normalize();
+    } else {
+        const auto& tris = mesh.bvh.getTriangles();
+        const auto& tri  = tris[tri_id];
+        local_n = (tri.v1 - tri.v0).cross(tri.v2 - tri.v0).normalize();
+    }
     return scene::transformNormal(inst.inv_transform, local_n).normalize();
 }
 
@@ -1326,7 +1534,8 @@ static SSSResult randomWalkSSS(
             // (i.e. outward from the surface toward the exterior world).
             lightrt::Vec3 exit_N = computeWorldNormal(scene,
                                                        hit.instance_id,
-                                                       hit.triangle_id);
+                                                       hit.triangle_id,
+                                                       hit.u, hit.v);
             if (exit_N.dot(ray_dir) < 0.0f) exit_N = exit_N * -1.0f;
 
             // Clamp throughput components: individual channels can grow before
@@ -1452,10 +1661,21 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
           const auto& tris = mesh_blas.bvh.getTriangles();
           const auto& tri = tris[hit.triangle_id];
 
-          // Compute local normal
-          lightrt::Vec3 e1 = tri.v1 - tri.v0;
-          lightrt::Vec3 e2 = tri.v2 - tri.v0;
-          lightrt::Vec3 local_n = e1.cross(e2).normalize();
+          // Compute local normal (smooth if available)
+          lightrt::Vec3 local_n;
+          if (!mesh_blas.tri_normals.empty() && hit.triangle_id * 9 + 8 < mesh_blas.tri_normals.size()) {
+            size_t nb = hit.triangle_id * 9;
+            float w = 1.0f - hit.u - hit.v;
+            local_n = lightrt::Vec3(
+              mesh_blas.tri_normals[nb+0]*w + mesh_blas.tri_normals[nb+3]*hit.u + mesh_blas.tri_normals[nb+6]*hit.v,
+              mesh_blas.tri_normals[nb+1]*w + mesh_blas.tri_normals[nb+4]*hit.u + mesh_blas.tri_normals[nb+7]*hit.v,
+              mesh_blas.tri_normals[nb+2]*w + mesh_blas.tri_normals[nb+5]*hit.u + mesh_blas.tri_normals[nb+8]*hit.v
+            ).normalize();
+          } else {
+            lightrt::Vec3 e1 = tri.v1 - tri.v0;
+            lightrt::Vec3 e2 = tri.v2 - tri.v0;
+            local_n = e1.cross(e2).normalize();
+          }
 
           // Transform normal to world space
           lightrt::Vec3 N = scene::transformNormal(inst.inv_transform, local_n).normalize();
@@ -1465,7 +1685,7 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
           lightrt::Vec3 hit_pos = cam_pos + dir * hit.t;
           float bias = 0.001f;
 
-          const scene::MaterialData& mat = resolveMaterial(scene, hit);
+          const scene::MaterialData mat = resolveMaterialTextured(scene, hit);
 
           // Emission
           if (mat.emission_luminance > 0.0f) {

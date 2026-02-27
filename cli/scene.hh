@@ -31,11 +31,18 @@ using lightrt_common::transformDir;
 using lightrt_common::transformNormal;
 using lightrt_common::transformAABB;
 
+struct ImageData {
+  std::vector<float> pixels; // width*height*4 RGBA linear float
+  int width = 0, height = 0;
+};
+
 struct MeshBLAS {
   lightrt::TriangleBVH bvh;
   lightrt::AABB local_bounds;
   std::vector<int32_t> tri_material_ids;
   int32_t default_material_id = -1;
+  std::vector<float> tri_uvs;     // num_tris * 6 (u0,v0,u1,v1,u2,v2)
+  std::vector<float> tri_normals; // num_tris * 9 (nx0,ny0,nz0,...per vertex)
 };
 
 struct Instance {
@@ -73,6 +80,7 @@ struct Scene {
   std::vector<MaterialData> materials;
   std::vector<LightData> lights;
   EnvmapData envmap;
+  std::vector<ImageData> images;
   lightrt::AABB scene_bounds;
 };
 
