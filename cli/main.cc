@@ -435,10 +435,12 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
       // Get the prim path for diagnostic
       const char* prim_path = P->name ? P->name : "DomeLight";
 
-      // If relative, resolve against USD file directory
-      // We need to find the USD base dir - stored in walk context
-      // For now, store texture_file path and resolve later in loadUSDScene
-      // Store dome light info in scene for deferred loading
+      // Normalize path separators (Windows → Unix)
+      for (auto& c : tex_path) { if (c == '\\') c = '/'; }
+      // Remove leading "./" prefix
+      if (tex_path.size() >= 2 && tex_path[0] == '.' && tex_path[1] == '/')
+        tex_path = tex_path.substr(2);
+
       float multiplier = dome.intensity * std::pow(2.0f, dome.exposure);
       // Try to load the texture file
       // tex_path may be relative to USD file or absolute
