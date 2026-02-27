@@ -138,13 +138,12 @@ static void collect_materials(LusdLayer_T* L, const LusdPrim_T* P,
                               scene::Scene& out_scene,
                               std::map<std::string, int>& mat_map) {
   if (P->type_name && strcmp(P->type_name, "Material") == 0) {
-    LydraCMaterialData mat_c;
-    LusdResult r = lydra_c_extract_material(
+    LydraCOpenPBRData pbr;
+    LusdResult r = lydra_c_extract_openpbr(
         reinterpret_cast<LusdLayer>(L),
         reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
-        &mat_c);
+        &pbr);
     if (r == LUSD_SUCCESS) {
-      // Get prim path for map lookup
       const char* prim_path = nullptr;
       if (P->spec_index < L->spec_count) {
         uint32_t pi = L->specs[P->spec_index].path_index;
@@ -155,24 +154,67 @@ static void collect_materials(LusdLayer_T* L, const LusdPrim_T* P,
         mat_map[prim_path] = idx;
 
         scene::MaterialData mat;
-        mat.base_weight     = 1.0f;
-        mat.base_color      = lightrt::Vec3(mat_c.diffuse_color[0], mat_c.diffuse_color[1], mat_c.diffuse_color[2]);
-        mat.base_metalness  = mat_c.metallic;
-        mat.specular_weight = 1.0f;
-        mat.specular_color  = lightrt::Vec3(mat_c.specular_color[0], mat_c.specular_color[1], mat_c.specular_color[2]);
-        mat.specular_roughness = mat_c.roughness;
-        mat.specular_ior    = mat_c.ior;
-        mat.coat_weight     = mat_c.clearcoat;
-        mat.coat_roughness  = mat_c.clearcoat_roughness;
-        mat.emission_luminance = (mat_c.emissive_color[0] + mat_c.emissive_color[1] + mat_c.emissive_color[2] > 0.0f) ? 1.0f : 0.0f;
-        mat.emission_color  = lightrt::Vec3(mat_c.emissive_color[0], mat_c.emissive_color[1], mat_c.emissive_color[2]);
-        mat.opacity         = mat_c.opacity;
+        // Base
+        mat.base_weight            = pbr.base_weight;
+        mat.base_color             = lightrt::Vec3(pbr.base_color[0], pbr.base_color[1], pbr.base_color[2]);
+        mat.base_roughness         = pbr.base_roughness;
+        mat.base_metalness         = pbr.base_metalness;
+        mat.base_diffuse_roughness = pbr.base_diffuse_roughness;
+        // Specular
+        mat.specular_weight        = pbr.specular_weight;
+        mat.specular_color         = lightrt::Vec3(pbr.specular_color[0], pbr.specular_color[1], pbr.specular_color[2]);
+        mat.specular_roughness     = pbr.specular_roughness;
+        mat.specular_ior           = pbr.specular_ior;
+        mat.specular_ior_level     = pbr.specular_ior_level;
+        mat.specular_anisotropy    = pbr.specular_anisotropy;
+        mat.specular_rotation      = pbr.specular_rotation;
+        // Transmission
+        mat.transmission_weight    = pbr.transmission_weight;
+        mat.transmission_color     = lightrt::Vec3(pbr.transmission_color[0], pbr.transmission_color[1], pbr.transmission_color[2]);
+        mat.transmission_depth     = pbr.transmission_depth;
+        mat.transmission_scatter   = lightrt::Vec3(pbr.transmission_scatter[0], pbr.transmission_scatter[1], pbr.transmission_scatter[2]);
+        mat.transmission_scatter_anisotropy = pbr.transmission_scatter_anisotropy;
+        mat.transmission_dispersion = pbr.transmission_dispersion;
+        // Subsurface
+        mat.subsurface_weight      = pbr.subsurface_weight;
+        mat.subsurface_color       = lightrt::Vec3(pbr.subsurface_color[0], pbr.subsurface_color[1], pbr.subsurface_color[2]);
+        mat.subsurface_radius      = pbr.subsurface_radius;
+        mat.subsurface_radius_scale = lightrt::Vec3(pbr.subsurface_radius_scale[0], pbr.subsurface_radius_scale[1], pbr.subsurface_radius_scale[2]);
+        mat.subsurface_scale       = pbr.subsurface_scale;
+        mat.subsurface_anisotropy  = pbr.subsurface_anisotropy;
+        // Sheen
+        mat.sheen_weight           = pbr.sheen_weight;
+        mat.sheen_color            = lightrt::Vec3(pbr.sheen_color[0], pbr.sheen_color[1], pbr.sheen_color[2]);
+        mat.sheen_roughness        = pbr.sheen_roughness;
+        // Fuzz
+        mat.fuzz_weight            = pbr.fuzz_weight;
+        mat.fuzz_color             = lightrt::Vec3(pbr.fuzz_color[0], pbr.fuzz_color[1], pbr.fuzz_color[2]);
+        mat.fuzz_roughness         = pbr.fuzz_roughness;
+        // Thin Film
+        mat.thin_film_weight       = pbr.thin_film_weight;
+        mat.thin_film_thickness    = pbr.thin_film_thickness;
+        mat.thin_film_ior          = pbr.thin_film_ior;
+        // Coat
+        mat.coat_weight            = pbr.coat_weight;
+        mat.coat_color             = lightrt::Vec3(pbr.coat_color[0], pbr.coat_color[1], pbr.coat_color[2]);
+        mat.coat_roughness         = pbr.coat_roughness;
+        mat.coat_anisotropy        = pbr.coat_anisotropy;
+        mat.coat_rotation          = pbr.coat_rotation;
+        mat.coat_ior               = pbr.coat_ior;
+        mat.coat_affect_color      = lightrt::Vec3(pbr.coat_affect_color[0], pbr.coat_affect_color[1], pbr.coat_affect_color[2]);
+        mat.coat_affect_roughness  = pbr.coat_affect_roughness;
+        // Emission
+        mat.emission_luminance     = pbr.emission_luminance;
+        mat.emission_color         = lightrt::Vec3(pbr.emission_color[0], pbr.emission_color[1], pbr.emission_color[2]);
+        // Geometry
+        mat.opacity                = pbr.opacity;
 
         out_scene.materials.push_back(mat);
-        printf("  Material[%d]: \"%s\" diffuse=(%.2f,%.2f,%.2f) metallic=%.2f roughness=%.2f\n",
+        printf("  Material[%d]: \"%s\" base=(%.2f,%.2f,%.2f) metallic=%.2f roughness=%.2f%s\n",
                idx, prim_path,
-               mat_c.diffuse_color[0], mat_c.diffuse_color[1], mat_c.diffuse_color[2],
-               mat_c.metallic, mat_c.roughness);
+               pbr.base_color[0], pbr.base_color[1], pbr.base_color[2],
+               pbr.base_metalness, pbr.specular_roughness,
+               pbr.is_openpbr ? " [OpenPBR]" : "");
       }
     }
   }
@@ -363,6 +405,8 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
     cam.fov_y_rad = 2.0f * std::atan(0.5f * cam_data.vertical_aperture / cam_data.focal_length);
     cam.znear = cam_data.znear;
     cam.zfar = cam_data.zfar;
+    cam.shutter_open = cam_data.shutter_open;
+    cam.shutter_close = cam_data.shutter_close;
     mat4d_to_4x4f(world_xform, cam.transform);
     out_scene.cameras.push_back(cam);
   }
@@ -456,6 +500,8 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
         printf("  DomeLight \"%s\": texture not found at \"%s\"\n", prim_path, tex_path.c_str());
       }
       if (hdr_data && w > 0 && h > 0) {
+        // Check if the source is an LDR image (needs sRGB→linear conversion)
+        bool is_ldr = !stbi_is_hdr(tex_path.c_str());
         scene::EnvmapData& env = out_scene.envmap;
         env.width = w;
         env.height = h;
@@ -466,6 +512,7 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
             size_t di = (static_cast<size_t>(y) * w + x) * 3;
             for (int c = 0; c < 3; c++) {
               float v = (c < ch) ? hdr_data[si + c] : 0.0f;
+              if (is_ldr) v = std::pow(v, 2.2f); // sRGB→linear
               env.pixels[di + c] = v * multiplier * dome.color[c];
             }
           }
