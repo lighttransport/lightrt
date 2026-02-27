@@ -71,6 +71,14 @@ struct OpenPBRMaterial {
 
   // --- Geometry ---
   float          opacity               = 1.0f;
+
+  // --- Texture image indices (-1 = none) ---
+  int32_t        base_color_tex_id     = -1;
+  int32_t        metalness_tex_id      = -1;
+  int32_t        roughness_tex_id      = -1;
+  int32_t        normal_tex_id         = -1;
+  int32_t        emissive_tex_id       = -1;
+  int32_t        opacity_tex_id        = -1;
 };
 
 // Backward-compatibility alias.
