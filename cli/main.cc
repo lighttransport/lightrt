@@ -139,6 +139,7 @@ static void collect_materials(LusdLayer_T* L, const LusdPrim_T* P,
                               std::map<std::string, int>& mat_map,
                               const std::string& usd_base_dir,
                               std::map<std::string, int>& tex_map) {
+  //fprintf(stderr, "collect_materials: path=%s type=%s\n", P->name?P->name:"?", P->type_name?P->type_name:"NULL");
   if (P->type_name && strcmp(P->type_name, "Material") == 0) {
     LydraCOpenPBRData pbr;
     LusdResult r = lydra_c_extract_openpbr(
