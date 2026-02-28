@@ -784,11 +784,12 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
       if (len > 1e-8f)
         light.direction = lightrt::Vec3(dir_x/len, dir_y/len, dir_z/len);
     } else if (ld.type == LYDRA_C_LIGHT_SPHERE) {
-      light.type = scene::LightData::Point;
+      light.type = scene::LightData::Sphere;
       light.position = lightrt::Vec3(
           static_cast<float>(world_xform[3*4+0]),
           static_cast<float>(world_xform[3*4+1]),
           static_cast<float>(world_xform[3*4+2]));
+      light.radius = std::max(0.0f, ld.radius);
     } else if (ld.type == LYDRA_C_LIGHT_RECT) {
       light.type = scene::LightData::Rect;
       light.position = lightrt::Vec3(
@@ -915,6 +916,7 @@ static bool loadUSDScene(const std::string& filename, double /*timecode*/,
 
   // Walk prim tree via internal Layer/Prim structs
   LusdLayer_T* L = reinterpret_cast<LusdLayer_T*>(layer);
+  out_scene.up_axis = L->metas.up_axis;
 
   // Compute base directory for relative asset path resolution.
   // For USDZ, lusd__read_usdz_file() updates layer->identifier to point at the
@@ -1222,13 +1224,19 @@ static void extractLights(const tinyusdz::tydra::RenderScene& render_scene,
       } else {
         light.direction = lightrt::Vec3(rl.direction[0], rl.direction[1], rl.direction[2]).normalize();
       }
-    } else if (rl.type == tinyusdz::tydra::RenderLight::Type::Point ||
-               rl.type == tinyusdz::tydra::RenderLight::Type::Sphere) {
+    } else if (rl.type == tinyusdz::tydra::RenderLight::Type::Point) {
       light.type = scene::LightData::Point;
       light.position = lightrt::Vec3(
         static_cast<float>(rl.transform.m[3][0]),
         static_cast<float>(rl.transform.m[3][1]),
         static_cast<float>(rl.transform.m[3][2]));
+    } else if (rl.type == tinyusdz::tydra::RenderLight::Type::Sphere) {
+      light.type = scene::LightData::Sphere;
+      light.position = lightrt::Vec3(
+        static_cast<float>(rl.transform.m[3][0]),
+        static_cast<float>(rl.transform.m[3][1]),
+        static_cast<float>(rl.transform.m[3][2]));
+      light.radius = std::max(0.0f, static_cast<float>(rl.radius));
     } else if (rl.type == tinyusdz::tydra::RenderLight::Type::Rect) {
       light.type     = scene::LightData::Rect;
       light.position = lightrt::Vec3(
@@ -1329,6 +1337,14 @@ static bool loadUSDScene(const std::string& filename, double timecode,
   if (!ret) {
     fprintf(stderr, "USD load error: %s\n", err.c_str());
     return false;
+  }
+
+  // Preserve USD upAxis so fallback camera up vector matches scene convention.
+  {
+    tinyusdz::Axis ax = stage.metas().upAxis.get_value();
+    if (ax == tinyusdz::Axis::Z) out_scene.up_axis = 1;
+    else if (ax == tinyusdz::Axis::X) out_scene.up_axis = 2;
+    else out_scene.up_axis = 0; // Y (default)
   }
 
   if (timecode < -1e29) {
@@ -2004,6 +2020,7 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
             color = color + mat.base_color * shade;
           } else {
             // ── Analytic light loop ─────────────────────────────────────────────
+            constexpr float kTwoPi = 6.28318530718f;
             for (const auto& light : scene.lights) {
               lightrt::Vec3 L;
               float light_dist = 1e20f;
@@ -2018,6 +2035,31 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
                 light_dist = to_light.length();
                 if (light_dist < 1e-6f) continue;
                 L = to_light * (1.0f / light_dist);
+              } else if (light.type == scene::LightData::Sphere) {
+                if (light.radius <= 0.0f) {
+                  lightrt::Vec3 to_light = light.position - hit_pos;
+                  light_dist = to_light.length();
+                  if (light_dist < 1e-6f) continue;
+                  L = to_light * (1.0f / light_dist);
+                  geom_factor = 1.0f / (light_dist * light_dist);
+                } else {
+                  // Sample a random point on the sphere surface (uniform area)
+                  float u1 = dist01(rng);
+                  float u2 = dist01(rng);
+                  float z = 1.0f - 2.0f * u1;
+                  float r = std::sqrt(std::max(0.0f, 1.0f - z * z));
+                  float phi = kTwoPi * u2;
+                  lightrt::Vec3 normal(r * std::cos(phi), r * std::sin(phi), z);
+                  lightrt::Vec3 sample_pos = light.position + normal * light.radius;
+                  lightrt::Vec3 to_light = sample_pos - hit_pos;
+                  light_dist = to_light.length();
+                  if (light_dist < 1e-6f) continue;
+                  L = to_light * (1.0f / light_dist);
+                  float cos_emit = normal.dot(L * -1.0f);
+                  if (cos_emit <= 0.0f) continue;
+                  float sphere_area = 4.0f * 3.14159265f * light.radius * light.radius;
+                  geom_factor = cos_emit * sphere_area / (light_dist * light_dist);
+                }
               } else if (light.type == scene::LightData::Rect) {
                 // Sample a random point on the rect surface
                 float u = dist01(rng) * 2.0f - 1.0f; // [-1, 1]
@@ -2054,6 +2096,8 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
               if (light.type == scene::LightData::Point) {
                 float inv_r2 = 1.0f / (light_dist * light_dist);
                 light_contribution = light_contribution * inv_r2;
+              } else if (light.type == scene::LightData::Sphere) {
+                light_contribution = light_contribution * geom_factor;
               } else if (light.type == scene::LightData::Rect) {
                 light_contribution = light_contribution * geom_factor;
               }
@@ -2186,6 +2230,7 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
                 // The SSS walk's throughput already accounts for volume transport.
 
                 // 1) Analytic lights at exit
+                constexpr float kTwoPi = 6.28318530718f;
                 for (const auto& light : scene.lights) {
                   lightrt::Vec3 Lex;
                   float ld = 1e20f;
@@ -2197,6 +2242,30 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
                     ld = tl.length();
                     if (ld < 1e-6f) continue;
                     Lex = tl * (1.0f / ld);
+                  } else if (light.type == scene::LightData::Sphere) {
+                    if (light.radius <= 0.0f) {
+                      lightrt::Vec3 tl = light.position - eP;
+                      ld = tl.length();
+                      if (ld < 1e-6f) continue;
+                      Lex = tl * (1.0f / ld);
+                      sss_geom = 1.0f / (ld * ld);
+                    } else {
+                      float u1 = dist01(rng);
+                      float u2 = dist01(rng);
+                      float z = 1.0f - 2.0f * u1;
+                      float r = std::sqrt(std::max(0.0f, 1.0f - z * z));
+                      float phi = kTwoPi * u2;
+                      lightrt::Vec3 normal(r * std::cos(phi), r * std::sin(phi), z);
+                      lightrt::Vec3 sp = light.position + normal * light.radius;
+                      lightrt::Vec3 tl = sp - eP;
+                      ld = tl.length();
+                      if (ld < 1e-6f) continue;
+                      Lex = tl * (1.0f / ld);
+                      float cos_emit = normal.dot(Lex * -1.0f);
+                      if (cos_emit <= 0.0f) continue;
+                      float sphere_area = 4.0f * 3.14159265f * light.radius * light.radius;
+                      sss_geom = cos_emit * sphere_area / (ld * ld);
+                    }
                   } else if (light.type == scene::LightData::Rect) {
                     float u = dist01(rng) * 2.0f - 1.0f;
                     float v = dist01(rng) * 2.0f - 1.0f;
@@ -2224,6 +2293,8 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
                   lightrt::Vec3 lc = light.color;
                   if (light.type == scene::LightData::Point)
                     lc = lc * (1.0f / (ld * ld));
+                  else if (light.type == scene::LightData::Sphere)
+                    lc = lc * sss_geom;
                   else if (light.type == scene::LightData::Rect)
                     lc = lc * sss_geom;
 
@@ -2473,7 +2544,17 @@ int main(int argc, char** argv) {
         cam_pos = center + lightrt::Vec3(0.0f, 0.0f, scene_radius * 2.5f);
       }
       cam_dir = (center - cam_pos).normalize();
-      cam_up = lightrt::Vec3(0.0f, 1.0f, 0.0f);
+      // Respect USD upAxis for fallback camera orientation.
+      if (scene.up_axis == 1) {
+        // Z-up
+        cam_up = lightrt::Vec3(0.0f, 0.0f, 1.0f);
+      } else if (scene.up_axis == 2) {
+        // X-up
+        cam_up = lightrt::Vec3(1.0f, 0.0f, 0.0f);
+      } else {
+        // Y-up (default)
+        cam_up = lightrt::Vec3(0.0f, 1.0f, 0.0f);
+      }
     }
 
     lightrt::Vec3 cam_right = cam_dir.cross(cam_up).normalize();
