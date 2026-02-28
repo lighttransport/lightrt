@@ -1480,6 +1480,55 @@ static float sampleImageChannel(const scene::ImageData& img, float u, float v, i
 }
 
 // Resolve material with texture overrides at hit UV
+// Compute TBN-perturbed normal from a normal map texture.
+// Returns the perturbed world-space normal, or 'N' unchanged if no normal map.
+static lightrt::Vec3 applyNormalMap(const scene::Scene& scene,
+                                     const scene::HitInfo& hit,
+                                     const lightrt::Vec3& N_world,
+                                     float tex_u, float tex_v) {
+  const auto& inst = scene.instances[hit.instance_id];
+  const auto& mesh = scene.meshes[inst.mesh_id];
+  const auto& mat_data = resolveMaterial(scene, hit);
+
+  if (mat_data.normal_tex_id < 0 ||
+      static_cast<size_t>(mat_data.normal_tex_id) >= scene.images.size())
+    return N_world;
+  if (mesh.tri_uvs.empty() || hit.triangle_id * 6 + 5 >= mesh.tri_uvs.size())
+    return N_world;
+
+  // Sample tangent-space normal map: [0,1]^3 -> [-1,1]^3
+  lightrt::Vec3 tn = sampleImage(scene.images[mat_data.normal_tex_id], tex_u, tex_v);
+  tn = tn * 2.0f - lightrt::Vec3(1.0f, 1.0f, 1.0f);
+  tn = tn.normalize();
+
+  // Build tangent from UV differentials across the triangle
+  const auto& tris = mesh.bvh.getTriangles();
+  const auto& tri = tris[hit.triangle_id];
+  lightrt::Vec3 e1 = tri.v1 - tri.v0;
+  lightrt::Vec3 e2 = tri.v2 - tri.v0;
+
+  size_t ub = hit.triangle_id * 6;
+  float du1 = mesh.tri_uvs[ub+2] - mesh.tri_uvs[ub+0];
+  float dv1 = mesh.tri_uvs[ub+3] - mesh.tri_uvs[ub+1];
+  float du2 = mesh.tri_uvs[ub+4] - mesh.tri_uvs[ub+0];
+  float dv2 = mesh.tri_uvs[ub+5] - mesh.tri_uvs[ub+1];
+
+  float det = du1 * dv2 - du2 * dv1;
+  if (std::abs(det) < 1e-8f) return N_world;
+  float inv_det = 1.0f / det;
+
+  // Local-space tangent T
+  lightrt::Vec3 T_local = (e1 * dv2 - e2 * dv1) * inv_det;
+
+  // Transform to world space and orthogonalize against N
+  lightrt::Vec3 T_world = scene::transformNormal(inst.inv_transform, T_local);
+  T_world = (T_world - N_world * N_world.dot(T_world)).normalize();
+  lightrt::Vec3 B_world = N_world.cross(T_world);
+
+  // Reconstruct world-space normal: N_new = T*tn.x + B*tn.y + N*tn.z
+  return (T_world * tn.x + B_world * tn.y + N_world * tn.z).normalize();
+}
+
 static scene::MaterialData resolveMaterialTextured(const scene::Scene& scene,
                                                     const scene::HitInfo& hit) {
   scene::MaterialData mat = resolveMaterial(scene, hit);
@@ -1798,6 +1847,16 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
           float bias = 0.001f;
 
           const scene::MaterialData mat = resolveMaterialTextured(scene, hit);
+
+          // Apply normal map if present: perturb N using tangent-space normal
+          if (!mesh_blas.tri_uvs.empty() && hit.triangle_id * 6 + 5 < mesh_blas.tri_uvs.size()) {
+            float w = 1.0f - hit.u - hit.v;
+            size_t ub = hit.triangle_id * 6;
+            float tu = mesh_blas.tri_uvs[ub+0]*w + mesh_blas.tri_uvs[ub+2]*hit.u + mesh_blas.tri_uvs[ub+4]*hit.v;
+            float tv = mesh_blas.tri_uvs[ub+1]*w + mesh_blas.tri_uvs[ub+3]*hit.u + mesh_blas.tri_uvs[ub+5]*hit.v;
+            N = applyNormalMap(scene, hit, N, tu, tv);
+            if (N.dot(V) < 0.0f) N = N * -1.0f;
+          }
 
           // Emission
           if (mat.emission_luminance > 0.0f) {
