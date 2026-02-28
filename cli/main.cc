@@ -2061,6 +2061,32 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
                 brdf_ndl.z * light_contribution.z) * brdf_scale;
             }
 
+            // ── Near-mirror specular (delta lobe for low roughness metallic) ────
+            // For roughness < 0.05, skip Monte Carlo and use deterministic reflection.
+            // This eliminates variance for chrome/mirror materials.
+            if (has_envmap && mat.base_metalness > 0.5f && mat.specular_roughness < 0.05f) {
+              float NdotV = std::max(0.0f, N.dot(V));
+              float r0 = ((mat.specular_ior - 1.0f) / (mat.specular_ior + 1.0f));
+              r0 = r0 * r0;
+              lightrt::Vec3 F0(
+                r0 + (mat.base_color.x - r0) * mat.base_metalness,
+                r0 + (mat.base_color.y - r0) * mat.base_metalness,
+                r0 + (mat.base_color.z - r0) * mat.base_metalness);
+              float schlick = std::pow(1.0f - NdotV, 5.0f);
+              lightrt::Vec3 F(
+                F0.x + (1.0f - F0.x) * schlick,
+                F0.y + (1.0f - F0.y) * schlick,
+                F0.z + (1.0f - F0.z) * schlick);
+              lightrt::Vec3 refl_d = (V * -1.0f + N * (2.0f * NdotV)).normalize();
+              lightrt::Ray refl_ray(hit_pos + N * bias, refl_d);
+              if (!scene::traceSceneAnyHit(scene, refl_ray, hit.instance_id, hit.triangle_id, ray_time)) {
+                lightrt::Vec3 env_col = evalEnvmap(scene.envmap, refl_d);
+                color.x += F.x * env_col.x * brdf_scale;
+                color.y += F.y * env_col.y * brdf_scale;
+                color.z += F.z * env_col.z * brdf_scale;
+              }
+            } else
+
             // ── Envmap MIS (if dome light exists) ───────────────────────────────
             if (has_envmap) {
               float alpha = std::max(0.001f, mat.specular_roughness * mat.specular_roughness);
@@ -2082,7 +2108,9 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
                     float NdotH = std::max(0.0f, N.dot(H));
                     float VdotH = std::max(0.0f, V.dot(H));
                     float brdf_pdf = pdfGGX(NdotH, VdotH, alpha);
-                    float combined_brdf_pdf = 0.5f * brdf_pdf + 0.5f * NdotL * kInvPi;
+                    float p_spec = (mat.base_metalness >= 0.9f) ? 1.0f : 0.5f;
+                    float p_diff = 1.0f - p_spec;
+                    float combined_brdf_pdf = p_spec * brdf_pdf + p_diff * NdotL * kInvPi;
                     float w = misBalance(env_pdf, combined_brdf_pdf);
                     lightrt::Vec3 contrib(
                       brdf_ndl.x * env_col.x * w / env_pdf,
@@ -2095,7 +2123,9 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
 
               // 2) BRDF sample
               {
-                bool sample_diffuse = dist01(rng) < 0.5f;
+                // For metallic materials, diffuse contribution is ~0.
+                // Skip diffuse sampling to avoid wasted samples.
+                bool sample_diffuse = (mat.base_metalness < 0.9f) && (dist01(rng) < 0.5f);
                 lightrt::Vec3 L;
                 if (sample_diffuse) {
                   float r1 = dist01(rng), r2 = dist01(rng);
@@ -2122,7 +2152,9 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
                     float NdotH = std::max(0.0f, N.dot(H));
                     float VdotH = std::max(0.0f, V.dot(H));
                     float brdf_pdf = pdfGGX(NdotH, VdotH, alpha);
-                    float combined_brdf_pdf = 0.5f * brdf_pdf + 0.5f * NdotL * kInvPi;
+                    float p_spec = (mat.base_metalness >= 0.9f) ? 1.0f : 0.5f;
+                    float p_diff = 1.0f - p_spec;
+                    float combined_brdf_pdf = p_spec * brdf_pdf + p_diff * NdotL * kInvPi;
                     float env_pdf = envmapPDF(scene.envmap, L);
                     float w = misBalance(combined_brdf_pdf, env_pdf);
                     if (combined_brdf_pdf > 1e-8f) {
