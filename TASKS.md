@@ -36,17 +36,13 @@ colorchart, geomsubset multi-material, emissive planes, glass sphere.
 
 ### High Priority
 
-- [ ] **Lighting quality**: The SphereLight is attenuated by `1/r²` but the
-  intensity is also pre-multiplied into `light.color`. Verify the combined
-  formula matches physically-based expectations. The cube currently renders
-  quite dark (most faces are near-black with only the light-facing face lit).
-  Consider adding an ambient contribution or checking the intensity pipeline.
+- [x] **Lighting quality**: SphereLight now uses area-light sampling with
+  radius-aware geometry factor (uniform surface sampling, `area / r²` term).
+  Point lights still use `1/r²`. No ambient term added.
 
-- [ ] **Z-up scene support**: Geometry is NOT converted from Z-up to Y-up.
-  Camera is correctly left in Z-up space. However, the default camera fallback
-  (`cam_up = (0,1,0)`) is wrong for Z-up scenes — it should be `(0,0,1)`.
-  Also, the fallback `cam_dir` (pointing toward scene center from +Z) is
-  correct for Z-up. Need to detect `upAxis` and adjust default camera up vector.
+- [x] **Z-up scene support**: Geometry is NOT converted from Z-up to Y-up.
+  Camera is correctly left in Z-up space. Default camera fallback now respects
+  `upAxis` (Z-up uses `(0,0,1)`, X-up uses `(1,0,0)`, Y-up uses `(0,1,0)`).
 
 - [ ] **Texture infrastructure** (from plan): load material textures, store
   per-triangle UVs, sample at hit points. The plan in

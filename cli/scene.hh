@@ -82,6 +82,7 @@ struct Scene {
   EnvmapData envmap;
   std::vector<ImageData> images;
   lightrt::AABB scene_bounds;
+  int up_axis = 0; // 0=Y, 1=Z, 2=X (USD upAxis)
 };
 
 // --- Scene traversal ---

@@ -87,11 +87,12 @@ struct OpenPBRMaterial {
 using MaterialData = OpenPBRMaterial;
 
 struct LightData {
-  enum Type { Distant, Point, Dome, Rect };
+  enum Type { Distant, Point, Sphere, Dome, Rect };
   Type type = Distant;
   lightrt::Vec3 color{1.0f, 1.0f, 1.0f}; // pre-multiplied intensity * 2^exposure
   lightrt::Vec3 direction{0.0f, -1.0f, 0.0f}; // Distant: toward-light; Rect: outward normal
   lightrt::Vec3 position{0.0f, 0.0f, 0.0f};
+  float radius = 0.0f; // Sphere lights; 0 = point light
   // Rect-light specific
   lightrt::Vec3 rect_axis_u{1.0f, 0.0f, 0.0f}; // local +X (half-width direction)
   lightrt::Vec3 rect_axis_v{0.0f, 1.0f, 0.0f}; // local +Y (half-height direction)
