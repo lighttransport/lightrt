@@ -516,6 +516,118 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
     }
   }
 
+  // Sphere primitive — tessellate into a UV sphere mesh
+  if (P->type_name && strcmp(P->type_name, "Sphere") == 0) {
+    // Read radius (default 1.0)
+    float radius = 1.0f;
+    lydra_c_read_float_attr(
+        reinterpret_cast<LusdLayer>(L),
+        reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
+        "radius", &radius);
+
+    // Resolve material
+    int32_t mat_id = -1;
+    {
+      const char* mat_path = lydra_c_resolve_material_binding(
+          reinterpret_cast<LusdLayer>(L),
+          reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)));
+      if (mat_path) {
+        auto it = mat_map.find(mat_path);
+        if (it != mat_map.end()) mat_id = it->second;
+      }
+    }
+
+    // Tessellate UV sphere (stacks × slices)
+    const int stacks = 32, slices = 64;
+    std::vector<lightrt::Triangle> triangles;
+    std::vector<float> pre_uvs, pre_normals;
+    triangles.reserve(stacks * slices * 2);
+
+    auto vert = [&](int si, int ti) -> std::pair<lightrt::Vec3, lightrt::Vec3> {
+      float phi   = static_cast<float>(M_PI) * si / stacks;        // 0..π
+      float theta = 2.0f * static_cast<float>(M_PI) * ti / slices; // 0..2π
+      float sp = std::sin(phi), cp = std::cos(phi);
+      float st = std::sin(theta), ct = std::cos(theta);
+      lightrt::Vec3 n(sp * ct, cp, sp * st);
+      return {n * radius, n};
+    };
+
+    for (int si = 0; si < stacks; si++) {
+      for (int ti = 0; ti < slices; ti++) {
+        auto [v00, n00] = vert(si,   ti);
+        auto [v10, n10] = vert(si+1, ti);
+        auto [v01, n01] = vert(si,   ti+1);
+        auto [v11, n11] = vert(si+1, ti+1);
+
+        float u0 = static_cast<float>(ti)   / slices;
+        float u1 = static_cast<float>(ti+1) / slices;
+        float v0 = static_cast<float>(si)   / stacks;
+        float v1 = static_cast<float>(si+1) / stacks;
+
+        if (si > 0) { // skip degenerate top cap row first tri
+          lightrt::Triangle t0; t0.v0 = v00; t0.v1 = v10; t0.v2 = v01;
+          triangles.push_back(t0);
+          pre_uvs.insert(pre_uvs.end(), {u0,v0, u0,v1, u1,v0});
+          pre_normals.insert(pre_normals.end(), {n00.x,n00.y,n00.z, n10.x,n10.y,n10.z, n01.x,n01.y,n01.z});
+        }
+        if (si < stacks - 1) { // skip degenerate bottom cap row second tri
+          lightrt::Triangle t1; t1.v0 = v10; t1.v1 = v11; t1.v2 = v01;
+          triangles.push_back(t1);
+          pre_uvs.insert(pre_uvs.end(), {u0,v1, u1,v1, u1,v0});
+          pre_normals.insert(pre_normals.end(), {n10.x,n10.y,n10.z, n11.x,n11.y,n11.z, n01.x,n01.y,n01.z});
+        }
+      }
+    }
+
+    if (!triangles.empty()) {
+      size_t mi = out_scene.meshes.size();
+      out_scene.meshes.emplace_back();
+      auto& md = out_scene.meshes.back();
+      md.default_material_id = mat_id;
+
+      // Build centroid map for BVH reorder
+      std::multimap<CentroidKey, size_t> centroid_map;
+      for (size_t ti = 0; ti < triangles.size(); ti++)
+        centroid_map.insert({makeCentroidKey(triangles[ti]), ti});
+
+      for (const auto& tri : triangles) {
+        md.local_bounds.expand(tri.v0);
+        md.local_bounds.expand(tri.v1);
+        md.local_bounds.expand(tri.v2);
+      }
+      md.bvh.build(triangles);
+
+      const auto& reordered = md.bvh.getTriangles();
+      size_t num_tris = reordered.size();
+      md.tri_material_ids.assign(num_tris, mat_id);
+      md.tri_uvs.resize(num_tris * 6);
+      md.tri_normals.resize(num_tris * 9);
+
+      for (size_t ti = 0; ti < num_tris; ti++) {
+        CentroidKey key = makeCentroidKey(reordered[ti]);
+        auto range = centroid_map.equal_range(key);
+        size_t orig = (range.first != range.second) ? range.first->second : ti;
+        if (range.first != range.second) centroid_map.erase(range.first);
+        if (orig * 6 + 5 < pre_uvs.size())
+          std::memcpy(&md.tri_uvs[ti * 6],     &pre_uvs[orig * 6],     6 * sizeof(float));
+        if (orig * 9 + 8 < pre_normals.size())
+          std::memcpy(&md.tri_normals[ti * 9], &pre_normals[orig * 9], 9 * sizeof(float));
+      }
+
+      scene::Instance inst;
+      inst.mesh_id = static_cast<uint32_t>(mi);
+      mat4d_to_3x4f(world_xform, inst.transform);
+      scene::invert3x4(inst.transform, inst.inv_transform);
+      std::memcpy(inst.transform_close, inst.transform, sizeof(inst.transform));
+      std::memcpy(inst.inv_transform_close, inst.inv_transform, sizeof(inst.inv_transform));
+      inst.has_motion  = false;
+      inst.world_bounds = scene::transformAABB(md.local_bounds, inst.transform);
+      out_scene.scene_bounds.expand(inst.world_bounds);
+      out_scene.instances.push_back(inst);
+      printf("  Sphere radius=%.3f -> %zu triangles\n", radius, num_tris);
+    }
+  }
+
   // Camera detection
   if (P->type_name && strcmp(P->type_name, "Camera") == 0) {
     LydraCCameraData cam_data;
