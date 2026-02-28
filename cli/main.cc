@@ -943,6 +943,9 @@ static bool loadUSDScene(const std::string& filename, double /*timecode*/,
   lusdDestroyLayer(instance, layer);
   lusdDestroyInstance(instance, nullptr);
 
+  // Note: geometry is NOT converted from Z-up/Y-up, so we keep the camera
+  // matrix in the original coordinate system for consistency.
+
   printf("Loaded %zu meshes, %zu instances, %zu materials, %zu cameras, %zu lights (lightusd-c layer)\n",
          out_scene.meshes.size(), out_scene.instances.size(),
          out_scene.materials.size(), out_scene.cameras.size(),
@@ -2445,11 +2448,15 @@ int main(int argc, char** argv) {
       const auto& cam = scene.cameras[cam_idx];
       fov_y = cam.fov_y_rad;
       const float* m = cam.transform;
-      cam_pos = lightrt::Vec3(m[3], m[7], m[11]);
-      cam_dir = lightrt::Vec3(-m[2], -m[6], -m[10]).normalize();
-      cam_up = lightrt::Vec3(m[1], m[5], m[9]).normalize();
-      printf("Using camera '%s' (fov=%.1f deg)\n", cam.name.c_str(),
-             fov_y * 180.0f / 3.14159265f);
+      // USD row-vector convention: p_world = p_local * M (row-major, m[r*4+c]).
+      // Row r = where local basis vector r maps in world space.
+      // row0=right, row1=up, row2=backward (camera looks along local -Z).
+      // Translation in last row: m[12..14].
+      cam_pos = lightrt::Vec3(m[12], m[13], m[14]);              // row3 = position
+      cam_dir = lightrt::Vec3(-m[8], -m[9], -m[10]).normalize(); // -row2 = forward
+      cam_up  = lightrt::Vec3( m[4],  m[5],  m[6]).normalize();  //  row1 = up
+      printf("Using camera '%s' (fov=%.1f deg)\n",
+             cam.name.c_str(), fov_y * 180.0f / 3.14159265f);
     } else {
       lightrt::Vec3 center = (scene.scene_bounds.min + scene.scene_bounds.max) * 0.5f;
       lightrt::Vec3 extent = scene.scene_bounds.max - scene.scene_bounds.min;
