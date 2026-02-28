@@ -51,6 +51,7 @@ struct Options {
   double time_range_step = 1;
   bool has_time_range = false;
   std::string camera_name;
+  std::string envmap_file;
   int camera_index = -1; // -1 = auto
   uint32_t mblur_samples = 1;
   uint32_t spp = 1;
@@ -95,6 +96,8 @@ static bool parseArgs(int argc, char** argv, Options& opts) {
     } else if (strcmp(argv[i], "--spp") == 0 && i + 1 < argc) {
       opts.spp = static_cast<uint32_t>(atoi(argv[++i]));
       if (opts.spp < 1) opts.spp = 1;
+    } else if (strcmp(argv[i], "--envmap") == 0 && i + 1 < argc) {
+      opts.envmap_file = argv[++i];
     }
   }
   return true;
@@ -2284,6 +2287,8 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
                   trans_col = resolveMaterialTextured(scene, rh).base_color;
                 } else if (has_envmap) {
                   trans_col = evalEnvmap(scene.envmap, refl_d);
+                } else {
+                  trans_col = lightrt::Vec3(0.118f, 0.118f, 0.157f);
                 }
               } else {
                 // Refraction via Snell's law
@@ -2292,6 +2297,7 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
                   // Total internal reflection
                   lightrt::Vec3 refl_d = (V * -1.0f + fN * (2.0f * cos_i)).normalize();
                   if (has_envmap) trans_col = evalEnvmap(scene.envmap, refl_d);
+                  else trans_col = lightrt::Vec3(0.118f, 0.118f, 0.157f);
                 } else {
                   float cos_t = std::sqrt(1.0f - sin2t);
                   lightrt::Vec3 refr_d = (V * -1.0f) * eta + fN * (eta * cos_i - cos_t);
@@ -2303,8 +2309,7 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
                   } else if (has_envmap) {
                     trans_col = evalEnvmap(scene.envmap, refr_d);
                   } else {
-                    // No envmap: background color
-                    trans_col = lightrt::Vec3(0.05f, 0.05f, 0.05f);
+                    trans_col = lightrt::Vec3(0.118f, 0.118f, 0.157f); // match background
                   }
                 }
               }
@@ -2355,6 +2360,22 @@ int main(int argc, char** argv) {
   auto renderOneFrame = [&](double timecode, const std::string& outpath) -> bool {
     scene::Scene scene;
     if (!loadUSDScene(opts.input_file, timecode, scene)) return false;
+
+    // CLI --envmap override: load HDR/EXR and set as environment map
+    if (!opts.envmap_file.empty() && !scene.envmap.valid()) {
+      int w, h, ch;
+      float* hdr = stbi_loadf(opts.envmap_file.c_str(), &w, &h, &ch, 3);
+      if (hdr) {
+        scene::EnvmapData& env = scene.envmap;
+        env.width = w; env.height = h;
+        env.pixels.assign(hdr, hdr + (size_t)w * h * 3);
+        stbi_image_free(hdr);
+        scene::shading::buildEnvmapCDF(env);
+        printf("Loaded envmap %dx%d from %s\n", w, h, opts.envmap_file.c_str());
+      } else {
+        fprintf(stderr, "Warning: failed to load envmap '%s'\n", opts.envmap_file.c_str());
+      }
+    }
 
     // Apply motion blur if a camera has shutter interval
     double shutter_offset = 0.0;
