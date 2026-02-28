@@ -629,6 +629,113 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
     }
   }
 
+  // Cube primitive — tessellate into 12 triangles (6 faces × 2 tris)
+  if (P->type_name && strcmp(P->type_name, "Cube") == 0) {
+    // USD Cube has `double size` (default 2.0 → half-extent 1.0)
+    float size = 2.0f;
+    lydra_c_read_float_attr(
+        reinterpret_cast<LusdLayer>(L),
+        reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
+        "size", &size);
+    float h = size * 0.5f;
+
+    // Resolve material
+    int32_t mat_id = -1;
+    {
+      const char* mat_path = lydra_c_resolve_material_binding(
+          reinterpret_cast<LusdLayer>(L),
+          reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)));
+      if (mat_path) {
+        auto it = mat_map.find(mat_path);
+        if (it != mat_map.end()) mat_id = it->second;
+      }
+    }
+
+    // 6 faces, each split into 2 triangles; normals and UVs per face
+    struct FaceQuad {
+      lightrt::Vec3 v[4]; // CCW order
+      lightrt::Vec3 n;
+      float uv[8]; // u0v0,u1v0,u1v1,u0v1
+    };
+    FaceQuad faces[6] = {
+      // +X
+      {{{h,-h,-h},{h,h,-h},{h,h,h},{h,-h,h}}, {1,0,0}, {0,0,1,0,1,1,0,1}},
+      // -X
+      {{{-h,-h,h},{-h,h,h},{-h,h,-h},{-h,-h,-h}}, {-1,0,0}, {0,0,1,0,1,1,0,1}},
+      // +Y
+      {{{-h,h,-h},{-h,h,h},{h,h,h},{h,h,-h}}, {0,1,0}, {0,0,1,0,1,1,0,1}},
+      // -Y
+      {{{-h,-h,h},{-h,-h,-h},{h,-h,-h},{h,-h,h}}, {0,-1,0}, {0,0,1,0,1,1,0,1}},
+      // +Z
+      {{{-h,-h,h},{h,-h,h},{h,h,h},{-h,h,h}}, {0,0,1}, {0,0,1,0,1,1,0,1}},
+      // -Z
+      {{{h,-h,-h},{-h,-h,-h},{-h,h,-h},{h,h,-h}}, {0,0,-1}, {0,0,1,0,1,1,0,1}},
+    };
+
+    std::vector<lightrt::Triangle> triangles;
+    std::vector<float> pre_uvs, pre_normals;
+    triangles.reserve(12);
+    for (auto& f : faces) {
+      // Tri 0: v0,v1,v2
+      lightrt::Triangle t0; t0.v0=f.v[0]; t0.v1=f.v[1]; t0.v2=f.v[2];
+      triangles.push_back(t0);
+      pre_uvs.insert(pre_uvs.end(), {f.uv[0],f.uv[1], f.uv[2],f.uv[3], f.uv[4],f.uv[5]});
+      pre_normals.insert(pre_normals.end(), {f.n.x,f.n.y,f.n.z, f.n.x,f.n.y,f.n.z, f.n.x,f.n.y,f.n.z});
+      // Tri 1: v0,v2,v3
+      lightrt::Triangle t1; t1.v0=f.v[0]; t1.v1=f.v[2]; t1.v2=f.v[3];
+      triangles.push_back(t1);
+      pre_uvs.insert(pre_uvs.end(), {f.uv[0],f.uv[1], f.uv[4],f.uv[5], f.uv[6],f.uv[7]});
+      pre_normals.insert(pre_normals.end(), {f.n.x,f.n.y,f.n.z, f.n.x,f.n.y,f.n.z, f.n.x,f.n.y,f.n.z});
+    }
+
+    {
+      size_t mi = out_scene.meshes.size();
+      out_scene.meshes.emplace_back();
+      auto& md = out_scene.meshes.back();
+      md.default_material_id = mat_id;
+
+      std::multimap<CentroidKey, size_t> centroid_map;
+      for (size_t ti = 0; ti < triangles.size(); ti++)
+        centroid_map.insert({makeCentroidKey(triangles[ti]), ti});
+
+      for (const auto& tri : triangles) {
+        md.local_bounds.expand(tri.v0);
+        md.local_bounds.expand(tri.v1);
+        md.local_bounds.expand(tri.v2);
+      }
+      md.bvh.build(triangles);
+
+      const auto& reordered = md.bvh.getTriangles();
+      size_t num_tris = reordered.size();
+      md.tri_material_ids.assign(num_tris, mat_id);
+      md.tri_uvs.resize(num_tris * 6);
+      md.tri_normals.resize(num_tris * 9);
+
+      for (size_t ti = 0; ti < num_tris; ti++) {
+        CentroidKey key = makeCentroidKey(reordered[ti]);
+        auto range = centroid_map.equal_range(key);
+        size_t orig = (range.first != range.second) ? range.first->second : ti;
+        if (range.first != range.second) centroid_map.erase(range.first);
+        if (orig * 6 + 5 < pre_uvs.size())
+          std::memcpy(&md.tri_uvs[ti * 6],     &pre_uvs[orig * 6],     6 * sizeof(float));
+        if (orig * 9 + 8 < pre_normals.size())
+          std::memcpy(&md.tri_normals[ti * 9], &pre_normals[orig * 9], 9 * sizeof(float));
+      }
+
+      scene::Instance inst;
+      inst.mesh_id = static_cast<uint32_t>(mi);
+      mat4d_to_3x4f(world_xform, inst.transform);
+      scene::invert3x4(inst.transform, inst.inv_transform);
+      std::memcpy(inst.transform_close, inst.transform, sizeof(inst.transform));
+      std::memcpy(inst.inv_transform_close, inst.inv_transform, sizeof(inst.inv_transform));
+      inst.has_motion  = false;
+      inst.world_bounds = scene::transformAABB(md.local_bounds, inst.transform);
+      out_scene.scene_bounds.expand(inst.world_bounds);
+      out_scene.instances.push_back(inst);
+      printf("  Cube size=%.3f -> %zu triangles\n", size, num_tris);
+    }
+  }
+
   // Camera detection
   if (P->type_name && strcmp(P->type_name, "Camera") == 0) {
     LydraCCameraData cam_data;
