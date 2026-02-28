@@ -2454,7 +2454,17 @@ int main(int argc, char** argv) {
       lightrt::Vec3 center = (scene.scene_bounds.min + scene.scene_bounds.max) * 0.5f;
       lightrt::Vec3 extent = scene.scene_bounds.max - scene.scene_bounds.min;
       float scene_radius = extent.length() * 0.5f;
-      cam_pos = center + lightrt::Vec3(0.0f, 0.0f, scene_radius * 2.5f);
+      // For flat scenes (very small Y extent), add 30-degree elevation so
+      // horizontal planes are visible instead of edge-on.
+      float y_extent = extent.y;
+      float xz_extent = std::sqrt(extent.x * extent.x + extent.z * extent.z);
+      bool is_flat = (xz_extent > 1e-4f) && (y_extent < xz_extent * 0.15f);
+      if (is_flat) {
+        float d = scene_radius * 2.5f;
+        cam_pos = center + lightrt::Vec3(0.0f, d * 0.6f, d * 0.8f);
+      } else {
+        cam_pos = center + lightrt::Vec3(0.0f, 0.0f, scene_radius * 2.5f);
+      }
       cam_dir = (center - cam_pos).normalize();
       cam_up = lightrt::Vec3(0.0f, 1.0f, 0.0f);
     }
