@@ -213,7 +213,8 @@ static void collect_materials(LusdLayer_T* L, const LusdPrim_T* P,
         mat.opacity                = pbr.opacity;
 
         // Load textures referenced by this material
-        auto load_tex = [&](const char* tex_path, int32_t& tex_id) {
+        // is_srgb=true applies sRGB→linear gamma correction; false keeps data as-is
+        auto load_tex = [&](const char* tex_path, int32_t& tex_id, bool is_srgb) {
           if (!tex_path) return;
           char resolved[1024];
           const char* rp = lydra_c_resolve_asset_path(
@@ -233,20 +234,21 @@ static void collect_materials(LusdLayer_T* L, const LusdPrim_T* P,
           bool is_hdr = stbi_is_hdr(rpath.c_str());
           for (size_t pi = 0; pi < static_cast<size_t>(tw) * th * 4; pi++) {
             float v = pixels[pi] / 255.0f;
-            if (!is_hdr && (pi % 4) < 3) v = std::pow(v, 2.2f); // sRGB→linear (RGB only)
+            if (is_srgb && !is_hdr && (pi % 4) < 3) v = std::pow(v, 2.2f); // sRGB→linear
             img.pixels[pi] = v;
           }
           stbi_image_free(pixels);
           tex_map[rpath] = img_idx;
           tex_id = img_idx;
-          printf("    Texture[%d]: \"%s\" %dx%d\n", img_idx, rpath.c_str(), tw, th);
+          printf("    Texture[%d]: \"%s\" %dx%d%s\n", img_idx, rpath.c_str(), tw, th,
+                 is_srgb ? "" : " [linear]");
         };
-        load_tex(pbr.base_color_tex, mat.base_color_tex_id);
-        load_tex(pbr.metalness_tex, mat.metalness_tex_id);
-        load_tex(pbr.roughness_tex, mat.roughness_tex_id);
-        load_tex(pbr.normal_tex, mat.normal_tex_id);
-        load_tex(pbr.emissive_tex, mat.emissive_tex_id);
-        load_tex(pbr.opacity_tex, mat.opacity_tex_id);
+        load_tex(pbr.base_color_tex, mat.base_color_tex_id, true);  // sRGB color
+        load_tex(pbr.metalness_tex, mat.metalness_tex_id, false);    // linear scalar
+        load_tex(pbr.roughness_tex, mat.roughness_tex_id, false);    // linear scalar
+        load_tex(pbr.normal_tex, mat.normal_tex_id, false);          // linear tangent-space normals
+        load_tex(pbr.emissive_tex, mat.emissive_tex_id, true);       // sRGB color
+        load_tex(pbr.opacity_tex, mat.opacity_tex_id, false);        // linear scalar
 
         out_scene.materials.push_back(mat);
         printf("  Material[%d]: \"%s\" base=(%.2f,%.2f,%.2f) metallic=%.2f roughness=%.2f%s\n",
