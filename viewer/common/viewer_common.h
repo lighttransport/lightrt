@@ -1,8 +1,8 @@
 #pragma once
 
 #include "../../lightrt.hh"
-#include "../../common/materials.hh"
-#include "../../common/shading.hh"
+#include "../../common/scene.hh"
+#include "../../common/usd_loader.hh"
 #include "bitmap_font.h"
 
 #include <vector>
@@ -33,23 +33,7 @@ enum ShadowMode {
     SHADOW_MODE_COUNT
 };
 
-// --- Data Structures ---
-
-struct SceneMesh {
-    std::string name;
-    std::vector<Triangle> triangles;
-    Vec3 color{0.8f, 0.8f, 0.8f};
-};
-
-struct Scene {
-    std::vector<SceneMesh> meshes;
-    std::vector<Triangle> allTriangles;
-    std::vector<uint32_t> meshIdPerTri;
-    TriangleBVH bvh;
-
-    void build();
-    Vec3 getMeshColor(uint32_t triIdx) const;
-};
+// --- Camera ---
 
 struct Camera {
     Vec3 position{0, 0, 5};
@@ -63,8 +47,17 @@ struct Camera {
     float orbitDistance = 5.0f;
 };
 
+// Count total triangles across all instances in a scene
+inline size_t sceneTriangleCount(const scene::Scene& sc) {
+    size_t count = 0;
+    for (const auto& inst : sc.instances) {
+        count += sc.meshes[inst.mesh_id].bvh.getTriangles().size();
+    }
+    return count;
+}
+
 struct ViewerState {
-    Scene scene;
+    scene::Scene scene;
     Camera camera;
     uint32_t width = 1280;
     uint32_t height = 720;
@@ -98,12 +91,9 @@ struct ViewerState {
 
 // --- Model Loading ---
 
-bool LoadOBJ(const std::string& filename, Scene& scene);
-bool LoadGLTF(const std::string& filename, Scene& scene);
-#ifdef LIGHTRT_HAS_TINYUSDZ
-bool LoadUSD(const std::string& filename, Scene& scene);
-#endif
-bool LoadModel(const std::string& filename, Scene& scene);
+bool LoadOBJ(const std::string& filename, scene::Scene& scene);
+bool LoadGLTF(const std::string& filename, scene::Scene& scene);
+bool LoadModel(const std::string& filename, scene::Scene& scene);
 
 // --- Input Processing ---
 // Returns true if the viewer should close (Escape pressed)
@@ -132,12 +122,12 @@ void ResizeFramebuffer(ViewerState& state, uint32_t w, uint32_t h);
 
 // --- Procedural Primitives ---
 
-void GeneratePlane(SceneMesh& out, Vec3 center, float halfSize);
-void GenerateUVSphere(SceneMesh& out, Vec3 center, float radius, int segments = 16, int rings = 8);
-void GenerateCube(SceneMesh& out, Vec3 center, float halfSize);
-void GenerateCone(SceneMesh& out, Vec3 center, float radius, float height, int segments = 16);
-void GenerateTube(SceneMesh& out, Vec3 center, float radius, float height, int segments = 16);
-void GenerateCapsule(SceneMesh& out, Vec3 center, float radius, float cylHeight, int segments = 16, int rings = 4);
-void CreateDefaultScene(Scene& scene);
+void GeneratePlane(std::vector<Triangle>& out, Vec3 center, float halfSize);
+void GenerateUVSphere(std::vector<Triangle>& out, Vec3 center, float radius, int segments = 16, int rings = 8);
+void GenerateCube(std::vector<Triangle>& out, Vec3 center, float halfSize);
+void GenerateCone(std::vector<Triangle>& out, Vec3 center, float radius, float height, int segments = 16);
+void GenerateTube(std::vector<Triangle>& out, Vec3 center, float radius, float height, int segments = 16);
+void GenerateCapsule(std::vector<Triangle>& out, Vec3 center, float radius, float cylHeight, int segments = 16, int rings = 4);
+void CreateDefaultScene(scene::Scene& scene);
 
 } // namespace lightrt_viewer
