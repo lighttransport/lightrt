@@ -2254,6 +2254,68 @@ static void renderFrame(const scene::Scene& scene, const Options& opts,
                   }
                 }
               }
+            }  // sss_weight
+            // ── Transmission / Glass ────────────────────────────────────────────
+            // For materials with non-zero transmission_weight (glass, etc.),
+            // cast a single-bounce refraction (or reflection on TIR) ray and
+            // sample the environment or the surface behind the glass.
+            if (mat.transmission_weight > 0.01f) {
+              // Determine if we're on the front or back face of the glass
+              float NdotV_raw = N.dot(V);  // V points toward camera
+              bool inside = NdotV_raw < 0.0f;
+              lightrt::Vec3 fN = inside ? N * -1.0f : N;  // face-forward normal
+              float cos_i = std::max(0.0f, fN.dot(V));
+
+              // Schlick Fresnel using specular IOR
+              float ior = mat.specular_ior > 1.0f ? mat.specular_ior : 1.5f;
+              float eta = inside ? ior : (1.0f / ior);
+              float r0 = (ior - 1.0f) / (ior + 1.0f);
+              r0 = r0 * r0;
+              float fresnel = r0 + (1.0f - r0) * std::pow(1.0f - cos_i, 5.0f);
+
+              // Route: reflect or refract stochastically
+              lightrt::Vec3 trans_col(0.0f, 0.0f, 0.0f);
+              if (dist01(rng) < fresnel) {
+                // Specular reflection
+                lightrt::Vec3 refl_d = (V * -1.0f + fN * (2.0f * cos_i)).normalize();
+                lightrt::Ray refl_ray(hit_pos + fN * bias, refl_d);
+                scene::HitInfo rh = scene::traceScene(scene, refl_ray, ray_time);
+                if (rh.triangle_id != lightrt::kInvalidIndex) {
+                  trans_col = resolveMaterialTextured(scene, rh).base_color;
+                } else if (has_envmap) {
+                  trans_col = evalEnvmap(scene.envmap, refl_d);
+                }
+              } else {
+                // Refraction via Snell's law
+                float sin2t = eta * eta * (1.0f - cos_i * cos_i);
+                if (sin2t > 1.0f) {
+                  // Total internal reflection
+                  lightrt::Vec3 refl_d = (V * -1.0f + fN * (2.0f * cos_i)).normalize();
+                  if (has_envmap) trans_col = evalEnvmap(scene.envmap, refl_d);
+                } else {
+                  float cos_t = std::sqrt(1.0f - sin2t);
+                  lightrt::Vec3 refr_d = (V * -1.0f) * eta + fN * (eta * cos_i - cos_t);
+                  refr_d = refr_d.normalize();
+                  lightrt::Ray refr_ray(hit_pos - fN * bias, refr_d);
+                  scene::HitInfo rh = scene::traceScene(scene, refr_ray, ray_time);
+                  if (rh.triangle_id != lightrt::kInvalidIndex) {
+                    trans_col = resolveMaterialTextured(scene, rh).base_color;
+                  } else if (has_envmap) {
+                    trans_col = evalEnvmap(scene.envmap, refr_d);
+                  } else {
+                    // No envmap: background color
+                    trans_col = lightrt::Vec3(0.05f, 0.05f, 0.05f);
+                  }
+                }
+              }
+              // Tint by transmission color and blend
+              trans_col.x *= mat.transmission_color.x;
+              trans_col.y *= mat.transmission_color.y;
+              trans_col.z *= mat.transmission_color.z;
+              // Mix: transmission ray replaces surface shading
+              color.x = color.x * (1.0f - mat.transmission_weight) + trans_col.x * mat.transmission_weight;
+              color.y = color.y * (1.0f - mat.transmission_weight) + trans_col.y * mat.transmission_weight;
+              color.z = color.z * (1.0f - mat.transmission_weight) + trans_col.z * mat.transmission_weight;
             }
           }
         }
