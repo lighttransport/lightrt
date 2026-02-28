@@ -803,12 +803,16 @@ static bool loadUSDScene(const std::string& filename, double /*timecode*/,
   // Walk prim tree via internal Layer/Prim structs
   LusdLayer_T* L = reinterpret_cast<LusdLayer_T*>(layer);
 
-  // Compute base directory for relative asset path resolution
+  // Compute base directory for relative asset path resolution.
+  // For USDZ, lusd__read_usdz_file() updates layer->identifier to point at the
+  // extracted root file in a temp dir, so use that instead of `filename`.
   std::string usd_base_dir;
   {
-    size_t slash_pos = filename.find_last_of("/\\");
+    const char* effective_id = L->identifier ? L->identifier : filename.c_str();
+    std::string eid(effective_id);
+    size_t slash_pos = eid.find_last_of("/\\");
     if (slash_pos != std::string::npos)
-      usd_base_dir = filename.substr(0, slash_pos);
+      usd_base_dir = eid.substr(0, slash_pos);
   }
 
   // Pass 1: Collect materials (needs usd_base_dir for texture loading)
