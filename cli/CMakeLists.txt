@@ -63,7 +63,9 @@ if(LIGHTRT_USE_LIGHTUSD_C)
   endif()
 
   # Build lightusd-c (C11) + lydra (C++) as a subdirectory.
-  # No LUSD_TINYUSDZ_DIR set — builds with pure-C stubs only.
+  # Force pure-C backend: do not link tinyusdz_static when using lightusd-c.
+  set(LUSD_TINYUSDZ_DIR OFF CACHE BOOL "" FORCE)
+  # No tinyusdz dependency; use native reader stubs only.
   if(EXISTS "${LIGHTUSD_C_DIR}/CMakeLists.txt")
     add_subdirectory("${LIGHTUSD_C_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/lightusd-c")
   else()
