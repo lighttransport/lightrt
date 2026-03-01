@@ -269,6 +269,8 @@ enum xkb_keymap_compile_flags {
 #define XKB_KEY_S           0x0053
 #define XKB_KEY_o           0x006f
 #define XKB_KEY_O           0x004f
+#define XKB_KEY_plus        0x002b
+#define XKB_KEY_equal       0x003d
 
 #ifdef __cplusplus
 }

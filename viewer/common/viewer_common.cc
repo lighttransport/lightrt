@@ -340,11 +340,11 @@ bool ProcessInput(ViewerState& state, float /*dt*/) {
     }
     state.sKeyWasPressed = sKeyPressed;
 
-    bool oKeyPressed = state.keys[KEY_O];
-    if (oKeyPressed && !state.oKeyWasPressed) {
+    bool plusKeyPressed = state.keys[KEY_PLUS];
+    if (plusKeyPressed && !state.plusKeyWasPressed) {
         state.fontScale = (state.fontScale == 1) ? 2 : 1;
     }
-    state.oKeyWasPressed = oKeyPressed;
+    state.plusKeyWasPressed = plusKeyPressed;
 
     return false;
 }
@@ -601,7 +601,7 @@ void RenderFrame(ViewerState& state) {
     DrawString(10, h - lineH * 3, help.c_str(), 0xFFFFFF00, state.pixels.data(), w, h, fs);
 
     static const char* shadowModeNames[] = {"OFF", "HARD", "SOFT", "STRONG_SOFT"};
-    std::string help2 = "F: Fit, S: Shadow [" + std::string(shadowModeNames[state.shadowMode]) + "], O: Font 2x [" + std::string(fs == 2 ? "ON" : "OFF") + "]";
+    std::string help2 = "F: Fit, S: Shadow [" + std::string(shadowModeNames[state.shadowMode]) + "], +: Font 2x [" + std::string(fs == 2 ? "ON" : "OFF") + "], O: Open File";
     DrawString(10, h - lineH * 2, help2.c_str(), 0xFFFFFF00, state.pixels.data(), w, h, fs);
 }
 
