@@ -9,6 +9,7 @@
 
 #include "common/viewer_common.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -55,6 +56,48 @@ static size_t           g_shm_size     = 0;
 static struct wl_buffer *g_buffers[2]  = {};
 static bool             g_buffer_busy[2] = {};
 static int              g_current_buffer = 0;
+
+// --- File loading ---
+
+static void LoadAndReplaceScene(const std::string& path) {
+    std::cout << "Loading " << path << "...\n";
+    scene::Scene newScene;
+    if (!LoadModel(path, newScene)) {
+        std::cerr << "Failed to load: " << path << "\n";
+        return;
+    }
+    if (sceneTriangleCount(newScene) == 0) {
+        std::cerr << "No triangles in: " << path << "\n";
+        return;
+    }
+    g_state.scene = std::move(newScene);
+    FitToScene(g_state);
+    std::cout << "Scene: " << g_state.scene.meshes.size() << " meshes, "
+              << sceneTriangleCount(g_state.scene) << " triangles.\n";
+
+    // Update window title
+    size_t sep = path.find_last_of("/\\");
+    std::string fname = (sep != std::string::npos) ? path.substr(sep + 1) : path;
+    if (g_toplevel)
+        xdg_toplevel_set_title(g_toplevel, ("LightRT Viewer (Wayland) - " + fname).c_str());
+}
+
+static void ShowOpenFileDialog() {
+    // Try zenity (GNOME/GTK), then kdialog (KDE)
+    FILE* f = popen("zenity --file-selection --title='Open File' 2>/dev/null", "r");
+    if (!f) f = popen("kdialog --getopenfilename . 2>/dev/null", "r");
+    if (!f) {
+        std::cerr << "No file dialog available — install zenity or kdialog\n";
+        return;
+    }
+    char buf[4096] = {};
+    if (fgets(buf, sizeof(buf), f)) {
+        size_t len = strlen(buf);
+        if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
+        if (buf[0] != '\0') LoadAndReplaceScene(buf);
+    }
+    pclose(f);
+}
 
 // --- Timing helpers ---
 
@@ -332,8 +375,10 @@ static void keyboard_key(void * /*data*/,
         g_state.keys[KEY_F] = pressed; break;
     case XKB_KEY_s: case XKB_KEY_S:
         g_state.keys[KEY_S] = pressed; break;
+    case XKB_KEY_plus: case XKB_KEY_equal:
+        g_state.keys[KEY_PLUS] = pressed; break;
     case XKB_KEY_o: case XKB_KEY_O:
-        g_state.keys[KEY_O] = pressed; break;
+        if (pressed) ShowOpenFileDialog(); break;
     case XKB_KEY_Escape:
         g_state.keys[KEY_ESCAPE] = pressed; break;
     case XKB_KEY_Shift_L: case XKB_KEY_Shift_R:
@@ -646,7 +691,7 @@ int main(int argc, char *argv[]) {
 
     std::cout << "Controls: Alt+LMB/Shift+LMB Orbit, Alt+MMB/Ctrl+LMB Pan, "
                  "Alt+RMB/Ctrl+Shift+LMB/Tab+LMB Dolly\n";
-    std::cout << "          F: Fit, S: Shadow, O: Font 2x\n";
+    std::cout << "          F: Fit, S: Shadow, +: Font 2x, O: Open File (zenity/kdialog)\n";
 
     // Main loop
     while (g_running) {

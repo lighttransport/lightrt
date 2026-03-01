@@ -18,7 +18,7 @@ using namespace lightrt;
 enum ViewerKey {
     KEY_F = 0,
     KEY_S,
-    KEY_O,
+    KEY_PLUS,
     KEY_ESCAPE,
     KEY_COUNT
 };
@@ -66,7 +66,7 @@ struct ViewerState {
     bool keys[KEY_COUNT] = {};
     bool fKeyWasPressed = false;
     bool sKeyWasPressed = false;
-    bool oKeyWasPressed = false;
+    bool plusKeyWasPressed = false;
     bool altPressed = false;
     bool shiftPressed = false;
     bool ctrlPressed = false;
