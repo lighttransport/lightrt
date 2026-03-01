@@ -7,6 +7,7 @@
 
 #include "common/viewer_common.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -18,6 +19,50 @@ using namespace lightrt_viewer;
 // --- Globals ---
 static ViewerState g_state;
 static bool        g_running = true;
+static Display*    g_dpy = nullptr;
+static Window      g_win = 0;
+
+// --- File loading ---
+
+static void LoadAndReplaceScene(const std::string& path) {
+    std::cout << "Loading " << path << "...\n";
+    scene::Scene newScene;
+    if (!LoadModel(path, newScene)) {
+        std::cerr << "Failed to load: " << path << "\n";
+        return;
+    }
+    if (sceneTriangleCount(newScene) == 0) {
+        std::cerr << "No triangles in: " << path << "\n";
+        return;
+    }
+    g_state.scene = std::move(newScene);
+    FitToScene(g_state);
+    std::cout << "Scene: " << g_state.scene.meshes.size() << " meshes, "
+              << sceneTriangleCount(g_state.scene) << " triangles.\n";
+
+    // Update window title
+    size_t sep = path.find_last_of("/\\");
+    std::string fname = (sep != std::string::npos) ? path.substr(sep + 1) : path;
+    std::string title = "LightRT Viewer (X11) - " + fname;
+    if (g_dpy && g_win) XStoreName(g_dpy, g_win, title.c_str());
+}
+
+static void ShowOpenFileDialog() {
+    // Try zenity (GNOME/GTK), then kdialog (KDE)
+    FILE* f = popen("zenity --file-selection --title='Open File' 2>/dev/null", "r");
+    if (!f) f = popen("kdialog --getopenfilename . 2>/dev/null", "r");
+    if (!f) {
+        std::cerr << "No file dialog available — install zenity or kdialog\n";
+        return;
+    }
+    char buf[4096] = {};
+    if (fgets(buf, sizeof(buf), f)) {
+        size_t len = strlen(buf);
+        if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
+        if (buf[0] != '\0') LoadAndReplaceScene(buf);
+    }
+    pclose(f);
+}
 
 // --- Timing helpers ---
 
@@ -44,15 +89,13 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    g_state.scene.build();
-
-    if (g_state.scene.allTriangles.empty()) {
+    if (sceneTriangleCount(g_state.scene) == 0) {
         std::cerr << "No triangles in scene.\n";
         return 1;
     }
 
     std::cout << "Scene: " << g_state.scene.meshes.size() << " meshes, "
-              << g_state.scene.allTriangles.size() << " triangles.\n";
+              << sceneTriangleCount(g_state.scene) << " triangles.\n";
 
     // Initialize sun direction and accumulation buffer
     g_state.sunDirection = Vec3(1, 1, -0.5f).normalize();
@@ -107,6 +150,8 @@ int main(int argc, char* argv[]) {
     XSetWMProtocols(dpy, win, &wm_delete, 1);
 
     XMapWindow(dpy, win);
+    g_dpy = dpy;
+    g_win = win;
 
     // Create GC for drawing
     GC gc = XCreateGC(dpy, win, 0, nullptr);
@@ -125,7 +170,7 @@ int main(int argc, char* argv[]) {
     int fpsFrameCount = 0;
 
     std::cout << "Controls: Alt+LMB/Shift+LMB Orbit, Alt+MMB/Ctrl+LMB Pan, Alt+RMB/Ctrl+Shift+LMB/Tab+LMB Dolly\n";
-    std::cout << "          F: Fit, S: Shadow, O: Font 2x\n";
+    std::cout << "          F: Fit, S: Shadow, +: Font 2x, O: Open File (zenity/kdialog)\n";
 
     // Main loop
     while (g_running) {
@@ -169,8 +214,10 @@ int main(int argc, char* argv[]) {
                     g_state.keys[KEY_F] = true; break;
                 case XK_s: case XK_S:
                     g_state.keys[KEY_S] = true; break;
+                case XK_plus: case XK_equal:
+                    g_state.keys[KEY_PLUS] = true; break;
                 case XK_o: case XK_O:
-                    g_state.keys[KEY_O] = true; break;
+                    ShowOpenFileDialog(); break;
                 case XK_Escape:
                     g_state.keys[KEY_ESCAPE] = true; break;
                 case XK_Shift_L: case XK_Shift_R:
@@ -205,8 +252,8 @@ int main(int argc, char* argv[]) {
                     g_state.keys[KEY_F] = false; break;
                 case XK_s: case XK_S:
                     g_state.keys[KEY_S] = false; break;
-                case XK_o: case XK_O:
-                    g_state.keys[KEY_O] = false; break;
+                case XK_plus: case XK_equal:
+                    g_state.keys[KEY_PLUS] = false; break;
                 case XK_Escape:
                     g_state.keys[KEY_ESCAPE] = false; break;
                 case XK_Shift_L: case XK_Shift_R:

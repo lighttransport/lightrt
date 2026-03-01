@@ -26,15 +26,14 @@ static LARGE_INTEGER g_lastTime;
 static void LoadAndReplaceScene(HWND hwnd, const std::string& path) {
     std::cout << "Loading " << path << "...\n";
 
-    Scene newScene;
+    scene::Scene newScene;
     if (!LoadModel(path, newScene)) {
         std::cerr << "Failed to load: " << path << "\n";
         MessageBoxA(hwnd, ("Failed to load:\n" + path).c_str(), "Load Error", MB_OK | MB_ICONERROR);
         return;
     }
 
-    newScene.build();
-    if (newScene.allTriangles.empty()) {
+    if (sceneTriangleCount(newScene) == 0) {
         std::cerr << "No triangles in: " << path << "\n";
         MessageBoxA(hwnd, "File contains no triangles.", "Load Error", MB_OK | MB_ICONWARNING);
         return;
@@ -44,7 +43,7 @@ static void LoadAndReplaceScene(HWND hwnd, const std::string& path) {
     FitToScene(g_state);
 
     std::cout << "Scene: " << g_state.scene.meshes.size() << " meshes, "
-              << g_state.scene.allTriangles.size() << " triangles.\n";
+              << sceneTriangleCount(g_state.scene) << " triangles.\n";
 
     // Update window title
     std::wstring title = L"LightRT Viewer - ";
@@ -138,18 +137,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_KEYDOWN: {
         switch (wParam) {
-        case 'F':      g_state.keys[KEY_F] = true; break;
-        case 'S':      g_state.keys[KEY_S] = true; break;
-        case 'O':
-            if (GetKeyState(VK_CONTROL) & 0x8000) {
-                ShowOpenFileDialog(hwnd);
-            } else {
-                g_state.keys[KEY_O] = true;
-            }
-            break;
-        case VK_ESCAPE: g_state.keys[KEY_ESCAPE] = true; break;
-        case VK_TAB:   g_state.tabPressed = true; break;
-        case VK_SHIFT:  g_state.shiftPressed = true; break;
+        case 'F':        g_state.keys[KEY_F] = true; break;
+        case 'S':        g_state.keys[KEY_S] = true; break;
+        case 'O':        ShowOpenFileDialog(hwnd); break;
+        case VK_OEM_PLUS: g_state.keys[KEY_PLUS] = true; break;
+        case VK_ESCAPE:  g_state.keys[KEY_ESCAPE] = true; break;
+        case VK_TAB:     g_state.tabPressed = true; break;
+        case VK_SHIFT:   g_state.shiftPressed = true; break;
         case VK_CONTROL: g_state.ctrlPressed = true; break;
         }
         return 0;
@@ -157,12 +151,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_KEYUP: {
         switch (wParam) {
-        case 'F':      g_state.keys[KEY_F] = false; break;
-        case 'S':      g_state.keys[KEY_S] = false; break;
-        case 'O':      g_state.keys[KEY_O] = false; break;
-        case VK_ESCAPE: g_state.keys[KEY_ESCAPE] = false; break;
-        case VK_TAB:   g_state.tabPressed = false; break;
-        case VK_SHIFT:  g_state.shiftPressed = false; break;
+        case 'F':        g_state.keys[KEY_F] = false; break;
+        case 'S':        g_state.keys[KEY_S] = false; break;
+        case VK_OEM_PLUS: g_state.keys[KEY_PLUS] = false; break;
+        case VK_ESCAPE:  g_state.keys[KEY_ESCAPE] = false; break;
+        case VK_TAB:     g_state.tabPressed = false; break;
+        case VK_SHIFT:   g_state.shiftPressed = false; break;
         case VK_CONTROL: g_state.ctrlPressed = false; break;
         }
         return 0;
@@ -342,7 +336,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     int fpsFrameCount = 0;
 
     std::cout << "Controls: Alt+LMB/Shift+LMB Orbit, Alt+MMB/Ctrl+LMB Pan, Alt+RMB/Ctrl+Shift+LMB/Tab+LMB Dolly\n";
-    std::cout << "          F: Fit, S: Shadow, O: Font 2x, Ctrl+O: Open file, Drag&Drop: Load file\n";
+    std::cout << "          F: Fit, S: Shadow, +: Font 2x, O: Open File, Drag&Drop: Load file\n";
 
     // Main loop
     while (g_running) {

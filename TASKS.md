@@ -36,55 +36,43 @@ colorchart, geomsubset multi-material, emissive planes, glass sphere.
 
 ### High Priority
 
-- [ ] **Lighting quality**: The SphereLight is attenuated by `1/r²` but the
-  intensity is also pre-multiplied into `light.color`. Verify the combined
-  formula matches physically-based expectations. The cube currently renders
-  quite dark (most faces are near-black with only the light-facing face lit).
-  Consider adding an ambient contribution or checking the intensity pipeline.
+- [x] **Lighting quality**: SphereLight now uses area-light sampling with
+  radius-aware geometry factor (uniform surface sampling, `area / r²` term).
+  Point lights still use `1/r²`. No ambient term added.
 
-- [ ] **Z-up scene support**: Geometry is NOT converted from Z-up to Y-up.
-  Camera is correctly left in Z-up space. However, the default camera fallback
-  (`cam_up = (0,1,0)`) is wrong for Z-up scenes — it should be `(0,0,1)`.
-  Also, the fallback `cam_dir` (pointing toward scene center from +Z) is
-  correct for Z-up. Need to detect `upAxis` and adjust default camera up vector.
+- [x] **Z-up scene support**: Geometry is NOT converted from Z-up to Y-up.
+  Camera is correctly left in Z-up space. Default camera fallback now respects
+  `upAxis` (Z-up uses `(0,0,1)`, X-up uses `(1,0,0)`, Y-up uses `(0,1,0)`).
 
-- [ ] **Texture infrastructure** (from plan): load material textures, store
-  per-triangle UVs, sample at hit points. The plan in
-  `~/.claude/plans/fluffy-tumbling-fairy.md` has full details.
+- [x] **Texture infrastructure** (from plan): load material textures, store
+  per-triangle UVs, sample at hit points. (Plan file
+  `~/.claude/plans/fluffy-tumbling-fairy.md` not found; implemented directly.)
 
-- [ ] **Asset resolver**: resolve texture paths relative to the USD file
-  directory. Partially designed in the plan.
+- [x] **Asset resolver**: resolve texture paths relative to the USD file
+  directory.
 
 ### Medium Priority
 
-- [ ] **Smooth normals for lightusd-c path**: `tri_normals` is not currently
-  populated. Add authored normal extraction + fallback to computed smooth normals
-  via `lydra_c_compute_smooth_normals()`. Meshes currently use flat shading
-  (face normals from cross product).
+- [x] **Smooth normals for lightusd-c path**: `tri_normals` populated from
+  authored normals or smooth-normal fallback (`lydra_c_compute_smooth_normals()`).
 
-- [ ] **Y-up scene camera fix**: For Y-up scenes without an authored camera, the
-  auto camera uses `cam_up = (0,1,0)` which is correct. But verify this is
-  working well for varied scenes.
+- [x] **Y-up scene camera fix**: Verified fallback camera on Y-up scene
+  (e.g., `mtlx-normalmap-cube.usda`).
 
-- [ ] **DistantLight support**: The lightusd-c path uses
-  `-(world_xform[0*4+2], world_xform[1*4+2], world_xform[2*4+2])` for the
-  direction (column 2). Verify this is correct with the same row-vector
-  convention used for the camera.
+- [x] **DistantLight support**: Verified lightusd-c render with DistantLight
+  scene (`mtlx-normalmap-cube.usda`).
 
-- [ ] **Multi-material rendering test**: Verify GeomSubset materials still
-  work correctly after the camera fix.
+- [x] **Multi-material rendering test**: Verified `geomsubset-test-001.usda`.
 
 ### Low Priority / Future
 
-- [ ] **USDC support for lightusd-c path**: Currently the lightusd-c path
-  handles both USDA and USDC (tested). Continue expanding model support.
+- [x] **USDC support for lightusd-c path**: Verified with
+  `cube-previewsurface.usdc` in lightusd-c.
 
-- [ ] **Motion blur**: Camera shutter interval is read but mblur ray time
-  is only used when `--mblur-samples N` > 1. Works for both paths.
+- [x] **Motion blur**: Verified `--mblur-samples 2` path on `skintest.usda`.
 
-- [ ] **tydra path parity**: Ensure tydra path gets the same camera fix if
-  it has the same bug. The tydra path uses `node.global_matrix.m[r][c]` with
-  the same convention (row-major, translation in row 3).
+- [x] **tydra path parity**: Camera uses the same row-major transform
+  convention in `main.cc`.
 
 ---
 

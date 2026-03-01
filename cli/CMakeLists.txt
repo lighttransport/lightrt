@@ -44,7 +44,14 @@ endif()
 set(LIGHTRT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/..")
 
 # CLI executable
-add_executable(lightrt_cli main.cc stb_image_write_impl.cc stb_image_impl.cc "${LIGHTRT_DIR}/lightrt.cc")
+add_executable(lightrt_cli
+  main.cc
+  stb_image_impl.cc
+  stb_image_write_impl.cc
+  "${LIGHTRT_DIR}/lightrt.cc"
+  "${LIGHTRT_DIR}/common/usd_loader.cc"
+  "${LIGHTRT_DIR}/common/renderer.cc"
+)
 
 target_include_directories(lightrt_cli PRIVATE
   "${LIGHTRT_DIR}"
@@ -63,7 +70,9 @@ if(LIGHTRT_USE_LIGHTUSD_C)
   endif()
 
   # Build lightusd-c (C11) + lydra (C++) as a subdirectory.
-  # No LUSD_TINYUSDZ_DIR set — builds with pure-C stubs only.
+  # Force pure-C backend: do not link tinyusdz_static when using lightusd-c.
+  set(LUSD_TINYUSDZ_DIR OFF CACHE BOOL "" FORCE)
+  # No tinyusdz dependency; use native reader stubs only.
   if(EXISTS "${LIGHTUSD_C_DIR}/CMakeLists.txt")
     add_subdirectory("${LIGHTUSD_C_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/lightusd-c")
   else()
@@ -99,5 +108,6 @@ else()
     "${TINYUSDZ_DIR}/src/external"
   )
   target_link_libraries(lightrt_cli PRIVATE tinyusdz_static)
+  target_compile_definitions(lightrt_cli PRIVATE LIGHTRT_HAS_TINYUSDZ)
   message(STATUS "USD backend: tinyusdz + tydra (${TINYUSDZ_DIR})")
 endif()
