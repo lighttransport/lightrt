@@ -14,16 +14,11 @@
 
 #include "viewer_common.h"
 
-#ifdef LIGHTRT_HAS_TINYUSDZ
-#include "tinyusdz.hh"
-#include "tydra/render-data.hh"
-#include "tydra/scene-access.hh"
-#endif
-
 #include <iostream>
 #include <thread>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace lightrt_viewer {
 
@@ -34,31 +29,7 @@ static Vec3 vmul(const Vec3& a, const Vec3& b) {
     return Vec3(a.x * b.x, a.y * b.y, a.z * b.z);
 }
 
-// --- Scene ---
-
-void Scene::build() {
-    allTriangles.clear();
-    meshIdPerTri.clear();
-    for (uint32_t mi = 0; mi < (uint32_t)meshes.size(); ++mi) {
-        for (const auto& tri : meshes[mi].triangles) {
-            allTriangles.push_back(tri);
-            meshIdPerTri.push_back(mi);
-        }
-    }
-    if (!allTriangles.empty()) {
-        lightrt::BVHBuildConfig config;
-        bvh.build(allTriangles, config);
-    }
-}
-
-Vec3 Scene::getMeshColor(uint32_t triIdx) const {
-    if (triIdx < (uint32_t)meshIdPerTri.size()) {
-        return meshes[meshIdPerTri[triIdx]].color;
-    }
-    return Vec3(0.8f, 0.8f, 0.8f);
-}
-
-// --- Model Loading ---
+// --- Color helpers ---
 
 static Vec3 hashColor(const std::string& name) {
     uint32_t h = 5381;
@@ -69,7 +40,61 @@ static Vec3 hashColor(const std::string& name) {
     return Vec3(r, g, b);
 }
 
-bool LoadOBJ(const std::string& filename, Scene& scene) {
+// --- Scene helpers ---
+
+// Add a mesh (triangles + base color) to a scene::Scene with identity transform.
+static void addMeshToScene(scene::Scene& sc,
+                            std::vector<Triangle> tris,
+                            Vec3 color) {
+    if (tris.empty()) return;
+
+    // Material
+    int32_t mat_id = (int32_t)sc.materials.size();
+    scene::MaterialData mat;
+    mat.base_color = color;
+    sc.materials.push_back(mat);
+
+    // MeshBLAS
+    uint32_t mesh_id = (uint32_t)sc.meshes.size();
+    sc.meshes.emplace_back();
+    auto& blas = sc.meshes.back();
+    blas.default_material_id = mat_id;
+    for (const auto& tri : tris) {
+        blas.local_bounds.expand(tri.v0);
+        blas.local_bounds.expand(tri.v1);
+        blas.local_bounds.expand(tri.v2);
+    }
+    lightrt::BVHBuildConfig cfg;
+    blas.bvh.build(tris, cfg);
+
+    // Instance (identity transform)
+    sc.instances.emplace_back();
+    auto& inst = sc.instances.back();
+    inst.mesh_id = mesh_id;
+    const float id[12] = {1,0,0,0, 0,1,0,0, 0,0,1,0};
+    std::memcpy(inst.transform,           id, sizeof(id));
+    std::memcpy(inst.inv_transform,       id, sizeof(id));
+    std::memcpy(inst.transform_close,     id, sizeof(id));
+    std::memcpy(inst.inv_transform_close, id, sizeof(id));
+    inst.world_bounds = blas.local_bounds;
+
+    sc.scene_bounds.expand(inst.world_bounds);
+}
+
+// Return the diffuse albedo for a scene hit.
+static Vec3 getHitAlbedo(const scene::Scene& sc, const scene::HitInfo& hit) {
+    const auto& blas = sc.meshes[sc.instances[hit.instance_id].mesh_id];
+    int32_t mat_id = blas.default_material_id;
+    if (hit.triangle_id < (uint32_t)blas.tri_material_ids.size())
+        mat_id = blas.tri_material_ids[hit.triangle_id];
+    if (mat_id >= 0 && mat_id < (int32_t)sc.materials.size())
+        return sc.materials[mat_id].base_color;
+    return hashColor(std::to_string(hit.instance_id));
+}
+
+// --- Model Loading ---
+
+bool LoadOBJ(const std::string& filename, scene::Scene& sc) {
     tinyobj::attrib_t attrib;
     std::vector<tinyobj::shape_t> shapes;
     std::vector<tinyobj::material_t> materials;
@@ -81,10 +106,10 @@ bool LoadOBJ(const std::string& filename, Scene& scene) {
     }
 
     for (const auto& shape : shapes) {
-        SceneMesh sm;
-        sm.name = shape.name.empty() ? "mesh" : shape.name;
-        sm.color = hashColor(sm.name);
+        std::string name = shape.name.empty() ? "mesh" : shape.name;
+        Vec3 color = hashColor(name);
 
+        std::vector<Triangle> tris;
         size_t index_offset = 0;
         for (size_t f = 0; f < shape.mesh.num_face_vertices.size(); f++) {
             int fv = shape.mesh.num_face_vertices[f];
@@ -93,27 +118,21 @@ bool LoadOBJ(const std::string& filename, Scene& scene) {
                 tinyobj::index_t idx1 = shape.mesh.indices[index_offset + 1];
                 tinyobj::index_t idx2 = shape.mesh.indices[index_offset + 2];
 
-                Vec3 v0(attrib.vertices[3 * idx0.vertex_index + 0], attrib.vertices[3 * idx0.vertex_index + 1], attrib.vertices[3 * idx0.vertex_index + 2]);
-                Vec3 v1(attrib.vertices[3 * idx1.vertex_index + 0], attrib.vertices[3 * idx1.vertex_index + 1], attrib.vertices[3 * idx1.vertex_index + 2]);
-                Vec3 v2(attrib.vertices[3 * idx2.vertex_index + 0], attrib.vertices[3 * idx2.vertex_index + 1], attrib.vertices[3 * idx2.vertex_index + 2]);
-
                 Triangle tri;
-                tri.v0 = v0;
-                tri.v1 = v1;
-                tri.v2 = v2;
-                sm.triangles.push_back(tri);
+                tri.v0 = Vec3(attrib.vertices[3*idx0.vertex_index+0], attrib.vertices[3*idx0.vertex_index+1], attrib.vertices[3*idx0.vertex_index+2]);
+                tri.v1 = Vec3(attrib.vertices[3*idx1.vertex_index+0], attrib.vertices[3*idx1.vertex_index+1], attrib.vertices[3*idx1.vertex_index+2]);
+                tri.v2 = Vec3(attrib.vertices[3*idx2.vertex_index+0], attrib.vertices[3*idx2.vertex_index+1], attrib.vertices[3*idx2.vertex_index+2]);
+                tris.push_back(tri);
             }
             index_offset += fv;
         }
 
-        if (!sm.triangles.empty()) {
-            scene.meshes.push_back(std::move(sm));
-        }
+        addMeshToScene(sc, std::move(tris), color);
     }
     return true;
 }
 
-bool LoadGLTF(const std::string& filename, Scene& scene) {
+bool LoadGLTF(const std::string& filename, scene::Scene& sc) {
     tinygltf::Model model;
     tinygltf::TinyGLTF loader;
     std::string err, warn;
@@ -134,12 +153,10 @@ bool LoadGLTF(const std::string& filename, Scene& scene) {
         for (size_t pi = 0; pi < gltfMesh.primitives.size(); ++pi) {
             const auto& primitive = gltfMesh.primitives[pi];
 
-            SceneMesh sm;
-            sm.name = gltfMesh.name.empty() ? ("mesh_" + std::to_string(mi)) : gltfMesh.name;
-            if (gltfMesh.primitives.size() > 1) {
-                sm.name += "_prim" + std::to_string(pi);
-            }
-            sm.color = hashColor(sm.name);
+            std::string name = gltfMesh.name.empty() ? ("mesh_" + std::to_string(mi)) : gltfMesh.name;
+            if (gltfMesh.primitives.size() > 1)
+                name += "_prim" + std::to_string(pi);
+            Vec3 color = hashColor(name);
 
             const float* positionBuffer = nullptr;
             const unsigned char* indexBuffer = nullptr;
@@ -163,6 +180,7 @@ bool LoadGLTF(const std::string& filename, Scene& scene) {
                 indexCount = accessor.count;
             }
 
+            std::vector<Triangle> tris;
             if (positionBuffer && indexCount > 0) {
                 for (size_t i = 0; i < indexCount; i += 3) {
                     uint32_t i0 = 0, i1 = 0, i2 = 0;
@@ -173,97 +191,23 @@ bool LoadGLTF(const std::string& filename, Scene& scene) {
                         const uint32_t* buf = (const uint32_t*)indexBuffer;
                         i0 = buf[i]; i1 = buf[i+1]; i2 = buf[i+2];
                     } else if (idxType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
-                         const uint8_t* buf = (const uint8_t*)indexBuffer;
-                         i0 = buf[i]; i1 = buf[i+1]; i2 = buf[i+2];
+                        const uint8_t* buf = (const uint8_t*)indexBuffer;
+                        i0 = buf[i]; i1 = buf[i+1]; i2 = buf[i+2];
                     }
 
-                    Vec3 v0(positionBuffer[i0 * posStride], positionBuffer[i0 * posStride + 1], positionBuffer[i0 * posStride + 2]);
-                    Vec3 v1(positionBuffer[i1 * posStride], positionBuffer[i1 * posStride + 1], positionBuffer[i1 * posStride + 2]);
-                    Vec3 v2(positionBuffer[i2 * posStride], positionBuffer[i2 * posStride + 1], positionBuffer[i2 * posStride + 2]);
-                    Triangle tri; tri.v0 = v0; tri.v1 = v1; tri.v2 = v2;
-                    sm.triangles.push_back(tri);
+                    Triangle tri;
+                    tri.v0 = Vec3(positionBuffer[i0*posStride], positionBuffer[i0*posStride+1], positionBuffer[i0*posStride+2]);
+                    tri.v1 = Vec3(positionBuffer[i1*posStride], positionBuffer[i1*posStride+1], positionBuffer[i1*posStride+2]);
+                    tri.v2 = Vec3(positionBuffer[i2*posStride], positionBuffer[i2*posStride+1], positionBuffer[i2*posStride+2]);
+                    tris.push_back(tri);
                 }
             }
 
-            if (!sm.triangles.empty()) {
-                scene.meshes.push_back(std::move(sm));
-            }
+            addMeshToScene(sc, std::move(tris), color);
         }
     }
     return true;
 }
-
-#ifdef LIGHTRT_HAS_TINYUSDZ
-bool LoadUSD(const std::string& filename, Scene& scene) {
-    std::string warn, err;
-    tinyusdz::Stage stage;
-
-    bool ret = tinyusdz::LoadUSDFromFile(filename, &stage, &warn, &err);
-    if (!warn.empty()) std::cerr << "USD warn: " << warn << "\n";
-    if (!ret) {
-        std::cerr << "USD load error: " << err << "\n";
-        return false;
-    }
-
-    tinyusdz::tydra::RenderScene render_scene;
-    tinyusdz::tydra::RenderSceneConverter converter;
-    tinyusdz::tydra::RenderSceneConverterEnv env(stage);
-    env.mesh_config.triangulate = true;
-    env.timecode = stage.metas().startTimeCode.get_value();
-
-    ret = converter.ConvertToRenderScene(env, &render_scene);
-    if (!ret) {
-        std::cerr << "Failed to convert USD to render scene\n";
-        return false;
-    }
-
-    // Z-up to Y-up: rotate -90 degrees around X => (x, y, z) -> (x, z, -y)
-    bool zUp = (render_scene.meta.upAxis == "Z" || render_scene.meta.upAxis == "z");
-    if (zUp) {
-        std::cout << "USD upAxis is Z — converting to Y-up\n";
-    }
-
-    for (size_t mi = 0; mi < render_scene.meshes.size(); mi++) {
-        const auto& mesh = render_scene.meshes[mi];
-        const auto& pts = mesh.points;
-        const auto& idx = mesh.faceVertexIndices();
-
-        if (idx.size() % 3 != 0) {
-            std::cerr << "Warning: non-triangulated mesh " << mi << ", skipping\n";
-            continue;
-        }
-
-        SceneMesh sm;
-        sm.name = mesh.prim_name.empty() ? ("mesh_" + std::to_string(mi)) : mesh.prim_name;
-        sm.color = hashColor(sm.name);
-
-        for (size_t i = 0; i + 2 < idx.size(); i += 3) {
-            uint32_t i0 = idx[i], i1 = idx[i + 1], i2 = idx[i + 2];
-            if (i0 >= pts.size() || i1 >= pts.size() || i2 >= pts.size()) continue;
-            Triangle tri;
-            tri.v0 = Vec3(pts[i0][0], pts[i0][1], pts[i0][2]);
-            tri.v1 = Vec3(pts[i1][0], pts[i1][1], pts[i1][2]);
-            tri.v2 = Vec3(pts[i2][0], pts[i2][1], pts[i2][2]);
-
-            if (zUp) {
-                // (x, y, z) -> (x, z, -y)
-                tri.v0 = Vec3(tri.v0.x, tri.v0.z, -tri.v0.y);
-                tri.v1 = Vec3(tri.v1.x, tri.v1.z, -tri.v1.y);
-                tri.v2 = Vec3(tri.v2.x, tri.v2.z, -tri.v2.y);
-                // Swap v1/v2 to restore CCW winding
-                std::swap(tri.v1, tri.v2);
-            }
-
-            sm.triangles.push_back(tri);
-        }
-
-        if (!sm.triangles.empty()) {
-            scene.meshes.push_back(std::move(sm));
-        }
-    }
-    return true;
-}
-#endif
 
 static bool hasExtension(const std::string& filename, const std::string& ext) {
     if (filename.size() < ext.size()) return false;
@@ -275,17 +219,16 @@ static bool hasExtension(const std::string& filename, const std::string& ext) {
     return lower == ext;
 }
 
-bool LoadModel(const std::string& filename, Scene& scene) {
+bool LoadModel(const std::string& filename, scene::Scene& sc) {
     if (hasExtension(filename, ".obj")) {
-        return LoadOBJ(filename, scene);
+        return LoadOBJ(filename, sc);
     }
-#ifdef LIGHTRT_HAS_TINYUSDZ
-    if (hasExtension(filename, ".usd") || hasExtension(filename, ".usda") ||
+    if (hasExtension(filename, ".usd")  || hasExtension(filename, ".usda") ||
         hasExtension(filename, ".usdc") || hasExtension(filename, ".usdz")) {
-        return LoadUSD(filename, scene);
+        // Delegate to common USD loader (tinyusdz or lightusd-c backend)
+        return lightrt_common::loadUSDScene(filename, -1e30, sc);
     }
-#endif
-    return LoadGLTF(filename, scene);
+    return LoadGLTF(filename, sc);
 }
 
 // --- Camera ---
@@ -294,7 +237,6 @@ void UpdateCameraFromOrbit(Camera& cam) {
     float yawRad = cam.yaw * kPi / 180.0f;
     float pitchRad = cam.pitch * kPi / 180.0f;
 
-    // Position on sphere around orbitCenter
     float cosPitch = cosf(pitchRad);
     Vec3 offset;
     offset.x = cosf(yawRad) * cosPitch;
@@ -308,12 +250,11 @@ void UpdateCameraFromOrbit(Camera& cam) {
 }
 
 void FitToScene(ViewerState& state) {
-    const auto& nodes = state.scene.bvh.getBVH().getNodes();
-    if (nodes.empty()) return;
-
-    AABB bounds = nodes[0].bounds;
-    Vec3 center = bounds.center();
+    const AABB& bounds = state.scene.scene_bounds;
     Vec3 ext = bounds.extents();
+    if (ext.length() < 1e-6f) return;
+
+    Vec3 center = bounds.center();
     float radius = ext.length() * 0.5f;
 
     state.camera.orbitCenter = center;
@@ -364,10 +305,6 @@ void OnMouseDrag(ViewerState& state, double x, double y) {
     state.lastX = x;
     state.lastY = y;
 
-    // Alt+button: Maya-style navigation
-    // Shift+LMB: orbit (touchpad-friendly)
-    // Ctrl+LMB: pan (touchpad-friendly)
-    // Ctrl+Shift+LMB: dolly (touchpad-friendly)
     bool wantOrbit = (state.altPressed && state.lmbPressed) ||
                      (state.shiftPressed && !state.ctrlPressed && !state.tabPressed && state.lmbPressed);
     bool wantPan   = (state.altPressed && state.mmbPressed) ||
@@ -390,14 +327,12 @@ void OnMouseDrag(ViewerState& state, double x, double y) {
 bool ProcessInput(ViewerState& state, float /*dt*/) {
     if (state.keys[KEY_ESCAPE]) return true;
 
-    // F key - fit to scene (edge-triggered)
     bool fKeyPressed = state.keys[KEY_F];
     if (fKeyPressed && !state.fKeyWasPressed) {
         FitToScene(state);
     }
     state.fKeyWasPressed = fKeyPressed;
 
-    // S key - cycle shadow mode (edge-triggered)
     bool sKeyPressed = state.keys[KEY_S];
     if (sKeyPressed && !state.sKeyWasPressed) {
         state.shadowMode = (ShadowMode)(((int)state.shadowMode + 1) % SHADOW_MODE_COUNT);
@@ -405,12 +340,11 @@ bool ProcessInput(ViewerState& state, float /*dt*/) {
     }
     state.sKeyWasPressed = sKeyPressed;
 
-    // O key - toggle 2x font scale (edge-triggered)
-    bool oKeyPressed = state.keys[KEY_O];
-    if (oKeyPressed && !state.oKeyWasPressed) {
+    bool plusKeyPressed = state.keys[KEY_PLUS];
+    if (plusKeyPressed && !state.plusKeyWasPressed) {
         state.fontScale = (state.fontScale == 1) ? 2 : 1;
     }
-    state.oKeyWasPressed = oKeyPressed;
+    state.plusKeyWasPressed = plusKeyPressed;
 
     return false;
 }
@@ -418,24 +352,19 @@ bool ProcessInput(ViewerState& state, float /*dt*/) {
 // --- Sun/Sky ---
 
 Vec3 SampleSky(const Vec3& dir, const Vec3& sun_dir) {
-    // Below horizon: ground color
     if (dir.y < 0.0f) {
         return Vec3(0.3f, 0.25f, 0.2f);
     }
 
-    // Sky gradient: horizon -> zenith
     float t = sqrtf(std::max(0.0f, dir.y));
     Vec3 horizon(0.7f, 0.8f, 1.0f);
     Vec3 zenith(0.3f, 0.5f, 0.9f);
     Vec3 sky = horizon * (1.0f - t) + zenith * t;
 
-    // Sun
     float sun_dot = dir.dot(sun_dir);
     if (sun_dot > 0.9995f) {
-        // Hard sun disk
         sky = Vec3(3.0f, 2.8f, 2.5f);
     } else if (sun_dot > 0.99f) {
-        // Glow halo
         float glow = (sun_dot - 0.99f) / (0.9995f - 0.99f);
         glow = glow * glow;
         sky = sky + Vec3(1.0f, 0.9f, 0.7f) * glow;
@@ -457,22 +386,18 @@ static float rand_float(uint32_t& seed) {
     return (float)(seed & 0xFFFFFFu) / (float)0x1000000u;
 }
 
-// Cosine-weighted hemisphere sample (delegates to shared implementation)
 static Vec3 cosine_hemisphere(float u1, float u2, const Vec3& normal) {
     return lightrt_common::shading::cosineHemisphere(u1, u2, normal);
 }
 
-// Jitter direction within a cone of given half-angle (radians)
 static Vec3 jitter_direction(const Vec3& dir, float half_angle, uint32_t& seed) {
     float u1 = rand_float(seed);
     float u2 = rand_float(seed);
-    // Uniform sample within cone
     float cos_max = cosf(half_angle);
     float cos_theta = 1.0f - u1 * (1.0f - cos_max);
     float sin_theta = sqrtf(std::max(0.0f, 1.0f - cos_theta * cos_theta));
     float phi = 2.0f * kPi * u2;
 
-    // Build tangent frame around dir
     Vec3 tangent;
     if (fabsf(dir.x) > 0.9f)
         tangent = Vec3(0, 1, 0).cross(dir).normalize();
@@ -485,11 +410,18 @@ static Vec3 jitter_direction(const Vec3& dir, float half_angle, uint32_t& seed) 
             dir * cos_theta).normalize();
 }
 
+// Get world-space normal for a scene hit
+static Vec3 getHitNormal(const scene::Scene& sc, const scene::HitInfo& hit) {
+    const auto& inst = sc.instances[hit.instance_id];
+    const Triangle& tri = sc.meshes[inst.mesh_id].bvh.getTriangles()[hit.triangle_id];
+    Vec3 local_n = tri.normal();
+    return scene::transformNormal(inst.inv_transform, local_n).normalize();
+}
+
 void PathTrace(ViewerState& state) {
     int width = (int)state.width;
     int height = (int)state.height;
 
-    // Reset accumulation if camera moved
     if (state.cameraDirty) {
         std::fill(state.accumBuffer.begin(), state.accumBuffer.end(), 0.0f);
         state.sampleCount = 0;
@@ -505,8 +437,6 @@ void PathTrace(ViewerState& state) {
     Vec3 sunDir = state.sunDirection;
     ShadowMode shadowMode = state.shadowMode;
 
-    // Soft shadow cone half-angles (radians)
-    // ~2 degrees for soft, ~5 degrees for strong soft
     float shadowConeAngle = 0.0f;
     if (shadowMode == SHADOW_SOFT) shadowConeAngle = 0.035f;
     else if (shadowMode == SHADOW_STRONG_SOFT) shadowConeAngle = 0.087f;
@@ -522,10 +452,8 @@ void PathTrace(ViewerState& state) {
 
             for (int y = start_y; y < end_y; ++y) {
                 for (int x = 0; x < width; ++x) {
-                    // Per-pixel RNG seed
                     uint32_t seed = pcg_hash((uint32_t)x + (uint32_t)y * 65537u + sampleIdx * 1000003u);
 
-                    // Sub-pixel jitter
                     float jx = rand_float(seed);
                     float jy = rand_float(seed);
 
@@ -535,23 +463,18 @@ void PathTrace(ViewerState& state) {
                     Vec3 dir = (state.camera.forward + state.camera.right * px + state.camera.up * py).normalize();
                     Ray ray(state.camera.position, dir);
 
-                    float t_hit, u, v;
-                    uint32_t hit_prim = state.scene.bvh.traverse(ray, t_hit, u, v);
+                    scene::HitInfo hit = scene::traceScene(state.scene, ray);
 
                     Vec3 color(0, 0, 0);
 
-                    if (hit_prim == kInvalidIndex) {
-                        // Background sky
+                    if (hit.instance_id == kInvalidIndex) {
                         color = SampleSky(dir, sunDir);
                     } else {
-                        const Triangle& tri = state.scene.allTriangles[hit_prim];
-                        Vec3 normal = tri.normal();
-
-                        // Flip normal if backfacing
+                        Vec3 normal = getHitNormal(state.scene, hit);
                         if (normal.dot(dir) > 0.0f) normal = normal * -1.0f;
 
-                        Vec3 hitPos = ray.at(t_hit);
-                        Vec3 albedo = state.scene.getMeshColor(hit_prim);
+                        Vec3 hitPos = ray.at(hit.t);
+                        Vec3 albedo = getHitAlbedo(state.scene, hit);
 
                         // Direct lighting (with optional soft shadow)
                         Vec3 shadowDir = sunDir;
@@ -564,18 +487,16 @@ void PathTrace(ViewerState& state) {
                             bool occluded = false;
                             if (shadowMode != SHADOW_OFF) {
                                 Ray shadowRay(hitPos + normal * 0.001f, shadowDir, 0.0f, 1e10f);
-                                occluded = state.scene.bvh.traverseAnyHit(shadowRay, hit_prim);
+                                occluded = scene::traceSceneAnyHit(state.scene, shadowRay,
+                                                                   hit.instance_id, hit.triangle_id);
                             }
                             if (!occluded) {
                                 directLight = NdotL;
                             }
                         }
 
-                        // Sun color
                         Vec3 sunColor(1.5f, 1.4f, 1.2f);
                         Vec3 direct = sunColor * directLight;
-
-                        // Ambient from sky
                         Vec3 ambient = SampleSky(normal, sunDir) * 0.15f;
 
                         // Indirect (1 bounce)
@@ -586,18 +507,15 @@ void PathTrace(ViewerState& state) {
                             Vec3 bounceDir = cosine_hemisphere(u1, u2, normal);
                             Ray bounceRay(hitPos + normal * 0.001f, bounceDir);
 
-                            float bt, bu, bv;
-                            uint32_t bhit = state.scene.bvh.traverse(bounceRay, bt, bu, bv);
+                            scene::HitInfo bhit = scene::traceScene(state.scene, bounceRay);
 
-                            if (bhit == kInvalidIndex) {
+                            if (bhit.instance_id == kInvalidIndex) {
                                 indirect = SampleSky(bounceDir, sunDir);
                             } else {
-                                // Direct + ambient at bounce point
-                                const Triangle& btri = state.scene.allTriangles[bhit];
-                                Vec3 bnorm = btri.normal();
+                                Vec3 bnorm = getHitNormal(state.scene, bhit);
                                 if (bnorm.dot(bounceDir) > 0.0f) bnorm = bnorm * -1.0f;
 
-                                Vec3 bHitPos = bounceRay.at(bt);
+                                Vec3 bHitPos = bounceRay.at(bhit.t);
                                 Vec3 bShadowDir = sunDir;
                                 if (shadowConeAngle > 0.0f)
                                     bShadowDir = jitter_direction(sunDir, shadowConeAngle, seed);
@@ -608,11 +526,12 @@ void PathTrace(ViewerState& state) {
                                     bool bOcc = false;
                                     if (shadowMode != SHADOW_OFF) {
                                         Ray bShadow(bHitPos + bnorm * 0.001f, bShadowDir, 0.0f, 1e10f);
-                                        bOcc = state.scene.bvh.traverseAnyHit(bShadow, bhit);
+                                        bOcc = scene::traceSceneAnyHit(state.scene, bShadow,
+                                                                       bhit.instance_id, bhit.triangle_id);
                                     }
                                     if (!bOcc) bDirect = bNdotL;
                                 }
-                                Vec3 bAlbedo = state.scene.getMeshColor(bhit);
+                                Vec3 bAlbedo = getHitAlbedo(state.scene, bhit);
                                 Vec3 bAmbient = SampleSky(bnorm, sunDir) * 0.15f;
                                 indirect = vmul(sunColor * bDirect + bAmbient, bAlbedo);
                             }
@@ -621,7 +540,6 @@ void PathTrace(ViewerState& state) {
                         color = vmul(direct + ambient + indirect, albedo);
                     }
 
-                    // Accumulate
                     size_t idx = ((size_t)y * width + x) * 3;
                     state.accumBuffer[idx + 0] += color.x;
                     state.accumBuffer[idx + 1] += color.y;
@@ -635,7 +553,6 @@ void PathTrace(ViewerState& state) {
 
     state.sampleCount++;
 
-    // Tonemap + gamma: accum/sampleCount -> Reinhard -> sRGB -> pixels
     using lightrt_common::shading::reinhardTonemap;
     using lightrt_common::shading::linearToSRGB;
     float invSamples = 1.0f / (float)state.sampleCount;
@@ -665,14 +582,13 @@ void RenderFrame(ViewerState& state) {
 
     PathTrace(state);
 
-    // Text overlay
     int fs = state.fontScale;
     int lineH = 10 * fs;
 
     std::string stats = "FPS: " + std::to_string((int)state.fps);
     DrawString(10, 10, stats.c_str(), 0xFFFFFFFF, state.pixels.data(), w, h, fs);
 
-    std::string tris = "Tris: " + std::to_string(state.scene.allTriangles.size());
+    std::string tris = "Tris: " + std::to_string(sceneTriangleCount(state.scene));
     DrawString(10, 10 + lineH, tris.c_str(), 0xFFFFFFFF, state.pixels.data(), w, h, fs);
 
     std::string meshCount = "Meshes: " + std::to_string(state.scene.meshes.size());
@@ -685,7 +601,7 @@ void RenderFrame(ViewerState& state) {
     DrawString(10, h - lineH * 3, help.c_str(), 0xFFFFFF00, state.pixels.data(), w, h, fs);
 
     static const char* shadowModeNames[] = {"OFF", "HARD", "SOFT", "STRONG_SOFT"};
-    std::string help2 = "F: Fit, S: Shadow [" + std::string(shadowModeNames[state.shadowMode]) + "], O: Font 2x [" + std::string(fs == 2 ? "ON" : "OFF") + "]";
+    std::string help2 = "F: Fit, S: Shadow [" + std::string(shadowModeNames[state.shadowMode]) + "], +: Font 2x [" + std::string(fs == 2 ? "ON" : "OFF") + "], O: Open File";
     DrawString(10, h - lineH * 2, help2.c_str(), 0xFFFFFF00, state.pixels.data(), w, h, fs);
 }
 
@@ -699,7 +615,7 @@ void ResizeFramebuffer(ViewerState& state, uint32_t w, uint32_t h) {
 
 // --- Procedural Primitives ---
 
-void GeneratePlane(SceneMesh& out, Vec3 center, float halfSize) {
+void GeneratePlane(std::vector<Triangle>& out, Vec3 center, float halfSize) {
     Vec3 p0(center.x - halfSize, center.y, center.z - halfSize);
     Vec3 p1(center.x + halfSize, center.y, center.z - halfSize);
     Vec3 p2(center.x + halfSize, center.y, center.z + halfSize);
@@ -707,12 +623,11 @@ void GeneratePlane(SceneMesh& out, Vec3 center, float halfSize) {
 
     Triangle t0; t0.v0 = p0; t0.v1 = p1; t0.v2 = p2;
     Triangle t1; t1.v0 = p0; t1.v1 = p2; t1.v2 = p3;
-    out.triangles.push_back(t0);
-    out.triangles.push_back(t1);
+    out.push_back(t0);
+    out.push_back(t1);
 }
 
-void GenerateUVSphere(SceneMesh& out, Vec3 center, float radius, int segments, int rings) {
-    // Generate vertices
+void GenerateUVSphere(std::vector<Triangle>& out, Vec3 center, float radius, int segments, int rings) {
     std::vector<Vec3> verts;
     verts.push_back(Vec3(center.x, center.y + radius, center.z)); // top pole
 
@@ -722,116 +637,86 @@ void GenerateUVSphere(SceneMesh& out, Vec3 center, float radius, int segments, i
         float ringR = sinf(phi) * radius;
         for (int s = 0; s < segments; ++s) {
             float theta = 2.0f * kPi * (float)s / (float)segments;
-            float x = cosf(theta) * ringR;
-            float z = sinf(theta) * ringR;
-            verts.push_back(Vec3(center.x + x, center.y + y, center.z + z));
+            verts.push_back(Vec3(center.x + cosf(theta)*ringR, center.y + y, center.z + sinf(theta)*ringR));
         }
     }
-
     verts.push_back(Vec3(center.x, center.y - radius, center.z)); // bottom pole
 
-    // Top cap
     for (int s = 0; s < segments; ++s) {
         int next = (s + 1) % segments;
-        Triangle tri;
-        tri.v0 = verts[0];
-        tri.v1 = verts[1 + s];
-        tri.v2 = verts[1 + next];
-        out.triangles.push_back(tri);
+        Triangle tri; tri.v0 = verts[0]; tri.v1 = verts[1 + s]; tri.v2 = verts[1 + next];
+        out.push_back(tri);
     }
 
-    // Middle rings
     for (int r = 0; r < rings - 2; ++r) {
         int row0 = 1 + r * segments;
         int row1 = 1 + (r + 1) * segments;
         for (int s = 0; s < segments; ++s) {
             int next = (s + 1) % segments;
             Triangle t0, t1;
-            t0.v0 = verts[row0 + s];
-            t0.v1 = verts[row1 + s];
-            t0.v2 = verts[row1 + next];
-            t1.v0 = verts[row0 + s];
-            t1.v1 = verts[row1 + next];
-            t1.v2 = verts[row0 + next];
-            out.triangles.push_back(t0);
-            out.triangles.push_back(t1);
+            t0.v0 = verts[row0 + s]; t0.v1 = verts[row1 + s]; t0.v2 = verts[row1 + next];
+            t1.v0 = verts[row0 + s]; t1.v1 = verts[row1 + next]; t1.v2 = verts[row0 + next];
+            out.push_back(t0); out.push_back(t1);
         }
     }
 
-    // Bottom cap
     int bottomPole = (int)verts.size() - 1;
     int lastRow = 1 + (rings - 2) * segments;
     for (int s = 0; s < segments; ++s) {
         int next = (s + 1) % segments;
-        Triangle tri;
-        tri.v0 = verts[bottomPole];
-        tri.v1 = verts[lastRow + next];
-        tri.v2 = verts[lastRow + s];
-        out.triangles.push_back(tri);
+        Triangle tri; tri.v0 = verts[bottomPole]; tri.v1 = verts[lastRow + next]; tri.v2 = verts[lastRow + s];
+        out.push_back(tri);
     }
 }
 
-void GenerateCube(SceneMesh& out, Vec3 center, float halfSize) {
+void GenerateCube(std::vector<Triangle>& out, Vec3 center, float halfSize) {
     float h = halfSize;
     Vec3 c = center;
-    // 8 corners
     Vec3 v[8] = {
-        {c.x - h, c.y - h, c.z - h}, {c.x + h, c.y - h, c.z - h},
-        {c.x + h, c.y + h, c.z - h}, {c.x - h, c.y + h, c.z - h},
-        {c.x - h, c.y - h, c.z + h}, {c.x + h, c.y - h, c.z + h},
-        {c.x + h, c.y + h, c.z + h}, {c.x - h, c.y + h, c.z + h}
+        {c.x-h, c.y-h, c.z-h}, {c.x+h, c.y-h, c.z-h},
+        {c.x+h, c.y+h, c.z-h}, {c.x-h, c.y+h, c.z-h},
+        {c.x-h, c.y-h, c.z+h}, {c.x+h, c.y-h, c.z+h},
+        {c.x+h, c.y+h, c.z+h}, {c.x-h, c.y+h, c.z+h}
     };
 
-    // 6 faces, 2 tris each (CCW from outside)
-    auto addQuad = [&](Vec3 a, Vec3 b, Vec3 c, Vec3 d) {
+    auto addQuad = [&](Vec3 a, Vec3 b, Vec3 cc, Vec3 d) {
         Triangle t0, t1;
-        t0.v0 = a; t0.v1 = b; t0.v2 = c;
-        t1.v0 = a; t1.v1 = c; t1.v2 = d;
-        out.triangles.push_back(t0);
-        out.triangles.push_back(t1);
+        t0.v0 = a; t0.v1 = b; t0.v2 = cc;
+        t1.v0 = a; t1.v1 = cc; t1.v2 = d;
+        out.push_back(t0); out.push_back(t1);
     };
 
-    addQuad(v[0], v[3], v[2], v[1]); // -Z face
-    addQuad(v[4], v[5], v[6], v[7]); // +Z face
-    addQuad(v[0], v[1], v[5], v[4]); // -Y face
-    addQuad(v[2], v[3], v[7], v[6]); // +Y face
-    addQuad(v[0], v[4], v[7], v[3]); // -X face
-    addQuad(v[1], v[2], v[6], v[5]); // +X face
+    addQuad(v[0], v[3], v[2], v[1]);
+    addQuad(v[4], v[5], v[6], v[7]);
+    addQuad(v[0], v[1], v[5], v[4]);
+    addQuad(v[2], v[3], v[7], v[6]);
+    addQuad(v[0], v[4], v[7], v[3]);
+    addQuad(v[1], v[2], v[6], v[5]);
 }
 
-void GenerateCone(SceneMesh& out, Vec3 center, float radius, float height, int segments) {
+void GenerateCone(std::vector<Triangle>& out, Vec3 center, float radius, float height, int segments) {
     Vec3 apex(center.x, center.y + height, center.z);
-    Vec3 baseCenter = center;
 
-    // Base ring vertices
     std::vector<Vec3> ring;
     for (int s = 0; s < segments; ++s) {
         float theta = 2.0f * kPi * (float)s / (float)segments;
-        ring.push_back(Vec3(center.x + cosf(theta) * radius, center.y, center.z + sinf(theta) * radius));
+        ring.push_back(Vec3(center.x + cosf(theta)*radius, center.y, center.z + sinf(theta)*radius));
     }
 
-    // Side triangles
     for (int s = 0; s < segments; ++s) {
         int next = (s + 1) % segments;
-        Triangle tri;
-        tri.v0 = apex;
-        tri.v1 = ring[next];
-        tri.v2 = ring[s];
-        out.triangles.push_back(tri);
+        Triangle tri; tri.v0 = apex; tri.v1 = ring[next]; tri.v2 = ring[s];
+        out.push_back(tri);
     }
 
-    // Base cap
     for (int s = 0; s < segments; ++s) {
         int next = (s + 1) % segments;
-        Triangle tri;
-        tri.v0 = baseCenter;
-        tri.v1 = ring[s];
-        tri.v2 = ring[next];
-        out.triangles.push_back(tri);
+        Triangle tri; tri.v0 = center; tri.v1 = ring[s]; tri.v2 = ring[next];
+        out.push_back(tri);
     }
 }
 
-void GenerateTube(SceneMesh& out, Vec3 center, float radius, float height, int segments) {
+void GenerateTube(std::vector<Triangle>& out, Vec3 center, float radius, float height, int segments) {
     float halfH = height * 0.5f;
 
     std::vector<Vec3> topRing, botRing;
@@ -843,38 +728,33 @@ void GenerateTube(SceneMesh& out, Vec3 center, float radius, float height, int s
         botRing.push_back(Vec3(center.x + x, center.y - halfH, center.z + z));
     }
 
-    // Side quads
     for (int s = 0; s < segments; ++s) {
         int next = (s + 1) % segments;
         Triangle t0, t1;
         t0.v0 = botRing[s]; t0.v1 = topRing[s]; t0.v2 = topRing[next];
         t1.v0 = botRing[s]; t1.v1 = topRing[next]; t1.v2 = botRing[next];
-        out.triangles.push_back(t0);
-        out.triangles.push_back(t1);
+        out.push_back(t0); out.push_back(t1);
     }
 }
 
-void GenerateCapsule(SceneMesh& out, Vec3 center, float radius, float cylHeight, int segments, int rings) {
+void GenerateCapsule(std::vector<Triangle>& out, Vec3 center, float radius, float cylHeight, int segments, int rings) {
     float halfH = cylHeight * 0.5f;
 
-    // Build vertex rings: top hemisphere + cylinder top/bottom + bottom hemisphere
     std::vector<std::vector<Vec3>> allRings;
-
-    // Top hemisphere (from pole down to equator)
     allRings.push_back(std::vector<Vec3>()); // top pole placeholder
+
     for (int r = 1; r <= rings; ++r) {
-        float phi = kPi * 0.5f * (float)r / (float)rings; // 0 to pi/2
+        float phi = kPi * 0.5f * (float)r / (float)rings;
         float y = cosf(phi) * radius + halfH;
         float ringR = sinf(phi) * radius;
         std::vector<Vec3> ring;
         for (int s = 0; s < segments; ++s) {
             float theta = 2.0f * kPi * (float)s / (float)segments;
-            ring.push_back(Vec3(center.x + cosf(theta) * ringR, center.y + y, center.z + sinf(theta) * ringR));
+            ring.push_back(Vec3(center.x + cosf(theta)*ringR, center.y + y, center.z + sinf(theta)*ringR));
         }
         allRings.push_back(ring);
     }
 
-    // Bottom hemisphere (from equator down to pole)
     for (int r = 1; r < rings; ++r) {
         float phi = kPi * 0.5f + kPi * 0.5f * (float)r / (float)rings;
         float y = cosf(phi) * radius - halfH;
@@ -882,105 +762,47 @@ void GenerateCapsule(SceneMesh& out, Vec3 center, float radius, float cylHeight,
         std::vector<Vec3> ring;
         for (int s = 0; s < segments; ++s) {
             float theta = 2.0f * kPi * (float)s / (float)segments;
-            ring.push_back(Vec3(center.x + cosf(theta) * ringR, center.y + y, center.z + sinf(theta) * ringR));
+            ring.push_back(Vec3(center.x + cosf(theta)*ringR, center.y + y, center.z + sinf(theta)*ringR));
         }
         allRings.push_back(ring);
     }
 
-    // Poles
     Vec3 topPole(center.x, center.y + halfH + radius, center.z);
     Vec3 botPole(center.x, center.y - halfH - radius, center.z);
 
-    // Top cap (pole to first ring)
     for (int s = 0; s < segments; ++s) {
         int next = (s + 1) % segments;
-        Triangle tri;
-        tri.v0 = topPole;
-        tri.v1 = allRings[1][s];
-        tri.v2 = allRings[1][next];
-        out.triangles.push_back(tri);
+        Triangle tri; tri.v0 = topPole; tri.v1 = allRings[1][s]; tri.v2 = allRings[1][next];
+        out.push_back(tri);
     }
 
-    // Rings (top hemisphere + cylinder + bottom hemisphere)
     for (size_t r = 1; r + 1 < allRings.size(); ++r) {
         for (int s = 0; s < segments; ++s) {
             int next = (s + 1) % segments;
             Triangle t0, t1;
-            t0.v0 = allRings[r][s]; t0.v1 = allRings[r + 1][s]; t0.v2 = allRings[r + 1][next];
-            t1.v0 = allRings[r][s]; t1.v1 = allRings[r + 1][next]; t1.v2 = allRings[r][next];
-            out.triangles.push_back(t0);
-            out.triangles.push_back(t1);
+            t0.v0 = allRings[r][s]; t0.v1 = allRings[r+1][s]; t0.v2 = allRings[r+1][next];
+            t1.v0 = allRings[r][s]; t1.v1 = allRings[r+1][next]; t1.v2 = allRings[r][next];
+            out.push_back(t0); out.push_back(t1);
         }
     }
 
-    // Bottom cap (last ring to pole)
     const auto& lastRing = allRings.back();
     for (int s = 0; s < segments; ++s) {
         int next = (s + 1) % segments;
-        Triangle tri;
-        tri.v0 = botPole;
-        tri.v1 = lastRing[next];
-        tri.v2 = lastRing[s];
-        out.triangles.push_back(tri);
+        Triangle tri; tri.v0 = botPole; tri.v1 = lastRing[next]; tri.v2 = lastRing[s];
+        out.push_back(tri);
     }
 }
 
-void CreateDefaultScene(Scene& scene) {
-    scene.meshes.clear();
+void CreateDefaultScene(scene::Scene& sc) {
+    sc = scene::Scene{}; // clear
 
-    // Ground plane
-    {
-        SceneMesh m;
-        m.name = "Ground";
-        m.color = Vec3(0.9f, 0.9f, 0.85f);
-        GeneratePlane(m, Vec3(0, 0, 0), 5.0f);
-        scene.meshes.push_back(std::move(m));
-    }
-
-    // Sphere
-    {
-        SceneMesh m;
-        m.name = "Sphere";
-        m.color = Vec3(0.85f, 0.25f, 0.25f);
-        GenerateUVSphere(m, Vec3(-2.0f, 0.5f, 0.0f), 0.5f, 16, 8);
-        scene.meshes.push_back(std::move(m));
-    }
-
-    // Cube
-    {
-        SceneMesh m;
-        m.name = "Cube";
-        m.color = Vec3(0.25f, 0.65f, 0.85f);
-        GenerateCube(m, Vec3(-0.8f, 0.4f, 0.0f), 0.4f);
-        scene.meshes.push_back(std::move(m));
-    }
-
-    // Cone
-    {
-        SceneMesh m;
-        m.name = "Cone";
-        m.color = Vec3(0.25f, 0.85f, 0.35f);
-        GenerateCone(m, Vec3(0.4f, 0.0f, 0.0f), 0.4f, 0.9f, 16);
-        scene.meshes.push_back(std::move(m));
-    }
-
-    // Tube
-    {
-        SceneMesh m;
-        m.name = "Tube";
-        m.color = Vec3(0.85f, 0.75f, 0.25f);
-        GenerateTube(m, Vec3(1.6f, 0.45f, 0.0f), 0.3f, 0.9f, 16);
-        scene.meshes.push_back(std::move(m));
-    }
-
-    // Capsule
-    {
-        SceneMesh m;
-        m.name = "Capsule";
-        m.color = Vec3(0.7f, 0.35f, 0.85f);
-        GenerateCapsule(m, Vec3(2.8f, 0.45f, 0.0f), 0.25f, 0.5f, 16, 4);
-        scene.meshes.push_back(std::move(m));
-    }
+    { std::vector<Triangle> tris; GeneratePlane(tris, Vec3(0,0,0), 5.0f);             addMeshToScene(sc, std::move(tris), Vec3(0.9f,0.9f,0.85f)); }
+    { std::vector<Triangle> tris; GenerateUVSphere(tris, Vec3(-2.0f,0.5f,0), 0.5f);  addMeshToScene(sc, std::move(tris), Vec3(0.85f,0.25f,0.25f)); }
+    { std::vector<Triangle> tris; GenerateCube(tris, Vec3(-0.8f,0.4f,0), 0.4f);       addMeshToScene(sc, std::move(tris), Vec3(0.25f,0.65f,0.85f)); }
+    { std::vector<Triangle> tris; GenerateCone(tris, Vec3(0.4f,0,0), 0.4f, 0.9f);    addMeshToScene(sc, std::move(tris), Vec3(0.25f,0.85f,0.35f)); }
+    { std::vector<Triangle> tris; GenerateTube(tris, Vec3(1.6f,0.45f,0), 0.3f, 0.9f); addMeshToScene(sc, std::move(tris), Vec3(0.85f,0.75f,0.25f)); }
+    { std::vector<Triangle> tris; GenerateCapsule(tris, Vec3(2.8f,0.45f,0), 0.25f, 0.5f); addMeshToScene(sc, std::move(tris), Vec3(0.7f,0.35f,0.85f)); }
 }
 
 } // namespace lightrt_viewer

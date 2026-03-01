@@ -269,6 +269,8 @@ typedef union _XEvent {
 #define XK_S                    0x0053
 #define XK_o                    0x006f
 #define XK_O                    0x004f
+#define XK_plus                 0x002b
+#define XK_equal                0x003d
 
 #ifdef __cplusplus
 }
