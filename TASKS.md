@@ -4,7 +4,7 @@
 
 The `lightrt_cli` renderer has two backends:
 - **tydra path**: uses tinyusdz's Tydra render-data converter (mature)
-- **lightusd-c path**: uses the lightweight C API in `deps/tinyusdz/sandbox/lightusd-c/` (active development)
+- **lightusd-c path**: uses the lightweight C API in `deps/lightusd-c/` (active development)
 
 Recent work has focused on the lightusd-c path. The renderer produces correct
 images for: cube-previewsurface, chromeball (ND_standard_surface metallic),
@@ -84,8 +84,8 @@ colorchart, geomsubset multi-material, emissive planes, glass sphere.
 | `cli/scene.hh` | Scene data structures (MeshBLAS, Instance, Camera, etc.) |
 | `common/materials.hh` | OpenPBRMaterial struct with texture ID fields |
 | `common/shading.hh` | evalBRDF, evalOpenPBR, evalEnvmap, MIS helpers |
-| `deps/tinyusdz/sandbox/lightusd-c/lydra/lydra-c/lydra_c_scene.c` | Material/camera/light extraction (gitignored, not committed) |
-| `deps/tinyusdz/sandbox/lightusd-c/src/lusd_stage_tinyusdz.cc` | USD stage loading for lightusd-c |
+| `deps/lightusd-c/lydra/lydra-c/lydra_c_scene.c` | Material/camera/light extraction (gitignored, not committed) |
+| `deps/lightusd-c/src/lusd_stage_tinyusdz.cc` | USD stage loading for lightusd-c |
 
 ## Build
 
