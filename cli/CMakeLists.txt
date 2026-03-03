@@ -31,7 +31,7 @@ endif()
 
 # USD backend selection
 # OFF (default): tinyusdz + tydra
-# ON:            lightusd-c + lydra  (sandbox/lightusd-c inside the tinyusdz repo)
+# ON:            lightusd-c + lydra  (standalone lightusd-c repo in deps/)
 option(LIGHTRT_USE_LIGHTUSD_C
   "Use lightusd-c + lydra USD backend instead of tinyusdz + tydra" OFF)
 
@@ -62,11 +62,11 @@ target_include_directories(lightrt_cli PRIVATE
 
 if(LIGHTRT_USE_LIGHTUSD_C)
   # lightusd-c + lydra backend (no tinyusdz dependency)
-  set(LIGHTUSD_C_DIR "${TINYUSDZ_DIR}/sandbox/lightusd-c")
+  set(LIGHTUSD_C_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../deps/lightusd-c")
   if(NOT EXISTS "${LIGHTUSD_C_DIR}")
     message(FATAL_ERROR
       "lightusd-c not found at ${LIGHTUSD_C_DIR}.\n"
-      "Make sure tinyusdz is on the 'lightusd' branch: bash scripts/setup_deps.sh")
+      "Run: bash scripts/setup_deps.sh")
   endif()
 
   # Build lightusd-c (C11) + lydra (C++) as a subdirectory.

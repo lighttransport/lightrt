@@ -17,4 +17,14 @@ else
     https://github.com/syoyo/tinyusdz.git "$TINYUSDZ_DIR"
 fi
 
+# LightUSD-C (standalone repo)
+LIGHTUSD_C_DIR="$DEPS_DIR/lightusd-c"
+if [ -d "$LIGHTUSD_C_DIR" ]; then
+  echo "lightusd-c already cloned at $LIGHTUSD_C_DIR"
+else
+  echo "Cloning lightusd-c..."
+  git clone --depth 1 \
+    https://github.com/lighttransport/lightusd-c "$LIGHTUSD_C_DIR"
+fi
+
 echo "Dependencies ready."
