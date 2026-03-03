@@ -273,3 +273,132 @@ int main(int argc, char** argv) {
 
   return 0;
 }
+
+// ============================================================================
+// AOV Rendering Support
+// ============================================================================
+
+// AOV (Arbitrary Output Variable) rendering - multiple render passes beyond beauty
+struct AOVRenderOptions {
+  bool beauty = true;           // Standard color output
+  bool geom_normal = false;     // Geometry normals
+  bool shading_normal = false;  // Normals after transformation
+  bool vertex_color = false;    // Vertex displayColor
+  bool vertex_opacity = false;  // Vertex displayOpacity
+  bool depth = false;           // Distance to hit point
+  bool material_id = false;     // Per-triangle material ID
+};
+
+// Extend Options struct with AOV flags
+struct AOVOptions {
+  AOVRenderOptions render_options;
+  std::string aov_outputs = "beauty"; // Comma-separated list: beauty,geom_normal,shading_normal,vertex_color,vertex_opacity,depth,material_id
+};
+
+// Parse AOV outputs string
+static bool parseAOVOutputs(const std::string& outputs, AOVRenderOptions& opts) {
+  std::string temp = outputs;
+  std::vector<std::string> parts;
+  
+  size_t start = 0;
+  while ((start = temp.find_first_of(',', start)) != std::string::npos) {
+    parts.push_back(temp.substr(start, temp.find(',', start) - start));
+    start++;
+  }
+  
+  for (const auto& part : parts) {
+    if (part == "beauty") opts.beauty = true;
+    else if (part == "geom_normal") opts.geom_normal = true;
+    else if (part == "shading_normal") opts.shading_normal = true;
+    else if (part == "vertex_color") opts.vertex_color = true;
+    else if (part == "vertex_opacity") opts.vertex_opacity = true;
+    else if (part == "depth") opts.depth = true;
+    else if (part == "material_id") opts.material_id = true;
+    else fprintf(stderr, "Unknown AOV output: %s\n", part.c_str());
+  }
+  return true;
+}
+
+// Extend Options struct
+struct ExtendedOptions {
+  Options base_options;
+  AOVOptions aov_options;
+  // ... other fields
+};
+
+
+// ============================================================================
+// AOV Rendering Integration
+// ============================================================================
+
+// Add AOV options to command line parsing
+struct ExtendedOptions {
+  std::string input_file;
+  std::string output_file = "output.png";
+  uint32_t width = 800;
+  uint32_t height = 600;
+  double timecode = -1e30;
+  double time_range_start = 0;
+  double time_range_end = 0;
+  double time_range_step = 1;
+  bool has_time_range = false;
+  std::string camera_name;
+  std::string envmap_file;
+  int camera_index = -1;
+  uint32_t mblur_samples = 1;
+  uint32_t spp = 1;
+  std::string aov_outputs = "beauty";  // AOV rendering outputs
+  AOVRenderOptions aov_opts;
+};
+
+// Modify parseArgs to include AOV outputs
+static bool parseArgsWithAOV(int argc, char** argv, ExtendedOptions& opts) {
+  if (argc < 2) {
+    fprintf(stderr,
+      "Usage: %s input.usd [-o output.png] [-w 800] [-h 600]\n"
+      "       [-t timecode] [--time-range start end step]\n"
+      "       [--camera name_or_index] [--mblur-samples N] [--spp N]\n"
+      "       [--aov beauty,geom_normal,shading_normal,vertex_color,vertex_opacity,depth,material_id]\n",
+      argv[0]);
+    return false;
+  }
+  opts.input_file = argv[1];
+  for (int i = 2; i < argc; i++) {
+    if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+      opts.output_file = argv[++i];
+    } else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
+      opts.width = static_cast<uint32_t>(atoi(argv[++i]));
+    } else if (strcmp(argv[i], "-h") == 0 && i + 1 < argc) {
+      opts.height = static_cast<uint32_t>(atoi(argv[++i]));
+    } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+      opts.timecode = atof(argv[++i]);
+    } else if (strcmp(argv[i], "--time-range") == 0 && i + 3 < argc) {
+      opts.time_range_start = atof(argv[++i]);
+      opts.time_range_end = atof(argv[++i]);
+      opts.time_range_step = atof(argv[++i]);
+      opts.has_time_range = true;
+    } else if (strcmp(argv[i], "--camera") == 0 && i + 1 < argc) {
+      ++i;
+      char* endp = nullptr;
+      long idx = strtol(argv[i], &endp, 10);
+      if (endp != argv[i] && *endp == '\0') {
+        opts.camera_index = static_cast<int>(idx);
+      } else {
+        opts.camera_name = argv[i];
+      }
+    } else if (strcmp(argv[i], "--mblur-samples") == 0 && i + 1 < argc) {
+      opts.mblur_samples = static_cast<uint32_t>(atoi(argv[++i]));
+      if (opts.mblur_samples < 1) opts.mblur_samples = 1;
+    } else if (strcmp(argv[i], "--spp") == 0 && i + 1 < argc) {
+      opts.spp = static_cast<uint32_t>(atoi(argv[++i]));
+      if (opts.spp < 1) opts.spp = 1;
+    } else if (strcmp(argv[i], "--envmap") == 0 && i + 1 < argc) {
+      opts.envmap_file = argv[++i];
+    } else if (strcmp(argv[i], "--aov") == 0 && i + 1 < argc) {
+      opts.aov_outputs = argv[++i];
+      opts.aov_opts.parse(opts.aov_outputs);
+    }
+  }
+  return true;
+}
+
