@@ -278,7 +278,7 @@ if(LIGHTRT_BUILD_FUZZERS)
     endif()
 endif()
 
-option(LIGHTRT_BUILD_WEBGPU "Build WebGPU software backend targets" ON)
+option(LIGHTRT_BUILD_WEBGPU "Build WebGPU software backend targets" OFF)
 if(LIGHTRT_BUILD_WEBGPU)
     add_subdirectory(webgpu)
 endif()
