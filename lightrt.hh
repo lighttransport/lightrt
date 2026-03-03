@@ -3157,4 +3157,93 @@ TraversalProfile* renderImageProfiled(
 
 } // namespace lightrt
 
+// ============================================================================
+// Memory Alignment Constants
+// ============================================================================
+
+
+// ============================================================================
+// Memory Alignment Constants
+// ============================================================================
+
+// 16-byte alignment for SIMD traversal
+static constexpr size_t kAlignment = 16;
+
+// 32-byte alignment for AVX/SSE2 RayContext
+static constexpr size_t kRayContextAlignment = 32;
+
+// ============================================================================
+// Memory Manager Documentation
+// ============================================================================
+
+/*
+  Memory Alignment Requirements:
+  
+  - 16-byte alignment: Used for Vec3, Ray, and base RayContext
+    - Required for SIMD packet traversal
+    - Aligns 3-vector components to 16-byte boundary
+    - Enables efficient SIMD operations (128-bit registers)
+  
+  - 32-byte alignment: Used for AVX/SSE2 RayContext
+    - Required for AVX/SSE2 packet traversal
+    - Aligns RayContext for AVX instructions
+    - Enables 128-bit register operations
+  
+  Why 16 bytes?
+    - Vec3 stores 3 floats (12 bytes) + padding to 16 bytes
+    - Enables SIMD operations without padding overhead
+    - Minimum for 128-bit SIMD register alignment
+  
+  TaskSystem Memory Manager:
+    
+    The TaskSystem provides a thread pool with work-stealing:
+    
+    - Initialization: TaskSystem::initialize() uses hardware concurrency
+    - Thread safety: Uses static members with RAII guard (TaskSystemGuard)
+    - Automatic shutdown: RAII guard destructor calls shutdown on exit
+    
+    Memory Allocation Patterns:
+    
+    1. No explicit allocator - Uses standard std::vector and std::queue
+    2. Static state - All TaskSystem state is static (singleton-like)
+    3. No external allocation - No custom memory pools or arenas
+    
+    Queue Size: Max tasks in queue before blocking is unlimited
+    (uses std::queue which grows dynamically)
+*/
+
+// ============================================================================
+// SIMD Memory Requirements
+// ============================================================================
+
+/*
+  SIMD Memory Alignment Requirements:
+  
+  AVX/SSE2 RayContext (32-byte aligned):
+  - Stores SIMD-optimized ray data for packet traversal
+  - Uses _mm_set_ps() for AVX/SSE2 intrinsics
+  - 128-bit register alignment required
+  
+  Memory Manager Notes:
+  
+  - All core types are 16-byte aligned (alignas(16))
+  - No external dependencies
+  - C++17 compatible compiler
+  - SIMD-friendly design
+  
+  Constants and Configuration:
+  
+  - kAlignment: 16 bytes for SIMD traversal
+  - kRayContextAlignment: 32 bytes for AVX/SSE2
+  - kEpsilon: 1e-6f (near-zero threshold)
+  - kInvalidIndex: 0xFFFFFFFF (no-hit result)
+  - kInfinity: infinity for traversal limits
+  
+  Memory Stats:
+  
+  - Track TaskSystem memory usage (queue size, thread count)
+  - Monitor alignment overhead (16 vs 32 byte)
+*/
+
+
 #endif // LIGHTRT_HH_
