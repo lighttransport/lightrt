@@ -89,6 +89,8 @@ struct GPUShaderModule::JITState {
     compiler.setFusionEnabled(fusion_enabled);
   }
 };
+#else
+struct GPUShaderModule::JITState {};
 #endif
 
 GPUShaderModule::GPUShaderModule(const std::string& code) : code_(code) {

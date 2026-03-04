@@ -13,72 +13,113 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Compiler flags: no RTTI, no exceptions
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti -fno-exceptions")
+if(MSVC)
+    # Remove default /GR to avoid override warning, keep /EHsc for MSVC
+    string(REPLACE "/GR" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /GR-")
+    add_definitions(-DNOMINMAX -D_CRT_SECURE_NO_WARNINGS)
+else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti -fno-exceptions")
+endif()
 
 # Optimization flags
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
-set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -DDEBUG")
+if(MSVC)
+    set(CMAKE_CXX_FLAGS_RELEASE "/O2 /DNDEBUG")
+    set(CMAKE_CXX_FLAGS_DEBUG "/Od /Zi /DDEBUG")
+else()
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+    set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -DDEBUG")
+endif()
 
 # Detect and enable SIMD support
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64)|(AMD64|amd64)|(^i.86$)")
     message(STATUS "x86/x64 architecture detected")
-    
-    # Check for SSE2 support (baseline for x64)
+
     include(CheckCXXCompilerFlag)
-    check_cxx_compiler_flag("-msse2" COMPILER_SUPPORTS_SSE2)
-    if(COMPILER_SUPPORTS_SSE2)
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse2")
-        message(STATUS "SSE2 support enabled")
+
+    if(MSVC)
+        # MSVC: SSE2 is default on x64, use /arch: for AVX/AVX2
+        if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+            # SSE2 flag only needed for 32-bit MSVC
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /arch:SSE2")
+            message(STATUS "SSE2 support enabled")
+        else()
+            message(STATUS "SSE2 support enabled (default on x64)")
+        endif()
+
+        if(NOT NO_AVX2)
+            check_cxx_compiler_flag("/arch:AVX2" COMPILER_SUPPORTS_AVX2)
+            if(COMPILER_SUPPORTS_AVX2)
+                set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /arch:AVX2")
+                message(STATUS "AVX2 support enabled (includes AVX, FMA, F16C)")
+            endif()
+        elseif(NOT NO_AVX)
+            check_cxx_compiler_flag("/arch:AVX" COMPILER_SUPPORTS_AVX)
+            if(COMPILER_SUPPORTS_AVX)
+                set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /arch:AVX")
+                message(STATUS "AVX support enabled")
+            endif()
+        endif()
+    else()
+        # GCC/Clang
+        check_cxx_compiler_flag("-msse2" COMPILER_SUPPORTS_SSE2)
+        if(COMPILER_SUPPORTS_SSE2)
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse2")
+            message(STATUS "SSE2 support enabled")
+        endif()
+
+        check_cxx_compiler_flag("-mavx" COMPILER_SUPPORTS_AVX)
+        if(COMPILER_SUPPORTS_AVX AND NOT NO_AVX)
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx")
+            message(STATUS "AVX support enabled")
+        endif()
+
+        check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
+        if(COMPILER_SUPPORTS_AVX2 AND NOT NO_AVX2)
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2 -mfma")
+            message(STATUS "AVX2 support enabled")
+        endif()
+
+        check_cxx_compiler_flag("-mf16c" COMPILER_SUPPORTS_F16C)
+        if(COMPILER_SUPPORTS_F16C AND NOT NO_F16C)
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mf16c")
+            message(STATUS "F16C support enabled")
+        endif()
     endif()
-    
-    # Check for AVX support
-    check_cxx_compiler_flag("-mavx" COMPILER_SUPPORTS_AVX)
-    if(COMPILER_SUPPORTS_AVX AND NOT NO_AVX)
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx")
-        message(STATUS "AVX support enabled")
-    endif()
-    
-    # Check for AVX2 support
-    check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
-    if(COMPILER_SUPPORTS_AVX2 AND NOT NO_AVX2)
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2 -mfma")
-        message(STATUS "AVX2 support enabled")
-    endif()
-    
-    # Check for F16C support (FP16 conversion)
-    check_cxx_compiler_flag("-mf16c" COMPILER_SUPPORTS_F16C)
-    if(COMPILER_SUPPORTS_F16C AND NOT NO_F16C)
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mf16c")
-        message(STATUS "F16C support enabled")
-    endif()
-    
+
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)")
     message(STATUS "ARM64 architecture detected")
-    
-    # ARM NEON is typically available by default on aarch64
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8-a")
-    message(STATUS "ARM NEON support enabled")
-    
-    # Check for SVE support
-    check_cxx_compiler_flag("-march=armv8-a+sve" COMPILER_SUPPORTS_SVE)
-    if(COMPILER_SUPPORTS_SVE AND NOT NO_SVE)
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8-a+sve")
-        message(STATUS "ARM SVE support enabled")
+
+    if(NOT MSVC)
+        # ARM NEON is typically available by default on aarch64
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8-a")
+        message(STATUS "ARM NEON support enabled")
+
+        # Check for SVE support
+        include(CheckCXXCompilerFlag)
+        check_cxx_compiler_flag("-march=armv8-a+sve" COMPILER_SUPPORTS_SVE)
+        if(COMPILER_SUPPORTS_SVE AND NOT NO_SVE)
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8-a+sve")
+            message(STATUS "ARM SVE support enabled")
+        endif()
+    else()
+        message(STATUS "ARM NEON support enabled (default on ARM64 MSVC)")
     endif()
-    
+
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
     message(STATUS "ARM32 architecture detected")
-    
-    # Check for NEON support on ARM32
-    include(CheckCXXCompilerFlag)
-    check_cxx_compiler_flag("-mfpu=neon" COMPILER_SUPPORTS_NEON)
-    if(COMPILER_SUPPORTS_NEON)
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mfpu=neon")
-        message(STATUS "ARM NEON support enabled")
+
+    if(NOT MSVC)
+        include(CheckCXXCompilerFlag)
+        check_cxx_compiler_flag("-mfpu=neon" COMPILER_SUPPORTS_NEON)
+        if(COMPILER_SUPPORTS_NEON)
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mfpu=neon")
+            message(STATUS "ARM NEON support enabled")
+        endif()
     endif()
 endif()
 
