@@ -286,15 +286,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     }
     LocalFree(argv);
 
-    g_state.scene.build();
-
-    if (g_state.scene.allTriangles.empty()) {
+    if (sceneTriangleCount(g_state.scene) == 0) {
         std::cerr << "No triangles in scene.\n";
         return 1;
     }
 
     std::cout << "Scene: " << g_state.scene.meshes.size() << " meshes, "
-              << g_state.scene.allTriangles.size() << " triangles.\n";
+              << sceneTriangleCount(g_state.scene) << " triangles.\n";
 
     // Initialize sun direction and accumulation buffer
     g_state.sunDirection = Vec3(1, 1, -0.5f).normalize();

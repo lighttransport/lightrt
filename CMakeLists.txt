@@ -156,6 +156,14 @@ if(LIGHTRT_BUILD_WEBGPU)
     add_subdirectory(webgpu)
 endif()
 
+# Build viewer_windows by default on Windows
+if(WIN32)
+    option(LIGHTRT_BUILD_VIEWER_WINDOWS "Build Windows viewer" ON)
+    if(LIGHTRT_BUILD_VIEWER_WINDOWS)
+        add_subdirectory(viewer_windows)
+    endif()
+endif()
+
 # Installation
 install(TARGETS lightrt
     ARCHIVE DESTINATION lib
@@ -174,4 +182,7 @@ message(STATUS "  C++ standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Compiler flags: ${CMAKE_CXX_FLAGS}")
 message(STATUS "  System processor: ${CMAKE_SYSTEM_PROCESSOR}")
 message(STATUS "  Build WebGPU: ${LIGHTRT_BUILD_WEBGPU}")
+if(WIN32)
+    message(STATUS "  Build Windows viewer: ${LIGHTRT_BUILD_VIEWER_WINDOWS}")
+endif()
 message(STATUS "")

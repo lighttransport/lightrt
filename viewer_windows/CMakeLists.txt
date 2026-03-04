@@ -1,9 +1,12 @@
 cmake_minimum_required(VERSION 3.15)
-project(viewer_windows LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+# Only set project when building standalone (not as subdirectory)
+if(NOT CMAKE_PROJECT_NAME OR CMAKE_PROJECT_NAME STREQUAL "viewer_windows")
+    project(viewer_windows LANGUAGES CXX)
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+endif()
 
 # TinyUSDZ (optional)
 set(TINYUSDZ_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../deps/tinyusdz")
@@ -16,21 +19,34 @@ else()
     message(STATUS "TinyUSDZ not found at ${TINYUSDZ_DIR} - USD loading disabled")
 endif()
 
-# Sources
-set(SOURCES
-    viewer_windows.cc
-    ../viewer/common/viewer_common.cc
-    ../lightrt.cc
-)
+# Sources - reuse lightrt target if available (building as subdirectory)
+if(TARGET lightrt)
+    set(SOURCES
+        viewer_windows.cc
+        ../viewer/common/viewer_common.cc
+        ../common/usd_loader.cc
+    )
+else()
+    set(SOURCES
+        viewer_windows.cc
+        ../viewer/common/viewer_common.cc
+        ../common/usd_loader.cc
+        ../lightrt.cc
+    )
+endif()
 
 add_executable(viewer_windows WIN32 ${SOURCES})
 
 target_include_directories(viewer_windows PRIVATE
-    ..
-    ../viewer
-    ../viewer/third_party
-    ../viewer/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../viewer
+    ${CMAKE_CURRENT_SOURCE_DIR}/../viewer/third_party
+    ${CMAKE_CURRENT_SOURCE_DIR}/../viewer/common
 )
+
+if(TARGET lightrt)
+    target_link_libraries(viewer_windows PRIVATE lightrt)
+endif()
 
 if(LIGHTRT_HAS_TINYUSDZ)
     target_compile_definitions(viewer_windows PRIVATE LIGHTRT_HAS_TINYUSDZ)
@@ -44,8 +60,11 @@ endif()
 # MSVC-specific flags
 if(MSVC)
     # Replace default /EHsc and /GR with our no-RTTI/no-exceptions settings
-    string(REPLACE "/GR" "/GR-" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
-    string(REPLACE "/EHsc" "/EHs-c-" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    # Only do this when building standalone (parent project already handles it)
+    if(NOT TARGET lightrt)
+        string(REPLACE "/GR" "/GR-" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+        string(REPLACE "/EHsc" "/EHs-c-" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    endif()
     target_compile_options(viewer_windows PRIVATE
         /W4
         /arch:AVX2    # AVX2 + FMA
