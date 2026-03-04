@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <numeric>
+#include <string>
 
 using namespace lightrt;
 
