@@ -2,6 +2,14 @@
 // SPDX-License-Identifier: MIT
 //
 // lightrt.cc - Lightweight ray tracing and BVH kernel implementation
+//
+// SIMD strategy: SSE2 has SoA-batched kernels (4-ray / 4-AABB blocks).
+// NEON-specific kernels exist for the BVH-traversal AABB hot path but
+// the batched ray/triangle SoA kernels are SSE-only — those guards say
+// `#if defined(LIGHTRT_HAS_SSE2)` (not `|| NEON`) so NEON builds fall
+// through to the scalar `#else` fallback. Don't widen those guards back
+// to NEON without adding actual NEON intrinsics inside; the previous
+// `SSE2 || NEON` form mis-compiled on Apple ARM64.
 
 #include "lightrt.hh"
 
@@ -77,7 +85,7 @@ void Triangle::intersect4(const Triangle& tri,
   hit_mask_out = 0;
   if (hit_mask_in == 0) return;
 
-#if defined(LIGHTRT_HAS_SSE2) || defined(LIGHTRT_HAS_NEON)
+#if defined(LIGHTRT_HAS_SSE2)
   // SoA Moller-Trumbore using SSE
   // Edge vectors (broadcast from triangle)
   float e1x = tri.v1.x - tri.v0.x, e1y = tri.v1.y - tri.v0.y, e1z = tri.v1.z - tri.v0.z;
@@ -3412,7 +3420,7 @@ void TriangleBVH::traverse4(const Ray4& rays, HitResult4& results) const noexcep
 
     // Test all active rays against node bounds
     uint32_t hit_mask = 0;
-#if defined(LIGHTRT_HAS_SSE2) || defined(LIGHTRT_HAS_NEON)
+#if defined(LIGHTRT_HAS_SSE2)
     // SIMD bounds test for 4 rays
     __m128 node_min_x = _mm_set1_ps(node.bounds.min.x);
     __m128 node_min_y = _mm_set1_ps(node.bounds.min.y);
@@ -3530,7 +3538,7 @@ uint32_t TriangleBVH::traverse4AnyHit(const Ray4& rays, uint32_t exclude_prim_id
 
     // SIMD bounds test for 4 rays
     uint32_t node_hit = 0;
-#if defined(LIGHTRT_HAS_SSE2) || defined(LIGHTRT_HAS_NEON)
+#if defined(LIGHTRT_HAS_SSE2)
     __m128 node_min_x = _mm_set1_ps(node.bounds.min.x);
     __m128 node_min_y = _mm_set1_ps(node.bounds.min.y);
     __m128 node_min_z = _mm_set1_ps(node.bounds.min.z);
@@ -5370,7 +5378,7 @@ void SBVH::traverse4(const Ray4& rays, HitResult4& results) const noexcept {
 
     // SIMD bounds test for 4 rays
     uint32_t hit_mask = 0;
-#if defined(LIGHTRT_HAS_SSE2) || defined(LIGHTRT_HAS_NEON)
+#if defined(LIGHTRT_HAS_SSE2)
     __m128 node_min_x = _mm_set1_ps(node.bounds.min.x);
     __m128 node_min_y = _mm_set1_ps(node.bounds.min.y);
     __m128 node_min_z = _mm_set1_ps(node.bounds.min.z);
@@ -5522,7 +5530,7 @@ uint32_t SBVH::traverse4AnyHit(const Ray4& rays, uint32_t exclude_prim_id) const
 
     // SIMD bounds test for 4 rays
     uint32_t node_hit = 0;
-#if defined(LIGHTRT_HAS_SSE2) || defined(LIGHTRT_HAS_NEON)
+#if defined(LIGHTRT_HAS_SSE2)
     __m128 node_min_x = _mm_set1_ps(node.bounds.min.x);
     __m128 node_min_y = _mm_set1_ps(node.bounds.min.y);
     __m128 node_min_z = _mm_set1_ps(node.bounds.min.z);
