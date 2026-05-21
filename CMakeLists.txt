@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 
 cmake_minimum_required(VERSION 3.10)
-project(lightrt VERSION 1.0.0 LANGUAGES CXX)
+project(lightrt VERSION 1.0.0 LANGUAGES CXX C)
 
 include(CTest)
 
@@ -11,6 +11,11 @@ include(CTest)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# C11 standard (for the pure-C binding lightrt_c.c and its test)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
 
 # Compiler flags: no RTTI, no exceptions
 if(MSVC)
@@ -123,11 +128,23 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
     endif()
 endif()
 
+# C binding implementation. lightrt_c.cc is a thin C++ wrapper over the C++
+# BVH; lightrt_c.c is a standalone pure-C11 reimplementation. Both expose the
+# same lightrt_c.h API, so exactly one is linked into the library.
+option(LIGHTRT_PURE_C_BINDING
+       "Use the standalone pure-C11 binding (lightrt_c.c) instead of the C++ wrapper (lightrt_c.cc)"
+       OFF)
+if(LIGHTRT_PURE_C_BINDING)
+    set(LIGHTRT_C_BINDING_SRC lightrt_c.c)
+else()
+    set(LIGHTRT_C_BINDING_SRC lightrt_c.cc)
+endif()
+
 # Library target
 add_library(lightrt STATIC
     lightrt.cc
     lightrt.hh
-    lightrt_c.cc
+    ${LIGHTRT_C_BINDING_SRC}
     lightrt_c.h
 )
 
@@ -152,6 +169,15 @@ add_executable(lightrt_benchmark
 target_link_libraries(lightrt_benchmark
     lightrt
 )
+
+# Pure-C11 binding self-test (compiles lightrt_c.c directly; no C++ dependency).
+if(BUILD_TESTING)
+    add_executable(lightrt_c_test lightrt_c.c tests/test_lightrt_c.c)
+    if(NOT MSVC)
+        target_link_libraries(lightrt_c_test m)
+    endif()
+    add_test(NAME lightrt_c_test COMMAND lightrt_c_test)
+endif()
 
 option(LIGHTRT_BUILD_WEBGPU "Build WebGPU software backend targets" ON)
 if(LIGHTRT_BUILD_WEBGPU)
