@@ -127,6 +127,8 @@ endif()
 add_library(lightrt STATIC
     lightrt.cc
     lightrt.hh
+    lightrt_c.cc
+    lightrt_c.h
 )
 
 target_include_directories(lightrt PUBLIC
@@ -170,7 +172,7 @@ install(TARGETS lightrt
     LIBRARY DESTINATION lib
 )
 
-install(FILES lightrt.hh
+install(FILES lightrt.hh lightrt_c.h
     DESTINATION include
 )
 
