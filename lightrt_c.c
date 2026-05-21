@@ -1,0 +1,427 @@
+/*
+ * lightrt_c.c — clean, self-contained C11 port of LightRT's generic BVH +
+ * custom-primitive ray intersection.
+ *
+ * This is a pure C11 implementation of the lightrt_c.h API. Unlike
+ * lightrt_c.cc (a thin C++ wrapper over lightrt::MMapGenericBVH), this file
+ * has NO dependency on the C++ library or its headers — it builds and
+ * traverses its own BVH. The two are interchangeable behind lightrt_c.h;
+ * link exactly one of them.
+ *
+ * Design (matching lightrt_c.cc):
+ *   - The BVH is single precision (broad phase). Build uses a binned Surface
+ *     Area Heuristic (16 bins per axis), ported from MMapGenericBVH.
+ *   - Traversal is stack-based with front-to-back child ordering, calling the
+ *     user's fp64 intersection callback per candidate primitive. The
+ *     authoritative fp64 ray and best hit are kept in fp64, so an analytic
+ *     surface can be solved at full double precision.
+ *
+ * NOTE: a scene keeps per-query scratch, so a single lrt_scene must not be
+ * intersected from multiple threads concurrently.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#include "lightrt_c.h"
+
+#include <float.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+/* ------------------------------------------------------------------------- */
+/* Tunables (mirror lightrt's BVHBuildConfig defaults).                      */
+/* ------------------------------------------------------------------------- */
+#define LRT_MAX_LEAF_SIZE 4u  /* max primitives per leaf */
+#define LRT_NUM_BINS      16u /* SAH bins per axis */
+#define LRT_TRAVERSAL_COST    1.0f
+#define LRT_INTERSECTION_COST 1.0f
+#define LRT_STACK_SIZE    64  /* traversal stack depth (>= max tree depth) */
+
+#define LRT_INF_F (3.402823466e+38f) /* ~FLT_MAX, used as +inf sentinel */
+
+/* BVH node (full precision). flags: bit0 = leaf, bits1-2 = split axis. */
+typedef struct lrt_node {
+    float lo[3];
+    float hi[3];
+    union {
+        struct { uint32_t left, right; } inner; /* interior children */
+        struct { uint32_t offset, count; } leaf; /* prim-index range */
+    } u;
+    uint32_t flags;
+} lrt_node;
+
+struct lrt_scene {
+    unsigned         nprims;
+    lrt_bounds_cb    bounds_cb;
+    lrt_intersect_cb isect_cb;
+    void            *user;
+
+    /* BVH */
+    lrt_node *nodes;
+    uint32_t  node_count;
+    uint32_t *prim_indices; /* leaf primitive references (length nprims) */
+    uint32_t  prim_index_count;
+    int       built;
+
+    /* per-query scratch (authoritative fp64 ray + best fp64 hit) */
+    double   org[3], dir[3], tmin, tmax;
+    double   best_t, best_u, best_v;
+    unsigned best_prim;
+};
+
+/* Build-time context: per-primitive fp32 bounds (freed after build). */
+typedef struct {
+    lrt_scene   *s;
+    const float *prim_lo; /* nprims * 3 */
+    const float *prim_hi; /* nprims * 3 */
+} lrt_build_ctx;
+
+/* ------------------------------------------------------------------------- */
+/* Small helpers.                                                            */
+/* ------------------------------------------------------------------------- */
+static inline float lrt_minf(float a, float b) { return a < b ? a : b; }
+static inline float lrt_maxf(float a, float b) { return a > b ? a : b; }
+
+static inline float lrt_surface_area(const float lo[3], const float hi[3]) {
+    float dx = hi[0] - lo[0], dy = hi[1] - lo[1], dz = hi[2] - lo[2];
+    return 2.0f * (dx * dy + dy * dz + dz * dx);
+}
+
+static inline void lrt_box_reset(float lo[3], float hi[3]) {
+    lo[0] = lo[1] = lo[2] = LRT_INF_F;
+    hi[0] = hi[1] = hi[2] = -LRT_INF_F;
+}
+
+static inline void lrt_box_expand(float lo[3], float hi[3],
+                                  const float plo[3], const float phi[3]) {
+    for (int a = 0; a < 3; a++) {
+        lo[a] = lrt_minf(lo[a], plo[a]);
+        hi[a] = lrt_maxf(hi[a], phi[a]);
+    }
+}
+
+/* Longest axis of a box (matches AABB::longestAxis tie-breaking). */
+static inline int lrt_longest_axis(const float lo[3], const float hi[3]) {
+    float dx = hi[0] - lo[0], dy = hi[1] - lo[1], dz = hi[2] - lo[2];
+    if (dx > dy && dx > dz) return 0;
+    if (dy > dz) return 1;
+    return 2;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Build (binned SAH).                                                       */
+/* ------------------------------------------------------------------------- */
+
+static uint32_t lrt_make_leaf(lrt_scene *s, uint32_t node_idx,
+                              const uint32_t *indices, uint32_t num) {
+    uint32_t offset = s->prim_index_count;
+    for (uint32_t i = 0; i < num; i++) {
+        s->prim_indices[s->prim_index_count++] = indices[i];
+    }
+    lrt_node *n = &s->nodes[node_idx];
+    n->u.leaf.offset = offset;
+    n->u.leaf.count = num;
+    n->flags |= 0x1u;
+    return node_idx;
+}
+
+/* Recursively build a subtree over indices[0..num). Returns the node index.
+ * The nodes array is preallocated to 2*nprims, so it never reallocates and
+ * indices held across recursion stay valid. */
+static uint32_t lrt_build_recursive(lrt_build_ctx *c, uint32_t *indices,
+                                    uint32_t num) {
+    lrt_scene *s = c->s;
+    const float *plo = c->prim_lo;
+    const float *phi = c->prim_hi;
+
+    /* Node bounds + centroid bounds. */
+    float nlo[3], nhi[3], clo[3], chi[3];
+    lrt_box_reset(nlo, nhi);
+    lrt_box_reset(clo, chi);
+    for (uint32_t i = 0; i < num; i++) {
+        uint32_t p = indices[i];
+        lrt_box_expand(nlo, nhi, &plo[p * 3], &phi[p * 3]);
+        for (int a = 0; a < 3; a++) {
+            float cen = 0.5f * (plo[p * 3 + a] + phi[p * 3 + a]);
+            clo[a] = lrt_minf(clo[a], cen);
+            chi[a] = lrt_maxf(chi[a], cen);
+        }
+    }
+
+    uint32_t node_idx = s->node_count++;
+    lrt_node *node = &s->nodes[node_idx];
+    for (int a = 0; a < 3; a++) { node->lo[a] = nlo[a]; node->hi[a] = nhi[a]; }
+    node->flags = 0;
+
+    if (num <= LRT_MAX_LEAF_SIZE) {
+        return lrt_make_leaf(s, node_idx, indices, num);
+    }
+
+    /* Binned SAH split search over all three axes. */
+    int   best_axis = lrt_longest_axis(clo, chi);
+    float best_pos = 0.0f;
+    float best_cost = LRT_INF_F;
+    float parent_area = lrt_surface_area(nlo, nhi);
+
+    for (int axis = 0; axis < 3; axis++) {
+        float amin = clo[axis], amax = chi[axis];
+        if (amax - amin < 1e-6f) continue; /* degenerate on this axis */
+
+        float bin_size = (amax - amin) / (float)LRT_NUM_BINS;
+
+        uint32_t bin_count[LRT_NUM_BINS];
+        float    bin_lo[LRT_NUM_BINS][3], bin_hi[LRT_NUM_BINS][3];
+        for (uint32_t b = 0; b < LRT_NUM_BINS; b++) {
+            bin_count[b] = 0;
+            lrt_box_reset(bin_lo[b], bin_hi[b]);
+        }
+
+        for (uint32_t i = 0; i < num; i++) {
+            uint32_t p = indices[i];
+            float cen = 0.5f * (plo[p * 3 + axis] + phi[p * 3 + axis]);
+            uint32_t b = (uint32_t)((cen - amin) / bin_size);
+            if (b >= LRT_NUM_BINS) b = LRT_NUM_BINS - 1;
+            bin_count[b]++;
+            lrt_box_expand(bin_lo[b], bin_hi[b], &plo[p * 3], &phi[p * 3]);
+        }
+
+        /* Left prefix sweep. */
+        float    left_lo[LRT_NUM_BINS][3], left_hi[LRT_NUM_BINS][3];
+        uint32_t left_cnt[LRT_NUM_BINS];
+        float run_lo[3], run_hi[3];
+        uint32_t run_cnt = 0;
+        lrt_box_reset(run_lo, run_hi);
+        for (uint32_t b = 0; b < LRT_NUM_BINS; b++) {
+            lrt_box_expand(run_lo, run_hi, bin_lo[b], bin_hi[b]);
+            run_cnt += bin_count[b];
+            for (int a = 0; a < 3; a++) { left_lo[b][a] = run_lo[a]; left_hi[b][a] = run_hi[a]; }
+            left_cnt[b] = run_cnt;
+        }
+
+        /* Right suffix sweep, evaluating each split plane. */
+        lrt_box_reset(run_lo, run_hi);
+        run_cnt = 0;
+        for (uint32_t b = LRT_NUM_BINS - 1; b > 0; b--) {
+            lrt_box_expand(run_lo, run_hi, bin_lo[b], bin_hi[b]);
+            run_cnt += bin_count[b];
+
+            uint32_t left_count = left_cnt[b - 1];
+            if (left_count == 0 || run_cnt == 0) continue;
+
+            float left_area = lrt_surface_area(left_lo[b - 1], left_hi[b - 1]);
+            float right_area = lrt_surface_area(run_lo, run_hi);
+            float cost = LRT_TRAVERSAL_COST +
+                         LRT_INTERSECTION_COST *
+                             ((float)left_count * left_area +
+                              (float)run_cnt * right_area) / parent_area;
+            if (cost < best_cost) {
+                best_cost = cost;
+                best_axis = axis;
+                best_pos = amin + (float)b * bin_size;
+            }
+        }
+    }
+
+    /* If splitting is not worthwhile, make a leaf. */
+    float leaf_cost = LRT_INTERSECTION_COST * (float)num;
+    if (best_cost >= leaf_cost) {
+        return lrt_make_leaf(s, node_idx, indices, num);
+    }
+
+    /* Partition indices around best_pos on best_axis. */
+    uint32_t mid = 0;
+    for (uint32_t i = 0; i < num; i++) {
+        uint32_t p = indices[i];
+        float cen = 0.5f * (plo[p * 3 + best_axis] + phi[p * 3 + best_axis]);
+        if (cen < best_pos) {
+            uint32_t tmp = indices[i];
+            indices[i] = indices[mid];
+            indices[mid] = tmp;
+            mid++;
+        }
+    }
+    if (mid == 0 || mid == num) mid = num / 2; /* fallback: median by index */
+
+    uint32_t left = lrt_build_recursive(c, indices, mid);
+    uint32_t right = lrt_build_recursive(c, indices + mid, num - mid);
+
+    /* Re-fetch: recursion appended nodes (array does not realloc). */
+    node = &s->nodes[node_idx];
+    node->u.inner.left = left;
+    node->u.inner.right = right;
+    node->flags = ((uint32_t)best_axis & 0x3u) << 1; /* clear leaf bit */
+    return node_idx;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Traversal.                                                                */
+/* ------------------------------------------------------------------------- */
+
+/* Slab test (ported from AABB::intersect). Returns 1 and the near distance on
+ * hit. invd[a] may be +/-inf for zero direction components; that is handled. */
+static inline int lrt_aabb_intersect(const float lo[3], const float hi[3],
+                                     const float org[3], const float invd[3],
+                                     float tmin, float tmax, float *tmin_out) {
+    for (int a = 0; a < 3; a++) {
+        float t0 = (lo[a] - org[a]) * invd[a];
+        float t1 = (hi[a] - org[a]) * invd[a];
+        if (invd[a] < 0.0f) { float tmp = t0; t0 = t1; t1 = tmp; }
+        tmin = t0 > tmin ? t0 : tmin;
+        tmax = t1 < tmax ? t1 : tmax;
+        if (tmax < tmin) return 0;
+    }
+    *tmin_out = tmin;
+    return 1;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Public API.                                                               */
+/* ------------------------------------------------------------------------- */
+
+lrt_scene *lrt_scene_create(unsigned nprims, lrt_bounds_cb bounds_cb,
+                            lrt_intersect_cb isect_cb, void *user) {
+    if (!bounds_cb || !isect_cb) return NULL;
+    lrt_scene *s = (lrt_scene *)calloc(1, sizeof(lrt_scene));
+    if (!s) return NULL;
+    s->nprims = nprims;
+    s->bounds_cb = bounds_cb;
+    s->isect_cb = isect_cb;
+    s->user = user;
+    s->best_prim = LRT_NO_HIT;
+    return s;
+}
+
+int lrt_scene_build(lrt_scene *s) {
+    if (!s || s->nprims == 0) return 0;
+
+    /* Per-primitive fp32 bounds (build-time only). */
+    float *prim_lo = (float *)malloc((size_t)s->nprims * 3 * sizeof(float));
+    float *prim_hi = (float *)malloc((size_t)s->nprims * 3 * sizeof(float));
+    uint32_t *indices = (uint32_t *)malloc((size_t)s->nprims * sizeof(uint32_t));
+
+    /* Worst-case node count for a binary tree with <= nprims leaves. */
+    size_t node_cap = (size_t)s->nprims * 2u;
+    if (node_cap < 1) node_cap = 1;
+    lrt_node *nodes = (lrt_node *)malloc(node_cap * sizeof(lrt_node));
+    uint32_t *prim_indices = (uint32_t *)malloc((size_t)s->nprims * sizeof(uint32_t));
+
+    if (!prim_lo || !prim_hi || !indices || !nodes || !prim_indices) {
+        free(prim_lo); free(prim_hi); free(indices);
+        free(nodes); free(prim_indices);
+        return 0;
+    }
+
+    for (unsigned i = 0; i < s->nprims; i++) {
+        lrt_aabb a = s->bounds_cb(i, s->user);
+        for (int k = 0; k < 3; k++) {
+            prim_lo[i * 3 + k] = (float)a.lo[k];
+            prim_hi[i * 3 + k] = (float)a.hi[k];
+        }
+        indices[i] = i;
+    }
+
+    /* Free any previous build, then attach fresh storage. */
+    free(s->nodes);
+    free(s->prim_indices);
+    s->nodes = nodes;
+    s->node_count = 0;
+    s->prim_indices = prim_indices;
+    s->prim_index_count = 0;
+
+    lrt_build_ctx ctx = { s, prim_lo, prim_hi };
+    lrt_build_recursive(&ctx, indices, s->nprims);
+    s->built = 1;
+
+    free(prim_lo);
+    free(prim_hi);
+    free(indices);
+    return 1;
+}
+
+unsigned lrt_scene_intersect(lrt_scene *s, const double org[3],
+                             const double dir[3], double tmin, double tmax,
+                             double *t, double *u, double *v) {
+    if (!s || !s->built || s->node_count == 0) return LRT_NO_HIT;
+
+    for (int k = 0; k < 3; k++) { s->org[k] = org[k]; s->dir[k] = dir[k]; }
+    s->tmin = tmin;
+    s->tmax = tmax;
+    s->best_t = DBL_MAX;
+    s->best_u = 0.0;
+    s->best_v = 0.0;
+    s->best_prim = LRT_NO_HIT;
+
+    /* fp32 ray for broad-phase node tests. */
+    float forg[3], fdir[3], finvd[3];
+    for (int k = 0; k < 3; k++) {
+        forg[k] = (float)org[k];
+        fdir[k] = (float)dir[k];
+        finvd[k] = 1.0f / fdir[k]; /* +/-inf for 0 dir; slab test handles it */
+    }
+    float ftmin = (tmin > 0.0) ? (float)tmin : 0.0f;
+    float ftmax = (float)tmax;
+
+    uint32_t stack[LRT_STACK_SIZE];
+    int sp = 0;
+    stack[sp++] = 0; /* root */
+
+    while (sp > 0) {
+        uint32_t node_idx = stack[--sp];
+        const lrt_node *n = &s->nodes[node_idx];
+
+        float box_tmin;
+        if (!lrt_aabb_intersect(n->lo, n->hi, forg, finvd, ftmin, ftmax,
+                                &box_tmin)) {
+            continue;
+        }
+        /* Cull against the closest hit so far (fp32 broad-phase bound). */
+        float cull = (s->best_prim != LRT_NO_HIT) ? (float)s->best_t : ftmax;
+        if (box_tmin > cull) continue;
+
+        if (n->flags & 0x1u) { /* leaf */
+            uint32_t offset = n->u.leaf.offset;
+            uint32_t count = n->u.leaf.count;
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t prim = s->prim_indices[offset + i];
+                double td = 0.0, ud = 0.0, vd = 0.0;
+                if (s->isect_cb(s->org, s->dir, s->tmin, s->tmax, prim,
+                                s->user, &td, &ud, &vd) &&
+                    td < s->best_t) {
+                    s->best_t = td;
+                    s->best_u = ud;
+                    s->best_v = vd;
+                    s->best_prim = prim;
+                }
+            }
+        } else { /* interior: push far child first so near is visited first */
+            uint32_t left = n->u.inner.left;
+            uint32_t right = n->u.inner.right;
+            uint32_t axis = (n->flags >> 1) & 0x3u;
+            if (sp + 2 > LRT_STACK_SIZE) continue; /* guard (very deep tree) */
+            if (fdir[axis] >= 0.0f) {
+                stack[sp++] = right; /* far */
+                stack[sp++] = left;  /* near */
+            } else {
+                stack[sp++] = left;
+                stack[sp++] = right;
+            }
+        }
+    }
+
+    if (s->best_prim != LRT_NO_HIT) {
+        if (t) *t = s->best_t;
+        if (u) *u = s->best_u;
+        if (v) *v = s->best_v;
+    }
+    return s->best_prim;
+}
+
+void lrt_scene_free(lrt_scene *s) {
+    if (!s) return;
+    free(s->nodes);
+    free(s->prim_indices);
+    free(s);
+}
+
+const char *lrt_backend_name(void) {
+    return "LightRT C11 (pure-C binned-SAH BVH, fp32 BVH, fp64 callback)";
+}
