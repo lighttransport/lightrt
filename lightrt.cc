@@ -19,6 +19,9 @@ namespace lightrt {
 // TaskSystem Implementation
 // ============================================================================
 
+#ifdef __EMSCRIPTEN__
+// WASM stub: no actual threads, inline execution
+#else
 std::vector<std::thread> TaskSystem::threads_;
 std::queue<std::function<void()>> TaskSystem::tasks_;
 std::mutex TaskSystem::mutex_;
@@ -32,6 +35,7 @@ struct TaskSystemGuard {
   }
 };
 static TaskSystemGuard g_task_system_guard;
+#endif  // __EMSCRIPTEN__
 
 // ============================================================================
 // Triangle Implementation
@@ -1497,7 +1501,11 @@ uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t dep
     // Work-stealing wait: help process tasks instead of blocking
     while (!done.load()) {
       if (!TaskSystem::tryProcessOne()) {
+#ifndef __EMSCRIPTEN__
         std::this_thread::yield();
+#else
+        // WASM: just spin
+#endif
       }
     }
   } else {
@@ -9705,6 +9713,9 @@ void TriangleBVH::traverseBatch(const Ray* rays, uint32_t num_rays,
                                  uint32_t num_threads) const noexcept {
   if (num_rays == 0) return;
 
+#ifdef __EMSCRIPTEN__
+  if (num_threads == 0) num_threads = 1;
+#else
   if (num_threads == 0) num_threads = std::thread::hardware_concurrency();
   if (num_threads < 1) num_threads = 1;
 
@@ -9723,6 +9734,7 @@ void TriangleBVH::traverseBatch(const Ray* rays, uint32_t num_rays,
       hit_prim_ids[i] = traverse(rays[i], hit_ts[i], hit_us[i], hit_vs[i]);
     }
   }, 64);
+#endif
 }
 
 void TriangleBVH::traverseBatchAnyHit(const Ray* rays, uint32_t num_rays,
@@ -9731,6 +9743,9 @@ void TriangleBVH::traverseBatchAnyHit(const Ray* rays, uint32_t num_rays,
                                        uint32_t num_threads) const noexcept {
   if (num_rays == 0) return;
 
+#ifdef __EMSCRIPTEN__
+  if (num_threads == 0) num_threads = 1;
+#else
   if (num_threads == 0) num_threads = std::thread::hardware_concurrency();
   if (num_threads < 1) num_threads = 1;
 
@@ -9747,6 +9762,7 @@ void TriangleBVH::traverseBatchAnyHit(const Ray* rays, uint32_t num_rays,
       hit_results[i] = traverseAnyHit(rays[i], exclude_prim_id);
     }
   }, 64);
+#endif
 }
 
 // ============================================================================
@@ -9759,6 +9775,9 @@ void SBVH::traverseBatch(const Ray* rays, uint32_t num_rays,
                           uint32_t num_threads) const noexcept {
   if (num_rays == 0) return;
 
+#ifdef __EMSCRIPTEN__
+  if (num_threads == 0) num_threads = 1;
+#else
   if (num_threads == 0) num_threads = std::thread::hardware_concurrency();
   if (num_threads < 1) num_threads = 1;
 
@@ -9777,6 +9796,7 @@ void SBVH::traverseBatch(const Ray* rays, uint32_t num_rays,
       hit_prim_ids[i] = traverse(rays[i], hit_ts[i], hit_us[i], hit_vs[i]);
     }
   }, 64);
+#endif
 }
 
 void SBVH::traverseBatchAnyHit(const Ray* rays, uint32_t num_rays,
@@ -9785,6 +9805,9 @@ void SBVH::traverseBatchAnyHit(const Ray* rays, uint32_t num_rays,
                                 uint32_t num_threads) const noexcept {
   if (num_rays == 0) return;
 
+#ifdef __EMSCRIPTEN__
+  if (num_threads == 0) num_threads = 1;
+#else
   if (num_threads == 0) num_threads = std::thread::hardware_concurrency();
   if (num_threads < 1) num_threads = 1;
 
@@ -9801,6 +9824,7 @@ void SBVH::traverseBatchAnyHit(const Ray* rays, uint32_t num_rays,
       hit_results[i] = traverseAnyHit(rays[i], exclude_prim_id);
     }
   }, 64);
+#endif
 }
 
 // ============================================================================

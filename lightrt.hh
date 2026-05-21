@@ -19,12 +19,16 @@
 #include <vector>
 #include <limits>
 #include <cmath>
+#ifndef __EMSCRIPTEN__
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#endif
 #include <atomic>
 #include <functional>
+#ifndef __EMSCRIPTEN__
 #include <queue>
+#endif
 
 // SIMD detection
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -66,6 +70,21 @@ constexpr uint32_t kInvalidIndex = 0xFFFFFFFF;
 // Task System (Simple Thread Pool)
 // ============================================================================
 
+#ifdef __EMSCRIPTEN__
+// WASM stub: threads not available, run tasks inline
+class TaskSystem {
+public:
+  static void initialize(uint32_t = 0) {}
+  static void shutdown() {}
+  static void submit(std::function<void()> task) { task(); }
+  static bool tryProcessOne() { return false; }
+  static void parallelFor(uint32_t start, uint32_t end,
+                          std::function<void(uint32_t, uint32_t)> body,
+                          uint32_t = 1024) {
+    body(start, end);
+  }
+};
+#else
 class TaskSystem {
 public:
   // Initialize with hardware concurrency
@@ -127,7 +146,9 @@ public:
 
   // Parallel For Loop
   // splits range [start, end) into chunks and runs them in parallel
-  static void parallelFor(uint32_t start, uint32_t end, std::function<void(uint32_t, uint32_t)> body, uint32_t min_chunk_size = 1024) {
+  static void parallelFor(uint32_t start, uint32_t end,
+                         std::function<void(uint32_t, uint32_t)> body,
+                         uint32_t min_chunk_size = 1024) {
     if (threads_.empty()) {
       body(start, end);
       return;
@@ -184,6 +205,7 @@ private:
   static std::condition_variable condition_;
   static bool stop_;
 };
+#endif  // __EMSCRIPTEN__
 
 // ============================================================================
 // Vector Math
