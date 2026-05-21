@@ -13,7 +13,7 @@ add_project_arguments('-Wall -Wextra -O3',
 
 # Library target
 static_lib = static_library('lightrt',
-  sources: ['lightrt.cc'],
+  sources: ['lightrt.cc', 'lightrt_c.cc'],
   install: true
 )
 
