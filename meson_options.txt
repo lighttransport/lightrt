@@ -1,0 +1,6 @@
+# Build options for LightRT
+
+option('pure_c_binding',
+       type: 'boolean',
+       value: false,
+       description: 'Use the standalone pure-C11 binding (lightrt_c.c) instead of the C++ wrapper (lightrt_c.cc)')
