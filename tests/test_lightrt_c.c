@@ -14,6 +14,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 
 /* --- scene: a set of spheres, intersected analytically in fp64 --- */
@@ -213,9 +214,10 @@ static int never_intersect(const double org[3], const double dir[3],
 }
 
 /* Deterministic LCG so the test is reproducible across platforms. */
-static unsigned long g_seed = 0x12345678ul;
+static uint64_t g_seed = UINT64_C(0x12345678);
 static double frand(void) {
-    g_seed = g_seed * 6364136223846793005ul + 1442695040888963407ul;
+    g_seed = g_seed * UINT64_C(6364136223846793005) +
+             UINT64_C(1442695040888963407);
     return (double)((g_seed >> 33) & 0x7fffffff) / (double)0x7fffffff;
 }
 static double frange(double lo, double hi) { return lo + (hi - lo) * frand(); }
