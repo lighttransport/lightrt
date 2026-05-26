@@ -24,8 +24,11 @@
 #include "lightrt_c.h"
 
 #include <float.h>
+#include <math.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* ------------------------------------------------------------------------- */
 /* Tunables (mirror lightrt's BVHBuildConfig defaults).                      */
@@ -37,6 +40,9 @@
 #define LRT_STACK_SIZE    64  /* traversal stack depth (>= max tree depth) */
 
 #define LRT_INF_F (3.402823466e+38f) /* ~FLT_MAX, used as +inf sentinel */
+#define LRT_INVALID_NODE 0xFFFFFFFFu
+#define LRT_DEFAULT_PROGRESS_INTERVAL 4096u
+#define LRT_DEFAULT_MAX_BUILD_DEPTH 64u
 
 /* BVH node (full precision). flags: bit0 = leaf, bits1-2 = split axis. */
 typedef struct lrt_node {
@@ -58,9 +64,17 @@ struct lrt_scene {
     /* BVH */
     lrt_node *nodes;
     uint32_t  node_count;
+    uint32_t  node_cap;
     uint32_t *prim_indices; /* leaf primitive references (length nprims) */
     uint32_t  prim_index_count;
     int       built;
+
+    lrt_options options;
+    atomic_int cancel_requested;
+    lrt_result last_result;
+    char       last_error[128];
+    size_t     last_progress_done;
+    const char *last_progress_stage;
 
     /* per-query scratch (authoritative fp64 ray + best fp64 hit) */
     double   org[3], dir[3], tmin, tmax;
@@ -80,6 +94,111 @@ typedef struct {
 /* ------------------------------------------------------------------------- */
 static inline float lrt_minf(float a, float b) { return a < b ? a : b; }
 static inline float lrt_maxf(float a, float b) { return a > b ? a : b; }
+
+static const char *lrt_result_string(lrt_result result) {
+    switch (result) {
+        case LRT_RESULT_OK: return "ok";
+        case LRT_RESULT_INVALID_ARGUMENT: return "invalid argument";
+        case LRT_RESULT_OUT_OF_MEMORY: return "out of memory";
+        case LRT_RESULT_CANCELED: return "canceled";
+        case LRT_RESULT_NOT_BUILT: return "scene is not built";
+        case LRT_RESULT_TRAVERSAL_OVERFLOW: return "traversal stack overflow";
+        case LRT_RESULT_INVALID_BOUNDS: return "invalid primitive bounds";
+        case LRT_RESULT_BUILD_LIMIT: return "BVH build limit reached";
+        default: return "unknown error";
+    }
+}
+
+static uint32_t lrt_max_build_depth(const lrt_scene *s) {
+    return (s && s->options.max_build_depth != 0)
+        ? s->options.max_build_depth
+        : LRT_DEFAULT_MAX_BUILD_DEPTH;
+}
+
+static uint32_t lrt_max_leaf_size(const lrt_scene *s) {
+    return (s && s->options.max_leaf_size != 0)
+        ? s->options.max_leaf_size
+        : LRT_MAX_LEAF_SIZE;
+}
+
+static void lrt_set_result(lrt_scene *s, lrt_result result, const char *message) {
+    if (!s) return;
+    s->last_result = result;
+    if (!message) message = lrt_result_string(result);
+    strncpy(s->last_error, message, sizeof(s->last_error) - 1u);
+    s->last_error[sizeof(s->last_error) - 1u] = '\0';
+}
+
+static int lrt_is_finite3(const double v[3]) {
+    return v && isfinite(v[0]) && isfinite(v[1]) && isfinite(v[2]);
+}
+
+static int lrt_valid_ray(const double org[3], const double dir[3],
+                         double tmin, double tmax) {
+    if (!lrt_is_finite3(org) || !lrt_is_finite3(dir)) return 0;
+    if (!isfinite(tmin) || !isfinite(tmax) || tmax < tmin) return 0;
+    return dir[0] != 0.0 || dir[1] != 0.0 || dir[2] != 0.0;
+}
+
+static int lrt_valid_aabb(const lrt_aabb *a) {
+    if (!a) return 0;
+    for (int k = 0; k < 3; k++) {
+        if (!isfinite(a->lo[k]) || !isfinite(a->hi[k]) || a->lo[k] > a->hi[k]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int lrt_should_cancel(lrt_scene *s) {
+    if (!s) return 1;
+    if (atomic_load_explicit(&s->cancel_requested, memory_order_relaxed)) {
+        if (s->last_result == LRT_RESULT_OK) {
+            lrt_set_result(s, LRT_RESULT_CANCELED, NULL);
+        }
+        return 1;
+    }
+    if (s->options.cancel_cb && s->options.cancel_cb(s->options.user)) {
+        atomic_store_explicit(&s->cancel_requested, 1, memory_order_relaxed);
+        lrt_set_result(s, LRT_RESULT_CANCELED, NULL);
+        return 1;
+    }
+    return 0;
+}
+
+static void lrt_reset_progress(lrt_scene *s) {
+    if (!s) return;
+    s->last_progress_done = (size_t)-1;
+    s->last_progress_stage = NULL;
+}
+
+static void lrt_report_progress(lrt_scene *s, const char *stage,
+                                size_t done, size_t total, int force) {
+    if (!s || !s->options.progress_cb) return;
+    size_t interval = s->options.progress_interval;
+    if (interval == 0) interval = LRT_DEFAULT_PROGRESS_INTERVAL;
+    if (!force && s->last_progress_stage == stage &&
+        s->last_progress_done != (size_t)-1 &&
+        done < s->last_progress_done + interval) {
+        return;
+    }
+
+    double fraction = 0.0;
+    if (total != 0) {
+        fraction = (double)done / (double)total;
+        if (fraction < 0.0) fraction = 0.0;
+        if (fraction > 1.0) fraction = 1.0;
+    }
+
+    lrt_progress progress;
+    progress.stage = stage;
+    progress.done = done;
+    progress.total = total;
+    progress.fraction = fraction;
+    s->last_progress_stage = stage;
+    s->last_progress_done = done;
+    s->options.progress_cb(&progress, s->options.user);
+}
 
 static inline float lrt_surface_area(const float lo[3], const float hi[3]) {
     float dx = hi[0] - lo[0], dy = hi[1] - lo[1], dz = hi[2] - lo[2];
@@ -113,6 +232,10 @@ static inline int lrt_longest_axis(const float lo[3], const float hi[3]) {
 
 static uint32_t lrt_make_leaf(lrt_scene *s, uint32_t node_idx,
                               const uint32_t *indices, uint32_t num) {
+    if (s->prim_index_count > s->nprims || num > s->nprims - s->prim_index_count) {
+        lrt_set_result(s, LRT_RESULT_OUT_OF_MEMORY, "primitive index storage overflow");
+        return LRT_INVALID_NODE;
+    }
     uint32_t offset = s->prim_index_count;
     for (uint32_t i = 0; i < num; i++) {
         s->prim_indices[s->prim_index_count++] = indices[i];
@@ -128,10 +251,20 @@ static uint32_t lrt_make_leaf(lrt_scene *s, uint32_t node_idx,
  * The nodes array is preallocated to 2*nprims, so it never reallocates and
  * indices held across recursion stay valid. */
 static uint32_t lrt_build_recursive(lrt_build_ctx *c, uint32_t *indices,
-                                    uint32_t num) {
+                                    uint32_t num, uint32_t depth) {
     lrt_scene *s = c->s;
     const float *plo = c->prim_lo;
     const float *phi = c->prim_hi;
+
+    if (lrt_should_cancel(s)) return LRT_INVALID_NODE;
+    if (depth > lrt_max_build_depth(s)) {
+        lrt_set_result(s, LRT_RESULT_BUILD_LIMIT, "BVH max build depth reached");
+        return LRT_INVALID_NODE;
+    }
+    if (s->node_count >= s->node_cap) {
+        lrt_set_result(s, LRT_RESULT_OUT_OF_MEMORY, "BVH node storage overflow");
+        return LRT_INVALID_NODE;
+    }
 
     /* Node bounds + centroid bounds. */
     float nlo[3], nhi[3], clo[3], chi[3];
@@ -148,11 +281,19 @@ static uint32_t lrt_build_recursive(lrt_build_ctx *c, uint32_t *indices,
     }
 
     uint32_t node_idx = s->node_count++;
+    lrt_report_progress(s, "build", (size_t)s->nprims + s->node_count,
+                        (size_t)s->nprims + s->node_cap, 0);
     lrt_node *node = &s->nodes[node_idx];
     for (int a = 0; a < 3; a++) { node->lo[a] = nlo[a]; node->hi[a] = nhi[a]; }
     node->flags = 0;
 
-    if (num <= LRT_MAX_LEAF_SIZE) {
+    uint32_t max_leaf_size = lrt_max_leaf_size(s);
+    if (max_leaf_size == 0) {
+        lrt_set_result(s, LRT_RESULT_BUILD_LIMIT, "BVH max leaf size must be non-zero");
+        return LRT_INVALID_NODE;
+    }
+
+    if (num <= max_leaf_size) {
         return lrt_make_leaf(s, node_idx, indices, num);
     }
 
@@ -224,7 +365,9 @@ static uint32_t lrt_build_recursive(lrt_build_ctx *c, uint32_t *indices,
     /* If splitting is not worthwhile, make a leaf. */
     float leaf_cost = LRT_INTERSECTION_COST * (float)num;
     if (best_cost >= leaf_cost) {
-        return lrt_make_leaf(s, node_idx, indices, num);
+        lrt_set_result(s, LRT_RESULT_BUILD_LIMIT,
+                       "BVH split failed before satisfying max leaf size");
+        return LRT_INVALID_NODE;
     }
 
     /* Partition indices around best_pos on best_axis. */
@@ -241,8 +384,10 @@ static uint32_t lrt_build_recursive(lrt_build_ctx *c, uint32_t *indices,
     }
     if (mid == 0 || mid == num) mid = num / 2; /* fallback: median by index */
 
-    uint32_t left = lrt_build_recursive(c, indices, mid);
-    uint32_t right = lrt_build_recursive(c, indices + mid, num - mid);
+    uint32_t left = lrt_build_recursive(c, indices, mid, depth + 1u);
+    if (left == LRT_INVALID_NODE) return LRT_INVALID_NODE;
+    uint32_t right = lrt_build_recursive(c, indices + mid, num - mid, depth + 1u);
+    if (right == LRT_INVALID_NODE) return LRT_INVALID_NODE;
 
     /* Re-fetch: recursion appended nodes (array does not realloc). */
     node = &s->nodes[node_idx];
@@ -287,36 +432,81 @@ lrt_scene *lrt_scene_create(unsigned nprims, lrt_bounds_cb bounds_cb,
     s->isect_cb = isect_cb;
     s->user = user;
     s->best_prim = LRT_NO_HIT;
+    atomic_init(&s->cancel_requested, 0);
+    lrt_set_result(s, LRT_RESULT_OK, NULL);
+    lrt_reset_progress(s);
     return s;
 }
 
+int lrt_scene_set_options(lrt_scene *s, const lrt_options *options) {
+    if (!s) return 0;
+    if (options) {
+        s->options = *options;
+    } else {
+        memset(&s->options, 0, sizeof(s->options));
+    }
+    lrt_set_result(s, LRT_RESULT_OK, NULL);
+    return 1;
+}
+
 int lrt_scene_build(lrt_scene *s) {
-    if (!s || s->nprims == 0) return 0;
+    if (!s || s->nprims == 0) {
+        lrt_set_result(s, LRT_RESULT_INVALID_ARGUMENT, "scene is null or has no primitives");
+        return 0;
+    }
+    lrt_set_result(s, LRT_RESULT_OK, NULL);
+    lrt_reset_progress(s);
+
+    size_t nprims_size = (size_t)s->nprims;
+    if (s->nprims > UINT32_MAX / 2u ||
+        nprims_size > SIZE_MAX / (3u * sizeof(float)) ||
+        nprims_size > SIZE_MAX / sizeof(uint32_t) ||
+        nprims_size > SIZE_MAX / (2u * sizeof(lrt_node)) ||
+        nprims_size > SIZE_MAX / 3u) {
+        lrt_set_result(s, LRT_RESULT_OUT_OF_MEMORY, "scene is too large");
+        return 0;
+    }
+    /* Worst-case node count for a binary tree with <= nprims leaves. */
+    size_t node_cap = (size_t)s->nprims * 2u;
+    if (node_cap < 1) node_cap = 1;
+    size_t build_total = nprims_size + node_cap;
+    lrt_report_progress(s, "build", 0, build_total, 1);
+    if (lrt_should_cancel(s)) return 0;
 
     /* Per-primitive fp32 bounds (build-time only). */
     float *prim_lo = (float *)malloc((size_t)s->nprims * 3 * sizeof(float));
     float *prim_hi = (float *)malloc((size_t)s->nprims * 3 * sizeof(float));
     uint32_t *indices = (uint32_t *)malloc((size_t)s->nprims * sizeof(uint32_t));
 
-    /* Worst-case node count for a binary tree with <= nprims leaves. */
-    size_t node_cap = (size_t)s->nprims * 2u;
-    if (node_cap < 1) node_cap = 1;
     lrt_node *nodes = (lrt_node *)malloc(node_cap * sizeof(lrt_node));
     uint32_t *prim_indices = (uint32_t *)malloc((size_t)s->nprims * sizeof(uint32_t));
 
     if (!prim_lo || !prim_hi || !indices || !nodes || !prim_indices) {
         free(prim_lo); free(prim_hi); free(indices);
         free(nodes); free(prim_indices);
+        lrt_set_result(s, LRT_RESULT_OUT_OF_MEMORY, NULL);
         return 0;
     }
 
     for (unsigned i = 0; i < s->nprims; i++) {
+        if (lrt_should_cancel(s)) {
+            free(prim_lo); free(prim_hi); free(indices);
+            free(nodes); free(prim_indices);
+            return 0;
+        }
         lrt_aabb a = s->bounds_cb(i, s->user);
+        if (!lrt_valid_aabb(&a)) {
+            free(prim_lo); free(prim_hi); free(indices);
+            free(nodes); free(prim_indices);
+            lrt_set_result(s, LRT_RESULT_INVALID_BOUNDS, "bounds callback returned invalid AABB");
+            return 0;
+        }
         for (int k = 0; k < 3; k++) {
             prim_lo[i * 3 + k] = (float)a.lo[k];
             prim_hi[i * 3 + k] = (float)a.hi[k];
         }
         indices[i] = i;
+        lrt_report_progress(s, "build", (size_t)i + 1u, build_total, 0);
     }
 
     /* Free any previous build, then attach fresh storage. */
@@ -324,12 +514,30 @@ int lrt_scene_build(lrt_scene *s) {
     free(s->prim_indices);
     s->nodes = nodes;
     s->node_count = 0;
+    s->node_cap = (uint32_t)node_cap;
     s->prim_indices = prim_indices;
     s->prim_index_count = 0;
+    s->built = 0;
 
     lrt_build_ctx ctx = { s, prim_lo, prim_hi };
-    lrt_build_recursive(&ctx, indices, s->nprims);
+    uint32_t root = lrt_build_recursive(&ctx, indices, s->nprims, 0);
+    if (root == LRT_INVALID_NODE) {
+        free(prim_lo);
+        free(prim_hi);
+        free(indices);
+        free(s->nodes);
+        free(s->prim_indices);
+        s->nodes = NULL;
+        s->prim_indices = NULL;
+        s->node_count = 0;
+        s->node_cap = 0;
+        s->prim_index_count = 0;
+        s->built = 0;
+        return 0;
+    }
     s->built = 1;
+    lrt_report_progress(s, "build", build_total, build_total, 1);
+    lrt_set_result(s, LRT_RESULT_OK, NULL);
 
     free(prim_lo);
     free(prim_hi);
@@ -340,7 +548,19 @@ int lrt_scene_build(lrt_scene *s) {
 unsigned lrt_scene_intersect(lrt_scene *s, const double org[3],
                              const double dir[3], double tmin, double tmax,
                              double *t, double *u, double *v) {
-    if (!s || !s->built || s->node_count == 0) return LRT_NO_HIT;
+    if (!s) return LRT_NO_HIT;
+    lrt_set_result(s, LRT_RESULT_OK, NULL);
+    lrt_reset_progress(s);
+    if (!s->built || s->node_count == 0) {
+        lrt_set_result(s, LRT_RESULT_NOT_BUILT, NULL);
+        return LRT_NO_HIT;
+    }
+    if (!lrt_valid_ray(org, dir, tmin, tmax)) {
+        lrt_set_result(s, LRT_RESULT_INVALID_ARGUMENT, "invalid ray or range");
+        return LRT_NO_HIT;
+    }
+    lrt_report_progress(s, "intersect", 0, s->node_count, 1);
+    if (lrt_should_cancel(s)) return LRT_NO_HIT;
 
     for (int k = 0; k < 3; k++) { s->org[k] = org[k]; s->dir[k] = dir[k]; }
     s->tmin = tmin;
@@ -363,10 +583,14 @@ unsigned lrt_scene_intersect(lrt_scene *s, const double org[3],
     uint32_t stack[LRT_STACK_SIZE];
     int sp = 0;
     stack[sp++] = 0; /* root */
+    size_t visited = 0;
 
     while (sp > 0) {
+        if (lrt_should_cancel(s)) return LRT_NO_HIT;
         uint32_t node_idx = stack[--sp];
         const lrt_node *n = &s->nodes[node_idx];
+        visited++;
+        lrt_report_progress(s, "intersect", visited, s->node_count, 0);
 
         float box_tmin;
         if (!lrt_aabb_intersect(n->lo, n->hi, forg, finvd, ftmin, ftmax,
@@ -381,10 +605,13 @@ unsigned lrt_scene_intersect(lrt_scene *s, const double org[3],
             uint32_t offset = n->u.leaf.offset;
             uint32_t count = n->u.leaf.count;
             for (uint32_t i = 0; i < count; i++) {
+                if (lrt_should_cancel(s)) return LRT_NO_HIT;
                 uint32_t prim = s->prim_indices[offset + i];
                 double td = 0.0, ud = 0.0, vd = 0.0;
-                if (s->isect_cb(s->org, s->dir, s->tmin, s->tmax, prim,
+                double cb_tmax = s->best_t < s->tmax ? s->best_t : s->tmax;
+                if (s->isect_cb(s->org, s->dir, s->tmin, cb_tmax, prim,
                                 s->user, &td, &ud, &vd) &&
+                    isfinite(td) && td >= s->tmin && td <= cb_tmax &&
                     td < s->best_t) {
                     s->best_t = td;
                     s->best_u = ud;
@@ -396,7 +623,10 @@ unsigned lrt_scene_intersect(lrt_scene *s, const double org[3],
             uint32_t left = n->u.inner.left;
             uint32_t right = n->u.inner.right;
             uint32_t axis = (n->flags >> 1) & 0x3u;
-            if (sp + 2 > LRT_STACK_SIZE) continue; /* guard (very deep tree) */
+            if (sp + 2 > LRT_STACK_SIZE) {
+                lrt_set_result(s, LRT_RESULT_TRAVERSAL_OVERFLOW, NULL);
+                return LRT_NO_HIT;
+            }
             if (fdir[axis] >= 0.0f) {
                 stack[sp++] = right; /* far */
                 stack[sp++] = left;  /* near */
@@ -412,7 +642,35 @@ unsigned lrt_scene_intersect(lrt_scene *s, const double org[3],
         if (u) *u = s->best_u;
         if (v) *v = s->best_v;
     }
+    lrt_report_progress(s, "intersect", s->node_count, s->node_count, 1);
+    lrt_set_result(s, LRT_RESULT_OK, NULL);
     return s->best_prim;
+}
+
+void lrt_scene_request_cancel(lrt_scene *s) {
+    if (!s) return;
+    atomic_store_explicit(&s->cancel_requested, 1, memory_order_relaxed);
+}
+
+void lrt_scene_clear_cancel(lrt_scene *s) {
+    if (!s) return;
+    atomic_store_explicit(&s->cancel_requested, 0, memory_order_relaxed);
+    lrt_set_result(s, LRT_RESULT_OK, NULL);
+}
+
+int lrt_scene_cancel_requested(const lrt_scene *s) {
+    if (!s) return 0;
+    return atomic_load_explicit(&s->cancel_requested, memory_order_relaxed) ? 1 : 0;
+}
+
+lrt_result lrt_scene_last_result(const lrt_scene *s) {
+    if (!s) return LRT_RESULT_INVALID_ARGUMENT;
+    return s->last_result;
+}
+
+const char *lrt_scene_last_error(const lrt_scene *s) {
+    if (!s) return "invalid argument";
+    return s->last_error[0] ? s->last_error : lrt_result_string(s->last_result);
 }
 
 void lrt_scene_free(lrt_scene *s) {

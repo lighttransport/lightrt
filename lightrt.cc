@@ -7150,7 +7150,8 @@ MMapTriangleBVH::Stats MMapTriangleBVH::getStats() const noexcept {
 MMapGenericBVH::MMapGenericBVH() noexcept
   : prim_data_(nullptr)
   , prim_count_(0)
-  , index_bytes_(4) {}
+  , index_bytes_(4)
+  , build_failed_(false) {}
 
 uint32_t MMapGenericBVH::getPrimIndex(uint32_t offset) const noexcept {
   switch (index_bytes_) {
@@ -7196,10 +7197,15 @@ bool MMapGenericBVH::build(const void* prim_data, uint32_t count,
   if (!prim_data || count == 0 || !bounds_fn) {
     return false;
   }
+  if (config.build.max_leaf_size == 0 || config.build.num_bins == 0 ||
+      config.build.max_depth == 0 || count > (kInvalidIndex / 2u)) {
+    return false;
+  }
 
   prim_data_ = prim_data;
   prim_count_ = count;
   config_ = config;
+  build_failed_ = false;
 
   // Determine index precision
   if (config.index_precision == IndexPrecision::Auto) {
@@ -7244,13 +7250,25 @@ bool MMapGenericBVH::build(const void* prim_data, uint32_t count,
   }
   reserveIndices(count);
 
-  buildRecursive(indices.data(), count, 0, prim_bounds);
+  uint32_t root = buildRecursive(indices.data(), count, 0, prim_bounds);
+  if (build_failed_ || root == kInvalidIndex) {
+    compact_nodes_.clear();
+    full_nodes_.clear();
+    prim_indices_storage_.clear();
+    prim_count_ = 0;
+    return false;
+  }
 
   return true;
 }
 
 uint32_t MMapGenericBVH::buildRecursive(uint32_t* indices, uint32_t num_prims,
                                          uint32_t depth, const std::vector<AABB>& prim_bounds) noexcept {
+  if (build_failed_ || depth > config_.build.max_depth) {
+    build_failed_ = true;
+    return kInvalidIndex;
+  }
+
   AABB node_bounds;
   AABB centroid_bounds;
 
@@ -7262,10 +7280,18 @@ uint32_t MMapGenericBVH::buildRecursive(uint32_t* indices, uint32_t num_prims,
 
   uint32_t node_idx;
   if (config_.use_compact_nodes) {
+    if (compact_nodes_.size() >= static_cast<size_t>(prim_count_) * 2u) {
+      build_failed_ = true;
+      return kInvalidIndex;
+    }
     node_idx = static_cast<uint32_t>(compact_nodes_.size());
     compact_nodes_.emplace_back();
     compact_nodes_[node_idx].quantizeBounds(node_bounds, scene_bounds_.min, scene_bounds_.max);
   } else {
+    if (full_nodes_.size() >= static_cast<size_t>(prim_count_) * 2u) {
+      build_failed_ = true;
+      return kInvalidIndex;
+    }
     node_idx = static_cast<uint32_t>(full_nodes_.size());
     full_nodes_.emplace_back();
     full_nodes_[node_idx].bounds = node_bounds;
@@ -7361,18 +7387,8 @@ uint32_t MMapGenericBVH::buildRecursive(uint32_t* indices, uint32_t num_prims,
 
   float leaf_cost = config_.build.intersection_cost * num_prims;
   if (best_cost >= leaf_cost && !config_.build.force_max_leaf_size) {
-    uint32_t prim_offset = static_cast<uint32_t>(prim_indices_storage_.size() / index_bytes_);
-
-    for (uint32_t i = 0; i < num_prims; i++) {
-      pushIndex(indices[i]);
-    }
-
-    if (config_.use_compact_nodes) {
-      compact_nodes_[node_idx].setLeaf(prim_offset, num_prims);
-    } else {
-      full_nodes_[node_idx].setLeaf(prim_offset, num_prims);
-    }
-    return node_idx;
+    build_failed_ = true;
+    return kInvalidIndex;
   }
 
   uint32_t mid = 0;
@@ -7397,7 +7413,15 @@ uint32_t MMapGenericBVH::buildRecursive(uint32_t* indices, uint32_t num_prims,
   }
 
   uint32_t left_child = buildRecursive(indices, mid, depth + 1, prim_bounds);
+  if (left_child == kInvalidIndex) {
+    build_failed_ = true;
+    return kInvalidIndex;
+  }
   uint32_t right_child = buildRecursive(indices + mid, num_prims - mid, depth + 1, prim_bounds);
+  if (right_child == kInvalidIndex) {
+    build_failed_ = true;
+    return kInvalidIndex;
+  }
 
   if (config_.use_compact_nodes) {
     compact_nodes_[node_idx].setInterior(left_child, right_child, static_cast<uint8_t>(best_axis));

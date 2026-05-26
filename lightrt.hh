@@ -1436,6 +1436,7 @@ struct BVHBuildConfig {
   bool force_max_leaf_size;    // Always enforce max_leaf_size (ignore SAH cost)
   bool use_lbvh;               // Use LBVH (Morton code-based, fast but lower quality)
   bool use_parallel_build;     // Use multi-threading for construction
+  uint32_t max_depth;          // Maximum recursive build depth
 
   BVHBuildConfig() noexcept
     : max_leaf_size(4)
@@ -1447,7 +1448,8 @@ struct BVHBuildConfig {
     , num_bins(16)
     , force_max_leaf_size(false)
     , use_lbvh(false)
-    , use_parallel_build(true) {}
+    , use_parallel_build(true)
+    , max_depth(64) {}
 
   // Preset for fast build (LBVH)
   static BVHBuildConfig fast() noexcept {
@@ -2617,6 +2619,7 @@ private:
 
   std::vector<uint8_t> prim_indices_storage_;
   uint8_t index_bytes_;
+  bool build_failed_;
 
   uint32_t getPrimIndex(uint32_t offset) const noexcept;
   void reserveIndices(uint32_t count) noexcept;
