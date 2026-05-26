@@ -134,6 +134,9 @@ endif()
 option(LIGHTRT_PURE_C_BINDING
        "Use the standalone pure-C11 binding (lightrt_c.c) instead of the C++ wrapper (lightrt_c.cc)"
        OFF)
+option(LIGHTRT_BUILD_FUZZERS
+       "Build libFuzzer harnesses for LightRT"
+       OFF)
 if(LIGHTRT_PURE_C_BINDING)
     set(LIGHTRT_C_BINDING_SRC lightrt_c.c)
 else()
@@ -177,6 +180,24 @@ if(BUILD_TESTING)
         target_link_libraries(lightrt_c_test m)
     endif()
     add_test(NAME lightrt_c_test COMMAND lightrt_c_test)
+endif()
+
+if(LIGHTRT_BUILD_FUZZERS)
+    if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "LIGHTRT_BUILD_FUZZERS requires Clang/libFuzzer")
+    endif()
+
+    add_executable(lightrt_c_fuzzer lightrt_c.c tests/fuzz_lightrt_c.c)
+    target_compile_options(lightrt_c_fuzzer PRIVATE
+        -fsanitize=fuzzer,address,undefined
+        -fno-omit-frame-pointer
+    )
+    target_link_options(lightrt_c_fuzzer PRIVATE
+        -fsanitize=fuzzer,address,undefined
+    )
+    if(NOT MSVC)
+        target_link_libraries(lightrt_c_fuzzer m)
+    endif()
 endif()
 
 option(LIGHTRT_BUILD_WEBGPU "Build WebGPU software backend targets" ON)
