@@ -416,7 +416,7 @@ struct alignas(16) Ray4 {
     int count = 0;
     uint32_t mask = active_mask;
     while (mask) {
-      count += mask & 1;
+      count += static_cast<int>(mask & 1u);
       mask >>= 1;
     }
     return count;
@@ -482,7 +482,7 @@ struct alignas(32) Ray8 {
     int count = 0;
     uint32_t mask = active_mask;
     while (mask) {
-      count += mask & 1;
+      count += static_cast<int>(mask & 1u);
       mask >>= 1;
     }
     return count;
@@ -1316,7 +1316,7 @@ inline uint16_t floatToFP16(float value) noexcept {
   std::memcpy(&bits, &value, sizeof(float));
   
   uint32_t sign = (bits >> 16) & 0x8000;
-  int32_t exponent = ((bits >> 23) & 0xFF) - 127 + 15;
+  int32_t exponent = static_cast<int32_t>((bits >> 23) & 0xFF) - 127 + 15;
   uint32_t mantissa = bits & 0x7FFFFF;
   
   if (exponent <= 0) {
@@ -1327,7 +1327,7 @@ inline uint16_t floatToFP16(float value) noexcept {
     return static_cast<uint16_t>(sign | 0x7C00);
   }
   
-  return static_cast<uint16_t>(sign | (exponent << 10) | (mantissa >> 13));
+  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10) | (mantissa >> 13));
 #endif
 }
 
@@ -1366,7 +1366,7 @@ inline float fp16ToFloat(uint16_t value) noexcept {
     return result;
   }
   
-  uint32_t bits = sign | ((exponent + 127 - 15) << 23) | (mantissa << 13);
+  uint32_t bits = sign | (static_cast<uint32_t>(exponent + 127 - 15) << 23) | (mantissa << 13);
   float result;
   std::memcpy(&result, &bits, sizeof(float));
   return result;
@@ -1380,18 +1380,19 @@ inline float fp16ToFloat(uint16_t value) noexcept {
 struct BVHNode {
   AABB bounds;
   
+  // First word: left child index (interior) aliased with primitive offset
+  // (leaf). Anonymous unions are valid ISO C++ (unlike anonymous structs),
+  // so this keeps the same layout and member access without -Wpedantic noise.
   union {
-    // Interior node
-    struct {
-      uint32_t left_child;   // Index to left child
-      uint32_t right_child;  // Index to right child
-    };
-    
-    // Leaf node
-    struct {
-      uint32_t prim_offset;  // Offset into primitive indices
-      uint32_t prim_count;   // Number of primitives
-    };
+    uint32_t left_child;   // Interior: index to left child
+    uint32_t prim_offset;  // Leaf: offset into primitive indices
+  };
+
+  // Second word: right child index (interior) aliased with primitive count
+  // (leaf).
+  union {
+    uint32_t right_child;  // Interior: index to right child
+    uint32_t prim_count;   // Leaf: number of primitives
   };
   
   // Flags: bit 0 = is_leaf, bits 1-2 = split axis (0=x, 1=y, 2=z)
@@ -1635,9 +1636,9 @@ public:
       return false;
     } else {
       // Linear probing hash table
-      uint32_t idx = prim_id % hash_table_.size();
+      uint32_t idx = static_cast<uint32_t>(prim_id % hash_table_.size());
       for (uint32_t i = 0; i < hash_table_.size(); i++) {
-        uint32_t probe = (idx + i) % hash_table_.size();
+        uint32_t probe = static_cast<uint32_t>((idx + i) % hash_table_.size());
         if (hash_table_[probe] == prim_id) {
           return true;  // Already tested
         }
@@ -2430,7 +2431,7 @@ struct alignas(16) CompactBVHNode {
     data0 = left;
     data1 = right;
     axis = split_axis;
-    flags &= ~0x1;
+    flags = static_cast<uint8_t>(flags & ~0x1u);
   }
 
   // Dequantize bounds

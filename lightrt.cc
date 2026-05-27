@@ -257,7 +257,7 @@ Vec3 NGon::centroid() const noexcept {
   for (const auto& v : vertices) {
     c = c + v;
   }
-  return c * (1.0f / vertices.size());
+  return c * (1.0f / static_cast<float>(vertices.size()));
 }
 
 AABB NGon::bounds() const noexcept {
@@ -457,7 +457,7 @@ Vec3 Curve::centroid() const noexcept {
   for (const auto& p : control_points) {
     c = c + p;
   }
-  return c * (1.0f / control_points.size());
+  return c * (1.0f / static_cast<float>(control_points.size()));
 }
 
 AABB Curve::bounds() const noexcept {
@@ -479,10 +479,10 @@ Vec3 Curve::evaluate(float t) const noexcept {
 
   if (type == CurveType::Linear || control_points.size() == 2) {
     // Linear interpolation between segments
-    float segment_t = t * (control_points.size() - 1);
+    float segment_t = t * static_cast<float>(control_points.size() - 1);
     size_t i = static_cast<size_t>(segment_t);
     i = std::min(i, control_points.size() - 2);
-    float local_t = segment_t - i;
+    float local_t = segment_t - static_cast<float>(i);
     return control_points[i] + (control_points[i + 1] - control_points[i]) * local_t;
   }
 
@@ -502,10 +502,10 @@ Vec3 Curve::evaluate(float t) const noexcept {
 
   if (type == CurveType::CatmullRom && control_points.size() >= 4) {
     // Catmull-Rom spline
-    float segment_t = t * (control_points.size() - 3);
+    float segment_t = t * static_cast<float>(control_points.size() - 3);
     size_t i = static_cast<size_t>(segment_t);
     i = std::min(i, control_points.size() - 4);
-    float local_t = segment_t - i;
+    float local_t = segment_t - static_cast<float>(i);
 
     const Vec3& p0 = control_points[i];
     const Vec3& p1 = control_points[i + 1];
@@ -522,10 +522,10 @@ Vec3 Curve::evaluate(float t) const noexcept {
   }
 
   // Fallback to linear
-  float segment_t = t * (control_points.size() - 1);
+  float segment_t = t * static_cast<float>(control_points.size() - 1);
   size_t i = static_cast<size_t>(segment_t);
   i = std::min(i, control_points.size() - 2);
-  float local_t = segment_t - i;
+  float local_t = segment_t - static_cast<float>(i);
   return control_points[i] + (control_points[i + 1] - control_points[i]) * local_t;
 }
 
@@ -542,10 +542,10 @@ float Curve::radiusAt(float t) const noexcept {
   if (radii.size() == 1) return radii[0];
 
   t = std::max(0.0f, std::min(1.0f, t));
-  float segment_t = t * (radii.size() - 1);
+  float segment_t = t * static_cast<float>(radii.size() - 1);
   size_t i = static_cast<size_t>(segment_t);
   i = std::min(i, radii.size() - 2);
-  float local_t = segment_t - i;
+  float local_t = segment_t - static_cast<float>(i);
 
   return radii[i] + (radii[i + 1] - radii[i]) * local_t;
 }
@@ -677,7 +677,7 @@ bool Curve::intersectLinear(const Ray& ray, float& t_hit, float& u_hit) const no
       float t;
       if (sphere.intersect(ray, t) && t < best_t) {
         best_t = t;
-        u_hit = static_cast<float>(i) / (control_points.size() - 1);
+        u_hit = static_cast<float>(i) / static_cast<float>(control_points.size() - 1);
         hit = true;
       }
       continue;
@@ -729,7 +729,7 @@ bool Curve::intersectLinear(const Ray& ray, float& t_hit, float& u_hit) const no
 
       if (t_surface > ray.tmin && t_surface < best_t) {
         best_t = t_surface;
-        u_hit = (i + seg_u) / (control_points.size() - 1);
+        u_hit = (static_cast<float>(i) + seg_u) / static_cast<float>(control_points.size() - 1);
         hit = true;
       }
     }
@@ -1461,7 +1461,7 @@ uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t dep
   
   // Check if split is worth it (SAH cost)
   if (config_.use_sah && !config_.force_max_leaf_size &&
-      split.cost >= config_.intersection_cost * num_prims) {
+      split.cost >= config_.intersection_cost * static_cast<float>(num_prims)) {
     // Don't split, create leaf
     uint32_t offset = static_cast<uint32_t>(indices - prim_indices_.data());
     node.setLeaf(offset, num_prims);
@@ -1514,7 +1514,7 @@ uint32_t BVH::buildRecursive(uint32_t* indices, uint32_t num_prims, uint32_t dep
   }
   
   // Update node with split axis for front-to-back traversal ordering
-  nodes_[node_idx].setInterior(left_child, right_child, split.axis);
+  nodes_[node_idx].setInterior(left_child, right_child, static_cast<uint32_t>(split.axis));
 
   return node_idx;
 }
@@ -1575,12 +1575,13 @@ BVH::SplitResult BVH::findBestSplit(
 
   // Try each axis
   for (int axis = 0; axis < 3; axis++) {
+    const uint32_t uaxis = static_cast<uint32_t>(axis);
     // Initialize sorted index array
     for (uint32_t i = 0; i < num_prims; i++) sorted_indices[i] = i;
 
     // Sort by pre-computed centroid along axis
     std::sort(sorted_indices, sorted_indices + num_prims, [&](uint32_t a, uint32_t b) {
-      return centroids[a * 3 + axis] < centroids[b * 3 + axis];
+      return centroids[a * 3 + uaxis] < centroids[b * 3 + uaxis];
     });
 
     // Forward sweep: build prefix bounds left-to-right
@@ -1598,7 +1599,8 @@ BVH::SplitResult BVH::findBestSplit(
       float left_area = left_prefix[i - 1].surfaceArea() * inv_parent_area;
       float right_area = right_bounds.surfaceArea() * inv_parent_area;
       float cost = config_.traversal_cost +
-                   config_.intersection_cost * (i * left_area + (num_prims - i) * right_area);
+                   config_.intersection_cost * (static_cast<float>(i) * left_area +
+                                                static_cast<float>(num_prims - i) * right_area);
 
       if (cost < best.cost) {
         best.cost = cost;
@@ -1607,8 +1609,8 @@ BVH::SplitResult BVH::findBestSplit(
         best.right_bounds = right_bounds;
 
         // Split position is between primitives
-        float c1 = centroids[sorted_indices[i - 1] * 3 + axis];
-        float c2 = centroids[sorted_indices[i] * 3 + axis];
+        float c1 = centroids[sorted_indices[i - 1] * 3 + uaxis];
+        float c2 = centroids[sorted_indices[i] * 3 + uaxis];
         best.pos = (c1 + c2) * 0.5f;
       }
     }
@@ -1684,7 +1686,7 @@ BVH::SplitResult BVH::findBestSplitBinned(
     const float* centroid_vals = (axis == 0) ? cx : (axis == 1) ? cy : cz;
 
     // Put primitives into bins (Parallelizable)
-    float scale = nb / (max_val - min_val);
+    float scale = static_cast<float>(nb) / (max_val - min_val);
     if (config_.use_parallel_build && num_prims > 4096) {
       std::mutex bins_mutex;
       TaskSystem::parallelFor(0, num_prims, [&](uint32_t start, uint32_t end) {
@@ -1740,12 +1742,13 @@ BVH::SplitResult BVH::findBestSplitBinned(
       float left_area = left_prefix_bounds[i - 1].surfaceArea() * inv_parent_area;
       float right_area = right_bounds.surfaceArea() * inv_parent_area;
       float cost = config_.traversal_cost +
-                   config_.intersection_cost * (left_count * left_area + right_count * right_area);
+                   config_.intersection_cost * (static_cast<float>(left_count) * left_area +
+                                                static_cast<float>(right_count) * right_area);
 
       if (cost < best.cost) {
         best.cost = cost;
         best.axis = axis;
-        best.pos = min_val + (max_val - min_val) * (static_cast<float>(i) / nb);
+        best.pos = min_val + (max_val - min_val) * (static_cast<float>(i) / static_cast<float>(nb));
         best.left_bounds = left_prefix_bounds[i - 1];
         best.right_bounds = right_bounds;
       }
@@ -1854,7 +1857,7 @@ uint32_t BVH::traverseSIMD(const Ray& ray, float& hit_t) const noexcept {
       // Front-to-back ordering
       if (stack_ptr < 62) {
         uint32_t children[2] = { node.left_child, node.right_child };
-        uint32_t s = ctx.sign[node.splitAxis()];
+        uint32_t s = static_cast<uint32_t>(ctx.sign[node.splitAxis()]);
         stack[stack_ptr++] = children[1 - s]; // far
         stack[stack_ptr++] = children[s];     // near
       }
@@ -1880,7 +1883,7 @@ BVH::Stats BVH::getStats() const noexcept {
     
     if (node.isLeaf()) {
       stats.num_leaves++;
-      stats.avg_leaf_size += node.prim_count;
+      stats.avg_leaf_size += static_cast<float>(node.prim_count);
       stats.max_depth = std::max(stats.max_depth, depths[i]);
     } else {
       depths[node.left_child] = depths[i] + 1;
@@ -1889,7 +1892,7 @@ BVH::Stats BVH::getStats() const noexcept {
   }
   
   if (stats.num_leaves > 0) {
-    stats.avg_leaf_size /= stats.num_leaves;
+    stats.avg_leaf_size /= static_cast<float>(stats.num_leaves);
   }
   
   // Compute SAH cost
@@ -1899,7 +1902,7 @@ BVH::Stats BVH::getStats() const noexcept {
     float area = node.bounds.surfaceArea();
     
     if (node.isLeaf()) {
-      stats.sah_cost += area * node.prim_count * config_.intersection_cost;
+      stats.sah_cost += area * static_cast<float>(node.prim_count) * config_.intersection_cost;
     } else {
       stats.sah_cost += area * config_.traversal_cost;
     }
@@ -1919,7 +1922,7 @@ void BVH::refit(const std::vector<AABB>& new_prim_aabbs) noexcept {
   // Bottom-up refit: process nodes in reverse order (leaves first)
   // This works because children always have higher indices than parents
   for (int32_t i = static_cast<int32_t>(nodes_.size()) - 1; i >= 0; i--) {
-    BVHNode& node = nodes_[i];
+    BVHNode& node = nodes_[static_cast<size_t>(i)];
 
     if (node.isLeaf()) {
       // Recompute bounds from primitives
@@ -3086,11 +3089,11 @@ uint32_t BVH4::traverse(const Ray& ray, float& hit_t) const noexcept {
     uint32_t hits[4];
     int hit_count = 0;
     for(int i=0; i<4; i++) {
-        if(hit_mask & (1 << i)) hits[hit_count++] = i;
+        if(hit_mask & (1 << i)) hits[hit_count++] = static_cast<uint32_t>(i);
     }
 
     for (int k = 0; k < hit_count; k++) {
-      int i = hits[k];
+      int i = static_cast<int>(hits[k]);
       uint32_t child = children_ptr[i];
       if (child & 0x80000000) {
         uint32_t offset = child & 0x7FFFFFFF;
@@ -3248,7 +3251,7 @@ uint32_t TriangleBVH::traverse(const Ray& ray, float& hit_t, float& hit_u, float
       // Branchless front-to-back ordering
       if (stack_ptr < 62) {
         uint32_t children[2] = { node.left_child, node.right_child };
-        uint32_t s = ctx.sign[node.splitAxis()];
+        uint32_t s = static_cast<uint32_t>(ctx.sign[node.splitAxis()]);
         stack[stack_ptr++] = children[1 - s]; // far
         stack[stack_ptr++] = children[s];     // near
       }
@@ -3339,7 +3342,7 @@ uint32_t TriangleBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hi
       // Front-to-back ordering
       if (stack_ptr < 62) {
         uint32_t children[2] = { node.left_child, node.right_child };
-        uint32_t s = ctx.sign[node.splitAxis()];
+        uint32_t s = static_cast<uint32_t>(ctx.sign[node.splitAxis()]);
         stack[stack_ptr++] = children[1 - s]; // far
         stack[stack_ptr++] = children[s];     // near
       }
@@ -3388,7 +3391,7 @@ bool TriangleBVH::traverseAnyHit(const Ray& ray, uint32_t exclude_prim_id) const
       // Branchless front-to-back ordering
       if (stack_ptr < 62) {
         uint32_t children[2] = { node.left_child, node.right_child };
-        uint32_t s = ctx.sign[node.splitAxis()];
+        uint32_t s = static_cast<uint32_t>(ctx.sign[node.splitAxis()]);
         stack[stack_ptr++] = children[1 - s]; // far
         stack[stack_ptr++] = children[s];     // near
       }
@@ -3936,7 +3939,7 @@ uint32_t TriangleBVH::traverseMultiHit(const Ray& ray, MultiHitResult& result,
     } else {
       if (stack_ptr < 62) {
         uint32_t children[2] = { node.left_child, node.right_child };
-        uint32_t s = ctx.sign[node.splitAxis()];
+        uint32_t s = static_cast<uint32_t>(ctx.sign[node.splitAxis()]);
         stack[stack_ptr++] = children[1 - s]; // far
         stack[stack_ptr++] = children[s];     // near
       }
@@ -4659,7 +4662,7 @@ bool SBVH::build(const std::vector<Triangle>& triangles, const SBVHBuildConfig& 
   nodes_.clear();
   nodes_.reserve(triangles.size() * 2);
   refs_.clear();
-  refs_.reserve(static_cast<size_t>(triangles.size() * config_.max_split_factor));
+  refs_.reserve(static_cast<size_t>(static_cast<float>(triangles.size()) * config_.max_split_factor));
 
   // Build recursively
   buildRecursive(initial_refs, 0);
@@ -4710,7 +4713,7 @@ uint32_t SBVH::buildRecursive(std::vector<PrimRef>& refs, uint32_t depth) noexce
 
   // Check reference count limit
   bool can_split_spatially = refs_.size() + refs.size() * 2 <
-                              static_cast<size_t>(triangles_.size() * config_.max_split_factor);
+                              static_cast<size_t>(static_cast<float>(triangles_.size()) * config_.max_split_factor);
 
   // Find best spatial split if overlap is significant and we haven't hit the limit
   SplitResult best_split = object_split;
@@ -4722,7 +4725,7 @@ uint32_t SBVH::buildRecursive(std::vector<PrimRef>& refs, uint32_t depth) noexce
   }
 
   // Check if split is worth it
-  float leaf_cost = config_.intersection_cost * num_refs;
+  float leaf_cost = config_.intersection_cost * static_cast<float>(num_refs);
   if (best_split.cost >= leaf_cost || best_split.left_count == 0 || best_split.right_count == 0) {
     // Create leaf
     uint32_t offset = static_cast<uint32_t>(refs_.size());
@@ -4745,8 +4748,8 @@ uint32_t SBVH::buildRecursive(std::vector<PrimRef>& refs, uint32_t depth) noexce
   // Handle degenerate case
   if (left_refs.empty() || right_refs.empty()) {
     size_t mid = refs.size() / 2;
-    left_refs.assign(refs.begin(), refs.begin() + mid);
-    right_refs.assign(refs.begin() + mid, refs.end());
+    left_refs.assign(refs.begin(), refs.begin() + static_cast<std::ptrdiff_t>(mid));
+    right_refs.assign(refs.begin() + static_cast<std::ptrdiff_t>(mid), refs.end());
   }
 
   // Clear refs to save memory
@@ -4757,7 +4760,7 @@ uint32_t SBVH::buildRecursive(std::vector<PrimRef>& refs, uint32_t depth) noexce
   uint32_t left_child = buildRecursive(left_refs, depth + 1);
   uint32_t right_child = buildRecursive(right_refs, depth + 1);
 
-  nodes_[node_idx].setInterior(left_child, right_child, best_split.axis);
+  nodes_[node_idx].setInterior(left_child, right_child, static_cast<uint32_t>(best_split.axis));
   return node_idx;
 }
 
@@ -4800,7 +4803,7 @@ SBVH::SplitResult SBVH::findObjectSplit(
     }
 
     // Put references into bins
-    float scale = actual_bins / (max_val - min_val);
+    float scale = static_cast<float>(actual_bins) / (max_val - min_val);
     for (const auto& ref : refs) {
       Vec3 centroid = ref.bounds.center();
       float val = axis == 0 ? centroid.x : axis == 1 ? centroid.y : centroid.z;
@@ -4842,12 +4845,13 @@ SBVH::SplitResult SBVH::findObjectSplit(
       float right_area = running_bounds.surfaceArea() * inv_node_area;
 
       float cost = config_.traversal_cost +
-                   config_.intersection_cost * (left_count * left_area + right_count * right_area);
+                   config_.intersection_cost * (static_cast<float>(left_count) * left_area +
+                                                static_cast<float>(right_count) * right_area);
 
       if (cost < best.cost) {
         best.cost = cost;
         best.axis = axis;
-        best.pos = min_val + (max_val - min_val) * (static_cast<float>(i) / actual_bins);
+        best.pos = min_val + (max_val - min_val) * (static_cast<float>(i) / static_cast<float>(actual_bins));
         best.left_bounds = left_bounds_arr[i - 1];
         best.right_bounds = running_bounds;
         best.left_count = left_count;
@@ -4895,7 +4899,7 @@ SBVH::SplitResult SBVH::findSpatialSplit(
     for (uint32_t i = 0; i < num_bins; i++) {
       bins[i] = SpatialBin();
     }
-    float bin_size = (max_val - min_val) / num_bins;
+    float bin_size = (max_val - min_val) / static_cast<float>(num_bins);
 
     // Fill bins with clipped reference bounds
     for (const auto& ref : refs) {
@@ -4915,8 +4919,8 @@ SBVH::SplitResult SBVH::findSpatialSplit(
 
       // Clip reference bounds to each overlapping bin (AABB-only, no triangle clipping)
       for (uint32_t b = first_bin; b <= last_bin; b++) {
-        float plane_left = min_val + b * bin_size;
-        float plane_right = min_val + (b + 1) * bin_size;
+        float plane_left = min_val + static_cast<float>(b) * bin_size;
+        float plane_right = min_val + static_cast<float>(b + 1) * bin_size;
 
         AABB clipped = ref.bounds;
         if (axis == 0) {
@@ -4964,12 +4968,13 @@ SBVH::SplitResult SBVH::findSpatialSplit(
       float right_area = running_bounds.surfaceArea() * inv_node_area;
 
       float cost = config_.traversal_cost +
-                   config_.intersection_cost * (left_count * left_area + right_count * right_area);
+                   config_.intersection_cost * (static_cast<float>(left_count) * left_area +
+                                                static_cast<float>(right_count) * right_area);
 
       if (cost < best.cost) {
         best.cost = cost;
         best.axis = axis;
-        best.pos = min_val + (max_val - min_val) * (static_cast<float>(i) / num_bins);
+        best.pos = min_val + (max_val - min_val) * (static_cast<float>(i) / static_cast<float>(num_bins));
         best.left_bounds = left_bounds_arr[i - 1];
         best.right_bounds = running_bounds;
         best.left_count = left_count;
@@ -5200,7 +5205,7 @@ uint32_t SBVH::traverse(const Ray& ray, float& hit_t, float& hit_u, float& hit_v
       // Branchless front-to-back ordering
       if (stack_ptr < 62) {
         uint32_t children[2] = { node.left_child, node.right_child };
-        uint32_t s = ctx.sign[node.splitAxis()];
+        uint32_t s = static_cast<uint32_t>(ctx.sign[node.splitAxis()]);
         stack[stack_ptr++] = children[1 - s]; // far
         stack[stack_ptr++] = children[s];     // near
       }
@@ -5327,7 +5332,7 @@ uint32_t SBVH::traverseWithConfig(const Ray& ray, float& hit_t, float& hit_u, fl
       // Front-to-back ordering: push far child first (popped last)
       if (stack_ptr < 62) {
         uint32_t children[2] = { node.left_child, node.right_child };
-        uint32_t s = ctx.sign[node.splitAxis()];
+        uint32_t s = static_cast<uint32_t>(ctx.sign[node.splitAxis()]);
         stack[stack_ptr++] = children[1 - s]; // far
         stack[stack_ptr++] = children[s];     // near
       }
@@ -5394,7 +5399,7 @@ bool SBVH::traverseAnyHit(const Ray& ray, uint32_t exclude_prim_id) const noexce
       // Branchless front-to-back ordering
       if (stack_ptr < 62) {
         uint32_t children[2] = { node.left_child, node.right_child };
-        uint32_t s = ctx.sign[node.splitAxis()];
+        uint32_t s = static_cast<uint32_t>(ctx.sign[node.splitAxis()]);
         stack[stack_ptr++] = children[1 - s]; // far
         stack[stack_ptr++] = children[s];     // near
       }
@@ -6129,7 +6134,7 @@ uint32_t SBVH::traverseMultiHit(const Ray& ray, MultiHitResult& result,
       // Front-to-back ordering: push far child first (popped last)
       if (stack_ptr < 62) {
         uint32_t children[2] = { node.left_child, node.right_child };
-        uint32_t s = ctx.sign[node.splitAxis()];
+        uint32_t s = static_cast<uint32_t>(ctx.sign[node.splitAxis()]);
         stack[stack_ptr++] = children[1 - s]; // far
         stack[stack_ptr++] = children[s];     // near
       }
@@ -6148,7 +6153,7 @@ SBVH::Stats SBVH::getStats() const noexcept {
 
   stats.num_primitives = static_cast<uint32_t>(triangles_.size());
   stats.num_references = static_cast<uint32_t>(refs_.size());
-  stats.split_ratio = static_cast<float>(stats.num_references) / stats.num_primitives;
+  stats.split_ratio = static_cast<float>(stats.num_references) / static_cast<float>(stats.num_primitives);
 
   // Count nodes and compute depth
   std::vector<uint32_t> depths(nodes_.size(), 0);
@@ -6159,7 +6164,7 @@ SBVH::Stats SBVH::getStats() const noexcept {
 
     if (node.isLeaf()) {
       stats.num_leaves++;
-      stats.avg_leaf_size += node.prim_count;
+      stats.avg_leaf_size += static_cast<float>(node.prim_count);
       stats.max_depth = std::max(stats.max_depth, depths[i]);
     } else {
       depths[node.left_child] = depths[i] + 1;
@@ -6168,7 +6173,7 @@ SBVH::Stats SBVH::getStats() const noexcept {
   }
 
   if (stats.num_leaves > 0) {
-    stats.avg_leaf_size /= stats.num_leaves;
+    stats.avg_leaf_size /= static_cast<float>(stats.num_leaves);
   }
 
   // Compute SAH cost
@@ -6178,7 +6183,7 @@ SBVH::Stats SBVH::getStats() const noexcept {
     float area = node.bounds.surfaceArea();
 
     if (node.isLeaf()) {
-      stats.sah_cost += area * node.prim_count * config_.intersection_cost;
+      stats.sah_cost += area * static_cast<float>(node.prim_count) * config_.intersection_cost;
     } else {
       stats.sah_cost += area * config_.traversal_cost;
     }
@@ -6212,7 +6217,7 @@ bool SBVHGeneric::build(const std::vector<AABB>& prim_aabbs, const SBVHBuildConf
   nodes_.clear();
   nodes_.reserve(prim_aabbs.size() * 2);
   refs_.clear();
-  refs_.reserve(static_cast<size_t>(prim_aabbs.size() * config_.max_split_factor));
+  refs_.reserve(static_cast<size_t>(static_cast<float>(prim_aabbs.size()) * config_.max_split_factor));
 
   buildRecursive(initial_refs, 0);
 
@@ -6247,7 +6252,7 @@ uint32_t SBVHGeneric::buildRecursive(std::vector<PrimRef>& refs, uint32_t depth)
   float overlap_ratio = scene_area > kEpsilon ? overlap_area / scene_area : 0.0f;
 
   bool can_split_spatially = refs_.size() + refs.size() * 2 <
-                              static_cast<size_t>(prim_aabbs_.size() * config_.max_split_factor);
+                              static_cast<size_t>(static_cast<float>(prim_aabbs_.size()) * config_.max_split_factor);
 
   SplitResult best_split = object_split;
   if (overlap_ratio > config_.alpha && can_split_spatially) {
@@ -6257,7 +6262,7 @@ uint32_t SBVHGeneric::buildRecursive(std::vector<PrimRef>& refs, uint32_t depth)
     }
   }
 
-  float leaf_cost = config_.intersection_cost * num_refs;
+  float leaf_cost = config_.intersection_cost * static_cast<float>(num_refs);
   if (best_split.cost >= leaf_cost || best_split.left_count == 0 || best_split.right_count == 0) {
     uint32_t offset = static_cast<uint32_t>(refs_.size());
     refs_.insert(refs_.end(), refs.begin(), refs.end());
@@ -6277,8 +6282,8 @@ uint32_t SBVHGeneric::buildRecursive(std::vector<PrimRef>& refs, uint32_t depth)
 
   if (left_refs.empty() || right_refs.empty()) {
     size_t mid = refs.size() / 2;
-    left_refs.assign(refs.begin(), refs.begin() + mid);
-    right_refs.assign(refs.begin() + mid, refs.end());
+    left_refs.assign(refs.begin(), refs.begin() + static_cast<std::ptrdiff_t>(mid));
+    right_refs.assign(refs.begin() + static_cast<std::ptrdiff_t>(mid), refs.end());
   }
 
   refs.clear();
@@ -6287,7 +6292,7 @@ uint32_t SBVHGeneric::buildRecursive(std::vector<PrimRef>& refs, uint32_t depth)
   uint32_t left_child = buildRecursive(left_refs, depth + 1);
   uint32_t right_child = buildRecursive(right_refs, depth + 1);
 
-  nodes_[node_idx].setInterior(left_child, right_child, best_split.axis);
+  nodes_[node_idx].setInterior(left_child, right_child, static_cast<uint32_t>(best_split.axis));
   return node_idx;
 }
 
@@ -6326,7 +6331,7 @@ SBVHGeneric::SplitResult SBVHGeneric::findObjectSplit(
     // Reset bins for this axis
     for (uint32_t i = 0; i < actual_bins; i++) bins[i] = ObjectBin();
 
-    float scale = actual_bins / (max_val - min_val);
+    float scale = static_cast<float>(actual_bins) / (max_val - min_val);
     for (const auto& ref : refs) {
       Vec3 centroid = ref.bounds.center();
       float val = axis == 0 ? centroid.x : axis == 1 ? centroid.y : centroid.z;
@@ -6366,12 +6371,13 @@ SBVHGeneric::SplitResult SBVHGeneric::findObjectSplit(
       float right_area = running_bounds.surfaceArea() * inv_node_area;
 
       float cost = config_.traversal_cost +
-                   config_.intersection_cost * (left_count * left_area + right_count * right_area);
+                   config_.intersection_cost * (static_cast<float>(left_count) * left_area +
+                                                static_cast<float>(right_count) * right_area);
 
       if (cost < best.cost) {
         best.cost = cost;
         best.axis = axis;
-        best.pos = min_val + (max_val - min_val) * (static_cast<float>(i) / actual_bins);
+        best.pos = min_val + (max_val - min_val) * (static_cast<float>(i) / static_cast<float>(actual_bins));
         best.left_bounds = left_bounds_arr[i - 1];
         best.right_bounds = running_bounds;
         best.left_count = left_count;
@@ -6408,7 +6414,7 @@ SBVHGeneric::SplitResult SBVHGeneric::findSpatialSplit(
     }
 
     std::vector<SpatialBin> bins(config_.num_spatial_bins);
-    float bin_size = (max_val - min_val) / config_.num_spatial_bins;
+    float bin_size = (max_val - min_val) / static_cast<float>(config_.num_spatial_bins);
 
     for (const auto& ref : refs) {
       float ref_min = axis == 0 ? ref.bounds.min.x :
@@ -6425,8 +6431,8 @@ SBVHGeneric::SplitResult SBVHGeneric::findSpatialSplit(
       bins[last_bin].exit++;
 
       for (uint32_t b = first_bin; b <= last_bin; b++) {
-        float plane_left = min_val + b * bin_size;
-        float plane_right = min_val + (b + 1) * bin_size;
+        float plane_left = min_val + static_cast<float>(b) * bin_size;
+        float plane_right = min_val + static_cast<float>(b + 1) * bin_size;
 
         AABB clipped = clipAABBToPlane(ref.bounds, axis, plane_left, false);
         AABB clipped2 = clipAABBToPlane(clipped, axis, plane_right, true);
@@ -6464,12 +6470,13 @@ SBVHGeneric::SplitResult SBVHGeneric::findSpatialSplit(
       float right_area = running_bounds.surfaceArea() * inv_node_area;
 
       float cost = config_.traversal_cost +
-                   config_.intersection_cost * (left_count * left_area + right_count * right_area);
+                   config_.intersection_cost * (static_cast<float>(left_count) * left_area +
+                                                static_cast<float>(right_count) * right_area);
 
       if (cost < best.cost) {
         best.cost = cost;
         best.axis = axis;
-        best.pos = min_val + (max_val - min_val) * (static_cast<float>(i) / config_.num_spatial_bins);
+        best.pos = min_val + (max_val - min_val) * (static_cast<float>(i) / static_cast<float>(config_.num_spatial_bins));
         best.left_bounds = left_bounds[i - 1];
         best.right_bounds = running_bounds;
         best.left_count = left_count;
@@ -6627,7 +6634,7 @@ SBVHGeneric::Stats SBVHGeneric::getStats() const noexcept {
 
   stats.num_primitives = static_cast<uint32_t>(prim_aabbs_.size());
   stats.num_references = static_cast<uint32_t>(refs_.size());
-  stats.split_ratio = static_cast<float>(stats.num_references) / stats.num_primitives;
+  stats.split_ratio = static_cast<float>(stats.num_references) / static_cast<float>(stats.num_primitives);
 
   std::vector<uint32_t> depths(nodes_.size(), 0);
 
@@ -6637,7 +6644,7 @@ SBVHGeneric::Stats SBVHGeneric::getStats() const noexcept {
 
     if (node.isLeaf()) {
       stats.num_leaves++;
-      stats.avg_leaf_size += node.prim_count;
+      stats.avg_leaf_size += static_cast<float>(node.prim_count);
       stats.max_depth = std::max(stats.max_depth, depths[i]);
     } else {
       depths[node.left_child] = depths[i] + 1;
@@ -6646,7 +6653,7 @@ SBVHGeneric::Stats SBVHGeneric::getStats() const noexcept {
   }
 
   if (stats.num_leaves > 0) {
-    stats.avg_leaf_size /= stats.num_leaves;
+    stats.avg_leaf_size /= static_cast<float>(stats.num_leaves);
   }
 
   stats.sah_cost = 0.0f;
@@ -6655,7 +6662,7 @@ SBVHGeneric::Stats SBVHGeneric::getStats() const noexcept {
     float area = node.bounds.surfaceArea();
 
     if (node.isLeaf()) {
-      stats.sah_cost += area * node.prim_count * config_.intersection_cost;
+      stats.sah_cost += area * static_cast<float>(node.prim_count) * config_.intersection_cost;
     } else {
       stats.sah_cost += area * config_.traversal_cost;
     }
@@ -6836,7 +6843,7 @@ uint32_t MMapTriangleBVH::buildRecursive(uint32_t* indices, uint32_t num_prims,
 
     if (axis_max - axis_min < kEpsilon) continue;
 
-    float bin_size = (axis_max - axis_min) / num_bins;
+    float bin_size = (axis_max - axis_min) / static_cast<float>(num_bins);
 
     // Count primitives per bin and compute bounds
     std::vector<uint32_t> bin_counts(num_bins, 0);
@@ -6885,18 +6892,19 @@ uint32_t MMapTriangleBVH::buildRecursive(uint32_t* indices, uint32_t num_prims,
       float right_area = running_bounds.surfaceArea();
 
       float cost = config_.build.traversal_cost +
-                   config_.build.intersection_cost * (left_count * left_area + running_count * right_area) / parent_area;
+                   config_.build.intersection_cost * (static_cast<float>(left_count) * left_area +
+                                                      static_cast<float>(running_count) * right_area) / parent_area;
 
       if (cost < best_cost) {
         best_cost = cost;
         best_axis = axis;
-        best_pos = axis_min + i * bin_size;
+        best_pos = axis_min + static_cast<float>(i) * bin_size;
       }
     }
   }
 
   // Check if split is beneficial
-  float leaf_cost = config_.build.intersection_cost * num_prims;
+  float leaf_cost = config_.build.intersection_cost * static_cast<float>(num_prims);
   if (best_cost >= leaf_cost && !config_.build.force_max_leaf_size) {
     // Make leaf
     uint32_t prim_offset = static_cast<uint32_t>(prim_indices_storage_.size() / index_bytes_);
@@ -7201,7 +7209,7 @@ MMapTriangleBVH::Stats MMapTriangleBVH::getStats() const noexcept {
       stats.num_nodes++;
       if (node.isLeaf()) {
         stats.num_leaves++;
-        stats.avg_leaf_size += node.data1;
+        stats.avg_leaf_size += static_cast<float>(node.data1);
       }
     }
   } else {
@@ -7211,7 +7219,7 @@ MMapTriangleBVH::Stats MMapTriangleBVH::getStats() const noexcept {
       stats.num_nodes++;
       if (node.isLeaf()) {
         stats.num_leaves++;
-        stats.avg_leaf_size += node.prim_count;
+        stats.avg_leaf_size += static_cast<float>(node.prim_count);
         stats.max_depth = std::max(stats.max_depth, depths[i]);
       } else {
         depths[node.left_child] = depths[i] + 1;
@@ -7221,7 +7229,7 @@ MMapTriangleBVH::Stats MMapTriangleBVH::getStats() const noexcept {
   }
 
   if (stats.num_leaves > 0) {
-    stats.avg_leaf_size /= stats.num_leaves;
+    stats.avg_leaf_size /= static_cast<float>(stats.num_leaves);
   }
 
   return stats;
@@ -7413,7 +7421,7 @@ uint32_t MMapGenericBVH::buildRecursive(uint32_t* indices, uint32_t num_prims,
 
     if (axis_max - axis_min < kEpsilon) continue;
 
-    float bin_size = (axis_max - axis_min) / num_bins;
+    float bin_size = (axis_max - axis_min) / static_cast<float>(num_bins);
 
     std::vector<uint32_t> bin_counts(num_bins, 0);
     std::vector<AABB> bin_bounds(num_bins);
@@ -7459,17 +7467,18 @@ uint32_t MMapGenericBVH::buildRecursive(uint32_t* indices, uint32_t num_prims,
       float right_area = running_bounds.surfaceArea();
 
       float cost = config_.build.traversal_cost +
-                   config_.build.intersection_cost * (left_count * left_area + running_count * right_area) / parent_area;
+                   config_.build.intersection_cost * (static_cast<float>(left_count) * left_area +
+                                                      static_cast<float>(running_count) * right_area) / parent_area;
 
       if (cost < best_cost) {
         best_cost = cost;
         best_axis = axis;
-        best_pos = axis_min + i * bin_size;
+        best_pos = axis_min + static_cast<float>(i) * bin_size;
       }
     }
   }
 
-  float leaf_cost = config_.build.intersection_cost * num_prims;
+  float leaf_cost = config_.build.intersection_cost * static_cast<float>(num_prims);
   if (best_cost >= leaf_cost && !config_.build.force_max_leaf_size) {
     build_failed_ = true;
     return kInvalidIndex;
@@ -7612,7 +7621,7 @@ MMapTriangleBVH::Stats MMapGenericBVH::getStats() const noexcept {
       stats.num_nodes++;
       if (node.isLeaf()) {
         stats.num_leaves++;
-        stats.avg_leaf_size += node.data1;
+        stats.avg_leaf_size += static_cast<float>(node.data1);
       }
     }
   } else {
@@ -7620,13 +7629,13 @@ MMapTriangleBVH::Stats MMapGenericBVH::getStats() const noexcept {
       stats.num_nodes++;
       if (node.isLeaf()) {
         stats.num_leaves++;
-        stats.avg_leaf_size += node.prim_count;
+        stats.avg_leaf_size += static_cast<float>(node.prim_count);
       }
     }
   }
 
   if (stats.num_leaves > 0) {
-    stats.avg_leaf_size /= stats.num_leaves;
+    stats.avg_leaf_size /= static_cast<float>(stats.num_leaves);
   }
 
   return stats;
@@ -7660,13 +7669,13 @@ double SimpleTimer::elapsedMicroseconds() const noexcept {
 void SimpleTimer::start() noexcept {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
-  start_time_ = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
+  start_time_ = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
 }
 
 void SimpleTimer::stop() noexcept {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
-  end_time_ = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
+  end_time_ = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
 }
 
 double SimpleTimer::elapsedMicroseconds() const noexcept {
@@ -7710,9 +7719,9 @@ std::vector<Triangle> AutoTuner::samplePrimitives(
   uint32_t num_strata = std::min(sample_count, 16u);
   float strata_size = 0.0f;
   switch (primary_axis) {
-    case 0: strata_size = extent.x / num_strata; break;
-    case 1: strata_size = extent.y / num_strata; break;
-    case 2: strata_size = extent.z / num_strata; break;
+    case 0: strata_size = extent.x / static_cast<float>(num_strata); break;
+    case 1: strata_size = extent.y / static_cast<float>(num_strata); break;
+    case 2: strata_size = extent.z / static_cast<float>(num_strata); break;
   }
 
   // Assign triangles to strata
@@ -7739,7 +7748,7 @@ std::vector<Triangle> AutoTuner::samplePrimitives(
 
     // Calculate samples for this stratum (proportional to its size)
     uint32_t stratum_samples = static_cast<uint32_t>(
-        static_cast<float>(strata[s].size()) / triangles.size() * sample_count);
+        static_cast<float>(strata[s].size()) / static_cast<float>(triangles.size()) * static_cast<float>(sample_count));
     stratum_samples = std::max(1u, std::min(stratum_samples, remaining));
     stratum_samples = std::min(stratum_samples, static_cast<uint32_t>(strata[s].size()));
 
@@ -7753,7 +7762,7 @@ std::vector<Triangle> AutoTuner::samplePrimitives(
 
   // If we didn't get enough samples (due to rounding), fill with random
   while (sampled.size() < sample_count) {
-    uint32_t idx = rng.next() % triangles.size();
+    uint32_t idx = static_cast<uint32_t>(rng.next() % triangles.size());
     sampled.push_back(triangles[idx]);
   }
 
@@ -8033,16 +8042,16 @@ AutoTuneResult::SceneCharacteristics AutoTuner::analyzeScene(
     }
   }
 
-  info.avg_triangle_area = total_area / triangles.size();
+  info.avg_triangle_area = total_area / static_cast<float>(triangles.size());
 
   Vec3 extent = scene_bounds.extents();
   info.scene_volume = extent.x * extent.y * extent.z;
 
   if (info.scene_volume > kEpsilon) {
-    info.triangle_density = triangles.size() / info.scene_volume;
+    info.triangle_density = static_cast<float>(triangles.size()) / info.scene_volume;
   }
 
-  info.has_thin_triangles = (thin_count > triangles.size() * 0.1f);
+  info.has_thin_triangles = (static_cast<float>(thin_count) > static_cast<float>(triangles.size()) * 0.1f);
 
   // Estimate overlap ratio using binning
   const uint32_t num_bins = 32;
@@ -8073,13 +8082,13 @@ AutoTuneResult::SceneCharacteristics AutoTuner::analyzeScene(
   }
 
   info.overlap_ratio = (non_empty_bins > 0) ?
-      static_cast<float>(overlap_bins) / non_empty_bins : 0.0f;
+      static_cast<float>(overlap_bins) / static_cast<float>(non_empty_bins) : 0.0f;
 
   // Detect clustering: high variance in bin counts indicates clustering
   float mean_count = static_cast<float>(triangles.size()) / (num_bins * num_bins * num_bins);
   float variance = 0.0f;
   for (uint32_t count : bin_counts) {
-    float diff = count - mean_count;
+    float diff = static_cast<float>(count) - mean_count;
     variance += diff * diff;
   }
   variance /= (num_bins * num_bins * num_bins);
@@ -8102,7 +8111,7 @@ AutoTuneResult::SceneCharacteristics AutoTuner::analyzeScene(
   }
 
   // If any bin has > 20% of triangles, likely co-planar region
-  uint32_t threshold = triangles.size() / 5;
+  uint32_t threshold = static_cast<uint32_t>(triangles.size() / 5);
   for (uint32_t count : normal_counts) {
     if (count > threshold) {
       info.has_coplanar_regions = true;
@@ -8268,7 +8277,7 @@ AutoTuneResult AutoTuner::tune(
     metrics.method = tc.method;
     metrics.build_time_us_per_prim = static_cast<float>(build_time / sample_count);
     metrics.traversal_time_ns_per_ray = static_cast<float>(trav_time * 1000.0 / config.sample_ray_count);
-    metrics.memory_bytes_per_prim = static_cast<float>(memory) / sample_count;
+    metrics.memory_bytes_per_prim = static_cast<float>(memory) / static_cast<float>(sample_count);
     metrics.combined_cost = combined_cost;
     metrics.max_leaf_size = (tc.method == BVHBuildMethod::TriangleBVH) ?
         tc.bvh_config.max_leaf_size : tc.sbvh_config.max_leaf_size;
@@ -9075,7 +9084,7 @@ RGB8 HeatmapWriter::viridis(float t) noexcept {
   float idx = t * 7.0f;
   int i0 = static_cast<int>(idx);
   int i1 = std::min(i0 + 1, 7);
-  float frac = idx - i0;
+  float frac = idx - static_cast<float>(i0);
 
   float r = viridis_data[i0][0] + frac * (viridis_data[i1][0] - viridis_data[i0][0]);
   float g = viridis_data[i0][1] + frac * (viridis_data[i1][1] - viridis_data[i0][1]);
@@ -9102,7 +9111,7 @@ RGB8 HeatmapWriter::turbo(float t) noexcept {
   float idx = t * 7.0f;
   int i0 = static_cast<int>(idx);
   int i1 = std::min(i0 + 1, 7);
-  float frac = idx - i0;
+  float frac = idx - static_cast<float>(i0);
 
   float r = turbo_data[i0][0] + frac * (turbo_data[i1][0] - turbo_data[i0][0]);
   float g = turbo_data[i0][1] + frac * (turbo_data[i1][1] - turbo_data[i0][1]);
@@ -9128,7 +9137,7 @@ RGB8 HeatmapWriter::plasma(float t) noexcept {
   float idx = t * 7.0f;
   int i0 = static_cast<int>(idx);
   int i1 = std::min(i0 + 1, 7);
-  float frac = idx - i0;
+  float frac = idx - static_cast<float>(i0);
 
   float r = plasma_data[i0][0] + frac * (plasma_data[i1][0] - plasma_data[i0][0]);
   float g = plasma_data[i0][1] + frac * (plasma_data[i1][1] - plasma_data[i0][1]);
@@ -9154,7 +9163,7 @@ RGB8 HeatmapWriter::inferno(float t) noexcept {
   float idx = t * 7.0f;
   int i0 = static_cast<int>(idx);
   int i1 = std::min(i0 + 1, 7);
-  float frac = idx - i0;
+  float frac = idx - static_cast<float>(i0);
 
   float r = inferno_data[i0][0] + frac * (inferno_data[i1][0] - inferno_data[i0][0]);
   float g = inferno_data[i0][1] + frac * (inferno_data[i1][1] - inferno_data[i0][1]);
@@ -9263,9 +9272,9 @@ bool HeatmapWriter::writeBMP(const char* filename, const RGB8* data,
   // Write pixel data (bottom-up, BGR order)
   std::vector<uint8_t> row_buffer(row_size, 0);
 
-  for (int y = height - 1; y >= 0; y--) {
+  for (int y = static_cast<int>(height) - 1; y >= 0; y--) {
     for (uint32_t x = 0; x < width; x++) {
-      const RGB8& pixel = data[y * width + x];
+      const RGB8& pixel = data[static_cast<uint32_t>(y) * width + x];
       row_buffer[x * 3 + 0] = pixel.b;  // BMP uses BGR
       row_buffer[x * 3 + 1] = pixel.g;
       row_buffer[x * 3 + 2] = pixel.r;
@@ -9491,8 +9500,8 @@ std::vector<uint8_t> zlib_compress(const uint8_t* data, size_t len) {
   uint8_t cmf = 0x78;
   uint8_t flg = 0x01;
   // Adjust FCHECK
-  uint32_t check = (cmf * 256 + flg) % 31;
-  if (check != 0) flg += (31 - check);
+  uint32_t check = static_cast<uint32_t>((cmf * 256 + flg) % 31);
+  if (check != 0) flg = static_cast<uint8_t>(flg + (31 - check));
 
   output.push_back(cmf);
   output.push_back(flg);
@@ -9701,14 +9710,14 @@ TraversalProfile* renderImageProfiled<TriangleBVH>(
   Vec3 right = forward.cross(camera_up).normalize();
   Vec3 up = right.cross(forward);
 
-  float aspect = static_cast<float>(width) / height;
+  float aspect = static_cast<float>(width) / static_cast<float>(height);
   float tan_fov = std::tan(fov_y * 0.5f);
 
   for (uint32_t y = 0; y < height; y++) {
     for (uint32_t x = 0; x < width; x++) {
       // Normalized device coordinates [-1, 1]
-      float ndc_x = (2.0f * (x + 0.5f) / width - 1.0f) * aspect * tan_fov;
-      float ndc_y = (1.0f - 2.0f * (y + 0.5f) / height) * tan_fov;
+      float ndc_x = (2.0f * (static_cast<float>(x) + 0.5f) / static_cast<float>(width) - 1.0f) * aspect * tan_fov;
+      float ndc_y = (1.0f - 2.0f * (static_cast<float>(y) + 0.5f) / static_cast<float>(height)) * tan_fov;
 
       Vec3 dir = (forward + right * ndc_x + up * ndc_y).normalize();
       Ray ray(camera_pos, dir);
@@ -9743,13 +9752,13 @@ TraversalProfile* renderImageProfiled<SBVH>(
   Vec3 right = forward.cross(camera_up).normalize();
   Vec3 up = right.cross(forward);
 
-  float aspect = static_cast<float>(width) / height;
+  float aspect = static_cast<float>(width) / static_cast<float>(height);
   float tan_fov = std::tan(fov_y * 0.5f);
 
   for (uint32_t y = 0; y < height; y++) {
     for (uint32_t x = 0; x < width; x++) {
-      float ndc_x = (2.0f * (x + 0.5f) / width - 1.0f) * aspect * tan_fov;
-      float ndc_y = (1.0f - 2.0f * (y + 0.5f) / height) * tan_fov;
+      float ndc_x = (2.0f * (static_cast<float>(x) + 0.5f) / static_cast<float>(width) - 1.0f) * aspect * tan_fov;
+      float ndc_y = (1.0f - 2.0f * (static_cast<float>(y) + 0.5f) / static_cast<float>(height)) * tan_fov;
 
       Vec3 dir = (forward + right * ndc_x + up * ndc_y).normalize();
       Ray ray(camera_pos, dir);
@@ -9784,13 +9793,13 @@ TraversalProfile* renderImageProfiled<MMapTriangleBVH>(
   Vec3 right = forward.cross(camera_up).normalize();
   Vec3 up = right.cross(forward);
 
-  float aspect = static_cast<float>(width) / height;
+  float aspect = static_cast<float>(width) / static_cast<float>(height);
   float tan_fov = std::tan(fov_y * 0.5f);
 
   for (uint32_t y = 0; y < height; y++) {
     for (uint32_t x = 0; x < width; x++) {
-      float ndc_x = (2.0f * (x + 0.5f) / width - 1.0f) * aspect * tan_fov;
-      float ndc_y = (1.0f - 2.0f * (y + 0.5f) / height) * tan_fov;
+      float ndc_x = (2.0f * (static_cast<float>(x) + 0.5f) / static_cast<float>(width) - 1.0f) * aspect * tan_fov;
+      float ndc_y = (1.0f - 2.0f * (static_cast<float>(y) + 0.5f) / static_cast<float>(height)) * tan_fov;
 
       Vec3 dir = (forward + right * ndc_x + up * ndc_y).normalize();
       Ray ray(camera_pos, dir);
@@ -10138,7 +10147,7 @@ bool CompactTriangleBVH::build(const std::vector<Triangle>& triangles,
     if (src.isLeaf()) {
       dst.setLeaf(src.prim_offset, src.prim_count);
     } else {
-      dst.setInterior(src.left_child, src.right_child, src.splitAxis());
+      dst.setInterior(src.left_child, src.right_child, static_cast<uint8_t>(src.splitAxis()));
     }
   }
 
@@ -10186,7 +10195,7 @@ uint32_t CompactTriangleBVH::traverse(const Ray& ray, float& hit_t,
       // Branchless front-to-back ordering
       if (stack_ptr < 62) {
         uint32_t children[2] = { node.data0, node.data1 };
-        uint32_t s = ctx.sign[node.axis];
+        uint32_t s = static_cast<uint32_t>(ctx.sign[node.axis]);
         stack[stack_ptr++] = children[1 - s]; // far
         stack[stack_ptr++] = children[s];     // near
       }
