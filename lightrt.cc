@@ -3978,8 +3978,92 @@ void TriangleBVH::queryKNN(const Vec3& point, uint32_t k, std::vector<KNNResult>
   bvh_.queryKNN(point, k, results);
 }
 
+// Exact squared distance from point p to triangle (a,b,c).
+// Ericson, "Real-Time Collision Detection" 5.1.5 (ClosestPtPointTriangle).
+static inline float pointTriangleDistSq(const Vec3& p, const Vec3& a,
+                                        const Vec3& b, const Vec3& c) noexcept {
+  Vec3 ab = b - a, ac = c - a, ap = p - a;
+  float d1 = ab.dot(ap), d2 = ac.dot(ap);
+  if (d1 <= 0.0f && d2 <= 0.0f) { Vec3 d = p - a; return d.dot(d); }
+  Vec3 bp = p - b;
+  float d3 = ab.dot(bp), d4 = ac.dot(bp);
+  if (d3 >= 0.0f && d4 <= d3) { Vec3 d = p - b; return d.dot(d); }
+  float vc = d1 * d4 - d3 * d2;
+  if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
+    float v = d1 / (d1 - d3); Vec3 q = a + ab * v; Vec3 d = p - q; return d.dot(d);
+  }
+  Vec3 cp = p - c;
+  float d5 = ab.dot(cp), d6 = ac.dot(cp);
+  if (d6 >= 0.0f && d5 <= d6) { Vec3 d = p - c; return d.dot(d); }
+  float vb = d5 * d2 - d1 * d6;
+  if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
+    float w = d2 / (d2 - d6); Vec3 q = a + ac * w; Vec3 d = p - q; return d.dot(d);
+  }
+  float va = d3 * d6 - d5 * d4;
+  if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
+    float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+    Vec3 q = b + (c - b) * w; Vec3 d = p - q; return d.dot(d);
+  }
+  float denom = 1.0f / (va + vb + vc);
+  float v = vb * denom, w = vc * denom;
+  Vec3 q = a + ab * v + ac * w; Vec3 d = p - q; return d.dot(d);
+}
+
+// Nearest triangle to `point`, by EXACT point-to-triangle distance. The
+// generic BVH::queryNearest only knows primitive AABBs, so it returns the
+// nearest bounding box -- which underestimates the distance and can pick the
+// wrong triangle, yielding a non-unit-gradient (blocky) distance field. Here we
+// traverse with the AABB distance as a (valid) lower-bound for pruning, but
+// score leaves by the true triangle distance.
 uint32_t TriangleBVH::queryNearest(const Vec3& point, float& distance_sq) const noexcept {
-  return bvh_.queryNearest(point, distance_sq);
+  const std::vector<BVHNode>& nodes = bvh_.getNodes();
+  const std::vector<uint32_t>& prim_indices = bvh_.getPrimitiveIndices();
+  if (nodes.empty()) {
+    distance_sq = std::numeric_limits<float>::max();
+    return kInvalidIndex;
+  }
+
+  uint32_t best_prim = kInvalidIndex;
+  float best_dist_sq = std::numeric_limits<float>::max();
+
+  // Min-heap on node AABB distance (lower bound on any triangle inside).
+  std::vector<std::pair<float, uint32_t>> node_queue;
+  node_queue.reserve(64);
+  node_queue.push_back({0.0f, 0});
+  auto cmp = [](const std::pair<float, uint32_t>& a,
+                const std::pair<float, uint32_t>& b) { return a.first > b.first; };
+
+  while (!node_queue.empty()) {
+    std::pop_heap(node_queue.begin(), node_queue.end(), cmp);
+    auto [node_dist, node_idx] = node_queue.back();
+    node_queue.pop_back();
+    if (node_dist > best_dist_sq) continue;  // can't beat current best
+
+    const BVHNode& node = nodes[node_idx];
+    if (node.isLeaf()) {
+      for (uint32_t i = 0; i < node.prim_count; i++) {
+        uint32_t prim = prim_indices[node.prim_offset + i];
+        if (prim >= triangles_.size()) continue;
+        const Triangle& t = triangles_[prim];
+        float d = pointTriangleDistSq(point, t.v0, t.v1, t.v2);
+        if (d < best_dist_sq) { best_dist_sq = d; best_prim = prim; }
+      }
+    } else {
+      float ld = nodes[node.left_child].bounds.distanceSquared(point);
+      float rd = nodes[node.right_child].bounds.distanceSquared(point);
+      if (ld <= best_dist_sq) {
+        node_queue.push_back({ld, node.left_child});
+        std::push_heap(node_queue.begin(), node_queue.end(), cmp);
+      }
+      if (rd <= best_dist_sq) {
+        node_queue.push_back({rd, node.right_child});
+        std::push_heap(node_queue.begin(), node_queue.end(), cmp);
+      }
+    }
+  }
+
+  distance_sq = best_dist_sq;
+  return best_prim;
 }
 
 void TriangleBVH::findCollisions(const TriangleBVH& other, std::vector<CollisionPair>& pairs) const noexcept {
