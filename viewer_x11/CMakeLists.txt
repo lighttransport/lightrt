@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(viewer_x11 LANGUAGES CXX)
+project(viewer_x11 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,6 +16,7 @@ set(SOURCES
     viewer_x11.cc
     ../viewer/common/viewer_common.cc
     ../lightrt.cc
+    ../lightrt_c.c
     ../common/usd_loader.cc
 )
 

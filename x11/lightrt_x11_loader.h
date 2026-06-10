@@ -41,6 +41,11 @@ typedef struct LightrtX11 {
     Visual*       (*XDefaultVisual)(Display *, int);
     int           (*XDefaultDepth)(Display *, int);
     unsigned long (*XBlackPixel)(Display *, int);
+    Screen*       (*XScreenOfDisplay)(Display *, int);
+    int           (*XWidthOfScreen)(Screen *);
+    int           (*XHeightOfScreen)(Screen *);
+    int           (*XWidthMMOfScreen)(Screen *);
+    int           (*XHeightMMOfScreen)(Screen *);
 
     /* Window management */
     Window (*XCreateWindow)(Display *, Window, int, int, unsigned int,
@@ -131,6 +136,11 @@ static int lightrt_x11_load(LightrtX11 *x11) {
     LIGHTRT_X11_LOAD_SYM(x11, XDefaultVisual);
     LIGHTRT_X11_LOAD_SYM(x11, XDefaultDepth);
     LIGHTRT_X11_LOAD_SYM(x11, XBlackPixel);
+    LIGHTRT_X11_LOAD_SYM(x11, XScreenOfDisplay);
+    LIGHTRT_X11_LOAD_SYM(x11, XWidthOfScreen);
+    LIGHTRT_X11_LOAD_SYM(x11, XHeightOfScreen);
+    LIGHTRT_X11_LOAD_SYM(x11, XWidthMMOfScreen);
+    LIGHTRT_X11_LOAD_SYM(x11, XHeightMMOfScreen);
 
     /* Window management */
     LIGHTRT_X11_LOAD_SYM(x11, XCreateWindow);
@@ -214,5 +224,10 @@ static void lightrt_x11_unload(LightrtX11 *x11) {
 #define DefaultVisual(d,s)   g_x11_.XDefaultVisual(d,s)
 #define DefaultDepth(d,s)    g_x11_.XDefaultDepth(d,s)
 #define BlackPixel(d,s)      g_x11_.XBlackPixel(d,s)
+#define ScreenOfDisplay(d,s) g_x11_.XScreenOfDisplay(d,s)
+#define WidthOfScreen(s)     g_x11_.XWidthOfScreen(s)
+#define HeightOfScreen(s)    g_x11_.XHeightOfScreen(s)
+#define WidthMMOfScreen(s)   g_x11_.XWidthMMOfScreen(s)
+#define HeightMMOfScreen(s)  g_x11_.XHeightMMOfScreen(s)
 
 #endif /* LIGHTRT_X11_MACROS_DEFINED_ */

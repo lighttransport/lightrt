@@ -35,6 +35,7 @@ typedef int           Status;
 typedef struct _XDisplay Display;
 typedef struct _XGC     *GC;
 typedef struct _Visual   Visual;  /* only passed as pointer, never dereferenced */
+typedef struct _XScreen  Screen;  /* only passed as pointer, never dereferenced */
 
 /* ================================================================
  * XSetWindowAttributes — 15 fields, ABI-exact layout on LP64
