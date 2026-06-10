@@ -463,6 +463,592 @@ static void RenderFrameX11(ViewerState& state, C11Scene& cs) {
     DrawString(10, h - lineH * 2, help2.c_str(), 0xFFFFFF00, state.pixels.data(), w, h, fs);
 }
 
+// --- Benchmark mode: procedural mandelbulb + rays/sec measurement ---
+
+// Direct C11 scene build from raw triangles (no scene::Scene needed)
+static void buildC11SceneFromTriangles(C11Scene& cs,
+                                       const float* verts, int num_tris,
+                                       const float* colors,
+                                       int num_threads) {
+    for (auto* s : cs.scenes) lrt_scene_free(s);
+    cs.scenes.clear();
+    cs.vertices.clear();
+    cs.colors.clear();
+    cs.instance_ids.clear();
+    cs.num_tris = 0;
+    cs.num_threads = num_threads;
+    if (num_tris == 0) return;
+
+    cs.vertices.assign(verts, verts + num_tris * 9);
+    cs.colors.assign(colors, colors + num_tris * 3);
+    cs.instance_ids.resize(num_tris, 0);
+    cs.num_tris = num_tris;
+
+    cs.scenes.resize(num_threads);
+    for (int t = 0; t < num_threads; t++) {
+        cs.scenes[t] = lrt_scene_create((unsigned)num_tris,
+                                        c11_bounds_cb, c11_intersect_cb, &cs);
+        if (cs.scenes[t]) lrt_scene_build(cs.scenes[t]);
+    }
+}
+
+// --- Marching Cubes (mandelbulb mesh generation) ---
+
+static const int kMcEdgeTable[256] = {
+    0x0, 0x109, 0x203, 0x30a, 0x406, 0x50f, 0x605, 0x70c, 0x80c, 0x905, 0xa0f, 0xb06, 0xc0a, 0xd03, 0xe09, 0xf00,
+    0x190, 0x99, 0x393, 0x29a, 0x596, 0x49f, 0x795, 0x69c, 0x99c, 0x895, 0xb9f, 0xa96, 0xd9a, 0xc93, 0xf99, 0xe90,
+    0x230, 0x339, 0x33, 0x13a, 0x636, 0x73f, 0x435, 0x53c, 0xa3c, 0xb35, 0x83f, 0x936, 0xe3a, 0xf33, 0xc39, 0xd30,
+    0x3a0, 0x2a9, 0x1a3, 0xaa, 0x7a6, 0x6af, 0x5a5, 0x4ac, 0xbac, 0xaa5, 0x9af, 0x8a6, 0xfaa, 0xea3, 0xda9, 0xca0,
+    0x460, 0x569, 0x663, 0x76a, 0x66, 0x16f, 0x265, 0x36c, 0xc6c, 0xd65, 0xe6f, 0xf66, 0x86a, 0x963, 0xa69, 0xb60,
+    0x5f0, 0x4f9, 0x7f3, 0x6fa, 0x1f6, 0xff, 0x3f5, 0x2fc, 0xdfc, 0xcf5, 0xfff, 0xef6, 0x9fa, 0x8f3, 0xbf9, 0xaf0,
+    0x650, 0x759, 0x453, 0x55a, 0x256, 0x35f, 0x55, 0x15c, 0xe5c, 0xf55, 0xc5f, 0xd56, 0xa5a, 0xb53, 0x859, 0x950,
+    0x7c0, 0x6c9, 0x5c3, 0x4ca, 0x3c6, 0x2cf, 0x1c5, 0xcc, 0xfcc, 0xec5, 0xdcf, 0xcc6, 0xbca, 0xac3, 0x9c9, 0x8c0,
+    0x8c0, 0x9c9, 0xac3, 0xbca, 0xcc6, 0xdcf, 0xec5, 0xfcc, 0xcc, 0x1c5, 0x2cf, 0x3c6, 0x4ca, 0x5c3, 0x6c9, 0x7c0,
+    0x950, 0x859, 0xb53, 0xa5a, 0xd56, 0xc5f, 0xf55, 0xe5c, 0x15c, 0x55, 0x35f, 0x256, 0x55a, 0x453, 0x759, 0x650,
+    0xaf0, 0xbf9, 0x8f3, 0x9fa, 0xef6, 0xfff, 0xcf5, 0xdfc, 0x2fc, 0x3f5, 0xff, 0x1f6, 0x6fa, 0x7f3, 0x4f9, 0x5f0,
+    0xb60, 0xa69, 0x963, 0x86a, 0xf66, 0xe6f, 0xd65, 0xc6c, 0x36c, 0x265, 0x16f, 0x66, 0x76a, 0x663, 0x569, 0x460,
+    0xca0, 0xda9, 0xea3, 0xfaa, 0x8a6, 0x9af, 0xaa5, 0xbac, 0x4ac, 0x5a5, 0x6af, 0x7a6, 0xaa, 0x1a3, 0x2a9, 0x3a0,
+    0xd30, 0xc39, 0xf33, 0xe3a, 0x936, 0x83f, 0xb35, 0xa3c, 0x53c, 0x435, 0x73f, 0x636, 0x13a, 0x33, 0x339, 0x230,
+    0xe90, 0xf99, 0xc93, 0xd9a, 0xa96, 0xb9f, 0x895, 0x99c, 0x69c, 0x795, 0x49f, 0x596, 0x29a, 0x393, 0x99, 0x190,
+    0xf00, 0xe09, 0xd03, 0xc0a, 0xb06, 0xa0f, 0x905, 0x80c, 0x70c, 0x605, 0x50f, 0x406, 0x30a, 0x203, 0x109, 0x0
+};
+
+static const int kMcTriTable[256][16] = {
+    {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,3,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,1,9,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,8,3,9,8,1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,2,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,3,1,2,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {9,2,10,0,2,9,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {2,8,3,2,10,8,10,9,8,-1,-1,-1,-1,-1,-1,-1},
+    {3,11,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,11,2,8,11,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,9,0,2,3,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,11,2,1,9,11,9,8,11,-1,-1,-1,-1,-1,-1,-1},
+    {3,10,1,11,10,3,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,10,1,0,8,10,8,11,10,-1,-1,-1,-1,-1,-1,-1},
+    {3,9,0,3,11,9,11,10,9,-1,-1,-1,-1,-1,-1,-1},
+    {9,8,10,10,8,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {4,7,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {4,3,0,7,3,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,1,9,8,4,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {4,1,9,4,7,1,7,3,1,-1,-1,-1,-1,-1,-1,-1},
+    {1,2,10,8,4,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {3,4,7,3,0,4,1,2,10,-1,-1,-1,-1,-1,-1,-1},
+    {9,2,10,9,0,2,8,4,7,-1,-1,-1,-1,-1,-1,-1},
+    {2,10,9,2,9,7,2,7,3,7,9,4,-1,-1,-1,-1},
+    {8,4,7,3,11,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {11,4,7,11,2,4,2,0,4,-1,-1,-1,-1,-1,-1,-1},
+    {9,0,1,8,4,7,2,3,11,-1,-1,-1,-1,-1,-1,-1},
+    {4,7,11,9,4,11,9,11,2,9,2,1,-1,-1,-1,-1},
+    {3,10,1,3,11,10,7,8,4,-1,-1,-1,-1,-1,-1,-1},
+    {1,11,10,1,4,11,1,0,4,7,11,4,-1,-1,-1,-1},
+    {4,7,8,9,0,11,9,11,10,11,0,3,-1,-1,-1,-1},
+    {4,7,11,4,11,9,9,11,10,-1,-1,-1,-1,-1,-1,-1},
+    {9,5,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {9,5,4,0,8,3,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,5,4,1,5,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {8,5,4,8,3,5,3,1,5,-1,-1,-1,-1,-1,-1,-1},
+    {1,2,10,9,5,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {3,0,8,1,2,10,4,9,5,-1,-1,-1,-1,-1,-1,-1},
+    {5,2,10,5,4,2,4,0,2,-1,-1,-1,-1,-1,-1,-1},
+    {2,10,5,3,2,5,3,5,4,3,4,8,-1,-1,-1,-1},
+    {9,5,4,2,3,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,11,2,0,8,11,4,9,5,-1,-1,-1,-1,-1,-1,-1},
+    {0,5,4,0,1,5,2,3,11,-1,-1,-1,-1,-1,-1,-1},
+    {2,1,5,2,5,8,2,8,11,4,8,5,-1,-1,-1,-1},
+    {10,3,11,10,1,3,9,5,4,-1,-1,-1,-1,-1,-1,-1},
+    {4,9,5,0,8,1,8,10,1,8,11,10,-1,-1,-1,-1},
+    {5,4,0,5,0,11,5,11,10,11,0,3,-1,-1,-1,-1},
+    {5,4,8,5,8,10,10,8,11,-1,-1,-1,-1,-1,-1,-1},
+    {9,7,8,5,7,9,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {9,3,0,9,5,3,5,7,3,-1,-1,-1,-1,-1,-1,-1},
+    {0,7,8,0,1,7,1,5,7,-1,-1,-1,-1,-1,-1,-1},
+    {1,5,3,3,5,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {9,7,8,9,5,7,10,1,2,-1,-1,-1,-1,-1,-1,-1},
+    {10,1,2,9,5,0,5,3,0,5,7,3,-1,-1,-1,-1},
+    {8,0,2,8,2,5,8,5,7,10,5,2,-1,-1,-1,-1},
+    {2,10,5,2,5,3,3,5,7,-1,-1,-1,-1,-1,-1,-1},
+    {7,9,5,7,8,9,3,11,2,-1,-1,-1,-1,-1,-1,-1},
+    {9,5,7,9,7,2,9,2,0,2,7,11,-1,-1,-1,-1},
+    {2,3,11,0,1,8,1,7,8,1,5,7,-1,-1,-1,-1},
+    {11,2,1,11,1,7,7,1,5,-1,-1,-1,-1,-1,-1,-1},
+    {9,5,8,8,5,7,10,1,3,10,3,11,-1,-1,-1,-1},
+    {5,7,0,5,0,9,7,11,0,1,0,10,11,10,0,-1},
+    {11,10,0,11,0,3,10,5,0,8,0,7,5,7,0,-1},
+    {11,10,5,7,11,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {10,6,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,3,5,10,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {9,0,1,5,10,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,8,3,1,9,8,5,10,6,-1,-1,-1,-1,-1,-1,-1},
+    {1,6,5,2,6,1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,6,5,1,2,6,3,0,8,-1,-1,-1,-1,-1,-1,-1},
+    {9,6,5,9,0,6,0,2,6,-1,-1,-1,-1,-1,-1,-1},
+    {5,9,8,5,8,2,5,2,6,3,2,8,-1,-1,-1,-1},
+    {2,3,11,10,6,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {11,0,8,11,2,0,10,6,5,-1,-1,-1,-1,-1,-1,-1},
+    {0,1,9,2,3,11,5,10,6,-1,-1,-1,-1,-1,-1,-1},
+    {5,10,6,1,9,2,9,11,2,9,8,11,-1,-1,-1,-1},
+    {6,3,11,6,5,3,5,1,3,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,11,0,11,5,0,5,1,5,11,6,-1,-1,-1,-1},
+    {3,11,6,0,3,6,0,6,5,0,5,9,-1,-1,-1,-1},
+    {6,5,9,6,9,11,11,9,8,-1,-1,-1,-1,-1,-1,-1},
+    {5,10,6,4,7,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {4,3,0,4,7,3,6,5,10,-1,-1,-1,-1,-1,-1,-1},
+    {1,9,0,5,10,6,8,4,7,-1,-1,-1,-1,-1,-1,-1},
+    {10,6,5,1,9,7,1,7,3,7,9,4,-1,-1,-1,-1},
+    {6,1,2,6,5,1,4,7,8,-1,-1,-1,-1,-1,-1,-1},
+    {1,2,5,5,2,6,3,0,4,3,4,7,-1,-1,-1,-1},
+    {8,4,7,9,0,5,0,6,5,0,2,6,-1,-1,-1,-1},
+    {7,3,4,5,9,2,5,2,6,2,9,4,-1,-1,-1,-1},
+    {3,11,2,7,8,4,10,6,5,-1,-1,-1,-1,-1,-1,-1},
+    {5,10,6,4,7,2,4,7,11,4,11,2,4,2,0,-1},
+    {0,1,9,4,7,8,2,3,11,5,10,6,-1,-1,-1,-1},
+    {9,2,1,9,11,2,9,4,11,7,11,4,5,10,6,-1},
+    {8,4,7,3,11,5,3,5,1,5,11,6,-1,-1,-1,-1},
+    {5,1,11,5,11,6,1,0,11,7,11,4,0,4,11,-1},
+    {0,5,9,0,3,5,3,11,5,4,7,8,6,5,11,-1},
+    {5,11,6,5,9,11,9,4,11,7,11,4,-1,-1,-1,-1},
+    {9,5,4,10,6,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,3,5,4,9,10,6,5,-1,-1,-1,-1,-1,-1,-1},
+    {0,5,4,0,1,5,10,6,5,-1,-1,-1,-1,-1,-1,-1},
+    {8,3,1,8,1,6,8,6,5,8,5,4,6,1,10,-1},
+    {1,6,5,1,2,6,9,5,4,-1,-1,-1,-1,-1,-1,-1},
+    {9,5,4,0,8,1,8,6,1,8,2,6,1,2,8,-1},
+    {0,2,6,0,6,4,4,6,5,-1,-1,-1,-1,-1,-1,-1},
+    {8,3,2,8,2,4,4,2,6,6,2,5,-1,-1,-1,-1},
+    {10,6,5,9,5,4,2,3,11,-1,-1,-1,-1,-1,-1,-1},
+    {4,9,5,0,8,11,0,11,2,11,8,3,10,6,5,-1},
+    {5,4,0,5,0,10,10,0,1,2,3,11,6,5,10,-1},
+    {10,6,5,1,9,2,9,11,2,9,8,11,4,8,9,-1},
+    {6,5,1,6,1,11,11,1,3,9,5,4,-1,-1,-1,-1},
+    {0,8,11,0,11,5,0,5,1,5,11,6,4,9,5,-1},
+    {5,4,0,5,0,6,6,0,3,6,3,11,-1,-1,-1,-1},
+    {5,4,8,5,8,6,6,8,11,-1,-1,-1,-1,-1,-1,-1},
+    {7,6,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,3,7,6,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,1,9,7,6,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,8,3,1,9,8,7,6,11,-1,-1,-1,-1,-1,-1,-1},
+    {10,1,2,6,11,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,2,10,3,0,8,6,11,7,-1,-1,-1,-1,-1,-1,-1},
+    {2,9,0,2,10,9,6,11,7,-1,-1,-1,-1,-1,-1,-1},
+    {6,11,7,2,10,3,10,8,3,10,9,8,-1,-1,-1,-1},
+    {7,2,3,6,2,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {7,0,8,7,6,0,6,2,0,-1,-1,-1,-1,-1,-1,-1},
+    {2,7,6,2,3,7,0,1,9,-1,-1,-1,-1,-1,-1,-1},
+    {1,6,2,1,8,6,1,9,8,8,7,6,-1,-1,-1,-1},
+    {10,7,6,10,1,7,1,3,7,-1,-1,-1,-1,-1,-1,-1},
+    {10,7,6,1,7,10,1,8,7,1,0,8,-1,-1,-1,-1},
+    {0,3,7,0,7,10,0,10,9,6,10,7,-1,-1,-1,-1},
+    {7,6,10,7,10,8,8,10,9,-1,-1,-1,-1,-1,-1,-1},
+    {6,8,4,11,8,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {3,6,11,3,0,6,0,4,6,-1,-1,-1,-1,-1,-1,-1},
+    {8,6,11,8,4,6,9,0,1,-1,-1,-1,-1,-1,-1,-1},
+    {9,4,6,9,6,3,9,3,1,11,3,6,-1,-1,-1,-1},
+    {6,8,4,6,11,8,2,10,1,-1,-1,-1,-1,-1,-1,-1},
+    {1,2,10,3,0,11,0,6,11,0,4,6,-1,-1,-1,-1},
+    {4,11,8,4,6,11,0,2,9,2,10,9,-1,-1,-1,-1},
+    {10,9,3,10,3,2,9,4,3,11,3,6,4,6,3,-1},
+    {8,2,3,8,4,2,4,6,2,-1,-1,-1,-1,-1,-1,-1},
+    {0,4,2,4,6,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,9,0,2,3,4,2,3,8,4,3,2,4,6,2,-1},
+    {1,9,4,1,4,2,2,4,6,-1,-1,-1,-1,-1,-1,-1},
+    {8,1,3,8,6,1,8,4,6,6,10,1,-1,-1,-1,-1},
+    {10,1,0,10,0,6,6,0,4,-1,-1,-1,-1,-1,-1,-1},
+    {4,6,3,4,3,8,6,10,3,0,3,9,10,9,3,-1},
+    {10,9,4,6,10,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {4,9,5,7,6,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,3,4,9,5,11,7,6,-1,-1,-1,-1,-1,-1,-1},
+    {5,0,1,5,4,0,7,6,11,-1,-1,-1,-1,-1,-1,-1},
+    {11,7,6,8,3,4,3,5,4,3,1,5,-1,-1,-1,-1},
+    {9,5,4,10,1,2,7,6,11,-1,-1,-1,-1,-1,-1,-1},
+    {6,11,7,1,2,10,0,8,3,4,9,5,-1,-1,-1,-1},
+    {7,6,11,5,4,10,4,2,10,4,0,2,-1,-1,-1,-1},
+    {3,4,8,3,5,4,3,2,5,10,5,2,11,7,6,-1},
+    {7,2,3,7,6,2,5,4,9,-1,-1,-1,-1,-1,-1,-1},
+    {9,5,4,0,8,6,0,6,2,6,8,7,-1,-1,-1,-1},
+    {3,7,6,3,6,2,5,4,0,5,0,1,-1,-1,-1,-1},
+    {1,5,4,1,4,9,2,1,9,6,2,9,4,5,6,2},
+    {5,4,9,7,6,1,7,1,3,1,6,10,-1,-1,-1,-1},
+    {1,0,8,1,8,10,10,8,7,10,7,6,4,9,5,-1},
+    {3,7,0,7,6,0,5,4,0,6,10,0,10,1,0,-1},
+    {7,6,10,7,10,8,8,10,1,8,1,0,5,4,9,-1},
+    {6,9,5,6,11,9,11,8,9,-1,-1,-1,-1,-1,-1,-1},
+    {3,6,11,0,6,3,0,5,6,0,9,5,-1,-1,-1,-1},
+    {0,11,8,0,5,11,0,1,5,5,6,11,-1,-1,-1,-1},
+    {6,11,3,6,3,5,5,3,1,-1,-1,-1,-1,-1,-1,-1},
+    {1,2,10,9,5,11,9,5,6,11,5,9,11,8,9,-1},
+    {0,9,5,0,5,3,3,5,6,3,6,11,1,2,10,-1},
+    {8,0,2,8,2,11,11,2,10,11,10,6,9,5,4,-1},
+    {2,10,6,2,6,3,3,6,11,-1,-1,-1,-1,-1,-1,-1},
+    {8,4,9,8,9,2,8,2,3,2,9,5,6,11,7,-1},
+    {0,9,5,0,5,2,2,5,6,2,6,11,7,6,2,-1},
+    {1,5,0,1,8,0,3,8,1,4,9,5,2,3,7,-1},
+    {1,5,6,1,6,2,5,4,6,7,6,4,-1,-1,-1,-1},
+    {8,4,9,8,9,3,3,9,1,5,4,9,6,10,1,3},
+    {9,5,4,1,0,10,10,0,6,6,0,4,6,4,5,3},
+    {4,9,5,0,3,8,8,3,7,8,7,6,8,6,10,8},
+    {5,6,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,2,10,7,6,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,3,7,6,11,1,2,10,-1,-1,-1,-1,-1,-1,-1},
+    {0,1,9,10,1,2,6,11,7,-1,-1,-1,-1,-1,-1,-1},
+    {1,9,8,10,9,1,6,11,7,10,1,6,-1,-1,-1,-1},
+    {7,6,11,1,2,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,3,1,2,10,7,6,11,-1,-1,-1,-1,-1,-1,-1},
+    {9,0,2,9,2,10,6,11,7,9,10,6,-1,-1,-1,-1},
+    {6,11,7,2,10,3,10,8,3,10,9,8,-1,-1,-1,-1},
+    {3,1,10,11,3,10,7,6,11,10,7,11,-1,-1,-1,-1},
+    {0,8,10,0,10,1,11,10,8,7,11,8,10,7,8,-1},
+    {0,1,9,2,3,7,2,7,6,7,3,11,2,6,7,-1},
+    {1,9,8,1,8,6,1,6,2,8,7,6,11,6,7,-1},
+    {7,6,1,7,1,3,11,1,6,10,1,11,7,11,6,-1},
+    {0,8,1,8,10,1,6,11,7,8,6,10,6,8,7,-1},
+    {0,3,7,0,7,9,7,6,9,10,9,6,0,9,7,-1},
+    {7,6,10,7,10,8,8,10,9,-1,-1,-1,-1,-1,-1,-1},
+    {6,8,4,11,8,6,1,2,10,-1,-1,-1,-1,-1,-1,-1},
+    {3,0,4,3,4,6,11,4,0,6,5,10,4,11,6,3},
+    {8,4,6,8,6,11,0,1,9,8,11,6,-1,-1,-1,-1},
+    {9,4,6,9,6,1,6,11,1,10,1,11,9,1,6,-1},
+    {6,8,4,6,11,8,2,10,1,-1,-1,-1,-1,-1,-1,-1},
+    {1,2,10,3,0,11,0,6,11,0,4,6,-1,-1,-1,-1},
+    {4,11,8,4,6,11,0,2,9,2,10,9,-1,-1,-1,-1},
+    {10,9,3,10,3,2,9,4,3,11,3,6,4,6,3,-1},
+    {8,2,3,8,4,2,4,6,2,1,2,10,-1,-1,-1,-1},
+    {0,4,2,4,6,2,1,2,10,-1,-1,-1,-1,-1,-1,-1},
+    {1,9,0,2,3,4,2,3,8,4,3,2,4,6,2,-1},
+    {1,9,4,1,4,2,2,4,6,-1,-1,-1,-1,-1,-1,-1},
+    {8,1,3,8,6,1,8,4,6,6,10,1,-1,-1,-1,-1},
+    {10,1,0,10,0,6,6,0,4,-1,-1,-1,-1,-1,-1,-1},
+    {4,6,3,4,3,8,6,10,3,0,3,9,10,9,3,-1},
+    {10,9,4,6,10,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {4,9,5,7,6,11,1,2,10,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,3,4,9,5,11,7,6,1,2,10,-1,-1,-1,-1},
+    {5,0,1,5,4,0,7,6,11,1,2,10,-1,-1,-1,-1},
+    {11,7,6,8,3,4,3,5,4,3,1,5,1,2,10,-1},
+    {9,5,4,10,1,2,7,6,11,-1,-1,-1,-1,-1,-1,-1},
+    {6,11,7,1,2,10,0,8,3,4,9,5,-1,-1,-1,-1},
+    {7,6,11,5,4,10,4,2,10,4,0,2,-1,-1,-1,-1},
+    {3,4,8,3,5,4,3,2,5,10,5,2,11,7,6,-1},
+    {7,2,3,7,6,2,5,4,9,1,2,10,-1,-1,-1,-1},
+    {9,5,4,0,8,6,0,6,2,6,8,7,1,2,10,-1},
+    {3,7,6,3,6,2,5,4,0,5,0,1,1,2,10,-1},
+    {1,5,4,1,4,9,2,1,9,6,2,9,4,5,6,2},
+    {5,4,9,7,6,1,7,1,3,1,6,10,-1,-1,-1,-1},
+    {1,0,8,1,8,10,10,8,7,10,7,6,4,9,5,-1},
+    {3,7,0,7,6,0,5,4,0,6,10,0,10,1,0,-1},
+    {7,6,10,7,10,8,8,10,1,8,1,0,5,4,9,-1},
+    {6,9,5,6,11,9,11,8,9,1,2,10,-1,-1,-1,-1},
+    {3,6,11,0,6,3,0,5,6,0,9,5,1,2,10,-1},
+    {0,11,8,0,5,11,0,1,5,5,6,11,1,2,10,-1},
+    {6,11,3,6,3,5,5,3,1,1,2,10,-1,-1,-1,-1},
+    {10,1,2,9,5,11,9,5,6,11,5,9,11,8,9,-1},
+    {0,9,5,0,5,3,3,5,6,3,6,11,1,2,10,-1},
+    {8,0,2,8,2,11,11,2,10,11,10,6,9,5,4,-1},
+    {2,10,6,2,6,3,3,6,11,-1,-1,-1,-1,-1,-1,-1},
+    {8,4,9,8,9,2,8,2,3,2,9,5,6,11,7,-1},
+    {0,9,5,0,5,2,2,5,6,2,6,11,7,6,2,-1},
+    {1,5,0,1,8,0,3,8,1,4,9,5,2,3,7,-1},
+    {1,5,6,1,6,2,5,4,6,7,6,4,-1,-1,-1,-1},
+    {8,4,9,8,9,3,3,9,1,5,4,9,6,10,1,3},
+    {9,5,4,1,0,10,10,0,6,6,0,4,6,4,5,3},
+    {4,9,5,0,3,8,8,3,7,8,7,6,8,6,10,8},
+    {5,6,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,2,10,5,6,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,3,5,10,6,1,2,10,-1,-1,-1,-1,-1,-1,-1},
+    {0,1,10,0,10,6,5,10,1,5,6,10,9,0,6,5},
+    {8,3,1,8,1,6,8,6,5,8,5,4,6,1,10,-1},
+    {5,6,10,1,2,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,3,1,2,10,5,6,10,-1,-1,-1,-1,-1,-1,-1},
+    {9,0,2,9,2,10,5,6,10,9,10,6,-1,-1,-1,-1},
+    {5,6,10,2,10,3,10,8,3,10,9,8,-1,-1,-1,-1},
+    {5,6,10,3,11,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,11,0,11,2,10,6,5,0,2,10,-1,-1,-1,-1},
+    {0,1,9,2,3,11,5,6,10,-1,-1,-1,-1,-1,-1,-1},
+    {5,10,6,1,9,2,9,11,2,9,8,11,-1,-1,-1,-1},
+    {5,6,10,3,11,6,11,1,3,11,5,1,11,6,5,-1},
+    {0,8,11,0,11,5,0,5,1,5,11,6,-1,-1,-1,-1},
+    {3,11,6,0,3,6,0,6,5,0,5,9,-1,-1,-1,-1},
+    {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1}
+};
+
+static const int kMcCorner[8][3] = {
+    {0,0,0},{1,0,0},{1,0,1},{0,0,1},
+    {0,1,0},{1,1,0},{1,1,1},{0,1,1}
+};
+static const int kMcEdge[12][2] = {
+    {0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},{0,4},{1,5},{2,6},{3,7}
+};
+
+static float lerp(float a, float b, float t) { return a + (b - a) * t; }
+
+static int marchingCubes(float (*de)(float,float,float,void*), void* de_user,
+                         const AABB& bounds, int res,
+                         std::vector<float>& out_verts) {
+    out_verts.clear();
+    int n = res;
+    Vec3 sz = bounds.extents();
+    Vec3 org = bounds.min;
+    float step_x = sz.x / n, step_y = sz.y / n, step_z = sz.z / n;
+    int grid_n = n + 1;
+    int grid_slice = grid_n * grid_n;
+
+    // Allocate grid
+    std::vector<float> grid(grid_n * grid_n * grid_n);
+    for (int k = 0; k <= n; k++)
+        for (int j = 0; j <= n; j++)
+            for (int i = 0; i <= n; i++) {
+                float px = org.x + i * step_x, py = org.y + j * step_y, pz = org.z + k * step_z;
+                grid[k * grid_slice + j * grid_n + i] = de(px, py, pz, de_user);
+            }
+
+    int tri_count = 0;
+    for (int k = 0; k < n; k++)
+        for (int j = 0; j < n; j++)
+            for (int i = 0; i < n; i++) {
+                int idx[8];
+                for (int c = 0; c < 8; c++)
+                    idx[c] = (k + kMcCorner[c][2]) * grid_slice +
+                             (j + kMcCorner[c][1]) * grid_n +
+                             (i + kMcCorner[c][0]);
+
+                int cube_idx = 0;
+                for (int c = 0; c < 8; c++)
+                    if (grid[idx[c]] < 0) cube_idx |= (1 << c);
+
+                if (cube_idx == 0 || cube_idx == 255) continue;
+
+                int edge_mask = kMcEdgeTable[cube_idx];
+                float vert_list[12][3];
+                for (int e = 0; e < 12; e++) {
+                    if (edge_mask & (1 << e)) {
+                        int c0 = kMcEdge[e][0], c1 = kMcEdge[e][1];
+                        float v0 = grid[idx[c0]], v1 = grid[idx[c1]];
+                        float t = v0 / (v0 - v1);
+                        float x0 = org.x + (i + kMcCorner[c0][0]) * step_x;
+                        float y0 = org.y + (j + kMcCorner[c0][1]) * step_y;
+                        float z0 = org.z + (k + kMcCorner[c0][2]) * step_z;
+                        float x1 = org.x + (i + kMcCorner[c1][0]) * step_x;
+                        float y1 = org.y + (j + kMcCorner[c1][1]) * step_y;
+                        float z1 = org.z + (k + kMcCorner[c1][2]) * step_z;
+                        vert_list[e][0] = lerp(x0, x1, t);
+                        vert_list[e][1] = lerp(y0, y1, t);
+                        vert_list[e][2] = lerp(z0, z1, t);
+                    }
+                }
+
+                for (int t = 0; t + 2 < 16; t += 3) {
+                    int i0 = kMcTriTable[cube_idx][t];
+                    if (i0 == -1) break;
+                    int i1 = kMcTriTable[cube_idx][t+1];
+                    int i2 = kMcTriTable[cube_idx][t+2];
+                    if (i1 == -1 || i2 == -1) break;
+                    out_verts.push_back(vert_list[i0][0]); out_verts.push_back(vert_list[i0][1]); out_verts.push_back(vert_list[i0][2]);
+                    out_verts.push_back(vert_list[i1][0]); out_verts.push_back(vert_list[i1][1]); out_verts.push_back(vert_list[i1][2]);
+                    out_verts.push_back(vert_list[i2][0]); out_verts.push_back(vert_list[i2][1]); out_verts.push_back(vert_list[i2][2]);
+                    tri_count++;
+                }
+            }
+
+    return tri_count;
+}
+
+// Mandelbulb distance estimator
+struct MandelbulbParams { int power; int iterations; float bailout; };
+
+static float mandelbulbDE(float x, float y, float z, void* user) {
+    MandelbulbParams* p = (MandelbulbParams*)user;
+    float wx = x, wy = y, wz = z;
+    float dr = 1.0f;
+    float r = 0.0f;
+    for (int i = 0; i < p->iterations; i++) {
+        r = sqrtf(wx*wx + wy*wy + wz*wz);
+        if (r > p->bailout) break;
+        float theta = acosf(wz / r);
+        float phi = atan2f(wy, wx);
+        float pow_r = powf(r, (float)p->power);
+        dr = powf(r, (float)(p->power - 1)) * (float)p->power * dr + 1.0f;
+        theta *= (float)p->power;
+        phi *= (float)p->power;
+        float st = sinf(theta);
+        wx = st * cosf(phi) * pow_r + x;
+        wy = st * sinf(phi) * pow_r + y;
+        wz = cosf(theta) * pow_r + z;
+    }
+    return 0.5f * logf(r) * r / dr;
+}
+
+static int generateMandelbulb(int fineness, std::vector<float>& out_verts,
+                              std::vector<float>& out_colors) {
+    MandelbulbParams params;
+    params.power = 8;
+    params.iterations = 10;
+    params.bailout = 2.0f;
+
+    AABB bounds(Vec3(-1.6f, -1.6f, -1.6f), Vec3(1.6f, 1.6f, 1.6f));
+    int ntri = marchingCubes(mandelbulbDE, &params, bounds, fineness, out_verts);
+
+    // Colors based on vertex position (gradient)
+    out_colors.clear();
+    out_colors.reserve(ntri * 3);
+    for (int i = 0; i < ntri; i++) {
+        float* v = &out_verts[i * 9];
+        float cx = (v[0] + v[3] + v[6]) / 3.0f;
+        float cy = (v[1] + v[4] + v[7]) / 3.0f;
+        float cz = (v[2] + v[5] + v[8]) / 3.0f;
+        float r = sqrtf(cx*cx + cy*cy + cz*cz);
+        float hue = atan2f(cz, cx) / 3.14159f * 0.5f + 0.5f;
+        float val = (1.0f - r * 0.4f);
+        // Simple HSV-like coloring
+        out_colors.push_back(fabsf(sinf(hue * 6.2832f)) * val);
+        out_colors.push_back(fabsf(sinf((hue + 0.333f) * 6.2832f)) * val);
+        out_colors.push_back(fabsf(sinf((hue + 0.667f) * 6.2832f)) * val);
+    }
+    return ntri;
+}
+
+// Benchmark mode state
+static struct {
+    bool active = false;
+    int fineness = 64;
+    double rays_per_sec = 0;
+    float build_time_ms = 0;
+    int num_tris = 0;
+    int num_rays = 0;
+    C11Scene c11scene;
+    bool c11scene_valid = false;
+} g_bench;
+
+static void regenerateBenchmark();
+static void runBenchmarkMeasurement();
+
+static void enterBenchmarkMode(C11Scene& main_cs) {
+    g_bench.active = true;
+    g_bench.num_rays = 0;
+    // Build a fresh C11 scene for the mandelbulb
+    regenerateBenchmark();
+    // Clear the accumulation buffer so the viewer starts fresh
+    std::fill(g_state.accumBuffer.begin(), g_state.accumBuffer.end(), 0.0f);
+    g_state.sampleCount = 0;
+    g_state.cameraDirty = true;
+    // Fit camera to the mandelbulb
+    g_state.camera.orbitCenter = Vec3(0, 0, 0);
+    g_state.camera.orbitDistance = 3.5f;
+    g_state.camera.yaw = 90.0f;
+    g_state.camera.pitch = 25.0f;
+    UpdateCameraFromOrbit(g_state.camera);
+}
+
+static void exitBenchmarkMode() {
+    g_bench.active = false;
+    // Free the benchmark C11 scene
+    for (auto* s : g_bench.c11scene.scenes) lrt_scene_free(s);
+    g_bench.c11scene.scenes.clear();
+    g_bench.c11scene.vertices.clear();
+    g_bench.c11scene.colors.clear();
+    g_bench.c11scene.num_tris = 0;
+    g_bench.c11scene_valid = false;
+}
+
+static void regenerateBenchmark() {
+    // Free old scene
+    for (auto* s : g_bench.c11scene.scenes) lrt_scene_free(s);
+    g_bench.c11scene.scenes.clear();
+
+    std::vector<float> verts, colors;
+    uint64_t t0 = GetTimeNs();
+    g_bench.num_tris = generateMandelbulb(g_bench.fineness, verts, colors);
+    uint64_t t1 = GetTimeNs();
+
+    int num_threads = std::max(1, (int)std::thread::hardware_concurrency());
+    buildC11SceneFromTriangles(g_bench.c11scene, verts.data(), g_bench.num_tris,
+                               colors.data(), num_threads);
+    uint64_t t2 = GetTimeNs();
+
+    g_bench.build_time_ms = (float)(t2 - t0) / 1e6f;
+    g_bench.c11scene_valid = true;
+    g_bench.num_rays = 0;
+
+    runBenchmarkMeasurement();
+}
+
+static void runBenchmarkMeasurement() {
+    if (!g_bench.c11scene_valid || g_bench.c11scene.num_tris == 0) return;
+    if (g_bench.c11scene.scenes.empty()) return;
+    lrt_scene* scene = g_bench.c11scene.scenes[0];
+    if (!scene) return;
+
+    // Cast random rays through the bounding box from random origins on a sphere
+    int total_rays = std::max(100000, g_bench.c11scene.num_tris * 50);
+    if (total_rays > 5000000) total_rays = 5000000;
+
+    uint64_t t0 = GetTimeNs();
+    uint32_t hits = 0;
+
+    for (int i = 0; i < total_rays; i++) {
+        uint32_t seed = (uint32_t)(i * 2654435761u);
+        // Random direction on unit sphere
+        float theta = 2.0f * 3.14159f * (float)(seed & 0xFFFFFF) / 16777216.0f; seed = pcg_hash_impl(seed);
+        float phi = acosf(2.0f * (float)(seed & 0xFFFFFF) / 16777216.0f - 1.0f); seed = pcg_hash_impl(seed);
+        float sx = sinf(phi) * cosf(theta);
+        float sy = sinf(phi) * sinf(theta);
+        float sz = cosf(phi);
+        double org[3] = {sx * 5.0, sy * 5.0, sz * 5.0};
+        // Direction toward center with some spread
+        seed = pcg_hash_impl(seed);
+        float spread = (float)(seed & 0xFFFF) / 65536.0f * 0.5f;
+        double tx = (double)((float)((seed >> 16) & 0xFF) / 256.0f * 2.0f - 1.0f) * spread;
+        double ty = (double)((float)((seed >> 8) & 0xFF) / 256.0f * 2.0f - 1.0f) * spread;
+        double tz = (double)((float)(seed & 0xFF) / 256.0f * 2.0f - 1.0f) * spread;
+        double dir[3] = {-org[0] + tx, -org[1] + ty, -org[2] + tz};
+        double dlen = sqrt(dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2]);
+        if (dlen > 1e-12) { dir[0] /= dlen; dir[1] /= dlen; dir[2] /= dlen; }
+        double ht;
+        unsigned hit = lrt_scene_intersect(scene, org, dir, 1e-6, 1e10, &ht, 0, 0);
+        if (hit != LRT_NO_HIT) hits++;
+    }
+
+    uint64_t t1 = GetTimeNs();
+    double elapsed = (double)(t1 - t0) / 1e9;
+    g_bench.rays_per_sec = (elapsed > 0) ? (double)total_rays / elapsed : 0;
+    g_bench.num_rays = total_rays;
+}
+
+// Overlay for benchmark mode (called from main loop after rendering)
+static void drawBenchmarkOverlay(ViewerState& state) {
+    int w = (int)state.width;
+    int h = (int)state.height;
+    int fs = state.fontScale;
+    int lineH = 12 * fs;
+    int x = 10;
+    int y = h - lineH * 8;
+    if (y < 10) y = 10;
+
+    uint32_t color = 0xFF00FF00; // green text
+
+    DrawString(x, y, "[BENCHMARK MODE]", color, state.pixels.data(), w, h, fs);
+    y += lineH;
+    std::string fstr = "Fineness: " + std::to_string(g_bench.fineness) + "x" + std::to_string(g_bench.fineness) + "x" + std::to_string(g_bench.fineness);
+    DrawString(x, y, fstr.c_str(), color, state.pixels.data(), w, h, fs);
+    y += lineH;
+    std::string tstr = "Triangles: " + std::to_string(g_bench.num_tris);
+    DrawString(x, y, tstr.c_str(), color, state.pixels.data(), w, h, fs);
+    y += lineH;
+    char btbuf[64];
+    snprintf(btbuf, sizeof(btbuf), "Build time: %.2f ms", g_bench.build_time_ms);
+    DrawString(x, y, btbuf, color, state.pixels.data(), w, h, fs);
+    y += lineH;
+    char rpsbuf[64];
+    snprintf(rpsbuf, sizeof(rpsbuf), "Throughput: %.1f M rays/sec", g_bench.rays_per_sec / 1e6);
+    DrawString(x, y, rpsbuf, color, state.pixels.data(), w, h, fs);
+    y += lineH;
+    char nrbuf[64];
+    snprintf(nrbuf, sizeof(nrbuf), "Rays traced: %d", g_bench.num_rays);
+    DrawString(x, y, nrbuf, color, state.pixels.data(), w, h, fs);
+    y += lineH;
+    DrawString(x, y, "B: Exit benchmark   [ ]: Fineness", color, state.pixels.data(), w, h, fs);
+}
+
 // --- Entry Point ---
 
 int main(int argc, char* argv[]) {
@@ -631,6 +1217,25 @@ int main(int argc, char* argv[]) {
                     g_state.keys[KEY_PLUS] = true; break;
                 case XK_o: case XK_O:
                     ShowOpenFileDialog(); break;
+                case XK_b: case XK_B:
+                    if (g_bench.active) {
+                        exitBenchmarkMode();
+                    } else {
+                        enterBenchmarkMode(g_c11scene);
+                    }
+                    break;
+                case XK_bracketleft:
+                    if (g_bench.active && g_bench.fineness > 16) {
+                        g_bench.fineness = std::max(16, g_bench.fineness / 2);
+                        regenerateBenchmark();
+                    }
+                    break;
+                case XK_bracketright:
+                    if (g_bench.active && g_bench.fineness < 256) {
+                        g_bench.fineness = std::min(256, g_bench.fineness * 2);
+                        regenerateBenchmark();
+                    }
+                    break;
                 case XK_Escape:
                     g_state.keys[KEY_ESCAPE] = true; break;
                 case XK_Shift_L: case XK_Shift_R:
@@ -760,7 +1365,12 @@ int main(int argc, char* argv[]) {
         }
 
         // Render (using C11 API for ray intersection)
-        RenderFrameX11(g_state, g_c11scene);
+        if (g_bench.active) {
+            RenderFrameX11(g_state, g_bench.c11scene);
+            drawBenchmarkOverlay(g_state);
+        } else {
+            RenderFrameX11(g_state, g_c11scene);
+        }
 
         // Blit to window via XPutImage
         // g_state.pixels is BGRA (uint32_t) which matches X11 ZPixmap on little-endian
