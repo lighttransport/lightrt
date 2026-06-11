@@ -12,9 +12,9 @@
 
 static void *tri_build_layout(const float *vertices, size_t ntris,
                               int num_threads, double *build_ms,
-                              lrt_tri_layout layout) {
+                              lrt_tri_layout layout, lrt_tri_quality quality) {
     lrt_tri_build_options opts = {
-        .quality = LRT_TRI_BUILD_DEFAULT,
+        .quality = quality,
         .layout = layout,
         .max_leaf_size = 0,
         .num_threads = (unsigned)(num_threads > 0 ? num_threads : 1),
@@ -27,10 +27,20 @@ static void *tri_build_layout(const float *vertices, size_t ntris,
 }
 
 static void *tri_build_bvh4(const float *v, size_t n, int t, double *ms) {
-    return tri_build_layout(v, n, t, ms, LRT_TRI_LAYOUT_BVH4);
+    return tri_build_layout(v, n, t, ms, LRT_TRI_LAYOUT_BVH4,
+                            LRT_TRI_BUILD_DEFAULT);
 }
 static void *tri_build_bvh8(const float *v, size_t n, int t, double *ms) {
-    return tri_build_layout(v, n, t, ms, LRT_TRI_LAYOUT_BVH8);
+    return tri_build_layout(v, n, t, ms, LRT_TRI_LAYOUT_BVH8,
+                            LRT_TRI_BUILD_DEFAULT);
+}
+static void *tri_build_lbvh4(const float *v, size_t n, int t, double *ms) {
+    return tri_build_layout(v, n, t, ms, LRT_TRI_LAYOUT_BVH4,
+                            LRT_TRI_BUILD_FAST);
+}
+static void *tri_build_lbvh8(const float *v, size_t n, int t, double *ms) {
+    return tri_build_layout(v, n, t, ms, LRT_TRI_LAYOUT_BVH8,
+                            LRT_TRI_BUILD_FAST);
 }
 
 static void tri_intersect1N(void *scene, int thread_idx, const lrt_ray *rays,
@@ -63,6 +73,16 @@ static const bench_backend g_bvh8_backend = {
     "c11-bvh8", tri_build_bvh8, tri_intersect1N, tri_occluded1N,
     tri_memory_bytes, tri_destroy,
 };
+static const bench_backend g_lbvh4_backend = {
+    "c11-lbvh4", tri_build_lbvh4, tri_intersect1N, tri_occluded1N,
+    tri_memory_bytes, tri_destroy,
+};
+static const bench_backend g_lbvh8_backend = {
+    "c11-lbvh8", tri_build_lbvh8, tri_intersect1N, tri_occluded1N,
+    tri_memory_bytes, tri_destroy,
+};
 
 const bench_backend *backend_lightrt_bvh4(void) { return &g_bvh4_backend; }
 const bench_backend *backend_lightrt_bvh8(void) { return &g_bvh8_backend; }
+const bench_backend *backend_lightrt_lbvh4(void) { return &g_lbvh4_backend; }
+const bench_backend *backend_lightrt_lbvh8(void) { return &g_lbvh8_backend; }

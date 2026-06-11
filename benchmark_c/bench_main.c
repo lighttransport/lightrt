@@ -43,7 +43,8 @@ static void usage(const char *argv0) {
             "  --scene mandelbulb     procedural scene (default mandelbulb)\n"
             "  --fineness N           marching-cubes grid resolution (default 128)\n"
             "  --power N              mandelbulb power (default 8)\n"
-            "  --backend LIST         all | comma list of: c11-cb,c11-bvh4,c11-bvh8,embree\n"
+            "  --backend LIST         all | comma list of: c11-cb,c11-bvh4,c11-bvh8,\n"
+            "                         c11-lbvh4,c11-lbvh8 (Morton fast build), embree\n"
             "  --rays LIST            all | comma list of: primary,incoherent,shadow\n"
             "  --nrays N              rays per workload (default 4000000)\n"
             "  --threads N            worker threads (default 1)\n"
@@ -247,6 +248,8 @@ int main(int argc, char **argv) {
             {"c11-cb", backend_lightrt_cb},
             {"c11-bvh4", backend_lightrt_bvh4},
             {"c11-bvh8", backend_lightrt_bvh8},
+            {"c11-lbvh4", backend_lightrt_lbvh4},
+            {"c11-lbvh8", backend_lightrt_lbvh8},
             {"embree", backend_embree},
         };
         int want_all = !strcmp(cfg.backends, "all");

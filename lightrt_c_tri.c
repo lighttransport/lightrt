@@ -165,6 +165,10 @@ typedef struct tri_build_ctx {
      * the subtree-parallel build); 0/1 = off */
     unsigned par_threads;
     uint32_t *par_scratch; /* ntris u32 scatter buffer (when par_threads > 1) */
+    /* LBVH (LRT_TRI_BUILD_FAST): Morton-sorted keys, (morton30 << 32) | prim,
+     * index-aligned with the sorted indices[]. NULL for SAH builds. */
+    const uint64_t *lbvh_keys;
+    uint32_t lbvh_leaf; /* LBVH leaf size (fixed; no SAH leaf decision) */
 } tri_build_ctx;
 
 /* ------------------------------------------------------------------------- */
@@ -675,6 +679,197 @@ static uint32_t tri_build_recursive(tri_build_ctx *c, uint32_t first,
     return node_idx;
 }
 
+/* ---- LBVH (Morton) fast build ---------------------------------------------
+ *
+ * LRT_TRI_BUILD_FAST: quantize centroids to 30-bit Morton codes, radix-sort
+ * (morton << 32) | prim keys, then build the binary tree by splitting each
+ * sorted range at its highest differing Morton bit (binary search — no
+ * binning, no partitioning). Bounds are unioned bottom-up. ~O(N) build with
+ * SAH quality typically within ~10-20% of the binned builder.
+ */
+
+/* Spread the low 10 bits of v so each lands at every 3rd bit position. */
+static inline uint32_t tri_morton_expand10(uint32_t v) {
+    v &= 0x3FFu;
+    v = (v | (v << 16)) & 0x030000FFu;
+    v = (v | (v << 8)) & 0x0300F00Fu;
+    v = (v | (v << 4)) & 0x030C30C3u;
+    v = (v | (v << 2)) & 0x09249249u;
+    return v;
+}
+
+/* LSD radix sort of n keys by their high-32 Morton bits (bytes 4..7). The
+ * low-32 prim id makes keys unique, so the result is fully deterministic.
+ * Returns the array holding the sorted keys (keys or tmp). */
+static uint64_t *tri_radix_sort_keys(uint64_t *keys, uint64_t *tmp, size_t n) {
+    uint64_t *src = keys, *dst = tmp;
+    for (int byte = 4; byte < 8; byte++) {
+        uint32_t shift = (uint32_t)byte * 8u;
+        size_t count[256];
+        memset(count, 0, sizeof(count));
+        for (size_t i = 0; i < n; i++) count[(src[i] >> shift) & 0xFFu]++;
+        /* skip passes where every key shares the digit (e.g. byte 7 has only
+         * 6 used bits, and small scenes leave high bytes constant) */
+        int trivial = 0;
+        for (int d = 0; d < 256; d++) {
+            if (count[d] == n) {
+                trivial = 1;
+                break;
+            }
+            if (count[d] != 0) break;
+        }
+        if (trivial) continue;
+        size_t offset[256];
+        size_t sum = 0;
+        for (int d = 0; d < 256; d++) {
+            offset[d] = sum;
+            sum += count[d];
+        }
+        for (size_t i = 0; i < n; i++) {
+            dst[offset[(src[i] >> shift) & 0xFFu]++] = src[i];
+        }
+        uint64_t *t = src;
+        src = dst;
+        dst = t;
+    }
+    return src;
+}
+
+/* First index in (0, num) where the highest differing Morton bit flips, or
+ * num/2 when all codes in the range are equal. */
+static uint32_t tri_lbvh_find_split(const uint64_t *keys, uint32_t first,
+                                    uint32_t num) {
+    uint64_t kf = keys[first] >> 32;
+    uint64_t kl = keys[first + num - 1] >> 32;
+    uint64_t x = kf ^ kl;
+    if (x == 0) return num / 2; /* identical codes: median */
+    int bit = 63 - __builtin_clzll(x);
+    /* sorted: a prefix has the bit clear, the suffix has it set */
+    uint32_t lo = 0, hi = num - 1;
+    while (hi - lo > 1) {
+        uint32_t m = lo + (hi - lo) / 2;
+        if (((keys[first + m] >> 32) >> bit) & 1u) {
+            hi = m;
+        } else {
+            lo = m;
+        }
+    }
+    return hi;
+}
+
+/* Build a subtree over the Morton-sorted range [first, first+num); returns
+ * the node index and writes the subtree bounds to lo_out/hi_out. */
+static uint32_t tri_lbvh_range(tri_build_ctx *c, uint32_t first, uint32_t num,
+                               float lo_out[3], float hi_out[3]) {
+    if (c->failed) return 0;
+    if (c->node_next >= c->node_end) {
+        c->failed = 1;
+        return 0;
+    }
+    uint32_t node_idx = c->node_next++;
+    tri_bnode *node = &c->bnodes[node_idx];
+
+    if (num <= c->lbvh_leaf) {
+        float lo[3], hi[3];
+        tri_box_reset(lo, hi);
+        for (uint32_t i = 0; i < num; i++) {
+            uint32_t p = c->indices[first + i];
+            tri_box_expand(lo, hi, &c->plo[(size_t)p * 3], &c->phi[(size_t)p * 3]);
+        }
+        for (int a = 0; a < 3; a++) {
+            node->lo[a] = lo_out[a] = lo[a];
+            node->hi[a] = hi_out[a] = hi[a];
+        }
+        node->a = first;
+        node->b = 0;
+        node->count = num;
+        return node_idx;
+    }
+
+    uint32_t mid = tri_lbvh_find_split(c->lbvh_keys, first, num);
+    float llo[3], lhi[3], rlo[3], rhi[3];
+    uint32_t left = tri_lbvh_range(c, first, mid, llo, lhi);
+    uint32_t right = tri_lbvh_range(c, first + mid, num - mid, rlo, rhi);
+    if (c->failed) return 0;
+
+    node = &c->bnodes[node_idx];
+    for (int a = 0; a < 3; a++) {
+        node->lo[a] = lo_out[a] = tri_minf(llo[a], rlo[a]);
+        node->hi[a] = hi_out[a] = tri_maxf(lhi[a], rhi[a]);
+    }
+    node->a = left;
+    node->b = right;
+    node->count = 0;
+    return node_idx;
+}
+
+/* Quantize centroids to a 1024^3 grid over the centroid bounds and emit
+ * (morton30 << 32) | prim keys. */
+typedef struct tri_morton_job {
+    const tri_build_ctx *c;
+    uint64_t *keys;
+    float base[3];
+    float scale[3];
+} tri_morton_job;
+
+static void tri_morton_chunk_impl(const tri_morton_job *j, uint32_t begin,
+                                  uint32_t end) {
+    const float *cen = j->c->cen;
+    for (uint32_t i = begin; i < end; i++) {
+        uint32_t q[3];
+        for (int a = 0; a < 3; a++) {
+            float v = (cen[(size_t)i * 3 + a] - j->base[a]) * j->scale[a];
+            int32_t qi = (int32_t)v;
+            if (qi < 0) qi = 0;
+            if (qi > 1023) qi = 1023;
+            q[a] = (uint32_t)qi;
+        }
+        uint32_t morton = (tri_morton_expand10(q[0]) << 2) |
+                          (tri_morton_expand10(q[1]) << 1) |
+                          tri_morton_expand10(q[2]);
+        j->keys[i] = ((uint64_t)morton << 32) | (uint64_t)i;
+    }
+}
+
+#if !defined(__STDC_NO_THREADS__)
+static void tri_morton_chunk(void *arg, unsigned chunk, uint32_t begin,
+                             uint32_t end) {
+    (void)chunk;
+    tri_morton_chunk_impl((const tri_morton_job *)arg, begin, end);
+}
+#endif
+
+static void tri_morton_encode(const tri_build_ctx *c, uint64_t *keys,
+                              unsigned threads) {
+    tri_morton_job j;
+    j.c = c;
+    j.keys = keys;
+    /* centroid bounds (cheap serial reduction) */
+    float clo[3], chi[3];
+    tri_box_reset(clo, chi);
+    for (size_t i = 0; i < c->ntris; i++) {
+        for (int a = 0; a < 3; a++) {
+            float v = c->cen[i * 3 + a];
+            clo[a] = tri_minf(clo[a], v);
+            chi[a] = tri_maxf(chi[a], v);
+        }
+    }
+    for (int a = 0; a < 3; a++) {
+        float ext = chi[a] - clo[a];
+        j.base[a] = clo[a];
+        j.scale[a] = ext > 0.0f ? 1024.0f / ext : 0.0f;
+    }
+#if !defined(__STDC_NO_THREADS__)
+    if (threads > 1 && c->ntris >= TRI_PAR_NODE_MIN) {
+        tri_parallel_for((uint32_t)c->ntris, threads, tri_morton_chunk, &j);
+        return;
+    }
+#else
+    (void)threads;
+#endif
+    tri_morton_chunk_impl(&j, 0, (uint32_t)c->ntris);
+}
+
 /* ---- Parallel binary build (C11 threads) ---------------------------------
  *
  * A serial frontier expansion splits the root task until there are enough
@@ -697,6 +892,7 @@ typedef struct tri_build_pool {
     /* per-task arena slices, precomputed */
     uint32_t *slice_base;
     atomic_int failed;
+    int lbvh; /* tasks run tri_lbvh_range instead of tri_build_recursive */
 } tri_build_pool;
 
 static int tri_build_worker(void *arg) {
@@ -710,8 +906,13 @@ static int tri_build_worker(void *arg) {
         c.par_threads = 0; /* subtree tasks are already parallel; no nesting */
         c.node_next = pool->slice_base[t];
         c.node_end = pool->slice_base[t] + 2u * task->num;
-        uint32_t root = tri_build_recursive(&c, task->first, task->num,
-                                            task->depth);
+        uint32_t root;
+        if (pool->lbvh) {
+            float lo[3], hi[3];
+            root = tri_lbvh_range(&c, task->first, task->num, lo, hi);
+        } else {
+            root = tri_build_recursive(&c, task->first, task->num, task->depth);
+        }
         if (c.failed) {
             atomic_store_explicit(&pool->failed, 1, memory_order_relaxed);
             break;
@@ -796,6 +997,7 @@ static uint32_t tri_build_binary(tri_build_ctx *c, unsigned num_threads) {
             atomic_init(&pool.next_task, 0u);
             pool.slice_base = slice_base;
             atomic_init(&pool.failed, 0);
+            pool.lbvh = 0;
 
             thrd_t tids[64];
             unsigned nthr = num_threads < 64u ? num_threads : 64u;
@@ -837,6 +1039,141 @@ static uint32_t tri_build_binary(tri_build_ctx *c, unsigned num_threads) {
     (void)num_threads;
 #endif
     return tri_build_recursive(c, 0, (uint32_t)c->ntris, 0);
+}
+
+/* LBVH counterpart of tri_build_binary: indices[] are already Morton-sorted
+ * and c->lbvh_keys is set. Frontier expansion is a binary search per split
+ * (no O(N) binning/partition), so it parallelizes much better; frontier node
+ * bounds are filled in afterwards from their children (reverse creation
+ * order: children are always created after their parent). */
+static uint32_t tri_build_lbvh(tri_build_ctx *c, unsigned num_threads) {
+#if !defined(__STDC_NO_THREADS__)
+    if (num_threads > 1 && c->ntris >= 4096) {
+        enum { MAX_TASKS = 256 };
+        tri_build_task tasks[MAX_TASKS];
+        uint32_t fixup[MAX_TASKS];
+        uint32_t nfix = 0;
+        uint32_t root_slot = LRT_TRI_NO_HIT;
+        uint32_t ntasks = 0;
+        unsigned target = num_threads * 8u;
+        if (target > MAX_TASKS) target = MAX_TASKS;
+
+        tasks[ntasks++] = (tri_build_task){0, (uint32_t)c->ntris, 0, &root_slot};
+
+        while (ntasks > 0 && ntasks < target) {
+            uint32_t big = 0;
+            for (uint32_t i = 1; i < ntasks; i++) {
+                if (tasks[i].num > tasks[big].num) big = i;
+            }
+            if (tasks[big].num <= c->lbvh_leaf * 4u) break;
+
+            tri_build_task task = tasks[big];
+            if (c->node_next >= c->node_end) {
+                c->failed = 1;
+                return 0;
+            }
+            uint32_t node_idx = c->node_next++;
+            tri_bnode *node = &c->bnodes[node_idx];
+            node->count = 0; /* bounds deferred to the fixup pass */
+            *task.parent_slot = node_idx;
+            fixup[nfix++] = node_idx;
+
+            uint32_t mid = tri_lbvh_find_split(c->lbvh_keys, task.first, task.num);
+            tasks[big] = (tri_build_task){task.first, mid, task.depth + 1,
+                                          &node->a};
+            tasks[ntasks++] = (tri_build_task){task.first + mid, task.num - mid,
+                                               task.depth + 1, &node->b};
+        }
+
+        for (uint32_t i = 1; i < ntasks; i++) { /* LPT order */
+            tri_build_task key = tasks[i];
+            uint32_t k = i;
+            while (k > 0 && tasks[k - 1].num < key.num) {
+                tasks[k] = tasks[k - 1];
+                k--;
+            }
+            tasks[k] = key;
+        }
+
+        uint32_t slice_base[MAX_TASKS];
+        uint32_t cursor = c->node_next;
+        int fits = 1;
+        for (uint32_t i = 0; i < ntasks; i++) {
+            slice_base[i] = cursor;
+            if (2u * tasks[i].num > c->node_end - cursor) {
+                fits = 0;
+                break;
+            }
+            cursor += 2u * tasks[i].num;
+        }
+
+        if (fits && ntasks > 1) {
+            tri_build_pool pool;
+            pool.proto = c;
+            pool.tasks = tasks;
+            pool.ntasks = ntasks;
+            atomic_init(&pool.next_task, 0u);
+            pool.slice_base = slice_base;
+            atomic_init(&pool.failed, 0);
+            pool.lbvh = 1;
+
+            thrd_t tids[64];
+            unsigned nthr = num_threads < 64u ? num_threads : 64u;
+            if (nthr > ntasks) nthr = ntasks;
+            unsigned spawned = 0;
+            for (unsigned i = 0; i + 1 < nthr; i++) {
+                if (thrd_create(&tids[i], tri_build_worker, &pool) ==
+                    thrd_success) {
+                    spawned++;
+                } else {
+                    break;
+                }
+            }
+            tri_build_worker(&pool);
+            for (unsigned i = 0; i < spawned; i++) thrd_join(tids[i], NULL);
+
+            if (atomic_load(&pool.failed)) {
+                c->failed = 1;
+                return 0;
+            }
+            /* Bounds fixup: reverse creation order guarantees children (later
+             * frontier nodes or worker-built subtree roots) are final. */
+            for (uint32_t i = nfix; i-- > 0;) {
+                tri_bnode *n = &c->bnodes[fixup[i]];
+                const tri_bnode *l = &c->bnodes[n->a];
+                const tri_bnode *r = &c->bnodes[n->b];
+                for (int a = 0; a < 3; a++) {
+                    n->lo[a] = tri_minf(l->lo[a], r->lo[a]);
+                    n->hi[a] = tri_maxf(l->hi[a], r->hi[a]);
+                }
+            }
+            return root_slot;
+        }
+        if (root_slot != LRT_TRI_NO_HIT) {
+            /* slicing failed after partial expansion: finish serially */
+            for (uint32_t i = 0; i < ntasks; i++) {
+                float lo[3], hi[3];
+                uint32_t r = tri_lbvh_range(c, tasks[i].first, tasks[i].num, lo, hi);
+                if (c->failed) return 0;
+                *tasks[i].parent_slot = r;
+            }
+            for (uint32_t i = nfix; i-- > 0;) {
+                tri_bnode *n = &c->bnodes[fixup[i]];
+                const tri_bnode *l = &c->bnodes[n->a];
+                const tri_bnode *r = &c->bnodes[n->b];
+                for (int a = 0; a < 3; a++) {
+                    n->lo[a] = tri_minf(l->lo[a], r->lo[a]);
+                    n->hi[a] = tri_maxf(l->hi[a], r->hi[a]);
+                }
+            }
+            return root_slot;
+        }
+    }
+#else
+    (void)num_threads;
+#endif
+    float lo[3], hi[3];
+    return tri_lbvh_range(c, 0, (uint32_t)c->ntris, lo, hi);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1903,8 +2240,38 @@ lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
         return NULL;
     }
 
+    /* --- LBVH preprocessing (LRT_TRI_BUILD_FAST): Morton sort. --- */
+    uint64_t *lbvh_keys = NULL, *lbvh_tmp = NULL;
+    if (o.quality == LRT_TRI_BUILD_FAST) {
+        lbvh_keys = (uint64_t *)malloc(ntris * sizeof(uint64_t));
+        lbvh_tmp = (uint64_t *)malloc(ntris * sizeof(uint64_t));
+        if (!lbvh_keys || !lbvh_tmp) {
+            free(lbvh_keys);
+            free(lbvh_tmp);
+            free(bc.plo);
+            free(bc.phi);
+            free(bc.cen);
+            free(bc.indices);
+            free(bc.bnodes);
+            free(bc.par_scratch);
+            tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+            return NULL;
+        }
+        tri_morton_encode(&bc, lbvh_keys, num_threads);
+        const uint64_t *sorted = tri_radix_sort_keys(lbvh_keys, lbvh_tmp, ntris);
+        for (size_t i = 0; i < ntris; i++) {
+            bc.indices[i] = (uint32_t)sorted[i];
+        }
+        bc.lbvh_keys = sorted;
+        uint32_t bw = 1u << bc.block_shift;
+        bc.lbvh_leaf = 2u * bw;
+        if (bc.lbvh_leaf > max_leaf) bc.lbvh_leaf = max_leaf;
+    }
+
     /* --- Binary build (parallel when num_threads > 1). --- */
-    uint32_t b_root = tri_build_binary(&bc, num_threads);
+    uint32_t b_root = (o.quality == LRT_TRI_BUILD_FAST)
+                          ? tri_build_lbvh(&bc, num_threads)
+                          : tri_build_binary(&bc, num_threads);
 
     lrt_tri_scene *s = NULL;
     if (!bc.failed) {
@@ -1968,6 +2335,8 @@ lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
     free(bc.indices);
     free(bc.bnodes);
     free(bc.par_scratch);
+    free(lbvh_keys);
+    free(lbvh_tmp);
 
     if (bc.failed) {
         lrt_tri_scene_free(s);

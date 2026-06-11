@@ -49,7 +49,7 @@ typedef struct lrt_hit {
 } lrt_hit;
 
 typedef enum lrt_tri_quality {
-    LRT_TRI_BUILD_FAST = 0,   /* object-median splits: fastest build */
+    LRT_TRI_BUILD_FAST = 0,   /* LBVH (Morton sort + bit splits): fastest build */
     LRT_TRI_BUILD_DEFAULT = 1 /* binned SAH (16 bins): best traversal */
 } lrt_tri_quality;
 

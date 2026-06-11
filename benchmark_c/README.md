@@ -7,12 +7,14 @@ a pinned Embree 4 prebuilt binary.
 
 ## Backends
 
-| name       | what it measures                                                       |
-|------------|------------------------------------------------------------------------|
-| `c11-cb`   | existing `lightrt_c.h` callback API (fp64 Möller-Trumbore callback) — the pre-optimization baseline |
-| `c11-bvh4` | new `lightrt_c_tri.h` fp32 triangle API, 4-wide BVH (SSE4 kernels)     |
-| `c11-bvh8` | new `lightrt_c_tri.h` fp32 triangle API, 8-wide BVH (AVX2 kernels)     |
-| `embree`   | Embree 4 `rtcIntersect1`/`rtcOccluded1` per ray (optional)             |
+| name        | what it measures                                                       |
+|-------------|------------------------------------------------------------------------|
+| `c11-cb`    | existing `lightrt_c.h` callback API (fp64 Möller-Trumbore callback) — the pre-optimization baseline |
+| `c11-bvh4`  | new `lightrt_c_tri.h` fp32 triangle API, 4-wide BVH (SSE4 kernels), binned SAH build |
+| `c11-bvh8`  | new `lightrt_c_tri.h` fp32 triangle API, 8-wide BVH (AVX2 kernels), binned SAH build |
+| `c11-lbvh4` | same BVH4 kernels, LBVH fast build (`LRT_TRI_BUILD_FAST`: Morton sort + bit splits) |
+| `c11-lbvh8` | same BVH8 kernels, LBVH fast build                                     |
+| `embree`    | Embree 4 `rtcIntersect1`/`rtcOccluded1` per ray (optional)             |
 
 ## Quick start
 
@@ -80,11 +82,19 @@ fineness 192 (347,460 triangles):
 Across the whole matrix the new triangle backends run at 0.62–1.27× of Embree
 (typically 0.7–0.9×) and 2.7–5× the `c11-cb` baseline. On the larger scenes'
 multithreaded incoherent workload `c11-bvh4` beats Embree (1.27× at 347k tris
-/ 16T, 1.22× at 710k / 32T). BVH build: ~1.4 Mtris/s serial and ~3.3–3.7
-Mtris/s at 16 threads vs Embree's ~13–17 Mtris/s (TBB); a Morton/LBVH path is
-the obvious next step there. On this Zen 1 part BVH4 and BVH8 are within a few
+/ 16T, 1.22× at 710k / 32T). On this Zen 1 part BVH4 and BVH8 are within a few
 percent of each other (256-bit ops execute as 2×128), which is why
 `LRT_TRI_LAYOUT_AUTO` picks BVH4.
+
+BVH build (SAH): ~1.4 Mtris/s serial, ~3.3–3.9 Mtris/s at 16 threads vs
+Embree's ~13–17 Mtris/s (TBB). The LBVH fast path (`LRT_TRI_BUILD_FAST`,
+Morton sort + highest-differing-bit splits) builds at ~6.5–7.3 Mtris/s serial
+and ~7.8–9.3 Mtris/s multithreaded — e.g. at 710k tris / 16 threads:
+`c11-lbvh4` 91 ms vs `c11-bvh4` 196 ms vs Embree 44 ms. Its tree quality costs
+~10–15% traversal throughput vs the SAH build (SAH cost +8.5% on the
+mandelbulb), e.g. 14.0 vs 16.9 Mrays/s incoherent at 710k/16T (Embree: 16.0).
+Builds are deterministic — bit-identical trees at any thread count for both
+quality modes.
 
 ## Notes
 
