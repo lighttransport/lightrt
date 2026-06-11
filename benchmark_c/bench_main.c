@@ -15,6 +15,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
+
 #include "backend.h"
 #include "rays.h"
 #include "scene_mandelbulb.h"
@@ -185,6 +189,13 @@ static FILE *open_csv(const char *path) {
 }
 
 int main(int argc, char **argv) {
+#if defined(__linux__) && defined(PR_SET_THP_DISABLE)
+    /* Some launch environments disable transparent huge pages per process
+     * (THP_enabled: 0 in /proc/self/status), which silently defeats both our
+     * MADV_HUGEPAGE arenas and Embree's huge-page allocator and inflates dTLB
+     * misses on incoherent workloads. Re-enable for a level playing field. */
+    (void)prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0);
+#endif
     bench_config cfg = {
         .scene = "mandelbulb",
         .fineness = 128,

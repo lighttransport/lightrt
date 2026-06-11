@@ -107,33 +107,45 @@ targets), neutral on multithreaded incoherent, ~10% slower on shadow rays
 where the decode ALU shows. Leaf blocks dominate the footprint, which bounds
 the win; an option rather than the default.
 
-### Cross-library comparison (same rays, hit fractions identical)
+### Transparent huge pages
+
+Some launch environments disable THP per process (`THP_enabled: 0` in
+`/proc/self/status`), which silently defeats both lightrt's `MADV_HUGEPAGE`
+arenas and Embree's huge-page allocator: a multi-MB BVH walked by incoherent
+rays then thrashes the dTLB through 4KB pages. `bench_c` clears
+`PR_SET_THP_DISABLE` at startup so every backend gets huge pages (system THP
+policy `madvise` is enough); the lightrt allocator 2MB-aligns and madvises
+all arenas ≥ 2MB. Worth ~+5-8% on large-scene traversal for every backend.
+
+### Cross-library comparison (same rays, hit fractions identical, THP on)
 
 Mandelbulb, fineness 128 (127,752 tris), single thread, Mrays/s:
 
 | backend   | primary | incoherent | shadow | build (ms) |
 |-----------|--------:|-----------:|-------:|-----------:|
-| embree    |   18.53 |       3.52 |   5.29 |       54.4 |
-| tinybvh   |   18.04 |       2.48 |   4.46 |       52.9 |
-| c11-bvh4  |   17.67 |   **2.66** |   3.67 |       90.9 |
-| c11-lbvh4 |   15.45 |       2.25 |   3.20 |   **19.4** |
-| c11-bvh8q |   14.76 |       2.57 |   3.59 |       77.1 |
-| mm-bvh    |   14.06 |       1.21 |   1.84 |      110.3 |
+| embree    |   19.69 |       3.48 |   5.43 |       50.4 |
+| tinybvh   |   18.61 |       2.49 |   4.56 |       52.8 |
+| c11-bvh4  |   18.13 |       2.86 |   3.93 |       75.3 |
+| c11-bvh8q |   15.76 |   **2.92** |   3.92 |       62.7 |
+| c11-lbvh4 |   15.80 |       2.40 |   3.50 |   **16.9** |
+| mm-bvh    |   14.39 |       1.21 |   1.90 |      107.9 |
 
 Fineness 256 (710,536 tris), 16 threads:
 
-| backend   | incoherent | shadow | build (ms) | build Mtris/s |
-|-----------|-----------:|-------:|-----------:|--------------:|
-| c11-bvh4  |  **16.83** |  34.31 |      199.6 |          3.56 |
-| embree    |      15.23 |  37.89 |       48.9 |         14.54 |
-| c11-lbvh4 |      14.32 |  30.70 |       89.8 |          7.91 |
-| tinybvh   |      13.16 |  32.90 |      500.2 |          1.42 |
-| mm-bvh    |       8.14 |  14.97 |      307.3 |          2.31 |
+| backend   | incoherent |    shadow | build (ms) | build Mtris/s |
+|-----------|-----------:|----------:|-----------:|--------------:|
+| c11-bvh4  |  **17.78** |     43.37 |      178.3 |          3.99 |
+| c11-bvh8  |      17.15 | **47.35** |      172.8 |          4.11 |
+| embree    |      15.90 |     44.60 |       82.0 |          8.66 |
+| c11-lbvh4 |      14.62 |     34.92 |   **80.3** |      **8.85** |
+| tinybvh   |      13.32 |     41.82 |      515.8 |          1.38 |
+| mm-bvh    |       9.00 |     16.60 |      298.8 |          2.38 |
 
-`c11-bvh4` beats tinybvh on incoherent rays at both scales and wins the
-multithreaded incoherent column outright at 710k tris; Embree keeps the lead
-on shadow rays and build throughput. tinybvh's `BVH8_CPU` build and
-madmann91/bvh's traversal are their respective weak spots in this setup.
+At 710k tris / 16 threads, `c11-bvh4` leads incoherent rays (1.12x Embree) and
+`c11-bvh8` leads shadow rays (1.06x Embree); the LBVH fast build matches
+Embree's TBB build throughput. Embree keeps the single-thread lead (incoherent
+0.84x, shadow 0.72x via `c11-bvh8q`/`c11-bvh8`) — its remaining edge is
+single-ray latency hiding, not memory layout.
 
 ## Notes
 

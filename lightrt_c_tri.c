@@ -20,6 +20,10 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+#if defined(__linux__) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE 1 /* madvise + MADV_HUGEPAGE despite _POSIX_C_SOURCE */
+#endif
+
 #include "lightrt_c_tri.h"
 
 #include <float.h>
@@ -190,7 +194,28 @@ typedef struct tri_build_ctx {
 /* Helpers.                                                                  */
 /* ------------------------------------------------------------------------- */
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+
+/* Threshold above which allocations are 2MB-aligned and madvised for
+ * transparent huge pages. Incoherent rays walk the BVH randomly; with 4KB
+ * pages a multi-MB structure overwhelms the dTLB, with 2MB pages it fits. */
+#define TRI_HUGE_PAGE_SIZE (2u * 1024u * 1024u)
+
 static void *tri_aligned_alloc(size_t align, size_t size) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE) && !defined(LRT_TRI_NO_HUGEPAGE)
+    if (size >= TRI_HUGE_PAGE_SIZE) {
+        size_t a = TRI_HUGE_PAGE_SIZE;
+        size_t sz = (size + a - 1u) & ~(a - 1u);
+        void *p = aligned_alloc(a, sz);
+        if (p) {
+            (void)madvise(p, sz, MADV_HUGEPAGE);
+            return p;
+        }
+        /* fall through to the normal path on failure */
+    }
+#endif
     size = (size + align - 1u) & ~(align - 1u);
 #if defined(_MSC_VER)
     return _aligned_malloc(size, align);
@@ -1974,6 +1999,7 @@ static int tri_occluded_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray) {
         while (mask) {
             int i = __builtin_ctz((unsigned)mask);
             mask &= mask - 1;
+            tri_prefetch_ref(s, n->child[i], 4);
             stack[sp++] = n->child[i];
         }
     }
@@ -2249,6 +2275,7 @@ static int tri_occluded_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray) {
         while (mask) {
             int i = __builtin_ctz((unsigned)mask);
             mask &= mask - 1;
+            tri_prefetch_ref(s, n->child[i], 8);
             stack[sp++] = n->child[i];
         }
     }
@@ -2389,6 +2416,7 @@ static int tri_occluded_bvh8q_avx2(const lrt_tri_scene *s, const lrt_ray *ray) {
         while (mask) {
             int i = __builtin_ctz((unsigned)mask);
             mask &= mask - 1;
+            tri_prefetch_ref(s, n->child[i], 8);
             stack[sp++] = n->child[i];
         }
     }
