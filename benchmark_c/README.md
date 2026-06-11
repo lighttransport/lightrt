@@ -148,18 +148,20 @@ Embree's TBB build throughput.
 ### Interleaved (software-pipelined) batch traversal
 
 `lrt_tri_intersect1N/occluded1N` take a `lrt_tri_batch_hint`. With
-`LRT_TRI_BATCH_INCOHERENT` (and the BVH4 layout) the library keeps
-`TRI_PIPE_WIDTH` (8, measured optimum on Zen 1) rays in flight per thread,
-advancing each by one node/leaf visit per turn, so one ray's cache miss
-overlaps the others' compute. Results are bit-identical to single-ray calls.
-Effect at 710k tris: single-thread incoherent 1.41 → 2.25 Mrays/s (+60%,
-1.33x Embree, where Embree was previously 1.12x ahead); 16-thread incoherent
-17.8 → 22.3 (1.09x Embree, same-run). Coherent batches (primary rays,
-surface-to-light shadow rays) run the plain per-ray kernel — pipelining
-costs ~20% there because the working set is already cache-resident; the
-benchmark passes the matching hint per workload. The remaining Embree leads
-are single-thread shadow (0.75x) and primary (parity at 128k, 0.85x at
-710k).
+`LRT_TRI_BATCH_INCOHERENT` the library keeps `TRI_PIPE_WIDTH` (8, measured
+optimum on Zen 1) rays in flight per thread — on all SIMD layouts (BVH4/SSE,
+BVH8 and BVH8Q/AVX2) — advancing each by one node/leaf visit per turn, so one
+ray's cache miss overlaps the others' compute. Results are bit-identical to
+single-ray calls (enforced by tests). Effect at 710k tris: single-thread
+incoherent 1.41 → 2.25 Mrays/s on BVH4 (+60%, 1.33x Embree, where Embree was
+previously 1.12x ahead), 1.43 → 1.92 on BVH8 (+34%), 1.51 → 1.82 on BVH8Q
+(+21%; with the latency hidden, the quantized decode ALU becomes the cost and
+plain BVH4 is the best layout); 16-thread incoherent 17.8 → 20-22 (1.1-1.3x
+Embree, same-run). Coherent batches (primary rays, surface-to-light shadow
+rays) run the plain per-ray kernel — pipelining costs ~20% there because the
+working set is already cache-resident; the benchmark passes the matching hint
+per workload. The remaining Embree leads are single-thread shadow (0.75x)
+and primary (parity at 128k, 0.85x at 710k).
 
 ## Notes
 

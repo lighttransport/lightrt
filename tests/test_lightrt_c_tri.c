@@ -177,9 +177,9 @@ static void test_vs_brute_force(const char *label, const float *verts,
 /* The batched entry points (which may pipeline several rays in flight) must
  * produce exactly the same results as the single-ray calls. */
 static void test_batch_matches_single(const float *verts, size_t ntris,
-                                      size_t nrays) {
+                                      lrt_tri_layout layout, size_t nrays) {
     lrt_tri_build_options o = {.quality = LRT_TRI_BUILD_DEFAULT,
-                               .layout = LRT_TRI_LAYOUT_BVH4};
+                               .layout = layout};
     lrt_tri_scene *s = lrt_tri_scene_build(verts, ntris, &o, NULL);
     CHECK(s != NULL, "batch-vs-single: build failed");
     if (!s) return;
@@ -209,10 +209,10 @@ static void test_batch_matches_single(const float *verts, size_t ntris,
         }
         if ((uint8_t)lrt_tri_occluded1(s, &rays[i]) != occ[i]) bad_occ++;
     }
-    CHECK(bad_hit == 0, "batched intersect1N differs from intersect1 on "
-          "%zu/%zu rays", bad_hit, nrays);
-    CHECK(bad_occ == 0, "batched occluded1N differs from occluded1 on "
-          "%zu/%zu rays", bad_occ, nrays);
+    CHECK(bad_hit == 0, "batched intersect1N (layout %d) differs from "
+          "intersect1 on %zu/%zu rays", (int)layout, bad_hit, nrays);
+    CHECK(bad_occ == 0, "batched occluded1N (layout %d) differs from "
+          "occluded1 on %zu/%zu rays", (int)layout, bad_occ, nrays);
 
     free(rays);
     free(hits);
@@ -333,7 +333,9 @@ int main(void) {
     test_vs_brute_force("medium/bvh8q/fast", med, 5000, LRT_TRI_LAYOUT_BVH8Q,
                         LRT_TRI_BUILD_FAST, 4000);
     test_layouts_agree(med, 5000, 50000);
-    test_batch_matches_single(med, 5000, 30000);
+    test_batch_matches_single(med, 5000, LRT_TRI_LAYOUT_BVH4, 30000);
+    test_batch_matches_single(med, 5000, LRT_TRI_LAYOUT_BVH8, 30000);
+    test_batch_matches_single(med, 5000, LRT_TRI_LAYOUT_BVH8Q, 30000);
     free(med);
 
     /* Co-planar / overlapping pathological soup. */

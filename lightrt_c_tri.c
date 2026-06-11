@@ -2635,6 +2635,237 @@ static int tri_occluded_bvh8q_avx2(const lrt_tri_scene *s, const lrt_ray *ray) {
     return 0;
 }
 
+/* ---- Software-pipelined batch traversal (BVH8/BVH8Q, AVX2) ----------------
+ * Same scheme as the BVH4 pipeline; one state serves both 8-wide node
+ * encodings (the per-step branch on s->quantized is loop-invariant and
+ * predicted perfectly). The 8-wide nodes are 2-4x larger than BVH4's, so a
+ * narrower pipe keeps the in-flight footprint from thrashing the shared
+ * cache when many threads run. */
+#ifndef TRI_PIPE_WIDTH8
+#define TRI_PIPE_WIDTH8 TRI_PIPE_WIDTH
+#endif
+typedef struct tri_pipe8_state {
+    tri_ray_ctx rc;
+    tri_avx_ctx ac;
+    float best_t, best_u, best_v;
+    uint32_t best_prim;
+    lrt_hit *hit;
+    int sp;
+    tri_stack_entry stack[TRI_STACK_SIZE];
+} tri_pipe8_state;
+
+static inline void tri_pipe8_init(const lrt_tri_scene *s, tri_pipe8_state *st,
+                                  const lrt_ray *ray, lrt_hit *hit) {
+    tri_ray_setup(ray, &st->rc);
+    tri_avx_setup(&st->rc, &st->ac);
+    st->best_t = ray->tmax;
+    st->best_u = 0.0f;
+    st->best_v = 0.0f;
+    st->best_prim = LRT_TRI_NO_HIT;
+    st->hit = hit;
+    st->stack[0].ref = s->root;
+    st->stack[0].tnear = st->rc.tmin;
+    st->sp = 1;
+}
+
+static inline int tri_pipe8_step(const lrt_tri_scene *s, tri_pipe8_state *st) {
+    while (st->sp > 0) {
+        tri_stack_entry e = st->stack[--st->sp];
+        if (e.tnear >= st->best_t) continue;
+        if (TRI_REF_IS_LEAF(e.ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(e.ref);
+            uint32_t nblk = TRI_REF_NBLOCKS(e.ref);
+            const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
+            for (uint32_t b = 0; b < nblk; b++) {
+                tri_block_isect_avx(&blocks[blk0 + b], &st->ac, &st->best_t,
+                                    &st->best_u, &st->best_v, &st->best_prim);
+            }
+            return 1;
+        }
+
+        _Alignas(32) float tnear[8];
+        const uint32_t *child;
+        int mask;
+        if (s->quantized) {
+            const lrt_bvh8q_node *n = &s->nodes8q[TRI_REF_NODE(e.ref)];
+            mask = tri_bvh8q_slab_avx(n, &st->rc, st->ac.tmin,
+                                      _mm256_set1_ps(st->best_t), tnear);
+            mask &= (1 << n->nchildren) - 1;
+            child = n->child;
+        } else {
+            const lrt_bvh8_node *n = &s->nodes8[TRI_REF_NODE(e.ref)];
+            mask = tri_bvh8_slab_avx(n, &st->ac, _mm256_set1_ps(st->best_t),
+                                     tnear);
+            mask &= (1 << n->nchildren) - 1;
+            child = n->child;
+        }
+        uint32_t hit_ref[8];
+        float hit_tn[8];
+        int nhit = 0;
+        while (mask) {
+            int i = __builtin_ctz((unsigned)mask);
+            mask &= mask - 1;
+            tri_prefetch_ref(s, child[i], 8);
+            int j = nhit++;
+            while (j > 0 && hit_tn[j - 1] > tnear[i]) {
+                hit_tn[j] = hit_tn[j - 1];
+                hit_ref[j] = hit_ref[j - 1];
+                j--;
+            }
+            hit_tn[j] = tnear[i];
+            hit_ref[j] = child[i];
+        }
+        for (int i = nhit - 1; i >= 0; i--) {
+            st->stack[st->sp].ref = hit_ref[i];
+            st->stack[st->sp].tnear = hit_tn[i];
+            st->sp++;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static inline void tri_pipe8_finish(tri_pipe8_state *st) {
+    st->hit->t = st->best_prim != LRT_TRI_NO_HIT ? st->best_t : 0.0f;
+    st->hit->u = st->best_u;
+    st->hit->v = st->best_v;
+    st->hit->prim_id = st->best_prim;
+}
+
+static void tri_intersect1N_bvh8_avx2(const lrt_tri_scene *s,
+                                      const lrt_ray *rays, lrt_hit *hits,
+                                      size_t n) {
+    if (n < TRI_PIPE_WIDTH8 * 2u) {
+        for (size_t i = 0; i < n; i++) {
+            if (s->quantized) {
+                tri_intersect_bvh8q_avx2(s, &rays[i], &hits[i]);
+            } else {
+                tri_intersect_bvh8_avx2(s, &rays[i], &hits[i]);
+            }
+        }
+        return;
+    }
+    tri_pipe8_state st[TRI_PIPE_WIDTH8];
+    size_t next = 0;
+    unsigned alive = 0;
+    for (int k = 0; k < TRI_PIPE_WIDTH8; k++) {
+        tri_pipe8_init(s, &st[k], &rays[next], &hits[next]);
+        next++;
+        alive |= 1u << k;
+    }
+    while (alive) {
+        for (int k = 0; k < TRI_PIPE_WIDTH8; k++) {
+            if (!(alive & (1u << k))) continue;
+            if (!tri_pipe8_step(s, &st[k])) {
+                tri_pipe8_finish(&st[k]);
+                if (next < n) {
+                    tri_pipe8_init(s, &st[k], &rays[next], &hits[next]);
+                    next++;
+                } else {
+                    alive &= ~(1u << k);
+                }
+            }
+        }
+    }
+}
+
+/* Pipelined any-hit for the 8-wide layouts. */
+typedef struct tri_pipeocc8_state {
+    tri_ray_ctx rc;
+    tri_avx_ctx ac;
+    __m256 tmax8;
+    uint8_t *out;
+    int sp;
+    uint32_t stack[TRI_STACK_SIZE];
+} tri_pipeocc8_state;
+
+static inline void tri_pipeocc8_init(const lrt_tri_scene *s,
+                                     tri_pipeocc8_state *st,
+                                     const lrt_ray *ray, uint8_t *out) {
+    tri_ray_setup(ray, &st->rc);
+    tri_avx_setup(&st->rc, &st->ac);
+    st->tmax8 = _mm256_set1_ps(ray->tmax);
+    st->out = out;
+    st->stack[0] = s->root;
+    st->sp = 1;
+}
+
+static inline int tri_pipeocc8_step(const lrt_tri_scene *s,
+                                    tri_pipeocc8_state *st) {
+    if (st->sp <= 0) {
+        *st->out = 0;
+        return 0;
+    }
+    uint32_t ref = st->stack[--st->sp];
+    if (TRI_REF_IS_LEAF(ref)) {
+        uint32_t blk0 = TRI_REF_BLOCK(ref);
+        uint32_t nblk = TRI_REF_NBLOCKS(ref);
+        const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
+        for (uint32_t b = 0; b < nblk; b++) {
+            if (tri_block_occluded_avx(&blocks[blk0 + b], &st->ac, st->tmax8)) {
+                *st->out = 1;
+                return 0;
+            }
+        }
+        return 1;
+    }
+    _Alignas(32) float tnear[8];
+    const uint32_t *child;
+    int mask;
+    if (s->quantized) {
+        const lrt_bvh8q_node *n = &s->nodes8q[TRI_REF_NODE(ref)];
+        mask = tri_bvh8q_slab_avx(n, &st->rc, st->ac.tmin, st->tmax8, tnear);
+        mask &= (1 << n->nchildren) - 1;
+        child = n->child;
+    } else {
+        const lrt_bvh8_node *n = &s->nodes8[TRI_REF_NODE(ref)];
+        mask = tri_bvh8_slab_avx(n, &st->ac, st->tmax8, tnear);
+        mask &= (1 << n->nchildren) - 1;
+        child = n->child;
+    }
+    while (mask) {
+        int i = __builtin_ctz((unsigned)mask);
+        mask &= mask - 1;
+        tri_prefetch_ref(s, child[i], 8);
+        st->stack[st->sp++] = child[i];
+    }
+    return 1;
+}
+
+static void tri_occluded1N_bvh8_avx2(const lrt_tri_scene *s,
+                                     const lrt_ray *rays, uint8_t *occluded,
+                                     size_t n) {
+    if (n < TRI_PIPE_WIDTH8 * 2u) {
+        for (size_t i = 0; i < n; i++) {
+            occluded[i] = (uint8_t)(s->quantized
+                                        ? tri_occluded_bvh8q_avx2(s, &rays[i])
+                                        : tri_occluded_bvh8_avx2(s, &rays[i]));
+        }
+        return;
+    }
+    tri_pipeocc8_state st[TRI_PIPE_WIDTH8];
+    size_t next = 0;
+    unsigned alive = 0;
+    for (int k = 0; k < TRI_PIPE_WIDTH8; k++) {
+        tri_pipeocc8_init(s, &st[k], &rays[next], &occluded[next]);
+        next++;
+        alive |= 1u << k;
+    }
+    while (alive) {
+        for (int k = 0; k < TRI_PIPE_WIDTH8; k++) {
+            if (!(alive & (1u << k))) continue;
+            if (!tri_pipeocc8_step(s, &st[k])) {
+                if (next < n) {
+                    tri_pipeocc8_init(s, &st[k], &rays[next], &occluded[next]);
+                    next++;
+                } else {
+                    alive &= ~(1u << k);
+                }
+            }
+        }
+    }
+}
+
 #endif /* LRT_TRI_HAS_AVX2 */
 
 /* ------------------------------------------------------------------------- */
@@ -2908,9 +3139,16 @@ int lrt_tri_occluded1(const lrt_tri_scene *s, const lrt_ray *ray) {
 void lrt_tri_intersect1N(const lrt_tri_scene *s, const lrt_ray *rays,
                          lrt_hit *hits, size_t n, lrt_tri_batch_hint hint) {
     if (!s || !rays || !hits) return;
-#if LRT_TRI_HAS_SSE4
+    (void)hint; /* unused in scalar-only builds */
     /* Interleaved traversal pays off only when rays diverge (cache-cold
      * nodes); coherent batches run the plain per-ray kernel. */
+#if LRT_TRI_HAS_AVX2
+    if (s->layout == 8 && hint != LRT_TRI_BATCH_COHERENT) {
+        tri_intersect1N_bvh8_avx2(s, rays, hits, n);
+        return;
+    }
+#endif
+#if LRT_TRI_HAS_SSE4
     if (s->layout == 4 && hint != LRT_TRI_BATCH_COHERENT) {
         tri_intersect1N_bvh4_sse(s, rays, hits, n);
         return;
@@ -2927,6 +3165,13 @@ void lrt_tri_intersect1N(const lrt_tri_scene *s, const lrt_ray *rays,
 void lrt_tri_occluded1N(const lrt_tri_scene *s, const lrt_ray *rays,
                         uint8_t *occluded, size_t n, lrt_tri_batch_hint hint) {
     if (!s || !rays || !occluded) return;
+    (void)hint; /* unused in scalar-only builds */
+#if LRT_TRI_HAS_AVX2
+    if (s->layout == 8 && hint != LRT_TRI_BATCH_COHERENT) {
+        tri_occluded1N_bvh8_avx2(s, rays, occluded, n);
+        return;
+    }
+#endif
 #if LRT_TRI_HAS_SSE4
     if (s->layout == 4 && hint != LRT_TRI_BATCH_COHERENT) {
         tri_occluded1N_bvh4_sse(s, rays, occluded, n);
