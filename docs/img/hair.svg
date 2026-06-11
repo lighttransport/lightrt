@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="420" font-family="sans-serif" font-size="12">
+<rect width="860" height="420" fill="white"/>
+<text x="430.0" y="22" text-anchor="middle" font-size="15" font-weight="bold">Hair scene: 100k thin diagonal hairs — primary rays (Mrays/s, log scale)</text>
+<line x1="70" y1="356.0" x2="840" y2="356.0" stroke="#e3e3e3"/>
+<text x="64" y="360.0" text-anchor="end" fill="#555">0.001</text>
+<line x1="70" y1="253.3" x2="840" y2="253.3" stroke="#e3e3e3"/>
+<text x="64" y="257.3" text-anchor="end" fill="#555">0.01</text>
+<line x1="70" y1="150.7" x2="840" y2="150.7" stroke="#e3e3e3"/>
+<text x="64" y="154.7" text-anchor="end" fill="#555">0.1</text>
+<line x1="70" y1="48.0" x2="840" y2="48.0" stroke="#e3e3e3"/>
+<text x="64" y="52.0" text-anchor="end" fill="#555">1</text>
+<text x="16" y="202.0" text-anchor="middle" fill="#333" transform="rotate(-90 16 202.0)">Mrays/s (log)</text>
+<text x="166.2" y="374" text-anchor="middle" fill="#333">embree (tris)</text>
+<rect x="89.2" y="276.1" width="141.7" height="79.9" fill="#e0a800"/>
+<text x="160.1" y="272.1" text-anchor="middle" font-size="10" fill="#333">0.006</text>
+<text x="358.8" y="374" text-anchor="middle" fill="#333">c11-bvh4 (tris)</text>
+<rect x="281.8" y="249.1" width="141.7" height="106.9" fill="#e0a800"/>
+<text x="352.6" y="245.1" text-anchor="middle" font-size="10" fill="#333">0.011</text>
+<text x="551.2" y="374" text-anchor="middle" fill="#333">c11-sbvh4 (tris)</text>
+<rect x="474.2" y="229.7" width="141.7" height="126.3" fill="#e0a800"/>
+<text x="545.1" y="225.7" text-anchor="middle" font-size="10" fill="#333">0.017</text>
+<text x="743.8" y="374" text-anchor="middle" fill="#333">c11-hair (capsules)</text>
+<rect x="666.8" y="108.2" width="141.7" height="247.8" fill="#e0a800"/>
+<text x="737.6" y="104.2" text-anchor="middle" font-size="10" fill="#333">0.259</text>
+<rect x="70" y="394" width="12" height="12" fill="#e0a800"/>
+<text x="86" y="404" fill="#333">throughput</text>
+</svg>
