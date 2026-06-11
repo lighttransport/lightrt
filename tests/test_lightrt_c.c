@@ -469,11 +469,25 @@ int main(void) {
             fprintf(stderr, "bad scene set_options failed\n");
             return 1;
         }
-        if (lrt_scene_build(bad_scene) ||
-            lrt_scene_last_result(bad_scene) != LRT_RESULT_BUILD_LIMIT) {
-            fprintf(stderr, "oversized leaf build limit was not reported: %s\n",
+        /* Coincident primitives admit no SAH split; the builder must fall
+         * back to an oversized leaf and still answer queries (it used to
+         * fail the whole build with LRT_RESULT_BUILD_LIMIT here). */
+        if (!lrt_scene_build(bad_scene) ||
+            lrt_scene_last_result(bad_scene) != LRT_RESULT_OK) {
+            fprintf(stderr, "coincident prims did not build as oversized leaf: %s\n",
                     lrt_scene_last_error(bad_scene));
             return 1;
+        }
+        {
+            double org[3] = {0.0, 0.0, -5.0};
+            double dir[3] = {0.0, 0.0, 1.0};
+            double t = 0.0;
+            unsigned hit = lrt_scene_intersect(bad_scene, org, dir, 0.0, 100.0,
+                                               &t, NULL, NULL);
+            if (hit == LRT_NO_HIT || t <= 0.0) {
+                fprintf(stderr, "oversized-leaf scene missed a hit\n");
+                return 1;
+            }
         }
         lrt_scene_free(bad_scene);
     }
@@ -499,16 +513,16 @@ int main(void) {
                             SYNTH_POINT_LEAF, &options, 1, LRT_RESULT_OK)) {
         return 1;
     }
-    if (!run_synthetic_case("degenerate point line reports build limit", 8,
-                            SYNTH_POINT_LINE, &options, 0, LRT_RESULT_BUILD_LIMIT)) {
+    if (!run_synthetic_case("degenerate point line builds oversized leaf", 8,
+                            SYNTH_POINT_LINE, &options, 1, LRT_RESULT_OK)) {
         return 1;
     }
-    if (!run_synthetic_case("all vertices same position reports build limit", 8,
-                            SYNTH_SAME_POINT, &options, 0, LRT_RESULT_BUILD_LIMIT)) {
+    if (!run_synthetic_case("all vertices same position builds oversized leaf", 8,
+                            SYNTH_SAME_POINT, &options, 1, LRT_RESULT_OK)) {
         return 1;
     }
-    if (!run_synthetic_case("duplicate-index equivalent reports build limit", 8,
-                            SYNTH_SAME_BOX, &options, 0, LRT_RESULT_BUILD_LIMIT)) {
+    if (!run_synthetic_case("duplicate-index equivalent builds oversized leaf", 8,
+                            SYNTH_SAME_BOX, &options, 1, LRT_RESULT_OK)) {
         return 1;
     }
     if (!run_synthetic_case("coplanar finite grid accepted", 16,

@@ -362,12 +362,13 @@ static uint32_t lrt_build_recursive(lrt_build_ctx *c, uint32_t *indices,
         }
     }
 
-    /* If splitting is not worthwhile, make a leaf. */
+    /* If splitting is not worthwhile (or impossible: e.g. all centroids
+     * coincide), make an oversized leaf rather than failing the build.
+     * Traversal handles any leaf size; prim_indices has room for exactly
+     * nprims entries across all leaves. */
     float leaf_cost = LRT_INTERSECTION_COST * (float)num;
     if (best_cost >= leaf_cost) {
-        lrt_set_result(s, LRT_RESULT_BUILD_LIMIT,
-                       "BVH split failed before satisfying max leaf size");
-        return LRT_INVALID_NODE;
+        return lrt_make_leaf(s, node_idx, indices, num);
     }
 
     /* Partition indices around best_pos on best_axis. */

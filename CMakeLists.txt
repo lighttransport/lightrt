@@ -149,7 +149,28 @@ add_library(lightrt STATIC
     lightrt.hh
     ${LIGHTRT_C_BINDING_SRC}
     lightrt_c.h
+    lightrt_c_tri.c
+    lightrt_c_tri.h
 )
+
+# SIMD flags above are CXX-only; the C11 triangle BVH needs its own C flags or
+# it silently builds scalar kernels (lrt_tri_kernel_name() reports which).
+include(CheckCCompilerFlag)
+set(LIGHTRT_C_TRI_SIMD_FLAGS "")
+if(NOT MSVC)
+    check_c_compiler_flag("-msse4.1" C_COMPILER_SUPPORTS_SSE41)
+    if(C_COMPILER_SUPPORTS_SSE41)
+        list(APPEND LIGHTRT_C_TRI_SIMD_FLAGS -msse4.1)
+    endif()
+    check_c_compiler_flag("-mavx2" C_COMPILER_SUPPORTS_AVX2)
+    if(C_COMPILER_SUPPORTS_AVX2)
+        list(APPEND LIGHTRT_C_TRI_SIMD_FLAGS -mavx2 -mfma)
+    endif()
+endif()
+if(LIGHTRT_C_TRI_SIMD_FLAGS)
+    set_source_files_properties(lightrt_c_tri.c PROPERTIES
+        COMPILE_OPTIONS "${LIGHTRT_C_TRI_SIMD_FLAGS}")
+endif()
 
 target_include_directories(lightrt PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -180,6 +201,20 @@ if(BUILD_TESTING)
         target_link_libraries(lightrt_c_test m)
     endif()
     add_test(NAME lightrt_c_test COMMAND lightrt_c_test)
+
+    # fp32 triangle BVH self-test (pure C11, SIMD kernels when available)
+    add_executable(lightrt_c_tri_test lightrt_c_tri.c tests/test_lightrt_c_tri.c)
+    if(LIGHTRT_C_TRI_SIMD_FLAGS)
+        target_compile_options(lightrt_c_tri_test PRIVATE ${LIGHTRT_C_TRI_SIMD_FLAGS})
+    endif()
+    find_package(Threads QUIET)
+    if(Threads_FOUND)
+        target_link_libraries(lightrt_c_tri_test Threads::Threads)
+    endif()
+    if(NOT MSVC)
+        target_link_libraries(lightrt_c_tri_test m)
+    endif()
+    add_test(NAME lightrt_c_tri_test COMMAND lightrt_c_tri_test)
 endif()
 
 if(LIGHTRT_BUILD_FUZZERS)
@@ -219,9 +254,15 @@ install(TARGETS lightrt
     LIBRARY DESTINATION lib
 )
 
-install(FILES lightrt.hh lightrt_c.h
+install(FILES lightrt.hh lightrt_c.h lightrt_c_tri.h
     DESTINATION include
 )
+
+# Standalone C11 benchmark vs Embree (benchmark_c/README.md)
+option(LIGHTRT_BUILD_BENCHMARK_C "Build the C11 lightrt-vs-Embree benchmark" OFF)
+if(LIGHTRT_BUILD_BENCHMARK_C)
+    add_subdirectory(benchmark_c)
+endif()
 
 # Print configuration summary
 message(STATUS "")
