@@ -160,8 +160,25 @@ plain BVH4 is the best layout); 16-thread incoherent 17.8 → 20-22 (1.1-1.3x
 Embree, same-run). Coherent batches (primary rays, surface-to-light shadow
 rays) run the plain per-ray kernel — pipelining costs ~20% there because the
 working set is already cache-resident; the benchmark passes the matching hint
-per workload. The remaining Embree leads are single-thread shadow (0.75x)
-and primary (parity at 128k, 0.85x at 710k).
+per workload.
+
+### Octant-ordered coherent traversal
+
+BVH4 nodes store a per-octant child permutation (8 octants x 4 slots x 2
+bits, packed into previously padding bytes) computed at collapse from child
+centers. The coherent closest-hit kernel iterates it instead of insertion-
+sorting child tnear values per node: primary rays gained ~20% (22.6 vs
+Embree's 20.5 Mrays/s at 128k tris, parity at 710k). Three variants were
+measured and rejected: octant order in the *incoherent* pipeline loses to
+exact tnear sorting (the sort hides behind cache misses and tighter order
+saves node visits), and for any-hit both ordered pushes and eager-leaf
+processing lose to plain unordered pushes.
+
+The one remaining single-thread Embree lead is shadow/any-hit (~0.75x).
+Profiling shows no kernel hotspot (work is spread across node tests and leaf
+loads), small leaves and push ordering don't help, so the difference is
+work-count: Embree's spatial-split (SBVH) builder produces a tighter tree
+for short bounded rays. A spatial-split build mode would be the next step.
 
 ## Notes
 

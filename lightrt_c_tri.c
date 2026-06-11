@@ -80,13 +80,17 @@
 /* Data structures.                                                          */
 /* ------------------------------------------------------------------------- */
 
-/* 4-wide node: SoA child bounds, 128 bytes = 2 cache lines. */
+/* 4-wide node: SoA child bounds, 128 bytes = 2 cache lines.
+ * perm[octant] packs an approximate front-to-back slot order (2 bits per
+ * position, nearest first) for rays whose direction-sign octant is `octant`;
+ * traversal iterates it instead of sorting child tnear values per node. */
 typedef struct lrt_bvh4_node {
     float lo_x[4], lo_y[4], lo_z[4];
     float hi_x[4], hi_y[4], hi_z[4];
     uint32_t child[4]; /* child refs; empty slots: 0 with inverted bounds */
     uint32_t nchildren;
-    uint32_t _pad[3];
+    uint8_t perm[8]; /* perm[octant]: slot at position p = (perm >> 2p) & 3 */
+    uint32_t _pad;
 } lrt_bvh4_node;
 
 /* 8-wide node: 256 bytes = 4 cache lines. */
@@ -1384,6 +1388,35 @@ static uint32_t tri_collapse(tri_collapse_ctx *cc, uint32_t b_idx,
                           s->nodes4[node_idx].hi_z, s->nodes4[node_idx].child,
                           i);
         }
+        /* Per-octant approximate front-to-back slot order: sort children by
+         * their center projected onto the octant's direction signs. */
+        w = &s->nodes4[node_idx];
+        for (int oct = 0; oct < 8; oct++) {
+            float key[4];
+            uint8_t order[4];
+            for (int i = 0; i < n; i++) {
+                float cx = 0.5f * (w->lo_x[i] + w->hi_x[i]);
+                float cy = 0.5f * (w->lo_y[i] + w->hi_y[i]);
+                float cz = 0.5f * (w->lo_z[i] + w->hi_z[i]);
+                key[i] = (oct & 1 ? -cx : cx) + (oct & 2 ? -cy : cy) +
+                         (oct & 4 ? -cz : cz);
+                order[i] = (uint8_t)i;
+            }
+            for (int i = 1; i < n; i++) { /* nearest first */
+                uint8_t oi = order[i];
+                float ki = key[oi];
+                int j = i;
+                while (j > 0 && key[order[j - 1]] > ki) {
+                    order[j] = order[j - 1];
+                    j--;
+                }
+                order[j] = oi;
+            }
+            uint8_t p = 0;
+            for (int i = 0; i < n; i++) p |= (uint8_t)(order[i] << (2 * i));
+            for (int i = n; i < 4; i++) p |= (uint8_t)(i << (2 * i));
+            w->perm[oct] = p;
+        }
     } else if (cc->quantized) {
         lrt_bvh8q_node *w = &s->nodes8q[node_idx];
         memset(w, 0, sizeof(*w));
@@ -1440,8 +1473,9 @@ static uint32_t tri_collapse(tri_collapse_ctx *cc, uint32_t b_idx,
 typedef struct tri_ray_ctx {
     float org[3];
     float dir[3];
-    float invd[3]; /* infinite components replaced by +/-FLT_MAX */
+    float invd[3]; /* infinite components replaced by clamped huge values */
     float tmin;
+    int octant; /* direction sign bits: 1=x neg, 2=y neg, 4=z neg */
 } tri_ray_ctx;
 
 /* Degenerate direction components get a finite huge inverse instead of inf.
@@ -1460,6 +1494,8 @@ static inline void tri_ray_setup(const lrt_ray *ray, tri_ray_ctx *rc) {
         }
         rc->invd[k] = inv;
     }
+    rc->octant = (rc->invd[0] < 0.0f ? 1 : 0) | (rc->invd[1] < 0.0f ? 2 : 0) |
+                 (rc->invd[2] < 0.0f ? 4 : 0);
     rc->tmin = ray->tmin;
 }
 
@@ -1935,26 +1971,15 @@ static int tri_intersect_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray,
         _Alignas(16) float tnear[4];
         int mask = tri_bvh4_slab_sse(n, &sc, _mm_set1_ps(best_t), tnear);
         mask &= (1 << n->nchildren) - 1;
-        /* Push hit children sorted far-to-near (insertion over <=4). */
-        uint32_t hit_ref[4];
-        float hit_tn[4];
-        int nhit = 0;
-        while (mask) {
-            int i = __builtin_ctz((unsigned)mask);
-            mask &= mask - 1;
-            tri_prefetch_ref(s, n->child[i], 4);
-            int j = nhit++;
-            while (j > 0 && hit_tn[j - 1] > tnear[i]) {
-                hit_tn[j] = hit_tn[j - 1];
-                hit_ref[j] = hit_ref[j - 1];
-                j--;
-            }
-            hit_tn[j] = tnear[i];
-            hit_ref[j] = n->child[i];
-        }
-        for (int i = nhit - 1; i >= 0; i--) {
-            stack[sp].ref = hit_ref[i];
-            stack[sp].tnear = hit_tn[i];
+        /* Push far-to-near following the precomputed octant order (no
+         * per-node sort; the nearest child ends on top of the stack). */
+        uint8_t perm = n->perm[rc.octant];
+        for (int p = 3; p >= 0; p--) {
+            int slot = (perm >> (2 * p)) & 3;
+            if (!(mask & (1 << slot))) continue;
+            tri_prefetch_ref(s, n->child[slot], 4);
+            stack[sp].ref = n->child[slot];
+            stack[sp].tnear = tnear[slot];
             sp++;
         }
     }
@@ -1996,6 +2021,8 @@ static int tri_occluded_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray) {
         _Alignas(16) float tnear[4];
         int mask = tri_bvh4_slab_sse(n, &sc, tmax4, tnear);
         mask &= (1 << n->nchildren) - 1;
+        /* Unordered pushes: measured faster for any-hit than tnear-sorted,
+         * octant-ordered, and eager-leaf variants on this workload. */
         while (mask) {
             int i = __builtin_ctz((unsigned)mask);
             mask &= mask - 1;
@@ -2065,6 +2092,10 @@ static inline int tri_pipe4_step(const lrt_tri_scene *s, tri_pipe4_state *st) {
         _Alignas(16) float tnear[4];
         int mask = tri_bvh4_slab_sse(n, &st->sc, _mm_set1_ps(st->best_t), tnear);
         mask &= (1 << n->nchildren) - 1;
+        /* Exact tnear ordering: when latency-bound, the insertion sort hides
+         * behind cache misses and the tighter order saves whole node visits
+         * (measured better than the octant table here, unlike the coherent
+         * single-ray kernel). */
         uint32_t hit_ref[4];
         float hit_tn[4];
         int nhit = 0;
