@@ -174,11 +174,20 @@ exact tnear sorting (the sort hides behind cache misses and tighter order
 saves node visits), and for any-hit both ordered pushes and eager-leaf
 processing lose to plain unordered pushes.
 
-The one remaining single-thread Embree lead is shadow/any-hit (~0.75x).
-Profiling shows no kernel hotspot (work is spread across node tests and leaf
-loads), small leaves and push ordering don't help, so the difference is
-work-count: Embree's spatial-split (SBVH) builder produces a tighter tree
-for short bounded rays. A spatial-split build mode would be the next step.
+### Spatial splits (`c11-sbvh4`, `LRT_TRI_BUILD_HQ`)
+
+`LRT_TRI_BUILD_HQ` is an SBVH build (Stich et al. 2009): binned object SAH
+plus alpha-gated spatial splits over 32 bins, with straddling references
+duplicated into both children under plane-clipped bounds (extended-range
+allocation, object-split fallback when a range's slack runs out). It is
+correct and verified, and helps overlapping geometry (the co-planar test
+scene improves), but on the mandelbulb it is a no-op: marching-cubes
+triangles are tiny and uniform, so fewer than 1% of references get split
+(memory 6.67 vs 6.62 MB) and shadow/primary throughput is unchanged. This
+*rules out* tree quality as the cause of the remaining single-thread
+shadow/any-hit gap (~0.75x Embree) on this scene; what remains is Embree's
+any-hit kernel itself (profiling on our side shows no hotspot — work is
+evenly spread across node tests and leaf loads).
 
 ## Notes
 

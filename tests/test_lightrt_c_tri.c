@@ -330,6 +330,10 @@ int main(void) {
                         LRT_TRI_BUILD_FAST, 4000);
     test_vs_brute_force("medium/bvh8q/sah", med, 5000, LRT_TRI_LAYOUT_BVH8Q,
                         LRT_TRI_BUILD_DEFAULT, 4000);
+    test_vs_brute_force("medium/bvh4/hq", med, 5000, LRT_TRI_LAYOUT_BVH4,
+                        LRT_TRI_BUILD_HQ, 4000);
+    test_vs_brute_force("medium/bvh8/hq", med, 5000, LRT_TRI_LAYOUT_BVH8,
+                        LRT_TRI_BUILD_HQ, 4000);
     test_vs_brute_force("medium/bvh8q/fast", med, 5000, LRT_TRI_LAYOUT_BVH8Q,
                         LRT_TRI_BUILD_FAST, 4000);
     test_layouts_agree(med, 5000, 50000);
@@ -359,6 +363,8 @@ int main(void) {
                         LRT_TRI_BUILD_DEFAULT, 4000);
     test_vs_brute_force("coplanar/bvh8q/sah", flat, 2000, LRT_TRI_LAYOUT_BVH8Q,
                         LRT_TRI_BUILD_DEFAULT, 4000);
+    test_vs_brute_force("coplanar/bvh4/hq", flat, 2000, LRT_TRI_LAYOUT_BVH4,
+                        LRT_TRI_BUILD_HQ, 4000);
     free(flat);
 
     if (g_failures == 0) {

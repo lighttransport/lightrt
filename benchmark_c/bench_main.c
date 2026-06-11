@@ -49,7 +49,8 @@ static void usage(const char *argv0) {
             "  --power N              mandelbulb power (default 8)\n"
             "  --backend LIST         all | comma list of: c11-cb,c11-bvh4,c11-bvh8,\n"
             "                         c11-lbvh4,c11-lbvh8 (Morton fast build),\n"
-            "                         c11-bvh8q (quantized nodes), embree, tinybvh, mm-bvh\n"
+            "                         c11-bvh8q (quantized nodes), c11-sbvh4 (spatial\n"
+            "                         splits), embree, tinybvh, mm-bvh\n"
             "  --rays LIST            all | comma list of: primary,incoherent,shadow\n"
             "  --nrays N              rays per workload (default 4000000)\n"
             "  --threads N            worker threads (default 1)\n"
@@ -267,6 +268,7 @@ int main(int argc, char **argv) {
             {"c11-lbvh4", backend_lightrt_lbvh4},
             {"c11-lbvh8", backend_lightrt_lbvh8},
             {"c11-bvh8q", backend_lightrt_bvh8q},
+            {"c11-sbvh4", backend_lightrt_sbvh4},
             {"embree", backend_embree},
             {"tinybvh", backend_tinybvh},
             {"mm-bvh", backend_madmann},

@@ -1220,6 +1220,432 @@ static uint32_t tri_build_lbvh(tri_build_ctx *c, unsigned num_threads) {
     return tri_lbvh_range(c, 0, (uint32_t)c->ntris, lo, hi);
 }
 
+/* ---- SBVH (spatial splits) build ------------------------------------------
+ *
+ * LRT_TRI_BUILD_HQ: binned object SAH plus spatial splits (Stich et al.,
+ * HPG 2009). A primitive reference straddling a chosen split plane is
+ * duplicated into both children with plane-clipped bounds, removing the
+ * child-box overlap that costs short (shadow) rays the most. References are
+ * AABB-clipped; leaves store original prim ids, so a triangle may simply be
+ * tested by more than one leaf — no other correctness impact.
+ *
+ * Ranges live in a shared refs array with slack distributed proportionally
+ * to the children (extended ranges), so duplication never reallocates; when
+ * a range's slack is exhausted the node falls back to an object split.
+ */
+#define TRI_SBVH_SPATIAL_BINS 32u
+#define TRI_SBVH_ALPHA 1e-5f    /* overlap/root-area gate for spatial split */
+#define TRI_SBVH_SPLIT_FACTOR 2 /* refs capacity = factor * ntris */
+
+typedef struct tri_pref {
+    float lo[3], hi[3];
+    uint32_t prim;
+    uint32_t _pad;
+} tri_pref; /* 32 bytes */
+
+typedef struct tri_sbvh_ctx {
+    tri_pref *refs;    /* cap slots, ranges with slack */
+    tri_pref *scratch; /* cap slots, spatial-split staging */
+    uint32_t cap;
+    tri_bnode *bnodes;
+    uint32_t node_next, node_end;
+    uint32_t max_leaf;
+    uint32_t block_shift;
+    float root_area;
+    uint32_t emit_total; /* sum of leaf reference counts */
+    int failed;
+} tri_sbvh_ctx;
+
+static uint32_t tri_sbvh_make_leaf(tri_sbvh_ctx *c, uint32_t node_idx,
+                                   uint32_t first, uint32_t num,
+                                   const float nlo[3], const float nhi[3]) {
+    tri_bnode *node = &c->bnodes[node_idx];
+    for (int a = 0; a < 3; a++) {
+        node->lo[a] = nlo[a];
+        node->hi[a] = nhi[a];
+    }
+    node->a = first;
+    node->b = 0;
+    node->count = num;
+    c->emit_total += num;
+    return node_idx;
+}
+
+static uint32_t tri_sbvh_recursive(tri_sbvh_ctx *c, uint32_t first,
+                                   uint32_t num, uint32_t avail,
+                                   uint32_t depth) {
+    if (c->failed) return 0;
+    if (c->node_next >= c->node_end) {
+        c->failed = 1;
+        return 0;
+    }
+
+    tri_pref *refs = c->refs;
+
+    /* Node + centroid bounds. */
+    float nlo[3], nhi[3], clo[3], chi[3];
+    tri_box_reset(nlo, nhi);
+    tri_box_reset(clo, chi);
+    for (uint32_t i = 0; i < num; i++) {
+        const tri_pref *r = &refs[first + i];
+        tri_box_expand(nlo, nhi, r->lo, r->hi);
+        for (int a = 0; a < 3; a++) {
+            float ce = 0.5f * (r->lo[a] + r->hi[a]);
+            clo[a] = tri_minf(clo[a], ce);
+            chi[a] = tri_maxf(chi[a], ce);
+        }
+    }
+
+    uint32_t node_idx = c->node_next++;
+    uint32_t block_width = 1u << c->block_shift;
+    uint32_t always_leaf = c->max_leaf < block_width ? c->max_leaf : block_width;
+    if (num <= always_leaf) {
+        return tri_sbvh_make_leaf(c, node_idx, first, num, nlo, nhi);
+    }
+
+    float parent_area = tri_surface_area(nlo, nhi);
+    if (parent_area <= 0.0f) parent_area = 1.0f;
+
+    /* --- Binned object split (all 3 axes, one pass). --- */
+    int obj_axis = -1;
+    float obj_pos = 0.0f;
+    float obj_cost = TRI_INF_F;
+    float obj_llo[3], obj_lhi[3], obj_rlo[3], obj_rhi[3]; /* overlap gate */
+    int best_bin = -1;
+    int use_median = depth >= TRI_MEDIAN_DEPTH;
+
+    if (!use_median) {
+        tri_bin bins[3][TRI_NUM_BINS];
+        float amin[3], ascale[3];
+        int axis_ok[3];
+        for (int a = 0; a < 3; a++) {
+            amin[a] = clo[a];
+            float ext = chi[a] - clo[a];
+            axis_ok[a] = ext > 1e-6f;
+            ascale[a] = axis_ok[a] ? (float)TRI_NUM_BINS / ext : 0.0f;
+            for (uint32_t b = 0; b < TRI_NUM_BINS; b++) {
+                tri_box_reset(bins[a][b].lo, bins[a][b].hi);
+                bins[a][b].count = 0;
+            }
+        }
+        for (uint32_t i = 0; i < num; i++) {
+            const tri_pref *r = &refs[first + i];
+            for (int a = 0; a < 3; a++) {
+                if (!axis_ok[a]) continue;
+                float cen = 0.5f * (r->lo[a] + r->hi[a]);
+                uint32_t b = (uint32_t)((cen - amin[a]) * ascale[a]);
+                if (b >= TRI_NUM_BINS) b = TRI_NUM_BINS - 1;
+                tri_box_expand(bins[a][b].lo, bins[a][b].hi, r->lo, r->hi);
+                bins[a][b].count++;
+            }
+        }
+        for (int a = 0; a < 3; a++) {
+            if (!axis_ok[a]) continue;
+            float left_area[TRI_NUM_BINS];
+            uint32_t left_cnt[TRI_NUM_BINS];
+            float run_lo[3], run_hi[3];
+            uint32_t run = 0;
+            tri_box_reset(run_lo, run_hi);
+            for (uint32_t b = 0; b < TRI_NUM_BINS; b++) {
+                tri_box_expand(run_lo, run_hi, bins[a][b].lo, bins[a][b].hi);
+                run += bins[a][b].count;
+                left_area[b] = tri_surface_area(run_lo, run_hi);
+                left_cnt[b] = run;
+            }
+            tri_box_reset(run_lo, run_hi);
+            run = 0;
+            for (uint32_t b = TRI_NUM_BINS - 1; b > 0; b--) {
+                tri_box_expand(run_lo, run_hi, bins[a][b].lo, bins[a][b].hi);
+                run += bins[a][b].count;
+                uint32_t lc = left_cnt[b - 1];
+                if (lc == 0 || run == 0) continue;
+                float cost = TRI_TRAV_COST +
+                             TRI_ISECT_COST *
+                                 (tri_sah_blocks(lc, c->block_shift) *
+                                      left_area[b - 1] +
+                                  tri_sah_blocks(run, c->block_shift) *
+                                      tri_surface_area(run_lo, run_hi)) /
+                                 parent_area;
+                if (cost < obj_cost) {
+                    obj_cost = cost;
+                    obj_axis = a;
+                    obj_pos = amin[a] + (float)b / ascale[a];
+                    best_bin = (int)b;
+                }
+            }
+        }
+        /* Best object split's child bounds, for the overlap gate. */
+        if (obj_axis >= 0) {
+            tri_box_reset(obj_llo, obj_lhi);
+            tri_box_reset(obj_rlo, obj_rhi);
+            for (uint32_t b = 0; b < TRI_NUM_BINS; b++) {
+                if ((int)b < best_bin) {
+                    tri_box_expand(obj_llo, obj_lhi, bins[obj_axis][b].lo,
+                                   bins[obj_axis][b].hi);
+                } else {
+                    tri_box_expand(obj_rlo, obj_rhi, bins[obj_axis][b].lo,
+                                   bins[obj_axis][b].hi);
+                }
+            }
+        }
+    }
+
+    /* --- Spatial split, gated on object-split child overlap. --- */
+    int sp_axis = -1;
+    float sp_pos = 0.0f;
+    float sp_cost = TRI_INF_F;
+    if (obj_axis >= 0 && avail > num) {
+        float ov_lo[3], ov_hi[3];
+        int overlapping = 1;
+        for (int a = 0; a < 3; a++) {
+            ov_lo[a] = tri_maxf(obj_llo[a], obj_rlo[a]);
+            ov_hi[a] = tri_minf(obj_lhi[a], obj_rhi[a]);
+            if (ov_lo[a] > ov_hi[a]) overlapping = 0;
+        }
+        if (overlapping &&
+            tri_surface_area(ov_lo, ov_hi) / c->root_area > TRI_SBVH_ALPHA) {
+            for (int a = 0; a < 3; a++) {
+                float ext = nhi[a] - nlo[a];
+                if (ext <= 1e-6f) continue;
+                float bin_w = ext / (float)TRI_SBVH_SPATIAL_BINS;
+                float inv_bin_w = (float)TRI_SBVH_SPATIAL_BINS / ext;
+                float blo[TRI_SBVH_SPATIAL_BINS][3], bhi[TRI_SBVH_SPATIAL_BINS][3];
+                uint32_t enter[TRI_SBVH_SPATIAL_BINS], leave[TRI_SBVH_SPATIAL_BINS];
+                for (uint32_t b = 0; b < TRI_SBVH_SPATIAL_BINS; b++) {
+                    tri_box_reset(blo[b], bhi[b]);
+                    enter[b] = leave[b] = 0;
+                }
+                for (uint32_t i = 0; i < num; i++) {
+                    const tri_pref *r = &refs[first + i];
+                    int b0 = (int)((r->lo[a] - nlo[a]) * inv_bin_w);
+                    int b1 = (int)((r->hi[a] - nlo[a]) * inv_bin_w);
+                    if (b0 < 0) b0 = 0;
+                    if (b0 > (int)TRI_SBVH_SPATIAL_BINS - 1)
+                        b0 = (int)TRI_SBVH_SPATIAL_BINS - 1;
+                    if (b1 < b0) b1 = b0;
+                    if (b1 > (int)TRI_SBVH_SPATIAL_BINS - 1)
+                        b1 = (int)TRI_SBVH_SPATIAL_BINS - 1;
+                    enter[b0]++;
+                    leave[b1]++;
+                    for (int b = b0; b <= b1; b++) {
+                        float cl[3], ch[3];
+                        for (int k = 0; k < 3; k++) {
+                            cl[k] = r->lo[k];
+                            ch[k] = r->hi[k];
+                        }
+                        cl[a] = tri_maxf(cl[a], nlo[a] + (float)b * bin_w);
+                        ch[a] = tri_minf(ch[a], nlo[a] + (float)(b + 1) * bin_w);
+                        tri_box_expand(blo[b], bhi[b], cl, ch);
+                    }
+                }
+                float left_area[TRI_SBVH_SPATIAL_BINS];
+                uint32_t left_cnt[TRI_SBVH_SPATIAL_BINS];
+                float run_lo[3], run_hi[3];
+                uint32_t run = 0;
+                tri_box_reset(run_lo, run_hi);
+                for (uint32_t b = 0; b < TRI_SBVH_SPATIAL_BINS; b++) {
+                    tri_box_expand(run_lo, run_hi, blo[b], bhi[b]);
+                    run += enter[b];
+                    left_area[b] = tri_surface_area(run_lo, run_hi);
+                    left_cnt[b] = run;
+                }
+                tri_box_reset(run_lo, run_hi);
+                run = 0;
+                for (uint32_t b = TRI_SBVH_SPATIAL_BINS - 1; b > 0; b--) {
+                    tri_box_expand(run_lo, run_hi, blo[b], bhi[b]);
+                    run += leave[b];
+                    uint32_t lc = left_cnt[b - 1];
+                    if (lc == 0 || run == 0) continue;
+                    float cost = TRI_TRAV_COST +
+                                 TRI_ISECT_COST *
+                                     (tri_sah_blocks(lc, c->block_shift) *
+                                          left_area[b - 1] +
+                                      tri_sah_blocks(run, c->block_shift) *
+                                          tri_surface_area(run_lo, run_hi)) /
+                                     parent_area;
+                    if (cost < sp_cost) {
+                        sp_cost = cost;
+                        sp_axis = a;
+                        sp_pos = nlo[a] + (float)b * bin_w;
+                    }
+                }
+            }
+        }
+    }
+
+    /* --- Leaf if neither split beats testing everything here (the forced
+     * median path below handles oversized degenerate clusters). --- */
+    float leaf_cost = TRI_ISECT_COST * tri_sah_blocks(num, c->block_shift);
+    float best_cost = obj_cost < sp_cost ? obj_cost : sp_cost;
+    if (num <= c->max_leaf &&
+        ((obj_axis < 0 && sp_axis < 0 && !use_median) ||
+         best_cost >= leaf_cost)) {
+        return tri_sbvh_make_leaf(c, node_idx, first, num, nlo, nhi);
+    }
+
+    uint32_t l_first = first, l_num = 0, l_avail = 0;
+    uint32_t r_first = 0, r_num = 0, r_avail = 0;
+    int did_split = 0;
+
+    if (sp_axis >= 0 && sp_cost < obj_cost) {
+        /* Spatial split: classify into scratch (lefts bottom-up, rights
+         * top-down), duplicating straddlers with plane-clipped bounds, then
+         * copy into the slack-extended range. Falls back to the object split
+         * when slack is insufficient or the split degenerates. */
+        tri_pref *sc = c->scratch;
+        uint32_t nl = 0;
+        uint32_t nr_end = avail;
+        int room = 1;
+        for (uint32_t i = 0; i < num; i++) {
+            const tri_pref *r = &refs[first + i];
+            if (nl + (avail - nr_end) + 2 > avail) {
+                room = 0;
+                break;
+            }
+            if (r->hi[sp_axis] <= sp_pos) {
+                sc[nl++] = *r;
+            } else if (r->lo[sp_axis] >= sp_pos) {
+                sc[--nr_end] = *r;
+            } else {
+                tri_pref l = *r, rr = *r;
+                l.hi[sp_axis] = sp_pos;
+                rr.lo[sp_axis] = sp_pos;
+                sc[nl++] = l;
+                sc[--nr_end] = rr;
+            }
+        }
+        uint32_t nr = avail - nr_end;
+        if (room && nl >= 1 && nr >= 1 && (nl < num || nr < num) &&
+            nl + nr <= avail) {
+            uint32_t slack = avail - (nl + nr);
+            l_num = nl;
+            l_avail = nl + (uint32_t)((uint64_t)slack * nl / (nl + nr));
+            r_num = nr;
+            r_avail = avail - l_avail;
+            r_first = first + l_avail;
+            memcpy(refs + first, sc, (size_t)nl * sizeof(tri_pref));
+            memcpy(refs + r_first, sc + nr_end, (size_t)nr * sizeof(tri_pref));
+            did_split = 1;
+        }
+    }
+
+    if (!did_split) {
+        /* Object split (in-place partition by centroid). */
+        int axis;
+        float pos;
+        if (obj_axis >= 0 && !use_median) {
+            axis = obj_axis;
+            pos = obj_pos;
+        } else {
+            axis = tri_longest_axis(clo, chi);
+            pos = 0.5f * (clo[axis] + chi[axis]);
+        }
+        uint32_t mid = 0;
+        for (uint32_t i = 0; i < num; i++) {
+            tri_pref *r = &refs[first + i];
+            if (0.5f * (r->lo[axis] + r->hi[axis]) < pos) {
+                tri_pref tmp = *r;
+                *r = refs[first + mid];
+                refs[first + mid] = tmp;
+                mid++;
+            }
+        }
+        if (mid == 0 || mid == num) mid = num / 2;
+        uint32_t slack = avail - num;
+        l_num = mid;
+        l_avail = mid + (uint32_t)((uint64_t)slack * mid / num);
+        r_num = num - mid;
+        r_avail = avail - l_avail;
+        r_first = first + l_avail;
+        memmove(refs + r_first, refs + first + mid,
+                (size_t)r_num * sizeof(tri_pref));
+    }
+
+    uint32_t left = tri_sbvh_recursive(c, l_first, l_num, l_avail, depth + 1);
+    uint32_t right = tri_sbvh_recursive(c, r_first, r_num, r_avail, depth + 1);
+    if (c->failed) return 0;
+
+    tri_bnode *node = &c->bnodes[node_idx];
+    for (int a = 0; a < 3; a++) {
+        node->lo[a] = nlo[a];
+        node->hi[a] = nhi[a];
+    }
+    node->a = left;
+    node->b = right;
+    node->count = 0;
+    return node_idx;
+}
+
+/* Build the binary SBVH; rewrites bc->indices so binary leaves reference the
+ * (possibly duplicated) prim ids, and reports the leaf-reference total for
+ * sizing the collapse outputs. Returns the root index or fails via
+ * bc->failed. */
+static uint32_t tri_build_sbvh(tri_build_ctx *bc, uint32_t *emit_total) {
+    size_t ntris = bc->ntris;
+    uint32_t cap = (uint32_t)(ntris * TRI_SBVH_SPLIT_FACTOR);
+    if (cap < 16u) cap = 16u;
+
+    tri_sbvh_ctx c;
+    memset(&c, 0, sizeof(c));
+    c.refs = (tri_pref *)calloc(cap, sizeof(tri_pref));
+    c.scratch = (tri_pref *)malloc((size_t)cap * sizeof(tri_pref));
+    c.cap = cap;
+    c.bnodes = bc->bnodes;
+    c.node_next = bc->node_next;
+    c.node_end = bc->node_end;
+    c.max_leaf = bc->max_leaf;
+    c.block_shift = bc->block_shift;
+    if (!c.refs || !c.scratch) {
+        free(c.refs);
+        free(c.scratch);
+        bc->failed = 1;
+        return 0;
+    }
+
+    float root_lo[3], root_hi[3];
+    tri_box_reset(root_lo, root_hi);
+    for (size_t i = 0; i < ntris; i++) {
+        tri_pref *r = &c.refs[i];
+        for (int a = 0; a < 3; a++) {
+            r->lo[a] = bc->plo[i * 3 + a];
+            r->hi[a] = bc->phi[i * 3 + a];
+        }
+        r->prim = (uint32_t)i;
+        tri_box_expand(root_lo, root_hi, r->lo, r->hi);
+    }
+    c.root_area = tri_surface_area(root_lo, root_hi);
+    if (c.root_area <= 0.0f) c.root_area = 1.0f;
+
+    uint32_t root = tri_sbvh_recursive(&c, 0, (uint32_t)ntris, cap, 0);
+
+    bc->node_next = c.node_next;
+    if (c.failed) {
+        free(c.refs);
+        free(c.scratch);
+        bc->failed = 1;
+        return 0;
+    }
+
+    /* Leaves reference ranges of the refs array; expose the prim ids through
+     * bc->indices for the (unchanged) leaf emission. calloc'd refs keep dead
+     * slack slots at prim 0, which no leaf references. */
+    uint32_t *idx = (uint32_t *)malloc((size_t)cap * sizeof(uint32_t));
+    if (!idx) {
+        free(c.refs);
+        free(c.scratch);
+        bc->failed = 1;
+        return 0;
+    }
+    for (uint32_t i = 0; i < cap; i++) idx[i] = c.refs[i].prim;
+    free(bc->indices);
+    bc->indices = idx;
+
+    free(c.refs);
+    free(c.scratch);
+    *emit_total = c.emit_total;
+    return root;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Collapse binary -> wide BVH.                                              */
 /* ------------------------------------------------------------------------- */
@@ -2963,8 +3389,12 @@ lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
     bc.cen = (float *)malloc(n3 * sizeof(float));
     bc.indices = (uint32_t *)malloc(ntris * sizeof(uint32_t));
     /* 2*ntris covers any binary tree; +512 absorbs the per-task rounding of
-     * the parallel builder's arena slices (2k vs the exact 2k-1). */
-    uint32_t bnode_cap = (uint32_t)(2 * ntris) + 512u;
+     * the parallel builder's arena slices (2k vs the exact 2k-1). Spatial
+     * splits (HQ) duplicate references, so their tree is bounded by the ref
+     * capacity instead. */
+    uint32_t bnode_cap = (o.quality == LRT_TRI_BUILD_HQ)
+                             ? (uint32_t)(2 * ntris * TRI_SBVH_SPLIT_FACTOR) + 512u
+                             : (uint32_t)(2 * ntris) + 512u;
     bc.node_next = 0;
     bc.node_end = bnode_cap;
     bc.bnodes = (tri_bnode *)malloc((size_t)bnode_cap * sizeof(tri_bnode));
@@ -3028,10 +3458,16 @@ lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
         if (bc.lbvh_leaf > max_leaf) bc.lbvh_leaf = max_leaf;
     }
 
-    /* --- Binary build (parallel when num_threads > 1). --- */
-    uint32_t b_root = (o.quality == LRT_TRI_BUILD_FAST)
-                          ? tri_build_lbvh(&bc, num_threads)
-                          : tri_build_binary(&bc, num_threads);
+    /* --- Binary build (parallel when num_threads > 1; HQ/SBVH is serial). */
+    uint32_t emit_total = (uint32_t)ntris;
+    uint32_t b_root;
+    if (o.quality == LRT_TRI_BUILD_HQ) {
+        b_root = tri_build_sbvh(&bc, &emit_total);
+    } else if (o.quality == LRT_TRI_BUILD_FAST) {
+        b_root = tri_build_lbvh(&bc, num_threads);
+    } else {
+        b_root = tri_build_binary(&bc, num_threads);
+    }
 
     lrt_tri_scene *s = NULL;
     if (!bc.failed) {
@@ -3042,9 +3478,9 @@ lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
     if (!bc.failed) {
         s->layout = layout;
         s->quantized = quantized;
-        uint32_t node_cap = (uint32_t)ntris;
+        uint32_t node_cap = emit_total;
         if (node_cap < 1) node_cap = 1;
-        uint32_t block_cap = (uint32_t)ntris;
+        uint32_t block_cap = emit_total;
         if (block_cap < 1) block_cap = 1;
         if (layout == 4) {
             s->nodes4 = (lrt_bvh4_node *)tri_aligned_alloc(

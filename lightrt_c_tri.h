@@ -49,8 +49,12 @@ typedef struct lrt_hit {
 } lrt_hit;
 
 typedef enum lrt_tri_quality {
-    LRT_TRI_BUILD_FAST = 0,   /* LBVH (Morton sort + bit splits): fastest build */
-    LRT_TRI_BUILD_DEFAULT = 1 /* binned SAH (16 bins): best traversal */
+    LRT_TRI_BUILD_FAST = 0,    /* LBVH (Morton sort + bit splits): fastest build */
+    LRT_TRI_BUILD_DEFAULT = 1, /* binned SAH (16 bins) */
+    /* Binned SAH + spatial splits (SBVH, Stich et al. 2009): overlapping
+     * primitives may be referenced by several leaves with clipped bounds.
+     * Tightest tree (helps short/shadow rays most), slowest build, serial. */
+    LRT_TRI_BUILD_HQ = 2
 } lrt_tri_quality;
 
 typedef enum lrt_tri_layout {

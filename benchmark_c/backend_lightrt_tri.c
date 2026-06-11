@@ -46,6 +46,10 @@ static void *tri_build_bvh8q(const float *v, size_t n, int t, double *ms) {
     return tri_build_layout(v, n, t, ms, LRT_TRI_LAYOUT_BVH8Q,
                             LRT_TRI_BUILD_DEFAULT);
 }
+static void *tri_build_sbvh4(const float *v, size_t n, int t, double *ms) {
+    return tri_build_layout(v, n, t, ms, LRT_TRI_LAYOUT_BVH4,
+                            LRT_TRI_BUILD_HQ);
+}
 
 static void tri_intersect1N(void *scene, int thread_idx, const lrt_ray *rays,
                             lrt_hit *hits, size_t n, int coherent) {
@@ -93,9 +97,14 @@ static const bench_backend g_bvh8q_backend = {
     "c11-bvh8q", tri_build_bvh8q, tri_intersect1N, tri_occluded1N,
     tri_memory_bytes, tri_destroy,
 };
+static const bench_backend g_sbvh4_backend = {
+    "c11-sbvh4", tri_build_sbvh4, tri_intersect1N, tri_occluded1N,
+    tri_memory_bytes, tri_destroy,
+};
 
 const bench_backend *backend_lightrt_bvh4(void) { return &g_bvh4_backend; }
 const bench_backend *backend_lightrt_bvh8(void) { return &g_bvh8_backend; }
 const bench_backend *backend_lightrt_lbvh4(void) { return &g_lbvh4_backend; }
 const bench_backend *backend_lightrt_lbvh8(void) { return &g_lbvh8_backend; }
 const bench_backend *backend_lightrt_bvh8q(void) { return &g_bvh8q_backend; }
+const bench_backend *backend_lightrt_sbvh4(void) { return &g_sbvh4_backend; }
