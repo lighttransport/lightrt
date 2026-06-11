@@ -174,6 +174,52 @@ static void test_vs_brute_force(const char *label, const float *verts,
     lrt_tri_scene_free(s);
 }
 
+/* The batched entry points (which may pipeline several rays in flight) must
+ * produce exactly the same results as the single-ray calls. */
+static void test_batch_matches_single(const float *verts, size_t ntris,
+                                      size_t nrays) {
+    lrt_tri_build_options o = {.quality = LRT_TRI_BUILD_DEFAULT,
+                               .layout = LRT_TRI_LAYOUT_BVH4};
+    lrt_tri_scene *s = lrt_tri_scene_build(verts, ntris, &o, NULL);
+    CHECK(s != NULL, "batch-vs-single: build failed");
+    if (!s) return;
+
+    lrt_ray *rays = (lrt_ray *)malloc(nrays * sizeof(lrt_ray));
+    lrt_hit *hits = (lrt_hit *)malloc(nrays * sizeof(lrt_hit));
+    uint8_t *occ = (uint8_t *)malloc(nrays * sizeof(uint8_t));
+    if (!rays || !hits || !occ) {
+        free(rays);
+        free(hits);
+        free(occ);
+        lrt_tri_scene_free(s);
+        return;
+    }
+    for (size_t i = 0; i < nrays; i++) make_random_ray(&rays[i]);
+
+    lrt_tri_intersect1N(s, rays, hits, nrays, LRT_TRI_BATCH_INCOHERENT);
+    lrt_tri_occluded1N(s, rays, occ, nrays, LRT_TRI_BATCH_INCOHERENT);
+
+    size_t bad_hit = 0, bad_occ = 0;
+    for (size_t i = 0; i < nrays; i++) {
+        lrt_hit h1;
+        lrt_tri_intersect1(s, &rays[i], &h1);
+        if (h1.prim_id != hits[i].prim_id || (h1.prim_id != LRT_TRI_NO_HIT &&
+                                              h1.t != hits[i].t)) {
+            bad_hit++;
+        }
+        if ((uint8_t)lrt_tri_occluded1(s, &rays[i]) != occ[i]) bad_occ++;
+    }
+    CHECK(bad_hit == 0, "batched intersect1N differs from intersect1 on "
+          "%zu/%zu rays", bad_hit, nrays);
+    CHECK(bad_occ == 0, "batched occluded1N differs from occluded1 on "
+          "%zu/%zu rays", bad_occ, nrays);
+
+    free(rays);
+    free(hits);
+    free(occ);
+    lrt_tri_scene_free(s);
+}
+
 /* BVH4 vs BVH8 (and their kernels) must agree with each other on hit/miss and
  * distances within fp32 noise. */
 static void test_layouts_agree(const float *verts, size_t ntris, size_t nrays) {
@@ -287,6 +333,7 @@ int main(void) {
     test_vs_brute_force("medium/bvh8q/fast", med, 5000, LRT_TRI_LAYOUT_BVH8Q,
                         LRT_TRI_BUILD_FAST, 4000);
     test_layouts_agree(med, 5000, 50000);
+    test_batch_matches_single(med, 5000, 30000);
     free(med);
 
     /* Co-planar / overlapping pathological soup. */

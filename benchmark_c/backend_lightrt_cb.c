@@ -119,7 +119,8 @@ static void *cb_build(const float *vertices, size_t ntris, int num_threads,
 }
 
 static void cb_intersect1N(void *scene, int thread_idx, const lrt_ray *rays,
-                           lrt_hit *hits, size_t n) {
+                           lrt_hit *hits, size_t n, int coherent) {
+    (void)coherent;
     cb_scene *cs = (cb_scene *)scene;
     lrt_scene *s = cs->scenes[thread_idx % cs->num_threads];
     for (size_t i = 0; i < n; i++) {
@@ -143,7 +144,8 @@ static void cb_intersect1N(void *scene, int thread_idx, const lrt_ray *rays,
 }
 
 static void cb_occluded1N(void *scene, int thread_idx, const lrt_ray *rays,
-                          uint8_t *occluded, size_t n) {
+                          uint8_t *occluded, size_t n, int coherent) {
+    (void)coherent;
     /* The callback API has no any-hit query; closest-hit stands in. */
     cb_scene *cs = (cb_scene *)scene;
     lrt_scene *s = cs->scenes[thread_idx % cs->num_threads];

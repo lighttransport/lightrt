@@ -87,11 +87,27 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
 /* Any hit (shadow/occlusion). Returns 1 if anything lies in [tmin, tmax]. */
 int lrt_tri_occluded1(const lrt_tri_scene *s, const lrt_ray *ray);
 
-/* Batched variants: amortize per-ray setup over n rays. */
+/* How a batch of rays relates spatially; picks the traversal strategy. */
+typedef enum lrt_tri_batch_hint {
+    /* Library default (currently the incoherent strategy: the coherent case
+     * is fast either way, the incoherent case is the painful one). */
+    LRT_TRI_BATCH_AUTO = 0,
+    /* Nearby rays visiting the same nodes (e.g. primary camera rays):
+     * straight per-ray traversal, which keeps the cache hot. */
+    LRT_TRI_BATCH_COHERENT = 1,
+    /* Unrelated rays (e.g. path-tracing bounces): several rays are kept in
+     * flight per thread, one node visit each in turn, so one ray's memory
+     * stall overlaps the others' compute. */
+    LRT_TRI_BATCH_INCOHERENT = 2
+} lrt_tri_batch_hint;
+
+/* Batched variants: amortize per-ray setup over n rays and, for incoherent
+ * batches, hide memory latency by interleaving rays. Results are identical
+ * to looping the single-ray calls regardless of hint. */
 void lrt_tri_intersect1N(const lrt_tri_scene *s, const lrt_ray *rays,
-                         lrt_hit *hits, size_t n);
+                         lrt_hit *hits, size_t n, lrt_tri_batch_hint hint);
 void lrt_tri_occluded1N(const lrt_tri_scene *s, const lrt_ray *rays,
-                        uint8_t *occluded, size_t n);
+                        uint8_t *occluded, size_t n, lrt_tri_batch_hint hint);
 
 typedef struct lrt_tri_stats {
     uint32_t node_count; /* wide nodes */

@@ -88,7 +88,8 @@ void *mm_build(const float *vertices, size_t ntris, int num_threads,
 }
 
 void mm_intersect1N(void *scene, int thread_idx, const lrt_ray *rays,
-                    lrt_hit *hits, size_t n) {
+                    lrt_hit *hits, size_t n, int coherent) {
+    (void)coherent;
     (void)thread_idx;
     const mm_scene *ms = (const mm_scene *)scene;
     for (size_t i = 0; i < n; i++) {
@@ -127,7 +128,8 @@ void mm_intersect1N(void *scene, int thread_idx, const lrt_ray *rays,
 }
 
 void mm_occluded1N(void *scene, int thread_idx, const lrt_ray *rays,
-                   uint8_t *occluded, size_t n) {
+                   uint8_t *occluded, size_t n, int coherent) {
+    (void)coherent;
     (void)thread_idx;
     const mm_scene *ms = (const mm_scene *)scene;
     for (size_t i = 0; i < n; i++) {

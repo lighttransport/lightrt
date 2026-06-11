@@ -48,15 +48,19 @@ static void *tri_build_bvh8q(const float *v, size_t n, int t, double *ms) {
 }
 
 static void tri_intersect1N(void *scene, int thread_idx, const lrt_ray *rays,
-                            lrt_hit *hits, size_t n) {
+                            lrt_hit *hits, size_t n, int coherent) {
     (void)thread_idx;
-    lrt_tri_intersect1N((const lrt_tri_scene *)scene, rays, hits, n);
+    lrt_tri_intersect1N((const lrt_tri_scene *)scene, rays, hits, n,
+                        coherent ? LRT_TRI_BATCH_COHERENT
+                                 : LRT_TRI_BATCH_INCOHERENT);
 }
 
 static void tri_occluded1N(void *scene, int thread_idx, const lrt_ray *rays,
-                           uint8_t *occluded, size_t n) {
+                           uint8_t *occluded, size_t n, int coherent) {
     (void)thread_idx;
-    lrt_tri_occluded1N((const lrt_tri_scene *)scene, rays, occluded, n);
+    lrt_tri_occluded1N((const lrt_tri_scene *)scene, rays, occluded, n,
+                       coherent ? LRT_TRI_BATCH_COHERENT
+                                : LRT_TRI_BATCH_INCOHERENT);
 }
 
 static size_t tri_memory_bytes(void *scene) {

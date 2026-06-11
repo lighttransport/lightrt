@@ -73,15 +73,18 @@ typedef struct {
     uint8_t *occ;
     size_t n;
     int occlusion;
+    int coherent;
 } worker_args;
 
 static void *worker_main(void *p) {
     worker_args *w = (worker_args *)p;
     if (w->n == 0) return NULL;
     if (w->occlusion) {
-        w->bk->occluded1N(w->scene, w->thread_idx, w->rays, w->occ, w->n);
+        w->bk->occluded1N(w->scene, w->thread_idx, w->rays, w->occ, w->n,
+                          w->coherent);
     } else {
-        w->bk->intersect1N(w->scene, w->thread_idx, w->rays, w->hits, w->n);
+        w->bk->intersect1N(w->scene, w->thread_idx, w->rays, w->hits, w->n,
+                           w->coherent);
     }
     return NULL;
 }
@@ -89,10 +92,10 @@ static void *worker_main(void *p) {
 /* Runs the workload across `threads` workers; returns wall seconds. */
 static double run_rays(const bench_backend *bk, void *scene, int threads,
                        const lrt_ray *rays, lrt_hit *hits, uint8_t *occ,
-                       size_t n, int occlusion) {
+                       size_t n, int occlusion, int coherent) {
     uint64_t t0 = bench_time_ns();
     if (threads <= 1) {
-        worker_args w = {bk, scene, 0, rays, hits, occ, n, occlusion};
+        worker_args w = {bk, scene, 0, rays, hits, occ, n, occlusion, coherent};
         worker_main(&w);
     } else {
         pthread_t tid[MAX_THREADS];
@@ -110,7 +113,8 @@ static double run_rays(const bench_backend *bk, void *scene, int threads,
                                   hits ? hits + lo : NULL,
                                   occ ? occ + lo : NULL,
                                   cnt,
-                                  occlusion};
+                                  occlusion,
+                                  coherent};
             pthread_create(&tid[t], NULL, worker_main, &wa[t]);
             spawned++;
         }
@@ -140,8 +144,8 @@ static int verify_backend(const bench_backend *bk, void *scene,
         free(ho);
         return 0;
     }
-    bk->intersect1N(scene, 0, rays, h, sample);
-    oracle_bk->intersect1N(oracle_scene, 0, rays, ho, sample);
+    bk->intersect1N(scene, 0, rays, h, sample, 0);
+    oracle_bk->intersect1N(oracle_scene, 0, rays, ho, sample, 0);
 
     /* A mismatch is a hit/miss disagreement or a hit whose distance differs
      * beyond fp32 noise. A handful of edge rays legitimately differ between
@@ -343,7 +347,7 @@ int main(int argc, char **argv) {
 
         /* Derive shadow rays once, from the first backend processed. */
         if (want_shadow && !shadow_ready) {
-            bk->intersect1N(scene, 0, primary, hits, n);
+            bk->intersect1N(scene, 0, primary, hits, n, 1);
             rays_gen_shadow(shadow, n, primary, hits, verts, ntris, cfg.seed);
             shadow_ready = 1;
         }
@@ -353,19 +357,22 @@ int main(int argc, char **argv) {
             const lrt_ray *rays;
             int occlusion;
             int enabled;
+            int coherent;
         } workloads[] = {
-            {"primary", primary, 0, want_primary},
-            {"incoherent", incoherent, 0, want_incoherent},
-            {"shadow", shadow, 1, want_shadow},
+            {"primary", primary, 0, want_primary, 1},
+            {"incoherent", incoherent, 0, want_incoherent, 0},
+            {"shadow", shadow, 1, want_shadow, 1},
         };
 
         for (size_t w = 0; w < sizeof(workloads) / sizeof(workloads[0]); w++) {
             if (!workloads[w].enabled) continue;
             const lrt_ray *rays = workloads[w].rays;
             int occlusion = workloads[w].occlusion;
+            int coherent = workloads[w].coherent;
 
             /* Warm-up, also produces hit_frac. */
-            run_rays(bk, scene, cfg.threads, rays, hits, occ, n, occlusion);
+            run_rays(bk, scene, cfg.threads, rays, hits, occ, n, occlusion,
+                     coherent);
             size_t nhit = 0;
             if (occlusion) {
                 for (size_t i = 0; i < n; i++) nhit += occ[i];
@@ -377,7 +384,8 @@ int main(int argc, char **argv) {
             double samples[64];
             int reps = cfg.repeat < 64 ? cfg.repeat : 64;
             for (int rep = 0; rep < reps; rep++) {
-                double secs = run_rays(bk, scene, cfg.threads, rays, hits, occ, n, occlusion);
+                double secs = run_rays(bk, scene, cfg.threads, rays, hits, occ,
+                                       n, occlusion, coherent);
                 samples[rep] = secs > 0.0 ? (double)n / secs / 1e6 : 0.0;
             }
             qsort(samples, (size_t)reps, sizeof(double), cmp_double);

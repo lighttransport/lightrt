@@ -143,9 +143,23 @@ Fineness 256 (710,536 tris), 16 threads:
 
 At 710k tris / 16 threads, `c11-bvh4` leads incoherent rays (1.12x Embree) and
 `c11-bvh8` leads shadow rays (1.06x Embree); the LBVH fast build matches
-Embree's TBB build throughput. Embree keeps the single-thread lead (incoherent
-0.84x, shadow 0.72x via `c11-bvh8q`/`c11-bvh8`) — its remaining edge is
-single-ray latency hiding, not memory layout.
+Embree's TBB build throughput.
+
+### Interleaved (software-pipelined) batch traversal
+
+`lrt_tri_intersect1N/occluded1N` take a `lrt_tri_batch_hint`. With
+`LRT_TRI_BATCH_INCOHERENT` (and the BVH4 layout) the library keeps
+`TRI_PIPE_WIDTH` (8, measured optimum on Zen 1) rays in flight per thread,
+advancing each by one node/leaf visit per turn, so one ray's cache miss
+overlaps the others' compute. Results are bit-identical to single-ray calls.
+Effect at 710k tris: single-thread incoherent 1.41 → 2.25 Mrays/s (+60%,
+1.33x Embree, where Embree was previously 1.12x ahead); 16-thread incoherent
+17.8 → 22.3 (1.09x Embree, same-run). Coherent batches (primary rays,
+surface-to-light shadow rays) run the plain per-ray kernel — pipelining
+costs ~20% there because the working set is already cache-resident; the
+benchmark passes the matching hint per workload. The remaining Embree leads
+are single-thread shadow (0.75x) and primary (parity at 128k, 0.85x at
+710k).
 
 ## Notes
 
