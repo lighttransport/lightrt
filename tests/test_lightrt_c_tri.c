@@ -303,10 +303,123 @@ static void test_edge_cases(void) {
           "NaN vertex rejected");
 }
 
+/* Reference ray-capsule test (same algorithm as the library's). */
+static int ref_capsule(const float p0[3], const float p1[3], float r,
+                       const lrt_ray *ray, float t_max, float *t_out) {
+    float dx = p1[0] - p0[0], dy = p1[1] - p0[1], dz = p1[2] - p0[2];
+    float mx = ray->org[0] - p0[0], my = ray->org[1] - p0[1],
+          mz = ray->org[2] - p0[2];
+    float ox = ray->dir[0], oy = ray->dir[1], oz = ray->dir[2];
+    float dd = dx * dx + dy * dy + dz * dz;
+    float best = t_max;
+    int hit = 0;
+    if (dd > 1e-20f) {
+        float inv_dd = 1.0f / dd;
+        float nd = (ox * dx + oy * dy + oz * dz) * inv_dd;
+        float md = (mx * dx + my * dy + mz * dz) * inv_dd;
+        float ax = ox - dx * nd, ay = oy - dy * nd, az = oz - dz * nd;
+        float bx = mx - dx * md, by = my - dy * md, bz = mz - dz * md;
+        float A = ax * ax + ay * ay + az * az;
+        float B = ax * bx + ay * by + az * bz;
+        float C = bx * bx + by * by + bz * bz - r * r;
+        if (A > 1e-12f) {
+            float disc = B * B - A * C;
+            if (disc >= 0.0f) {
+                float sq = sqrtf(disc);
+                for (int k = 0; k < 2; k++) {
+                    float t = (k == 0 ? (-B - sq) : (-B + sq)) / A;
+                    if (t < ray->tmin || t >= best) continue;
+                    float s = md + t * nd;
+                    if (s >= 0.0f && s <= 1.0f) {
+                        best = t;
+                        hit = 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    float a2 = ox * ox + oy * oy + oz * oz;
+    for (int cap = 0; cap < 2 && a2 > 1e-20f; cap++) {
+        float cx = cap ? mx - dx : mx;
+        float cy = cap ? my - dy : my;
+        float cz = cap ? mz - dz : mz;
+        float b = cx * ox + cy * oy + cz * oz;
+        float cc = cx * cx + cy * cy + cz * cz - r * r;
+        float disc = b * b - a2 * cc;
+        if (disc < 0.0f) continue;
+        float t = (-b - sqrtf(disc)) / a2;
+        if (t >= ray->tmin && t < best) {
+            best = t;
+            hit = 1;
+        }
+    }
+    if (hit) *t_out = best;
+    return hit;
+}
+
+static void test_curve_scene(void) {
+    enum { NSEG = 300, NRAYS = 20000 };
+    float *segs = (float *)malloc(NSEG * 6 * sizeof(float));
+    float *radii = (float *)malloc(NSEG * sizeof(float));
+    g_rng = 0xC0FFEE123ull;
+    for (int i = 0; i < NSEG; i++) {
+        for (int k = 0; k < 6; k++) segs[i * 6 + k] = rnd_f(-2.0f, 2.0f);
+        radii[i] = rnd_f(0.01f, 0.06f);
+    }
+    lrt_tri_scene *s = lrt_curve_scene_build(segs, radii, 0.0f, NSEG, NULL, NULL);
+    CHECK(s != NULL, "curve build failed");
+    if (!s) {
+        free(segs);
+        free(radii);
+        return;
+    }
+    printf("  curve scene [%s]\n", lrt_tri_kernel_name(s));
+
+    size_t mismatches = 0, occl_mismatches = 0;
+    for (int i = 0; i < NRAYS; i++) {
+        lrt_ray r;
+        make_random_ray(&r);
+        /* brute force over whole capsules */
+        float bt = r.tmax;
+        int bf = 0;
+        for (int j = 0; j < NSEG; j++) {
+            float t;
+            if (ref_capsule(&segs[j * 6], &segs[j * 6 + 3], radii[j], &r, bt,
+                            &t)) {
+                bt = t;
+                bf = 1;
+            }
+        }
+        lrt_hit h;
+        int bvh = lrt_tri_intersect1(s, &r, &h);
+        if (bf != bvh) {
+            mismatches++;
+        } else if (bf &&
+                   fabs((double)h.t - (double)bt) >
+                       1e-3 * (1.0 + fabs((double)bt))) {
+            mismatches++;
+        }
+        if (lrt_tri_occluded1(s, &r) != bvh) occl_mismatches++;
+    }
+    /* Sub-segment joints can flip near-tangent rays by one ulp (the joint
+     * cap sphere vs the whole-capsule cylinder root); allow the same 0.05%
+     * budget the fp32-vs-fp64 verification uses. */
+    CHECK(mismatches <= NRAYS / 2000, "curve: %zu/%d mismatches vs "
+          "brute-force capsules", mismatches, NRAYS);
+    CHECK(occl_mismatches == 0, "curve: %zu occluded disagreements",
+          occl_mismatches);
+
+    lrt_tri_scene_free(s);
+    free(segs);
+    free(radii);
+}
+
 int main(void) {
     printf("lightrt_c_tri test\n");
 
     test_edge_cases();
+    test_curve_scene();
 
     /* Small soup: every leaf shape exercised. */
     g_rng = 0x9E3779B97F4A7C15ull;

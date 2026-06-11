@@ -207,8 +207,28 @@ Findings (100k tris, primary rays, single thread):
   barely shrinks it while doubling references. Embree agrees: its own
   spatial-split builder (`LRTBENCH_EMBREE_QUALITY=high`, 10x build time)
   gains nothing on this scene either.
-- The real fix for hair-like geometry is a different primitive (oriented
-  bounds / curve intersectors), not spatial splits.
+- The real fix for hair-like geometry is a different primitive — measured
+  below.
+
+### Capsule (curve) primitive: `c11-hair`
+
+`lrt_curve_scene_build` treats each hair as a capsule (segment + radius),
+subdivided at build time into short sub-segments (length ~16 radii, capped at
+32 pieces) whose AABBs hug the hair; hits report the original segment id and
+its [0,1] parameter. The `c11-hair` backend reinterprets thinspan's sliver
+triangles as capsules. On span-1.0 hairs (100k):
+
+| backend   | primary | incoherent | vs best triangle BVH |
+|-----------|--------:|-----------:|---------------------:|
+| c11-hair  |   0.259 |      0.128 | **15-16x** |
+| c11-sbvh4 |   0.017 |      0.008 | 1x |
+| embree    |   0.006 |      0.006 | 0.4-0.7x |
+
+The right primitive beats any triangle-BVH strategy by an order of magnitude
+(43x Embree on primary rays). The trade is build cost: 3.2M sub-segments
+take ~3.9 s and 143 MB. `c11-hair` is excluded from `--backend all` because
+its geometry (and hence hit fractions) intentionally differs from the
+triangle representation on generic scenes.
 
 ### Ray-space transform slab test
 

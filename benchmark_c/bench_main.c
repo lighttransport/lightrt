@@ -276,21 +276,25 @@ int main(int argc, char **argv) {
         const struct {
             const char *name;
             const bench_backend *(*get)(void);
+            int explicit_only; /* not part of --backend all */
         } registry[] = {
-            {"c11-cb", backend_lightrt_cb},
-            {"c11-bvh4", backend_lightrt_bvh4},
-            {"c11-bvh8", backend_lightrt_bvh8},
-            {"c11-lbvh4", backend_lightrt_lbvh4},
-            {"c11-lbvh8", backend_lightrt_lbvh8},
-            {"c11-bvh8q", backend_lightrt_bvh8q},
-            {"c11-sbvh4", backend_lightrt_sbvh4},
-            {"embree", backend_embree},
-            {"tinybvh", backend_tinybvh},
-            {"mm-bvh", backend_madmann},
+            {"c11-cb", backend_lightrt_cb, 0},
+            {"c11-bvh4", backend_lightrt_bvh4, 0},
+            {"c11-bvh8", backend_lightrt_bvh8, 0},
+            {"c11-lbvh4", backend_lightrt_lbvh4, 0},
+            {"c11-lbvh8", backend_lightrt_lbvh8, 0},
+            {"c11-bvh8q", backend_lightrt_bvh8q, 0},
+            {"c11-sbvh4", backend_lightrt_sbvh4, 0},
+            /* capsule reinterpretation of thin triangles: geometry (and so
+             * hit fractions) intentionally differ from the tri backends */
+            {"c11-hair", backend_lightrt_hair, 1},
+            {"embree", backend_embree, 0},
+            {"tinybvh", backend_tinybvh, 0},
+            {"mm-bvh", backend_madmann, 0},
         };
         int want_all = !strcmp(cfg.backends, "all");
         for (size_t r = 0; r < sizeof(registry) / sizeof(registry[0]); r++) {
-            int wanted = want_all;
+            int wanted = want_all && !registry[r].explicit_only;
             if (!wanted) {
                 char buf[256];
                 snprintf(buf, sizeof(buf), ",%s,", cfg.backends);

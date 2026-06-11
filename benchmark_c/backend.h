@@ -53,6 +53,7 @@ const bench_backend *backend_lightrt_lbvh4(void); /* BVH4, Morton fast build */
 const bench_backend *backend_lightrt_lbvh8(void); /* BVH8, Morton fast build */
 const bench_backend *backend_lightrt_bvh8q(void); /* BVH8, quantized nodes */
 const bench_backend *backend_lightrt_sbvh4(void); /* BVH4, spatial splits (HQ) */
+const bench_backend *backend_lightrt_hair(void);  /* capsules (thin tris) */
 const bench_backend *backend_embree(void);        /* Embree 4 (optional) */
 const bench_backend *backend_tinybvh(void);       /* jbikker/tinybvh BVH8_CPU */
 const bench_backend *backend_madmann(void);       /* madmann91/bvh v2 */

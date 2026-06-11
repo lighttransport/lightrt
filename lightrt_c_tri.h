@@ -128,6 +128,26 @@ void lrt_tri_scene_stats(const lrt_tri_scene *s, lrt_tri_stats *out);
  * compiler SIMD flags. */
 const char *lrt_tri_kernel_name(const lrt_tri_scene *s);
 
+/* --- Hair / curve scenes ---------------------------------------------------
+ *
+ * Axis-aligned boxes around long thin diagonal primitives are mostly empty
+ * space, which no triangle BVH (object or spatial splits) can remove. The
+ * right tool is a dedicated primitive: each hair is a capsule (line segment
+ * swept by a sphere of radius r) and is subdivided at build time into short
+ * sub-segments whose boxes are tight, while hits still report the original
+ * segment.
+ *
+ * segments = 6*nsegs floats (p0.xyz p1.xyz per segment). radii = per-segment
+ * radius array, or NULL to use constant_radius for all. The scene is queried
+ * through the same lrt_tri_* intersection functions; hits report
+ * prim_id = segment index, u = parameter along the segment in [0,1], v = 0.
+ * opts: layout is forced to BVH4 and quality to DEFAULT; max_leaf_size and
+ * num_threads apply as for triangles. */
+lrt_tri_scene *lrt_curve_scene_build(const float *segments, const float *radii,
+                                     float constant_radius, size_t nsegs,
+                                     const lrt_tri_build_options *opts,
+                                     lrt_result *err);
+
 #ifdef __cplusplus
 }
 #endif
