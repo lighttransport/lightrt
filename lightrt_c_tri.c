@@ -94,6 +94,19 @@ typedef struct lrt_bvh8_node {
     uint32_t _pad[7];
 } lrt_bvh8_node;
 
+/* Quantized 8-wide node: child bounds as 8-bit offsets on a node-local grid
+ * (org + q * scale, quantization rounded outward so decoded boxes always
+ * contain the true ones). 128 bytes = 2 cache lines. */
+typedef struct lrt_bvh8q_node {
+    float org[3];
+    float scale[3];
+    uint32_t nchildren;
+    uint8_t qlo_x[8], qlo_y[8], qlo_z[8]; /* empty slots: qlo=255 */
+    uint8_t qhi_x[8], qhi_y[8], qhi_z[8]; /* empty slots: qhi=0   */
+    uint32_t child[8];
+    uint32_t _pad[5];
+} lrt_bvh8q_node;
+
 /* Triangle blocks: SoA with precomputed edges, sized to the traversal SIMD
  * width (4 for BVH4/SSE, 8 for BVH8/AVX2). Both share the same generic float
  * layout — 9 arrays of `width` floats (v0xyz, e1xyz, e2xyz) followed by
@@ -115,10 +128,12 @@ typedef struct lrt_tri8 {
 } lrt_tri8;
 
 struct lrt_tri_scene {
-    int layout; /* 4 or 8 */
+    int layout;    /* traversal width: 4 or 8 */
+    int quantized; /* nodes8q used instead of nodes8 */
     uint32_t root;
     lrt_bvh4_node *nodes4;
     lrt_bvh8_node *nodes8;
+    lrt_bvh8q_node *nodes8q;
     uint32_t node_count;
     void *blocks; /* lrt_tri4[] when layout==4, lrt_tri8[] when layout==8 */
     uint32_t block_count;
@@ -1191,8 +1206,33 @@ typedef struct tri_collapse_ctx {
     uint32_t leaf_count;
     uint32_t max_depth;
     int width;
+    int quantized;
     int failed;
 } tri_collapse_ctx;
+
+/* Conservative 8-bit quantization of a child bound onto the parent grid:
+ * decoded lo never exceeds the true lo, decoded hi never undershoots. */
+static inline uint8_t tri_quantize_lo(float v, float org, float scale,
+                                      float inv_scale) {
+    if (scale <= 0.0f) return 0;
+    float f = (v - org) * inv_scale;
+    int q = (int)f;
+    if (q < 0) q = 0;
+    if (q > 255) q = 255;
+    while (q > 0 && org + (float)q * scale > v) q--;
+    return (uint8_t)q;
+}
+
+static inline uint8_t tri_quantize_hi(float v, float org, float scale,
+                                      float inv_scale) {
+    if (scale <= 0.0f) return 0; /* zero extent: decode == org == v */
+    float f = (v - org) * inv_scale;
+    int q = (int)f + 1;
+    if (q < 0) q = 0;
+    if (q > 255) q = 255;
+    while (q < 255 && org + (float)q * scale < v) q++;
+    return (uint8_t)q;
+}
 
 /* Emit the triangles of a binary leaf as SoA blocks of the scene's SIMD
  * width; returns a leaf ref. */
@@ -1319,6 +1359,36 @@ static uint32_t tri_collapse(tri_collapse_ctx *cc, uint32_t b_idx,
                           s->nodes4[node_idx].hi_z, s->nodes4[node_idx].child,
                           i);
         }
+    } else if (cc->quantized) {
+        lrt_bvh8q_node *w = &s->nodes8q[node_idx];
+        memset(w, 0, sizeof(*w));
+        float scale[3], inv_scale[3];
+        for (int a = 0; a < 3; a++) {
+            w->org[a] = bn->lo[a];
+            float ext = bn->hi[a] - bn->lo[a];
+            /* small relative inflation guarantees org + 255*scale >= hi
+             * despite rounding in the decode arithmetic */
+            scale[a] = ext > 0.0f ? (ext / 255.0f) * (1.0f + 4e-7f) : 0.0f;
+            inv_scale[a] = scale[a] > 0.0f ? 1.0f / scale[a] : 0.0f;
+            w->scale[a] = scale[a];
+        }
+        for (int i = 0; i < 8; i++) { /* empty slots decode inverted */
+            w->qlo_x[i] = w->qlo_y[i] = w->qlo_z[i] = 255;
+            w->qhi_x[i] = w->qhi_y[i] = w->qhi_z[i] = 0;
+        }
+        w->nchildren = (uint32_t)n;
+        for (int i = 0; i < n; i++) {
+            const tri_bnode *m = &cc->bc->bnodes[set[i]];
+            w = &s->nodes8q[node_idx];
+            w->qlo_x[i] = tri_quantize_lo(m->lo[0], w->org[0], scale[0], inv_scale[0]);
+            w->qlo_y[i] = tri_quantize_lo(m->lo[1], w->org[1], scale[1], inv_scale[1]);
+            w->qlo_z[i] = tri_quantize_lo(m->lo[2], w->org[2], scale[2], inv_scale[2]);
+            w->qhi_x[i] = tri_quantize_hi(m->hi[0], w->org[0], scale[0], inv_scale[0]);
+            w->qhi_y[i] = tri_quantize_hi(m->hi[1], w->org[1], scale[1], inv_scale[1]);
+            w->qhi_z[i] = tri_quantize_hi(m->hi[2], w->org[2], scale[2], inv_scale[2]);
+            uint32_t ref = tri_collapse(cc, set[i], depth + 1);
+            s->nodes8q[node_idx].child[i] = ref;
+        }
     } else {
         lrt_bvh8_node *w = &s->nodes8[node_idx];
         memset(w, 0, sizeof(*w));
@@ -1349,13 +1419,19 @@ typedef struct tri_ray_ctx {
     float tmin;
 } tri_ray_ctx;
 
+/* Degenerate direction components get a finite huge inverse instead of inf.
+ * 1e18 (not FLT_MAX) so that the quantized-node decode, which multiplies
+ * invd by a node-local scale, cannot overflow to inf and produce 0 * inf
+ * NaNs; |dir| < 1e-18 is treated as zero. */
+#define TRI_INVD_MAX 1e18f
+
 static inline void tri_ray_setup(const lrt_ray *ray, tri_ray_ctx *rc) {
     for (int k = 0; k < 3; k++) {
         rc->org[k] = ray->org[k];
         rc->dir[k] = ray->dir[k];
         float inv = 1.0f / ray->dir[k];
-        if (!isfinite(inv)) {
-            inv = copysignf(FLT_MAX, ray->dir[k] == 0.0f ? 1.0f : ray->dir[k]);
+        if (!(inv >= -TRI_INVD_MAX && inv <= TRI_INVD_MAX)) {
+            inv = copysignf(TRI_INVD_MAX, ray->dir[k] == 0.0f ? 1.0f : ray->dir[k]);
         }
         rc->invd[k] = inv;
     }
@@ -1378,6 +1454,12 @@ static inline void tri_prefetch_ref(const lrt_tri_scene *s, uint32_t ref,
                                                        TRI_REF_BLOCK(ref), width);
         _mm_prefetch(b, _MM_HINT_T0);
         _mm_prefetch(b + 64, _MM_HINT_T0);
+        return;
+    }
+    if (s->quantized) {
+        const char *p = (const char *)&s->nodes8q[TRI_REF_NODE(ref)];
+        _mm_prefetch(p, _MM_HINT_T0);
+        _mm_prefetch(p + 64, _MM_HINT_T0);
         return;
     }
     const char *p = (width == 4) ? (const char *)&s->nodes4[TRI_REF_NODE(ref)]
@@ -1424,6 +1506,20 @@ static inline int tri_isect_lane(const float *f, int bw, int lane,
     *u = uu;
     *v = vv;
     return 1;
+}
+
+/* Decode a quantized node's child bounds to floats (scalar fallback path). */
+static inline void tri_bvh8q_decode(const lrt_bvh8q_node *n, float *lo_x,
+                                    float *lo_y, float *lo_z, float *hi_x,
+                                    float *hi_y, float *hi_z) {
+    for (int i = 0; i < 8; i++) {
+        lo_x[i] = n->org[0] + (float)n->qlo_x[i] * n->scale[0];
+        lo_y[i] = n->org[1] + (float)n->qlo_y[i] * n->scale[1];
+        lo_z[i] = n->org[2] + (float)n->qlo_z[i] * n->scale[2];
+        hi_x[i] = n->org[0] + (float)n->qhi_x[i] * n->scale[0];
+        hi_y[i] = n->org[1] + (float)n->qhi_y[i] * n->scale[1];
+        hi_z[i] = n->org[2] + (float)n->qhi_z[i] * n->scale[2];
+    }
 }
 
 /* Scalar slab test for slot `i` of SoA bounds arrays. */
@@ -1489,10 +1585,19 @@ static int tri_intersect_scalar(const lrt_tri_scene *s, const lrt_ray *ray,
         const float *lo_x, *lo_y, *lo_z, *hi_x, *hi_y, *hi_z;
         const uint32_t *child;
         int nchildren;
+        float dec[48]; /* decode buffer for quantized nodes */
         if (width == 4) {
             const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(e.ref)];
             lo_x = n->lo_x; lo_y = n->lo_y; lo_z = n->lo_z;
             hi_x = n->hi_x; hi_y = n->hi_y; hi_z = n->hi_z;
+            child = n->child;
+            nchildren = (int)n->nchildren;
+        } else if (s->quantized) {
+            const lrt_bvh8q_node *n = &s->nodes8q[TRI_REF_NODE(e.ref)];
+            tri_bvh8q_decode(n, dec, dec + 8, dec + 16, dec + 24, dec + 32,
+                             dec + 40);
+            lo_x = dec; lo_y = dec + 8; lo_z = dec + 16;
+            hi_x = dec + 24; hi_y = dec + 32; hi_z = dec + 40;
             child = n->child;
             nchildren = (int)n->nchildren;
         } else {
@@ -1572,10 +1677,19 @@ static int tri_occluded_scalar(const lrt_tri_scene *s, const lrt_ray *ray) {
         const float *lo_x, *lo_y, *lo_z, *hi_x, *hi_y, *hi_z;
         const uint32_t *child;
         int nchildren;
+        float dec[48];
         if (width == 4) {
             const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(ref)];
             lo_x = n->lo_x; lo_y = n->lo_y; lo_z = n->lo_z;
             hi_x = n->hi_x; hi_y = n->hi_y; hi_z = n->hi_z;
+            child = n->child;
+            nchildren = (int)n->nchildren;
+        } else if (s->quantized) {
+            const lrt_bvh8q_node *n = &s->nodes8q[TRI_REF_NODE(ref)];
+            tri_bvh8q_decode(n, dec, dec + 8, dec + 16, dec + 24, dec + 32,
+                             dec + 40);
+            lo_x = dec; lo_y = dec + 8; lo_z = dec + 16;
+            hi_x = dec + 24; hi_y = dec + 32; hi_z = dec + 40;
             child = n->child;
             nchildren = (int)n->nchildren;
         } else {
@@ -2141,6 +2255,146 @@ static int tri_occluded_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray) {
     return 0;
 }
 
+/* Quantized-node slab: decode 8-bit child bounds on the fly. With
+ * s = scale*invd and b = (org_node - org_ray)*invd per axis, each plane is
+ * t = q * s + b (one cvt + fma per plane). invd is clamped to +/-1e18 at ray
+ * setup, so s and b stay finite and no 0*inf NaN can appear. */
+static inline int tri_bvh8q_slab_avx(const lrt_bvh8q_node *n,
+                                     const tri_ray_ctx *rc, __m256 tmin8,
+                                     __m256 t_best, float *tnear_out) {
+    __m256 sx = _mm256_set1_ps(n->scale[0] * rc->invd[0]);
+    __m256 sy = _mm256_set1_ps(n->scale[1] * rc->invd[1]);
+    __m256 sz = _mm256_set1_ps(n->scale[2] * rc->invd[2]);
+    __m256 bx = _mm256_set1_ps((n->org[0] - rc->org[0]) * rc->invd[0]);
+    __m256 by = _mm256_set1_ps((n->org[1] - rc->org[1]) * rc->invd[1]);
+    __m256 bz = _mm256_set1_ps((n->org[2] - rc->org[2]) * rc->invd[2]);
+
+#define TRI_Q8_LOAD(arr) \
+    _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32( \
+        _mm_loadl_epi64((const __m128i *)(const void *)(arr))))
+    __m256 tlx = _mm256_fmadd_ps(TRI_Q8_LOAD(n->qlo_x), sx, bx);
+    __m256 thx = _mm256_fmadd_ps(TRI_Q8_LOAD(n->qhi_x), sx, bx);
+    __m256 tly = _mm256_fmadd_ps(TRI_Q8_LOAD(n->qlo_y), sy, by);
+    __m256 thy = _mm256_fmadd_ps(TRI_Q8_LOAD(n->qhi_y), sy, by);
+    __m256 tlz = _mm256_fmadd_ps(TRI_Q8_LOAD(n->qlo_z), sz, bz);
+    __m256 thz = _mm256_fmadd_ps(TRI_Q8_LOAD(n->qhi_z), sz, bz);
+#undef TRI_Q8_LOAD
+
+    __m256 tnear = _mm256_max_ps(
+        _mm256_max_ps(_mm256_min_ps(tlx, thx), _mm256_min_ps(tly, thy)),
+        _mm256_max_ps(_mm256_min_ps(tlz, thz), tmin8));
+    __m256 tfar = _mm256_min_ps(
+        _mm256_min_ps(_mm256_max_ps(tlx, thx), _mm256_max_ps(tly, thy)),
+        _mm256_min_ps(_mm256_max_ps(tlz, thz), t_best));
+    _mm256_store_ps(tnear_out, tnear);
+    return _mm256_movemask_ps(_mm256_cmp_ps(tnear, tfar, _CMP_LE_OQ));
+}
+
+static int tri_intersect_bvh8q_avx2(const lrt_tri_scene *s, const lrt_ray *ray,
+                                    lrt_hit *hit) {
+    tri_ray_ctx rc;
+    tri_ray_setup(ray, &rc);
+    tri_avx_ctx ac;
+    tri_avx_setup(&rc, &ac);
+
+    float best_t = ray->tmax;
+    float best_u = 0.0f, best_v = 0.0f;
+    uint32_t best_prim = LRT_TRI_NO_HIT;
+
+    tri_stack_entry stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp].ref = s->root;
+    stack[sp].tnear = rc.tmin;
+    sp++;
+
+    while (sp > 0) {
+        tri_stack_entry e = stack[--sp];
+        if (e.tnear >= best_t) continue;
+        if (TRI_REF_IS_LEAF(e.ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(e.ref);
+            uint32_t nblk = TRI_REF_NBLOCKS(e.ref);
+            const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
+            for (uint32_t b = 0; b < nblk; b++) {
+                tri_block_isect_avx(&blocks[blk0 + b], &ac, &best_t, &best_u,
+                                    &best_v, &best_prim);
+            }
+            continue;
+        }
+
+        const lrt_bvh8q_node *n = &s->nodes8q[TRI_REF_NODE(e.ref)];
+        _Alignas(32) float tnear[8];
+        int mask = tri_bvh8q_slab_avx(n, &rc, ac.tmin, _mm256_set1_ps(best_t),
+                                      tnear);
+        mask &= (1 << n->nchildren) - 1;
+        uint32_t hit_ref[8];
+        float hit_tn[8];
+        int nhit = 0;
+        while (mask) {
+            int i = __builtin_ctz((unsigned)mask);
+            mask &= mask - 1;
+            tri_prefetch_ref(s, n->child[i], 8);
+            int j = nhit++;
+            while (j > 0 && hit_tn[j - 1] > tnear[i]) {
+                hit_tn[j] = hit_tn[j - 1];
+                hit_ref[j] = hit_ref[j - 1];
+                j--;
+            }
+            hit_tn[j] = tnear[i];
+            hit_ref[j] = n->child[i];
+        }
+        for (int i = nhit - 1; i >= 0; i--) {
+            stack[sp].ref = hit_ref[i];
+            stack[sp].tnear = hit_tn[i];
+            sp++;
+        }
+    }
+
+    if (hit) {
+        hit->t = best_prim != LRT_TRI_NO_HIT ? best_t : 0.0f;
+        hit->u = best_u;
+        hit->v = best_v;
+        hit->prim_id = best_prim;
+    }
+    return best_prim != LRT_TRI_NO_HIT;
+}
+
+static int tri_occluded_bvh8q_avx2(const lrt_tri_scene *s, const lrt_ray *ray) {
+    tri_ray_ctx rc;
+    tri_ray_setup(ray, &rc);
+    tri_avx_ctx ac;
+    tri_avx_setup(&rc, &ac);
+    __m256 tmax8 = _mm256_set1_ps(ray->tmax);
+
+    uint32_t stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp++] = s->root;
+
+    while (sp > 0) {
+        uint32_t ref = stack[--sp];
+        if (TRI_REF_IS_LEAF(ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(ref);
+            uint32_t nblk = TRI_REF_NBLOCKS(ref);
+            const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
+            for (uint32_t b = 0; b < nblk; b++) {
+                if (tri_block_occluded_avx(&blocks[blk0 + b], &ac, tmax8)) {
+                    return 1;
+                }
+            }
+            continue;
+        }
+        const lrt_bvh8q_node *n = &s->nodes8q[TRI_REF_NODE(ref)];
+        _Alignas(32) float tnear[8];
+        int mask = tri_bvh8q_slab_avx(n, &rc, ac.tmin, tmax8, tnear);
+        mask &= (1 << n->nchildren) - 1;
+        while (mask) {
+            int i = __builtin_ctz((unsigned)mask);
+            mask &= mask - 1;
+            stack[sp++] = n->child[i];
+        }
+    }
+    return 0;
+}
+
 #endif /* LRT_TRI_HAS_AVX2 */
 
 /* ------------------------------------------------------------------------- */
@@ -2171,10 +2425,14 @@ lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
     }
 
     int layout;
+    int quantized = 0;
     if (o.layout == LRT_TRI_LAYOUT_BVH4) {
         layout = 4;
     } else if (o.layout == LRT_TRI_LAYOUT_BVH8) {
         layout = 8;
+    } else if (o.layout == LRT_TRI_LAYOUT_BVH8Q) {
+        layout = 8;
+        quantized = 1;
     } else {
         /* AUTO: BVH4. Measured on Zen 1 (mandelbulb, 128k tris, primary and
          * incoherent rays, 1 and 16 threads), BVH4 matches or beats BVH8:
@@ -2281,6 +2539,7 @@ lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
 
     if (!bc.failed) {
         s->layout = layout;
+        s->quantized = quantized;
         uint32_t node_cap = (uint32_t)ntris;
         if (node_cap < 1) node_cap = 1;
         uint32_t block_cap = (uint32_t)ntris;
@@ -2288,13 +2547,16 @@ lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
         if (layout == 4) {
             s->nodes4 = (lrt_bvh4_node *)tri_aligned_alloc(
                 64, (size_t)node_cap * sizeof(lrt_bvh4_node));
+        } else if (quantized) {
+            s->nodes8q = (lrt_bvh8q_node *)tri_aligned_alloc(
+                64, (size_t)node_cap * sizeof(lrt_bvh8q_node));
         } else {
             s->nodes8 = (lrt_bvh8_node *)tri_aligned_alloc(
                 64, (size_t)node_cap * sizeof(lrt_bvh8_node));
         }
         s->blocks = tri_aligned_alloc(
             64, (size_t)block_cap * tri_block_size(layout));
-        if ((!s->nodes4 && !s->nodes8) || !s->blocks) {
+        if ((!s->nodes4 && !s->nodes8 && !s->nodes8q) || !s->blocks) {
             bc.failed = 1;
         } else {
             tri_collapse_ctx cc;
@@ -2304,6 +2566,7 @@ lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
             cc.node_cap = node_cap;
             cc.block_cap = block_cap;
             cc.width = layout;
+            cc.quantized = quantized;
             const tri_bnode *rootn = &bc.bnodes[b_root];
             cc.root_area = tri_surface_area(rootn->lo, rootn->hi);
             if (cc.root_area <= 0.0f) cc.root_area = 1.0f;
@@ -2319,9 +2582,11 @@ lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
                 s->stats.node_count = s->node_count;
                 s->stats.leaf_count = cc.leaf_count;
                 s->stats.max_depth = cc.max_depth;
+                size_t node_size = layout == 4 ? sizeof(lrt_bvh4_node)
+                                   : quantized ? sizeof(lrt_bvh8q_node)
+                                               : sizeof(lrt_bvh8_node);
                 s->stats.memory_bytes =
-                    (size_t)s->node_count * (layout == 4 ? sizeof(lrt_bvh4_node)
-                                                         : sizeof(lrt_bvh8_node)) +
+                    (size_t)s->node_count * node_size +
                     (size_t)s->block_count * tri_block_size(layout);
                 s->stats.sah_cost = (float)(TRI_TRAV_COST * cc.sah_inner +
                                             TRI_ISECT_COST * cc.sah_leaf);
@@ -2345,11 +2610,17 @@ lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
     }
 
 #if LRT_TRI_HAS_AVX2
-    s->kernel_name = layout == 8 ? "bvh8/avx2" : "bvh4/sse4";
+    s->kernel_name = layout == 4    ? "bvh4/sse4"
+                     : quantized    ? "bvh8q/avx2"
+                                    : "bvh8/avx2";
 #elif LRT_TRI_HAS_SSE4
-    s->kernel_name = layout == 8 ? "bvh8/scalar" : "bvh4/sse4";
+    s->kernel_name = layout == 4    ? "bvh4/sse4"
+                     : quantized    ? "bvh8q/scalar"
+                                    : "bvh8/scalar";
 #else
-    s->kernel_name = layout == 8 ? "bvh8/scalar" : "bvh4/scalar";
+    s->kernel_name = layout == 4    ? "bvh4/scalar"
+                     : quantized    ? "bvh8q/scalar"
+                                    : "bvh8/scalar";
 #endif
     return s;
 }
@@ -2358,6 +2629,7 @@ void lrt_tri_scene_free(lrt_tri_scene *s) {
     if (!s) return;
     tri_aligned_free(s->nodes4);
     tri_aligned_free(s->nodes8);
+    tri_aligned_free(s->nodes8q);
     tri_aligned_free(s->blocks);
     free(s);
 }
@@ -2368,7 +2640,10 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
         return 0;
     }
 #if LRT_TRI_HAS_AVX2
-    if (s->layout == 8) return tri_intersect_bvh8_avx2(s, ray, hit);
+    if (s->layout == 8) {
+        return s->quantized ? tri_intersect_bvh8q_avx2(s, ray, hit)
+                            : tri_intersect_bvh8_avx2(s, ray, hit);
+    }
 #endif
 #if LRT_TRI_HAS_SSE4
     if (s->layout == 4) return tri_intersect_bvh4_sse(s, ray, hit);
@@ -2379,7 +2654,10 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
 int lrt_tri_occluded1(const lrt_tri_scene *s, const lrt_ray *ray) {
     if (!s || !ray) return 0;
 #if LRT_TRI_HAS_AVX2
-    if (s->layout == 8) return tri_occluded_bvh8_avx2(s, ray);
+    if (s->layout == 8) {
+        return s->quantized ? tri_occluded_bvh8q_avx2(s, ray)
+                            : tri_occluded_bvh8_avx2(s, ray);
+    }
 #endif
 #if LRT_TRI_HAS_SSE4
     if (s->layout == 4) return tri_occluded_bvh4_sse(s, ray);

@@ -14,13 +14,18 @@ a pinned Embree 4 prebuilt binary.
 | `c11-bvh8`  | new `lightrt_c_tri.h` fp32 triangle API, 8-wide BVH (AVX2 kernels), binned SAH build |
 | `c11-lbvh4` | same BVH4 kernels, LBVH fast build (`LRT_TRI_BUILD_FAST`: Morton sort + bit splits) |
 | `c11-lbvh8` | same BVH8 kernels, LBVH fast build                                     |
+| `c11-bvh8q` | 8-wide with 8-bit quantized child bounds (128B nodes vs 256B)          |
 | `embree`    | Embree 4 `rtcIntersect1`/`rtcOccluded1` per ray (optional)             |
+| `tinybvh`   | jbikker/tinybvh `BVH8_CPU` (8-wide AVX2 layout) (optional)             |
+| `mm-bvh`    | madmann91/bvh v2, `DefaultBuilder` Quality::High + `PrecomputedTri` (optional) |
 
 ## Quick start
 
 ```bash
-# optional: fetch the pinned Embree 4.3.3 SDK into third_party/embree
-benchmark_c/scripts/download_embree.sh
+# optional: fetch ALL comparison libraries (Embree 4.3.3 SDK + pinned clones
+# of madmann91/bvh and jbikker/tinybvh) into third_party/
+benchmark_c/scripts/download_libs.sh
+# (or just the Embree SDK: benchmark_c/scripts/download_embree.sh)
 
 cmake -S benchmark_c -B build_bench_c -DCMAKE_BUILD_TYPE=Release
 cmake --build build_bench_c -j
@@ -95,6 +100,40 @@ and ~7.8–9.3 Mtris/s multithreaded — e.g. at 710k tris / 16 threads:
 mandelbulb), e.g. 14.0 vs 16.9 Mrays/s incoherent at 710k/16T (Embree: 16.0).
 Builds are deterministic — bit-identical trees at any thread count for both
 quality modes.
+
+Quantized nodes (`c11-bvh8q`, 128-byte nodes with 8-bit child bounds): +8%
+single-thread incoherent vs `c11-bvh8` (the memory-latency-bound case it
+targets), neutral on multithreaded incoherent, ~10% slower on shadow rays
+where the decode ALU shows. Leaf blocks dominate the footprint, which bounds
+the win; an option rather than the default.
+
+### Cross-library comparison (same rays, hit fractions identical)
+
+Mandelbulb, fineness 128 (127,752 tris), single thread, Mrays/s:
+
+| backend   | primary | incoherent | shadow | build (ms) |
+|-----------|--------:|-----------:|-------:|-----------:|
+| embree    |   18.53 |       3.52 |   5.29 |       54.4 |
+| tinybvh   |   18.04 |       2.48 |   4.46 |       52.9 |
+| c11-bvh4  |   17.67 |   **2.66** |   3.67 |       90.9 |
+| c11-lbvh4 |   15.45 |       2.25 |   3.20 |   **19.4** |
+| c11-bvh8q |   14.76 |       2.57 |   3.59 |       77.1 |
+| mm-bvh    |   14.06 |       1.21 |   1.84 |      110.3 |
+
+Fineness 256 (710,536 tris), 16 threads:
+
+| backend   | incoherent | shadow | build (ms) | build Mtris/s |
+|-----------|-----------:|-------:|-----------:|--------------:|
+| c11-bvh4  |  **16.83** |  34.31 |      199.6 |          3.56 |
+| embree    |      15.23 |  37.89 |       48.9 |         14.54 |
+| c11-lbvh4 |      14.32 |  30.70 |       89.8 |          7.91 |
+| tinybvh   |      13.16 |  32.90 |      500.2 |          1.42 |
+| mm-bvh    |       8.14 |  14.97 |      307.3 |          2.31 |
+
+`c11-bvh4` beats tinybvh on incoherent rays at both scales and wins the
+multithreaded incoherent column outright at 710k tris; Embree keeps the lead
+on shadow rays and build throughput. tinybvh's `BVH8_CPU` build and
+madmann91/bvh's traversal are their respective weak spots in this setup.
 
 ## Notes
 

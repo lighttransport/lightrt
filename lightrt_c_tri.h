@@ -56,7 +56,11 @@ typedef enum lrt_tri_quality {
 typedef enum lrt_tri_layout {
     LRT_TRI_LAYOUT_AUTO = 0, /* widest kernel compiled in */
     LRT_TRI_LAYOUT_BVH4 = 4,
-    LRT_TRI_LAYOUT_BVH8 = 8
+    LRT_TRI_LAYOUT_BVH8 = 8,
+    /* 8-wide with 8-bit quantized child bounds (128-byte nodes vs 256):
+     * halves node bandwidth at the cost of extra decode ALU; intended for
+     * memory-latency-bound incoherent rays on large scenes. */
+    LRT_TRI_LAYOUT_BVH8Q = 9
 } lrt_tri_layout;
 
 typedef struct lrt_tri_build_options {

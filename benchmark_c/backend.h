@@ -49,7 +49,10 @@ const bench_backend *backend_lightrt_bvh4(void);  /* lightrt_c_tri.h, BVH4/SAH *
 const bench_backend *backend_lightrt_bvh8(void);  /* lightrt_c_tri.h, BVH8/SAH */
 const bench_backend *backend_lightrt_lbvh4(void); /* BVH4, Morton fast build */
 const bench_backend *backend_lightrt_lbvh8(void); /* BVH8, Morton fast build */
+const bench_backend *backend_lightrt_bvh8q(void); /* BVH8, quantized nodes */
 const bench_backend *backend_embree(void);        /* Embree 4 (optional) */
+const bench_backend *backend_tinybvh(void);       /* jbikker/tinybvh BVH8_CPU */
+const bench_backend *backend_madmann(void);       /* madmann91/bvh v2 */
 
 #ifdef __cplusplus
 }
