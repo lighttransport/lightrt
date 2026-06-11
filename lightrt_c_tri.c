@@ -28,6 +28,9 @@
 
 #include <float.h>
 #include <math.h>
+#ifdef TRI_SBVH_DEBUG
+#include <stdio.h>
+#endif
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1253,6 +1256,7 @@ typedef struct tri_sbvh_ctx {
     uint32_t block_shift;
     float root_area;
     uint32_t emit_total; /* sum of leaf reference counts */
+    uint32_t dbg_spatial, dbg_object, dbg_sp_considered;
     int failed;
 } tri_sbvh_ctx;
 
@@ -1487,6 +1491,14 @@ static uint32_t tri_sbvh_recursive(tri_sbvh_ctx *c, uint32_t first,
     uint32_t r_first = 0, r_num = 0, r_avail = 0;
     int did_split = 0;
 
+    if (sp_axis >= 0) c->dbg_sp_considered++;
+#ifdef TRI_SBVH_DEBUG
+    if (depth <= 2) {
+        fprintf(stderr,
+                "sbvh d%u num %u: obj_cost %.1f (axis %d) sp_cost %.1f (axis %d)\n",
+                depth, num, (double)obj_cost, obj_axis, (double)sp_cost, sp_axis);
+    }
+#endif
     if (sp_axis >= 0 && sp_cost < obj_cost) {
         /* Spatial split: classify into scratch (lefts bottom-up, rights
          * top-down), duplicating straddlers with plane-clipped bounds, then
@@ -1526,10 +1538,12 @@ static uint32_t tri_sbvh_recursive(tri_sbvh_ctx *c, uint32_t first,
             memcpy(refs + first, sc, (size_t)nl * sizeof(tri_pref));
             memcpy(refs + r_first, sc + nr_end, (size_t)nr * sizeof(tri_pref));
             did_split = 1;
+            c->dbg_spatial++;
         }
     }
 
     if (!did_split) {
+        c->dbg_object++;
         /* Object split (in-place partition by centroid). */
         int axis;
         float pos;
@@ -1618,6 +1632,11 @@ static uint32_t tri_build_sbvh(tri_build_ctx *bc, uint32_t *emit_total) {
 
     uint32_t root = tri_sbvh_recursive(&c, 0, (uint32_t)ntris, cap, 0);
 
+#ifdef TRI_SBVH_DEBUG
+    fprintf(stderr, "sbvh: %u spatial, %u object, %u considered, emit %u/%zu\n",
+            c.dbg_spatial, c.dbg_object, c.dbg_sp_considered, c.emit_total,
+            ntris);
+#endif
     bc->node_next = c.node_next;
     if (c.failed) {
         free(c.refs);
@@ -1900,6 +1919,7 @@ typedef struct tri_ray_ctx {
     float org[3];
     float dir[3];
     float invd[3]; /* infinite components replaced by clamped huge values */
+    float oinv[3]; /* org * invd, clamped finite: slab planes become FMAs */
     float tmin;
     int octant; /* direction sign bits: 1=x neg, 2=y neg, 4=z neg */
 } tri_ray_ctx;
@@ -1919,6 +1939,11 @@ static inline void tri_ray_setup(const lrt_ray *ray, tri_ray_ctx *rc) {
             inv = copysignf(TRI_INVD_MAX, ray->dir[k] == 0.0f ? 1.0f : ray->dir[k]);
         }
         rc->invd[k] = inv;
+        /* Clamped so that fmsub(bound, invd, oinv) can never see inf - inf:
+         * bound*invd may overflow to +/-inf, but oinv stays finite. */
+        float oi = ray->org[k] * inv;
+        if (!(oi >= -1e37f && oi <= 1e37f)) oi = copysignf(1e37f, oi);
+        rc->oinv[k] = oi;
     }
     rc->octant = (rc->invd[0] < 0.0f ? 1 : 0) | (rc->invd[1] < 0.0f ? 2 : 0) |
                  (rc->invd[2] < 0.0f ? 4 : 0);
@@ -2206,6 +2231,7 @@ static int tri_occluded_scalar(const lrt_tri_scene *s, const lrt_ray *ray) {
 typedef struct tri_sse_ctx {
     __m128 orgx, orgy, orgz;
     __m128 invdx, invdy, invdz;
+    __m128 oinvx, oinvy, oinvz; /* org * invd (clamped), for FMA slab */
     __m128 dirx, diry, dirz;
     __m128 tmin;
 } tri_sse_ctx;
@@ -2217,6 +2243,9 @@ static inline void tri_sse_setup(const tri_ray_ctx *rc, tri_sse_ctx *sc) {
     sc->invdx = _mm_set1_ps(rc->invd[0]);
     sc->invdy = _mm_set1_ps(rc->invd[1]);
     sc->invdz = _mm_set1_ps(rc->invd[2]);
+    sc->oinvx = _mm_set1_ps(rc->oinv[0]);
+    sc->oinvy = _mm_set1_ps(rc->oinv[1]);
+    sc->oinvz = _mm_set1_ps(rc->oinv[2]);
     sc->dirx = _mm_set1_ps(rc->dir[0]);
     sc->diry = _mm_set1_ps(rc->dir[1]);
     sc->dirz = _mm_set1_ps(rc->dir[2]);
@@ -2228,12 +2257,21 @@ static inline void tri_sse_setup(const tri_ray_ctx *rc, tri_sse_ctx *sc) {
 static inline int tri_bvh4_slab_sse(const lrt_bvh4_node *n,
                                     const tri_sse_ctx *sc, __m128 t_best,
                                     float *tnear_out) {
+#if LRT_TRI_HAS_AVX2 /* implies FMA: plane = bound*invd - org*invd, one op */
+    __m128 tlx = _mm_fmsub_ps(_mm_load_ps(n->lo_x), sc->invdx, sc->oinvx);
+    __m128 thx = _mm_fmsub_ps(_mm_load_ps(n->hi_x), sc->invdx, sc->oinvx);
+    __m128 tly = _mm_fmsub_ps(_mm_load_ps(n->lo_y), sc->invdy, sc->oinvy);
+    __m128 thy = _mm_fmsub_ps(_mm_load_ps(n->hi_y), sc->invdy, sc->oinvy);
+    __m128 tlz = _mm_fmsub_ps(_mm_load_ps(n->lo_z), sc->invdz, sc->oinvz);
+    __m128 thz = _mm_fmsub_ps(_mm_load_ps(n->hi_z), sc->invdz, sc->oinvz);
+#else
     __m128 tlx = _mm_mul_ps(_mm_sub_ps(_mm_load_ps(n->lo_x), sc->orgx), sc->invdx);
     __m128 thx = _mm_mul_ps(_mm_sub_ps(_mm_load_ps(n->hi_x), sc->orgx), sc->invdx);
     __m128 tly = _mm_mul_ps(_mm_sub_ps(_mm_load_ps(n->lo_y), sc->orgy), sc->invdy);
     __m128 thy = _mm_mul_ps(_mm_sub_ps(_mm_load_ps(n->hi_y), sc->orgy), sc->invdy);
     __m128 tlz = _mm_mul_ps(_mm_sub_ps(_mm_load_ps(n->lo_z), sc->orgz), sc->invdz);
     __m128 thz = _mm_mul_ps(_mm_sub_ps(_mm_load_ps(n->hi_z), sc->orgz), sc->invdz);
+#endif
     __m128 tnear = _mm_max_ps(
         _mm_max_ps(_mm_min_ps(tlx, thx), _mm_min_ps(tly, thy)),
         _mm_max_ps(_mm_min_ps(tlz, thz), sc->tmin));
@@ -2685,6 +2723,7 @@ static void tri_occluded1N_bvh4_sse(const lrt_tri_scene *s,
 typedef struct tri_avx_ctx {
     __m256 orgx, orgy, orgz;
     __m256 invdx, invdy, invdz;
+    __m256 oinvx, oinvy, oinvz;
     __m256 dirx, diry, dirz;
     __m256 tmin;
 } tri_avx_ctx;
@@ -2696,6 +2735,9 @@ static inline void tri_avx_setup(const tri_ray_ctx *rc, tri_avx_ctx *ac) {
     ac->invdx = _mm256_set1_ps(rc->invd[0]);
     ac->invdy = _mm256_set1_ps(rc->invd[1]);
     ac->invdz = _mm256_set1_ps(rc->invd[2]);
+    ac->oinvx = _mm256_set1_ps(rc->oinv[0]);
+    ac->oinvy = _mm256_set1_ps(rc->oinv[1]);
+    ac->oinvz = _mm256_set1_ps(rc->oinv[2]);
     ac->dirx = _mm256_set1_ps(rc->dir[0]);
     ac->diry = _mm256_set1_ps(rc->dir[1]);
     ac->dirz = _mm256_set1_ps(rc->dir[2]);
@@ -2824,18 +2866,12 @@ static inline int tri_block_occluded_avx(const lrt_tri8 *blk,
 static inline int tri_bvh8_slab_avx(const lrt_bvh8_node *n,
                                     const tri_avx_ctx *ac, __m256 t_best,
                                     float *tnear_out) {
-    __m256 tlx = _mm256_mul_ps(_mm256_sub_ps(_mm256_load_ps(n->lo_x), ac->orgx),
-                               ac->invdx);
-    __m256 thx = _mm256_mul_ps(_mm256_sub_ps(_mm256_load_ps(n->hi_x), ac->orgx),
-                               ac->invdx);
-    __m256 tly = _mm256_mul_ps(_mm256_sub_ps(_mm256_load_ps(n->lo_y), ac->orgy),
-                               ac->invdy);
-    __m256 thy = _mm256_mul_ps(_mm256_sub_ps(_mm256_load_ps(n->hi_y), ac->orgy),
-                               ac->invdy);
-    __m256 tlz = _mm256_mul_ps(_mm256_sub_ps(_mm256_load_ps(n->lo_z), ac->orgz),
-                               ac->invdz);
-    __m256 thz = _mm256_mul_ps(_mm256_sub_ps(_mm256_load_ps(n->hi_z), ac->orgz),
-                               ac->invdz);
+    __m256 tlx = _mm256_fmsub_ps(_mm256_load_ps(n->lo_x), ac->invdx, ac->oinvx);
+    __m256 thx = _mm256_fmsub_ps(_mm256_load_ps(n->hi_x), ac->invdx, ac->oinvx);
+    __m256 tly = _mm256_fmsub_ps(_mm256_load_ps(n->lo_y), ac->invdy, ac->oinvy);
+    __m256 thy = _mm256_fmsub_ps(_mm256_load_ps(n->hi_y), ac->invdy, ac->oinvy);
+    __m256 tlz = _mm256_fmsub_ps(_mm256_load_ps(n->lo_z), ac->invdz, ac->oinvz);
+    __m256 thz = _mm256_fmsub_ps(_mm256_load_ps(n->hi_z), ac->invdz, ac->oinvz);
     __m256 tnear = _mm256_max_ps(
         _mm256_max_ps(_mm256_min_ps(tlx, thx), _mm256_min_ps(tly, thy)),
         _mm256_max_ps(_mm256_min_ps(tlz, thz), ac->tmin));

@@ -189,6 +189,35 @@ shadow/any-hit gap (~0.75x Embree) on this scene; what remains is Embree's
 any-hit kernel itself (profiling on our side shows no hotspot — work is
 evenly spread across node tests and leaf loads).
 
+### Synthetic adversarial scene: `--scene thinspan`
+
+Long thin diagonal triangles (`--ntris`, `--span` = length as a fraction of
+the cube diagonal, `0.002` thick). Every backend collapses on it — at span
+1.0 (corner-to-corner hairs, 100k tris) throughput drops three orders of
+magnitude below the mandelbulb for everyone — which is the point: thin
+diagonal slivers give every axis-aligned box enormous empty volume no
+partitioning can remove.
+
+Findings (100k tris, primary rays, single thread):
+- span 1.0: `c11-sbvh4` 0.016 Mrays/s vs `c11-bvh4` 0.011 (+45%) vs Embree
+  and tinybvh both 0.006 — spatial splits help (+77% duplicated refs) and
+  our SBVH leads the field 2.7x over Embree here.
+- span <= 0.5: spatial splits stop firing — the per-node SAH comparison
+  correctly concludes that chopping a *diagonal* sliver's box on one axis
+  barely shrinks it while doubling references. Embree agrees: its own
+  spatial-split builder (`LRTBENCH_EMBREE_QUALITY=high`, 10x build time)
+  gains nothing on this scene either.
+- The real fix for hair-like geometry is a different primitive (oriented
+  bounds / curve intersectors), not spatial splits.
+
+### Ray-space transform slab test
+
+On FMA-capable builds the per-ray setup precomputes `org*invd` (clamped
+finite so `bound*invd` overflow cannot produce inf−inf NaNs), turning every
+slab plane into a single `fmsub` instead of subtract+multiply — 6 fewer ops
+per node test. Measured effect on Zen 1: within noise to +3% (the slab is
+not the bottleneck); kept since it is strictly fewer operations.
+
 ## Notes
 
 - The mandelbulb DE is NaN at the grid point exactly at the origin

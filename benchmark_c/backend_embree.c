@@ -17,6 +17,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* LRTBENCH_EMBREE_QUALITY=high selects RTC_BUILD_QUALITY_HIGH (Embree's
+ * spatial-split builder) instead of the default. */
+static enum RTCBuildQuality em_quality(void) {
+    const char *q = getenv("LRTBENCH_EMBREE_QUALITY");
+    if (q && (q[0] == 'h' || q[0] == 'H')) return RTC_BUILD_QUALITY_HIGH;
+    return RTC_BUILD_QUALITY_MEDIUM;
+}
+
 #include "timing.h"
 
 typedef struct {
@@ -54,7 +62,9 @@ static void *em_build(const float *vertices, size_t ntris, int num_threads,
 
     uint64_t t0 = bench_time_ns();
     es->scene = rtcNewScene(es->device);
+    rtcSetSceneBuildQuality(es->scene, em_quality());
     RTCGeometry geom = rtcNewGeometry(es->device, RTC_GEOMETRY_TYPE_TRIANGLE);
+    rtcSetGeometryBuildQuality(geom, em_quality());
 
     /* Vertex buffer: 3 vertices per triangle (soup), index buffer 0..3N. */
     float *vb = (float *)rtcSetNewGeometryBuffer(

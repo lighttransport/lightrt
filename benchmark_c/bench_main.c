@@ -22,6 +22,7 @@
 #include "backend.h"
 #include "rays.h"
 #include "scene_mandelbulb.h"
+#include "scene_thinspan.h"
 #include "timing.h"
 
 #define MAX_BACKENDS 16
@@ -31,6 +32,8 @@ typedef struct {
     const char *scene;
     int fineness;
     int power;
+    size_t scene_ntris; /* thinspan primitive count */
+    float scene_span;   /* thinspan length fraction of the cube diagonal */
     const char *backends; /* comma list or "all" */
     const char *workloads; /* comma list or "all" */
     size_t nrays;
@@ -44,9 +47,13 @@ typedef struct {
 static void usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s [options]\n"
-            "  --scene mandelbulb     procedural scene (default mandelbulb)\n"
+            "  --scene NAME           mandelbulb (default) | thinspan (long thin\n"
+            "                         diagonal triangles; the spatial-split showcase)\n"
             "  --fineness N           marching-cubes grid resolution (default 128)\n"
             "  --power N              mandelbulb power (default 8)\n"
+            "  --ntris N              thinspan triangle count (default 100000)\n"
+            "  --span F               thinspan length as a fraction of the cube\n"
+            "                         diagonal (default 0.25)\n"
             "  --backend LIST         all | comma list of: c11-cb,c11-bvh4,c11-bvh8,\n"
             "                         c11-lbvh4,c11-lbvh8 (Morton fast build),\n"
             "                         c11-bvh8q (quantized nodes), c11-sbvh4 (spatial\n"
@@ -205,6 +212,8 @@ int main(int argc, char **argv) {
         .scene = "mandelbulb",
         .fineness = 128,
         .power = 8,
+        .scene_ntris = 100000,
+        .scene_span = 0.25f,
         .backends = "all",
         .workloads = "all",
         .nrays = 4000000,
@@ -221,6 +230,8 @@ int main(int argc, char **argv) {
         if (!strcmp(a, "--scene") && next) cfg.scene = argv[++i];
         else if (!strcmp(a, "--fineness") && next) cfg.fineness = atoi(argv[++i]);
         else if (!strcmp(a, "--power") && next) cfg.power = atoi(argv[++i]);
+        else if (!strcmp(a, "--ntris") && next) cfg.scene_ntris = (size_t)atoll(argv[++i]);
+        else if (!strcmp(a, "--span") && next) cfg.scene_span = (float)atof(argv[++i]);
         else if (!strcmp(a, "--backend") && next) cfg.backends = argv[++i];
         else if (!strcmp(a, "--rays") && next) cfg.workloads = argv[++i];
         else if (!strcmp(a, "--nrays") && next) cfg.nrays = (size_t)atoll(argv[++i]);
@@ -237,15 +248,19 @@ int main(int argc, char **argv) {
     if (cfg.repeat < 1) cfg.repeat = 1;
     if (cfg.nrays < 1024) cfg.nrays = 1024;
 
-    if (strcmp(cfg.scene, "mandelbulb") != 0) {
+    /* --- Scene generation --- */
+    float *verts = NULL;
+    size_t ntris = 0;
+    uint64_t g0 = bench_time_ns();
+    if (strcmp(cfg.scene, "mandelbulb") == 0) {
+        ntris = scene_mandelbulb_generate(cfg.fineness, cfg.power, &verts);
+    } else if (strcmp(cfg.scene, "thinspan") == 0) {
+        ntris = scene_thinspan_generate(cfg.scene_ntris, 0.0f, cfg.scene_span,
+                                        cfg.seed, &verts);
+    } else {
         fprintf(stderr, "unknown scene: %s\n", cfg.scene);
         return 1;
     }
-
-    /* --- Scene generation --- */
-    float *verts = NULL;
-    uint64_t g0 = bench_time_ns();
-    size_t ntris = scene_mandelbulb_generate(cfg.fineness, cfg.power, &verts);
     uint64_t g1 = bench_time_ns();
     if (ntris == 0) {
         fprintf(stderr, "scene generation failed\n");
@@ -393,7 +408,7 @@ int main(int argc, char **argv) {
             qsort(samples, (size_t)reps, sizeof(double), cmp_double);
             double mrays = samples[reps / 2];
 
-            printf("%-10s %-10s threads=%-3d %9.2f Mrays/s  hit %.4f\n", bk->name,
+            printf("%-10s %-10s threads=%-3d %9.3f Mrays/s  hit %.4f\n", bk->name,
                    workloads[w].name, cfg.threads, mrays, hit_frac);
             if (csv) {
                 fprintf(csv, "%s,%s,%zu,%.3f,%.3f,%.3f,%s,%d,%.3f,%.5f\n", bk->name,

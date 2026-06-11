@@ -23,6 +23,7 @@ add_executable(bench_c
     bench_main.c
     rays.c
     scene_mandelbulb.c
+    scene_thinspan.c
     backend_lightrt_cb.c
     backend_lightrt_tri.c
     backend_embree.c
