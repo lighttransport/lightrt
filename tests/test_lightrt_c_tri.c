@@ -415,11 +415,1165 @@ static void test_curve_scene(void) {
     free(radii);
 }
 
+/* Reference ray-sphere (matches the library's root selection: near root in
+ * [tmin, tmax) else the far root). */
+static int ref_sphere(const float *sp, const lrt_ray *r, float tmax,
+                      float *t_out) {
+    float rr = sp[3];
+    if (rr <= 0.0f) return 0;
+    float ocx = r->org[0] - sp[0], ocy = r->org[1] - sp[1],
+          ocz = r->org[2] - sp[2];
+    float a = r->dir[0] * r->dir[0] + r->dir[1] * r->dir[1] +
+              r->dir[2] * r->dir[2];
+    if (a <= 1e-20f) return 0;
+    float b = ocx * r->dir[0] + ocy * r->dir[1] + ocz * r->dir[2];
+    float c = ocx * ocx + ocy * ocy + ocz * ocz - rr * rr;
+    float disc = b * b - a * c;
+    if (disc < 0.0f) return 0;
+    float sq = sqrtf(disc), inv = 1.0f / a;
+    float t0 = (-b - sq) * inv;
+    if (t0 >= r->tmin && t0 < tmax) {
+        *t_out = t0;
+        return 1;
+    }
+    float t1 = (-b + sq) * inv;
+    if (t1 >= r->tmin && t1 < tmax) {
+        *t_out = t1;
+        return 1;
+    }
+    return 0;
+}
+
+static void test_sphere_scene(void) {
+    enum { NSPH = 400, NRAYS = 20000 };
+    float *sph = (float *)malloc(NSPH * 4 * sizeof(float));
+    g_rng = 0x5151515151ull;
+    for (int i = 0; i < NSPH; i++) {
+        sph[i * 4 + 0] = rnd_f(-2.0f, 2.0f);
+        sph[i * 4 + 1] = rnd_f(-2.0f, 2.0f);
+        sph[i * 4 + 2] = rnd_f(-2.0f, 2.0f);
+        sph[i * 4 + 3] = rnd_f(0.02f, 0.2f);
+    }
+    lrt_result err = LRT_RESULT_OK;
+    lrt_tri_scene *s = lrt_sphere_scene_build(sph, NSPH, NULL, &err);
+    CHECK(s != NULL, "sphere build failed (err=%d)", (int)err);
+    if (!s) {
+        free(sph);
+        return;
+    }
+    printf("  sphere scene [%s]\n", lrt_tri_kernel_name(s));
+    size_t mism = 0, occl = 0;
+    for (int i = 0; i < NRAYS; i++) {
+        lrt_ray r;
+        make_random_ray(&r);
+        float bt = r.tmax;
+        int bf = 0;
+        for (int j = 0; j < NSPH; j++) {
+            float t;
+            if (ref_sphere(&sph[j * 4], &r, bt, &t)) {
+                bt = t;
+                bf = 1;
+            }
+        }
+        lrt_hit h;
+        int bvh = lrt_tri_intersect1(s, &r, &h);
+        if (bf != bvh) {
+            mism++;
+        } else if (bf && fabs((double)h.t - (double)bt) >
+                             1e-3 * (1.0 + fabs((double)bt))) {
+            mism++;
+        }
+        if (lrt_tri_occluded1(s, &r) != bvh) occl++;
+    }
+    /* grazing/tangent rays can flip near/far root by an ulp: same 0.05% budget
+     * the curve test uses. */
+    CHECK(mism <= NRAYS / 2000,
+          "sphere: %zu/%d closest mismatches vs brute force", mism, NRAYS);
+    CHECK(occl == 0, "sphere: %zu occluded disagreements", occl);
+    lrt_tri_scene_free(s);
+    free(sph);
+}
+
+/* User-geometry callbacks: a sphere field and a triangle soup driven through
+ * the generic custom-geometry path. */
+typedef struct { const float *sph; } user_sph_ctx;
+static int user_sphere_cb(const lrt_ray *ray, uint32_t prim, void *user,
+                          float *t, float *u, float *v) {
+    const user_sph_ctx *c = (const user_sph_ctx *)user;
+    float tt;
+    if (ref_sphere(&c->sph[prim * 4], ray, ray->tmax, &tt)) {
+        *t = tt;
+        *u = 0.0f;
+        *v = 0.0f;
+        return 1;
+    }
+    return 0;
+}
+typedef struct { const float *verts; } user_tri_ctx;
+static int user_tri_cb(const lrt_ray *ray, uint32_t prim, void *user, float *t,
+                       float *u, float *v) {
+    const user_tri_ctx *c = (const user_tri_ctx *)user;
+    return ref_isect(&c->verts[prim * 9], ray, t, u, v);
+}
+
+static void test_user_geometry(void) {
+    lrt_result err = LRT_RESULT_OK;
+
+    /* (a) sphere field via the generic callback path vs brute force. */
+    enum { NSPH = 400, NRAYS = 12000 };
+    float *sph = (float *)malloc(NSPH * 4 * sizeof(float));
+    float *aabb = (float *)malloc(NSPH * 6 * sizeof(float));
+    g_rng = 0x7777ull;
+    for (int i = 0; i < NSPH; i++) {
+        float cx = rnd_f(-2, 2), cy = rnd_f(-2, 2), cz = rnd_f(-2, 2);
+        float r = rnd_f(0.02f, 0.2f);
+        sph[i * 4 + 0] = cx;
+        sph[i * 4 + 1] = cy;
+        sph[i * 4 + 2] = cz;
+        sph[i * 4 + 3] = r;
+        aabb[i * 6 + 0] = cx - r;
+        aabb[i * 6 + 1] = cy - r;
+        aabb[i * 6 + 2] = cz - r;
+        aabb[i * 6 + 3] = cx + r;
+        aabb[i * 6 + 4] = cy + r;
+        aabb[i * 6 + 5] = cz + r;
+    }
+    user_sph_ctx uctx = {sph};
+    lrt_tri_scene *us =
+        lrt_user_scene_build(aabb, NSPH, user_sphere_cb, NULL, &uctx, NULL, &err);
+    CHECK(us != NULL, "user(sphere) build failed (err=%d)", (int)err);
+    if (us) {
+        printf("  user scene [%s]\n", lrt_tri_kernel_name(us));
+        size_t mism = 0, occl = 0;
+        for (int i = 0; i < NRAYS; i++) {
+            lrt_ray r;
+            make_random_ray(&r);
+            float bt = r.tmax;
+            int bf = 0;
+            for (int j = 0; j < NSPH; j++) {
+                float t;
+                if (ref_sphere(&sph[j * 4], &r, bt, &t)) {
+                    bt = t;
+                    bf = 1;
+                }
+            }
+            lrt_hit h;
+            int bvh = lrt_tri_intersect1(us, &r, &h);
+            if (bf != bvh) {
+                mism++;
+            } else if (bf && fabs((double)h.t - (double)bt) >
+                                 1e-3 * (1.0 + fabs((double)bt))) {
+                mism++;
+            }
+            if (lrt_tri_occluded1(us, &r) != bvh) occl++;
+        }
+        CHECK(mism <= NRAYS / 2000,
+              "user(sphere): %zu/%d closest mismatches vs brute force", mism,
+              NRAYS);
+        CHECK(occl == 0, "user(sphere): %zu occluded disagreements", occl);
+        lrt_tri_scene_free(us);
+    }
+    free(sph);
+    free(aabb);
+
+    /* (b) triangle soup via the generic callback path vs the native tri BVH. */
+    g_rng = 0xA5A5A5A5ull;
+    enum { NT = 800 };
+    float *verts = make_random_soup(NT, 0.2f);
+    float *taabb = (float *)malloc(NT * 6 * sizeof(float));
+    for (int i = 0; i < NT; i++) {
+        const float *tv = &verts[i * 9];
+        for (int a = 0; a < 3; a++) {
+            float lo = tv[a], hi = tv[a];
+            for (int k = 1; k < 3; k++) {
+                float c = tv[k * 3 + a];
+                lo = c < lo ? c : lo;
+                hi = c > hi ? c : hi;
+            }
+            taabb[i * 6 + a] = lo;
+            taabb[i * 6 + 3 + a] = hi;
+        }
+    }
+    user_tri_ctx tctx = {verts};
+    lrt_tri_scene *uu =
+        lrt_user_scene_build(taabb, NT, user_tri_cb, NULL, &tctx, NULL, &err);
+    lrt_tri_scene *nat = lrt_tri_scene_build(verts, NT, NULL, &err);
+    CHECK(uu && nat, "user(tri)/native build failed");
+    if (uu && nat) {
+        size_t mism = 0;
+        for (int i = 0; i < 12000; i++) {
+            lrt_ray r;
+            make_random_ray(&r);
+            lrt_hit hu, hn;
+            int a = lrt_tri_intersect1(uu, &r, &hu);
+            int b = lrt_tri_intersect1(nat, &r, &hn);
+            if (a != b) {
+                mism++;
+            } else if (a && fabs((double)hu.t - (double)hn.t) >
+                                1e-3 * (1.0 + fabs((double)hn.t))) {
+                mism++;
+            }
+        }
+        CHECK(mism <= 12000 / 2000,
+              "user(tri) vs native: %zu mismatches", mism);
+    }
+    lrt_tri_scene_free(uu);
+    lrt_tri_scene_free(nat);
+    free(verts);
+    free(taabb);
+}
+
+/* Analytic sphere SDF: length(p - c) - r. */
+typedef struct { float c[3]; float r; } sdf_sphere_ctx;
+static float sdf_sphere(const float p[3], void *user) {
+    const sdf_sphere_ctx *c = (const sdf_sphere_ctx *)user;
+    float dx = p[0] - c->c[0], dy = p[1] - c->c[1], dz = p[2] - c->c[2];
+    return sqrtf(dx * dx + dy * dy + dz * dz) - c->r;
+}
+
+/* Ray aimed near a target point (mostly non-grazing, to exercise the marcher
+ * cleanly rather than its tangent edge cases). */
+static void make_ray_at_target(lrt_ray *r, const float center[3], float spread) {
+    float ox = rnd_f(-1, 1), oy = rnd_f(-1, 1), oz = rnd_f(-1, 1);
+    float ol = sqrtf(ox * ox + oy * oy + oz * oz);
+    if (ol < 1e-6f) {
+        ox = 1;
+        ol = 1;
+    }
+    r->org[0] = center[0] + ox / ol * 5.0f;
+    r->org[1] = center[1] + oy / ol * 5.0f;
+    r->org[2] = center[2] + oz / ol * 5.0f;
+    float dx = center[0] + rnd_f(-spread, spread) - r->org[0];
+    float dy = center[1] + rnd_f(-spread, spread) - r->org[1];
+    float dz = center[2] + rnd_f(-spread, spread) - r->org[2];
+    float dl = sqrtf(dx * dx + dy * dy + dz * dz);
+    r->dir[0] = dx / dl;
+    r->dir[1] = dy / dl;
+    r->dir[2] = dz / dl;
+    r->tmin = 1e-4f;
+    r->tmax = 20.0f;
+}
+
+static void test_sdf_standalone(void) {
+    sdf_sphere_ctx c = {{0.5f, -0.3f, 0.2f}, 1.2f};
+    lrt_sdf_params p;
+    memset(&p, 0, sizeof(p));
+    p.epsilon = 1e-4f;
+    p.max_steps = 256;
+    p.normal_eps = 1e-3f;
+    g_rng = 0x9911ull;
+    size_t mism = 0, nrm_bad = 0;
+    int tested = 0;
+    for (int i = 0; i < 4000; i++) {
+        lrt_ray r;
+        make_ray_at_target(&r, c.c, 0.9f);
+        float sp[4] = {c.c[0], c.c[1], c.c[2], c.r};
+        float at;
+        int ahit = ref_sphere(sp, &r, r.tmax, &at);
+        lrt_sdf_hit hit;
+        int shit = lrt_sdf_sphere_trace(r.org, r.dir, r.tmin, r.tmax, sdf_sphere,
+                                        &c, &p, &hit);
+        if (ahit != shit) {
+            mism++;
+            continue;
+        }
+        if (ahit) {
+            tested++;
+            if (fabs((double)hit.t - (double)at) > 5e-3 * (1.0 + fabs((double)at)))
+                mism++;
+            float nx = (hit.p[0] - c.c[0]) / c.r;
+            float ny = (hit.p[1] - c.c[1]) / c.r;
+            float nz = (hit.p[2] - c.c[2]) / c.r;
+            double dot = hit.n[0] * nx + hit.n[1] * ny + hit.n[2] * nz;
+            if (dot < 0.99) nrm_bad++;
+        }
+    }
+    CHECK(mism <= 4000 / 100, "sdf standalone: %zu mismatches vs analytic sphere",
+          mism);
+    CHECK(nrm_bad <= (size_t)(tested / 50 + 1),
+          "sdf standalone: %zu/%d bad normals", nrm_bad, tested);
+
+    /* over-relaxation must not change the surface found */
+    size_t relax_bad = 0;
+    g_rng = 0x9911ull;
+    for (int i = 0; i < 2000; i++) {
+        lrt_ray r;
+        make_ray_at_target(&r, c.c, 0.9f);
+        float omegas[3] = {1.0f, 1.6f, 1.9f};
+        float ts[3];
+        int hits[3];
+        for (int k = 0; k < 3; k++) {
+            p.over_relax = omegas[k];
+            lrt_sdf_hit h;
+            hits[k] = lrt_sdf_sphere_trace(r.org, r.dir, r.tmin, r.tmax,
+                                           sdf_sphere, &c, &p, &h);
+            ts[k] = h.t;
+        }
+        if (hits[0] != hits[1] || hits[1] != hits[2]) {
+            relax_bad++;
+        } else if (hits[0] &&
+                   (fabs((double)ts[0] - (double)ts[1]) > 1e-2 ||
+                    fabs((double)ts[0] - (double)ts[2]) > 1e-2)) {
+            relax_bad++;
+        }
+    }
+    CHECK(relax_bad <= 2000 / 100,
+          "sdf over-relaxation changed the surface on %zu rays", relax_bad);
+}
+
+static void test_sdf_scene(void) {
+    enum { GRID = 4, NB = GRID * GRID * GRID, NRAYS = 8000 };
+    float *sph = (float *)malloc(NB * 4 * sizeof(float));
+    sdf_sphere_ctx *ctx = (sdf_sphere_ctx *)malloc(NB * sizeof(sdf_sphere_ctx));
+    lrt_sdf_blob *blobs = (lrt_sdf_blob *)malloc(NB * sizeof(lrt_sdf_blob));
+    const float R = 0.4f, SP = 1.2f; /* disjoint: gap 0.4 between spheres */
+    int idx = 0;
+    for (int x = 0; x < GRID; x++)
+        for (int y = 0; y < GRID; y++)
+            for (int z = 0; z < GRID; z++, idx++) {
+                float cx = (x - 1.5f) * SP, cy = (y - 1.5f) * SP,
+                      cz = (z - 1.5f) * SP;
+                sph[idx * 4 + 0] = cx;
+                sph[idx * 4 + 1] = cy;
+                sph[idx * 4 + 2] = cz;
+                sph[idx * 4 + 3] = R;
+                ctx[idx].c[0] = cx;
+                ctx[idx].c[1] = cy;
+                ctx[idx].c[2] = cz;
+                ctx[idx].r = R;
+                blobs[idx].aabb[0] = cx - R;
+                blobs[idx].aabb[1] = cy - R;
+                blobs[idx].aabb[2] = cz - R;
+                blobs[idx].aabb[3] = cx + R;
+                blobs[idx].aabb[4] = cy + R;
+                blobs[idx].aabb[5] = cz + R;
+                blobs[idx].sdf = sdf_sphere;
+                blobs[idx].user = &ctx[idx];
+            }
+    lrt_sdf_params p;
+    memset(&p, 0, sizeof(p));
+    p.epsilon = 5e-5f;
+    p.max_steps = 128;
+    lrt_result err = LRT_RESULT_OK;
+    lrt_tri_scene *sdf = lrt_sdf_scene_build(blobs, NB, &p, NULL, &err);
+    lrt_tri_scene *ana = lrt_sphere_scene_build(sph, NB, NULL, &err);
+    CHECK(sdf && ana, "sdf/analytic sphere scene build failed");
+    if (sdf && ana) {
+        printf("  sdf scene [%s]\n", lrt_tri_kernel_name(sdf));
+        const float center[3] = {0, 0, 0};
+        size_t mism = 0, occl = 0;
+        g_rng = 0x4242ull;
+        for (int i = 0; i < NRAYS; i++) {
+            lrt_ray r;
+            make_ray_at_target(&r, center, 3.0f);
+            lrt_hit hs, ha;
+            int a = lrt_tri_intersect1(sdf, &r, &hs);
+            int b = lrt_tri_intersect1(ana, &r, &ha);
+            if (a != b) {
+                mism++;
+            } else if (a && fabs((double)hs.t - (double)ha.t) >
+                                3e-3 * (1.0 + fabs((double)ha.t))) {
+                mism++;
+            }
+            if (lrt_tri_occluded1(sdf, &r) != a) occl++;
+        }
+        CHECK(mism <= NRAYS / 100, "sdf scene: %zu mismatches vs analytic spheres",
+              mism);
+        CHECK(occl == 0, "sdf scene: %zu occluded disagreements", occl);
+    }
+    lrt_tri_scene_free(sdf);
+    lrt_tri_scene_free(ana);
+    free(sph);
+    free(ctx);
+    free(blobs);
+}
+
+/* Reference closest-point-on-triangle squared distance (Ericson). */
+static float ref_point_tri_distsq(const float *tri, const float p[3]) {
+    const float *A = &tri[0], *B = &tri[3], *C = &tri[6];
+    float ab[3] = {B[0] - A[0], B[1] - A[1], B[2] - A[2]};
+    float ac[3] = {C[0] - A[0], C[1] - A[1], C[2] - A[2]};
+    float ap[3] = {p[0] - A[0], p[1] - A[1], p[2] - A[2]};
+    float d1 = ab[0] * ap[0] + ab[1] * ap[1] + ab[2] * ap[2];
+    float d2 = ac[0] * ap[0] + ac[1] * ap[1] + ac[2] * ap[2];
+    float q[3];
+    do {
+        if (d1 <= 0 && d2 <= 0) {
+            q[0] = A[0]; q[1] = A[1]; q[2] = A[2];
+            break;
+        }
+        float bp[3] = {p[0] - B[0], p[1] - B[1], p[2] - B[2]};
+        float d3 = ab[0] * bp[0] + ab[1] * bp[1] + ab[2] * bp[2];
+        float d4 = ac[0] * bp[0] + ac[1] * bp[1] + ac[2] * bp[2];
+        if (d3 >= 0 && d4 <= d3) {
+            q[0] = B[0]; q[1] = B[1]; q[2] = B[2];
+            break;
+        }
+        float vc = d1 * d4 - d3 * d2;
+        if (vc <= 0 && d1 >= 0 && d3 <= 0) {
+            float v = d1 / (d1 - d3);
+            for (int a = 0; a < 3; a++) q[a] = A[a] + v * ab[a];
+            break;
+        }
+        float cp[3] = {p[0] - C[0], p[1] - C[1], p[2] - C[2]};
+        float d5 = ab[0] * cp[0] + ab[1] * cp[1] + ab[2] * cp[2];
+        float d6 = ac[0] * cp[0] + ac[1] * cp[1] + ac[2] * cp[2];
+        if (d6 >= 0 && d5 <= d6) {
+            q[0] = C[0]; q[1] = C[1]; q[2] = C[2];
+            break;
+        }
+        float vb = d5 * d2 - d1 * d6;
+        if (vb <= 0 && d2 >= 0 && d6 <= 0) {
+            float w = d2 / (d2 - d6);
+            for (int a = 0; a < 3; a++) q[a] = A[a] + w * ac[a];
+            break;
+        }
+        float va = d3 * d6 - d5 * d4;
+        if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) {
+            float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+            for (int a = 0; a < 3; a++) q[a] = B[a] + w * (C[a] - B[a]);
+            break;
+        }
+        float denom = 1.0f / (va + vb + vc);
+        float v = vb * denom, w = vc * denom;
+        for (int a = 0; a < 3; a++) q[a] = A[a] + ab[a] * v + ac[a] * w;
+    } while (0);
+    float dx = p[0] - q[0], dy = p[1] - q[1], dz = p[2] - q[2];
+    return dx * dx + dy * dy + dz * dz;
+}
+
+static int cmp_float(const void *a, const void *b) {
+    float fa = *(const float *)a, fb = *(const float *)b;
+    return fa < fb ? -1 : (fa > fb ? 1 : 0);
+}
+
+static void test_closest_point_knn(void) {
+    enum { NT = 600, K = 8 };
+    g_rng = 0xB00B5ull;
+    float *verts = make_random_soup(NT, 0.2f);
+    lrt_result err = LRT_RESULT_OK;
+    lrt_tri_scene *s = lrt_tri_scene_build(verts, NT, NULL, &err);
+    CHECK(s != NULL, "knn build failed");
+    if (!s) {
+        free(verts);
+        return;
+    }
+    size_t mism = 0, cp_mism = 0;
+    float *bd = (float *)malloc(NT * sizeof(float));
+    for (int i = 0; i < 3000; i++) {
+        float p[3] = {rnd_f(-3, 3), rnd_f(-3, 3), rnd_f(-3, 3)};
+        for (int j = 0; j < NT; j++) bd[j] = ref_point_tri_distsq(&verts[j * 9], p);
+        qsort(bd, NT, sizeof(float), cmp_float);
+        lrt_knn_result kr[K];
+        size_t n = lrt_tri_knn(s, p, K, kr, K);
+        if (n != K) mism++;
+        for (size_t m = 0; m < n; m++) {
+            if (m > 0 && kr[m].dist_sq < kr[m - 1].dist_sq) mism++; /* sorted */
+            if (fabs((double)kr[m].dist_sq - (double)bd[m]) >
+                1e-4 * (1.0 + (double)bd[m]))
+                mism++;
+        }
+        lrt_point_hit ph;
+        int c = lrt_tri_closest_point(s, p, &ph);
+        if (!c) {
+            cp_mism++;
+        } else {
+            if (fabs((double)ph.dist_sq - (double)kr[0].dist_sq) >
+                1e-4 * (1.0 + (double)kr[0].dist_sq))
+                cp_mism++;
+            float dx = p[0] - ph.point[0], dy = p[1] - ph.point[1],
+                  dz = p[2] - ph.point[2];
+            double d = (double)(dx * dx + dy * dy + dz * dz);
+            if (fabs(d - (double)ph.dist_sq) > 1e-4 * (1.0 + d)) cp_mism++;
+        }
+    }
+    CHECK(mism == 0, "knn: %zu discrepancies vs brute force", mism);
+    CHECK(cp_mism == 0, "closest_point: %zu discrepancies vs knn(1)", cp_mism);
+    free(bd);
+    lrt_tri_scene_free(s);
+    free(verts);
+}
+
+static void tri_aabb(const float *tri, float lo[3], float hi[3]) {
+    for (int a = 0; a < 3; a++) {
+        lo[a] = hi[a] = tri[a];
+        for (int k = 1; k < 3; k++) {
+            float c = tri[k * 3 + a];
+            if (c < lo[a]) lo[a] = c;
+            if (c > hi[a]) hi[a] = c;
+        }
+    }
+}
+
+static void test_region_queries(void) {
+    enum { NT = 1000 };
+    g_rng = 0xCAFEF00Dull;
+    float *verts = make_random_soup(NT, 0.15f);
+    lrt_tri_scene *s = lrt_tri_scene_build(verts, NT, NULL, NULL);
+    CHECK(s != NULL, "region build failed");
+    if (!s) {
+        free(verts);
+        return;
+    }
+    uint32_t *out = (uint32_t *)malloc(NT * sizeof(uint32_t));
+    uint8_t *exp = (uint8_t *)malloc(NT);
+    size_t aabb_bad = 0, sph_bad = 0, dup_bad = 0;
+    for (int trial = 0; trial < 400; trial++) {
+        float cx = rnd_f(-2, 2), cy = rnd_f(-2, 2), cz = rnd_f(-2, 2);
+        float h = rnd_f(0.3f, 1.5f);
+        float qlo[3] = {cx - h, cy - h, cz - h}, qhi[3] = {cx + h, cy + h, cz + h};
+        size_t n = lrt_tri_query_aabb(s, qlo, qhi, out, NT);
+        memset(exp, 0, NT);
+        size_t nexp = 0;
+        for (int j = 0; j < NT; j++) {
+            float lo[3], hi[3];
+            tri_aabb(&verts[j * 9], lo, hi);
+            if (lo[0] <= qhi[0] && hi[0] >= qlo[0] && lo[1] <= qhi[1] &&
+                hi[1] >= qlo[1] && lo[2] <= qhi[2] && hi[2] >= qlo[2]) {
+                exp[j] = 1;
+                nexp++;
+            }
+        }
+        if (n != nexp) aabb_bad++;
+        uint8_t *seen = (uint8_t *)calloc(NT, 1);
+        for (size_t i = 0; i < n; i++) {
+            if (out[i] >= NT || !exp[out[i]]) aabb_bad++;
+            if (seen[out[i]]) dup_bad++;
+            seen[out[i]] = 1;
+        }
+        free(seen);
+
+        /* sphere */
+        float r = rnd_f(0.3f, 1.2f);
+        float center[3] = {cx, cy, cz};
+        size_t ns = lrt_tri_query_sphere(s, center, r, out, NT);
+        size_t nexps = 0;
+        for (int j = 0; j < NT; j++) {
+            float lo[3], hi[3];
+            tri_aabb(&verts[j * 9], lo, hi);
+            float dsq = 0;
+            for (int a = 0; a < 3; a++) {
+                float v = center[a];
+                float cl = v < lo[a] ? lo[a] : (v > hi[a] ? hi[a] : v);
+                float d = v - cl;
+                dsq += d * d;
+            }
+            if (dsq <= r * r) nexps++;
+        }
+        if (ns != nexps) sph_bad++;
+    }
+    CHECK(aabb_bad == 0, "query_aabb: %zu discrepancies vs brute force", aabb_bad);
+    CHECK(sph_bad == 0, "query_sphere: %zu discrepancies vs brute force", sph_bad);
+    CHECK(dup_bad == 0, "query_aabb: %zu duplicate ids on object-split build",
+          dup_bad);
+
+    /* truncation: a tiny cap must return exactly cap and signal truncation. */
+    float big_lo[3] = {-100, -100, -100}, big_hi[3] = {100, 100, 100};
+    uint32_t small[4];
+    size_t nt = lrt_tri_query_aabb(s, big_lo, big_hi, small, 4);
+    CHECK(nt == 4, "query truncation returns cap (%zu)", nt);
+
+    free(out);
+    free(exp);
+    lrt_tri_scene_free(s);
+    free(verts);
+}
+
+static int frustum_box_pass(const lrt_frustum *f, const float lo[3],
+                            const float hi[3]) {
+    for (int pl = 0; pl < 6; pl++) {
+        const float *P = f->planes[pl];
+        float px = P[0] >= 0 ? hi[0] : lo[0];
+        float py = P[1] >= 0 ? hi[1] : lo[1];
+        float pz = P[2] >= 0 ? hi[2] : lo[2];
+        if (P[0] * px + P[1] * py + P[2] * pz + P[3] < 0.0f) return 0;
+    }
+    return 1;
+}
+
+static void test_frustum(void) {
+    /* identity matrix => clip-space cube [-1,1]^3 as the frustum. */
+    float m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    lrt_frustum f;
+    lrt_frustum_from_matrix(m, &f);
+
+    enum { NT = 800 };
+    g_rng = 0x9F9Full;
+    float *verts = make_random_soup(NT, 0.3f); /* spread across [-2.5, 2.5]^3 */
+    lrt_tri_scene *s = lrt_tri_scene_build(verts, NT, NULL, NULL);
+    CHECK(s != NULL, "frustum build failed");
+    if (!s) {
+        free(verts);
+        return;
+    }
+    uint32_t *out = (uint32_t *)malloc(NT * sizeof(uint32_t));
+    size_t n = lrt_tri_query_frustum(s, &f, out, NT);
+    size_t nexp = 0;
+    uint8_t *exp = (uint8_t *)calloc(NT, 1);
+    for (int j = 0; j < NT; j++) {
+        float lo[3], hi[3];
+        tri_aabb(&verts[j * 9], lo, hi);
+        if (frustum_box_pass(&f, lo, hi)) {
+            exp[j] = 1;
+            nexp++;
+        }
+    }
+    size_t bad = 0;
+    if (n != nexp) bad++;
+    for (size_t i = 0; i < n; i++)
+        if (out[i] >= NT || !exp[out[i]]) bad++;
+    CHECK(bad == 0, "query_frustum: %zu discrepancies vs brute force (n=%zu "
+          "exp=%zu)", bad, n, nexp);
+    CHECK(nexp > 0 && nexp < NT, "frustum should partition the scene (in=%zu)",
+          nexp);
+    free(out);
+    free(exp);
+    lrt_tri_scene_free(s);
+    free(verts);
+}
+
+static void test_multihit(void) {
+    /* Stacked big triangles along +z at z = 1..8, all covering the origin ray. */
+    enum { NP = 8 };
+    float verts[NP * 9];
+    for (int k = 0; k < NP; k++) {
+        float z = (float)(k + 1);
+        float t[9] = {-10, -10, z, 10, -10, z, 0, 10, z};
+        memcpy(&verts[k * 9], t, sizeof(t));
+    }
+    lrt_tri_scene *s = lrt_tri_scene_build(verts, NP, NULL, NULL);
+    CHECK(s != NULL, "multihit build failed");
+    if (!s) return;
+    lrt_ray r = {{0, 0, 0}, 0.0f, {0, 0, 1}, 100.0f};
+    lrt_hit hits[5];
+    size_t n = lrt_tri_intersect_n(s, &r, hits, 5);
+    CHECK(n == 5, "multihit: expected 5 of 8, got %zu", n);
+    int sorted_ok = 1;
+    for (size_t i = 0; i < n; i++) {
+        if (fabsf(hits[i].t - (float)(i + 1)) > 1e-4f) sorted_ok = 0;
+    }
+    CHECK(sorted_ok, "multihit: hits not sorted t=1..5");
+    lrt_hit one;
+    lrt_tri_intersect1(s, &r, &one);
+    CHECK(n > 0 && one.prim_id == hits[0].prim_id &&
+              fabsf(one.t - hits[0].t) < 1e-6f,
+          "multihit out[0] != intersect1");
+    /* requesting all returns 8 */
+    lrt_hit all[16];
+    size_t na = lrt_tri_intersect_n(s, &r, all, 16);
+    CHECK(na == 8, "multihit: expected all 8, got %zu", na);
+    lrt_tri_scene_free(s);
+
+    /* random soup: intersect_n (large cap) vs brute-force sorted hit list. */
+    g_rng = 0x1234ABCDull;
+    enum { NT = 400 };
+    float *vs = make_random_soup(NT, 0.5f);
+    lrt_tri_scene *ss = lrt_tri_scene_build(vs, NT, NULL, NULL);
+    size_t bad = 0;
+    if (ss) {
+        for (int i = 0; i < 4000; i++) {
+            lrt_ray rr;
+            make_random_ray(&rr);
+            lrt_hit mh[32];
+            size_t mn = lrt_tri_intersect_n(ss, &rr, mh, 32);
+            /* brute force all hits, sorted by t */
+            float bts[NT];
+            int bn = 0;
+            for (int j = 0; j < NT; j++) {
+                float t, u, v;
+                if (ref_isect(&vs[j * 9], &rr, &t, &u, &v)) bts[bn++] = t;
+            }
+            qsort(bts, bn, sizeof(float), cmp_float);
+            size_t want = (size_t)(bn < 32 ? bn : 32);
+            if (mn != want) {
+                bad++;
+                continue;
+            }
+            for (size_t m = 0; m + 1 < mn; m++)
+                if (mh[m].t > mh[m + 1].t + 1e-6f) bad++; /* sorted */
+            for (size_t m = 0; m < mn; m++)
+                if (fabs((double)mh[m].t - (double)bts[m]) >
+                    1e-3 * (1.0 + fabs((double)bts[m])))
+                    bad++;
+        }
+        CHECK(bad <= 4000 / 500, "multihit soup: %zu discrepancies", bad);
+        lrt_tri_scene_free(ss);
+    }
+    free(vs);
+}
+
+/* Queries must agree across node layouts (exercises the BVH8 / BVH8Q decode in
+ * tri_node_load). */
+static void test_query_layouts(void) {
+    enum { NT = 700, K = 6 };
+    g_rng = 0xFEEDFACEull;
+    float *verts = make_random_soup(NT, 0.18f);
+    lrt_tri_layout layouts[3] = {LRT_TRI_LAYOUT_BVH4, LRT_TRI_LAYOUT_BVH8,
+                                 LRT_TRI_LAYOUT_BVH8Q};
+    lrt_tri_scene *sc[3];
+    for (int l = 0; l < 3; l++) {
+        lrt_tri_build_options o = {.quality = LRT_TRI_BUILD_DEFAULT,
+                                   .layout = layouts[l]};
+        sc[l] = lrt_tri_scene_build(verts, NT, &o, NULL);
+    }
+    CHECK(sc[0] && sc[1] && sc[2], "query-layouts: build failed");
+    if (sc[0] && sc[1] && sc[2]) {
+        size_t knn_bad = 0, aabb_bad = 0;
+        for (int i = 0; i < 1500; i++) {
+            float p[3] = {rnd_f(-3, 3), rnd_f(-3, 3), rnd_f(-3, 3)};
+            lrt_knn_result k0[K], k1[K], k2[K];
+            size_t n0 = lrt_tri_knn(sc[0], p, K, k0, K);
+            size_t n1 = lrt_tri_knn(sc[1], p, K, k1, K);
+            size_t n2 = lrt_tri_knn(sc[2], p, K, k2, K);
+            if (n0 != n1 || n0 != n2) knn_bad++;
+            for (size_t m = 0; m < n0 && m < n1 && m < n2; m++) {
+                if (fabs((double)k0[m].dist_sq - (double)k1[m].dist_sq) > 1e-4 ||
+                    fabs((double)k0[m].dist_sq - (double)k2[m].dist_sq) > 1e-3)
+                    knn_bad++;
+            }
+            float c[3] = {p[0], p[1], p[2]};
+            uint32_t o0[64], o1[64], o2[64];
+            size_t a0 = lrt_tri_query_sphere(sc[0], c, 0.6f, o0, 64);
+            size_t a1 = lrt_tri_query_sphere(sc[1], c, 0.6f, o1, 64);
+            size_t a2 = lrt_tri_query_sphere(sc[2], c, 0.6f, o2, 64);
+            if (a0 != a1 || a0 != a2) aabb_bad++;
+        }
+        CHECK(knn_bad == 0, "query-layouts: %zu knn disagreements", knn_bad);
+        CHECK(aabb_bad == 0, "query-layouts: %zu sphere-query disagreements",
+              aabb_bad);
+    }
+    for (int l = 0; l < 3; l++) lrt_tri_scene_free(sc[l]);
+    free(verts);
+}
+
+/* Two scenes must give bitwise-identical closest/any-hit results. */
+static size_t scenes_disagree(lrt_tri_scene *a, lrt_tri_scene *b, int nrays) {
+    size_t bad = 0;
+    for (int i = 0; i < nrays; i++) {
+        lrt_ray r;
+        make_random_ray(&r);
+        lrt_hit ha, hb;
+        int x = lrt_tri_intersect1(a, &r, &ha);
+        int y = lrt_tri_intersect1(b, &r, &hb);
+        if (x != y) {
+            bad++;
+        } else if (x && (ha.prim_id != hb.prim_id || ha.t != hb.t)) {
+            bad++;
+        }
+        if (lrt_tri_occluded1(a, &r) != lrt_tri_occluded1(b, &r)) bad++;
+    }
+    return bad;
+}
+
+static void test_serialization(void) {
+    g_rng = 0x5E512Eull;
+    enum { NT = 2000 };
+    float *verts = make_random_soup(NT, 0.15f);
+    lrt_tri_layout layouts[3] = {LRT_TRI_LAYOUT_BVH4, LRT_TRI_LAYOUT_BVH8,
+                                 LRT_TRI_LAYOUT_BVH8Q};
+    const char *path = "/tmp/lrt_test_scene.lrts";
+    for (int l = 0; l < 3; l++) {
+        lrt_tri_build_options o = {.quality = LRT_TRI_BUILD_DEFAULT,
+                                   .layout = layouts[l]};
+        lrt_result err = LRT_RESULT_OK;
+        lrt_tri_scene *s = lrt_tri_scene_build(verts, NT, &o, &err);
+        CHECK(s != NULL, "serialization: build failed");
+        if (!s) continue;
+
+        void *buf = NULL;
+        size_t n = 0;
+        CHECK(lrt_tri_scene_save_to_memory(s, &buf, &n) == LRT_RESULT_OK && buf,
+              "save_to_memory failed");
+        if (buf) {
+            lrt_tri_scene *ld = lrt_tri_scene_load_from_memory(buf, n, &err);
+            CHECK(ld != NULL, "load_from_memory failed (err=%d)", (int)err);
+            if (ld) {
+                CHECK(scenes_disagree(s, ld, 15000) == 0,
+                      "load_from_memory layout %d: traversal differs", l);
+                lrt_tri_scene_free(ld);
+            }
+            /* corruption must be rejected, not crash */
+            unsigned char *c1 = (unsigned char *)malloc(n);
+            memcpy(c1, buf, n);
+            c1[0] = 'X'; /* bad magic */
+            CHECK(lrt_tri_scene_load_from_memory(c1, n, &err) == NULL,
+                  "corrupt magic accepted");
+            memcpy(c1, buf, n);
+            *(uint32_t *)(c1 + 32) = 0x70000000u; /* root -> huge node idx */
+            CHECK(lrt_tri_scene_load_from_memory(c1, n, &err) == NULL,
+                  "corrupt root accepted");
+            CHECK(lrt_tri_scene_load_from_memory(buf, n - 1, &err) == NULL,
+                  "truncated buffer accepted");
+            free(c1);
+            free(buf);
+        }
+
+        /* file + mmap round trip */
+        CHECK(lrt_tri_scene_save(s, path) == LRT_RESULT_OK, "save to file failed");
+        lrt_tri_scene *lf = lrt_tri_scene_load(path, &err);
+        CHECK(lf != NULL, "load from file failed");
+        if (lf) {
+            CHECK(scenes_disagree(s, lf, 8000) == 0, "file load differs");
+            lrt_tri_scene_free(lf);
+        }
+        lrt_tri_scene *mm = lrt_tri_scene_open_mmap(path, &err);
+        CHECK(mm != NULL, "open_mmap failed (err=%d)", (int)err);
+        if (mm) {
+            CHECK(scenes_disagree(s, mm, 8000) == 0, "mmap load differs");
+            lrt_tri_scene_free(mm);
+        }
+        remove(path);
+        lrt_tri_scene_free(s);
+    }
+
+    /* curve scenes serialize too; user/sphere scenes must refuse. */
+    {
+        lrt_result err = LRT_RESULT_OK;
+        float segs[6] = {-1, 0, 0, 1, 0.2f, 0.1f};
+        lrt_tri_scene *cs = lrt_curve_scene_build(segs, NULL, 0.05f, 1, NULL, &err);
+        if (cs) {
+            void *buf = NULL;
+            size_t n = 0;
+            CHECK(lrt_tri_scene_save_to_memory(cs, &buf, &n) == LRT_RESULT_OK,
+                  "curve save failed");
+            if (buf) {
+                lrt_tri_scene *ld = lrt_tri_scene_load_from_memory(buf, n, &err);
+                CHECK(ld != NULL, "curve load failed");
+                if (ld) {
+                    CHECK(scenes_disagree(cs, ld, 5000) == 0,
+                          "curve serialization differs");
+                    lrt_tri_scene_free(ld);
+                }
+                free(buf);
+            }
+            lrt_tri_scene_free(cs);
+        }
+        float sph[4] = {0, 0, 0, 1};
+        lrt_tri_scene *sp = lrt_sphere_scene_build(sph, 1, NULL, &err);
+        if (sp) {
+            void *buf = NULL;
+            size_t n = 0;
+            CHECK(lrt_tri_scene_save_to_memory(sp, &buf, &n) ==
+                      LRT_RESULT_INVALID_ARGUMENT,
+                  "sphere scene should refuse serialization");
+            free(buf);
+            lrt_tri_scene_free(sp);
+        }
+    }
+    free(verts);
+}
+
+/* refit(scene, V) must agree with a fresh build over V (checked vs brute force). */
+static size_t refit_vs_brute(lrt_tri_scene *s, const float *verts, size_t ntris,
+                             int nrays) {
+    size_t bad = 0;
+    for (int i = 0; i < nrays; i++) {
+        lrt_ray r;
+        make_random_ray(&r);
+        lrt_hit ha, hb;
+        int bf = brute_force(verts, ntris, &r, &hb);
+        int bvh = lrt_tri_intersect1(s, &r, &ha);
+        if (bf != bvh) {
+            bad++;
+        } else if (bf && fabs((double)ha.t - (double)hb.t) >
+                             1e-3 * (1.0 + fabs((double)hb.t))) {
+            bad++;
+        }
+    }
+    return bad;
+}
+
+static void test_refit(void) {
+    g_rng = 0xBEEF77ull;
+    enum { NT = 1500 };
+    float *v0 = make_random_soup(NT, 0.15f);
+    float *v1 = (float *)malloc(NT * 9 * sizeof(float));
+    float *vf = (float *)malloc(NT * 9 * sizeof(float));
+    for (int i = 0; i < NT * 9; i++) v1[i] = v0[i] * 1.4f + 0.6f; /* affine move */
+    for (int i = 0; i < NT * 9; i++)
+        vf[i] = (i % 3 == 2) ? 1.0f : v0[i]; /* flatten onto z=1 */
+
+    lrt_tri_layout layouts[3] = {LRT_TRI_LAYOUT_BVH4, LRT_TRI_LAYOUT_BVH8,
+                                 LRT_TRI_LAYOUT_BVH8Q};
+    for (int l = 0; l < 3; l++) {
+        lrt_tri_build_options o = {.quality = LRT_TRI_BUILD_DEFAULT,
+                                   .layout = layouts[l]};
+        lrt_tri_scene *a = lrt_tri_scene_build(v0, NT, &o, NULL);
+        CHECK(a != NULL, "refit build failed");
+        if (!a) continue;
+        CHECK(lrt_tri_scene_refit(a, v1, NT) == LRT_RESULT_OK,
+              "refit returned error (layout %d)", l);
+        CHECK(refit_vs_brute(a, v1, NT, 8000) == 0,
+              "refit layout %d: disagrees with brute force over new verts", l);
+        /* a second refit onto a flattened (degenerate) frame */
+        CHECK(lrt_tri_scene_refit(a, vf, NT) == LRT_RESULT_OK, "refit flat");
+        CHECK(refit_vs_brute(a, vf, NT, 6000) == 0,
+              "refit layout %d: flattened frame disagrees", l);
+        lrt_tri_scene_free(a);
+    }
+
+    /* mmapped scenes are read-only: refit must be rejected, not crash. */
+    {
+        lrt_tri_scene *s = lrt_tri_scene_build(v0, NT, NULL, NULL);
+        const char *path = "/tmp/lrt_refit_scene.lrts";
+        if (s && lrt_tri_scene_save(s, path) == LRT_RESULT_OK) {
+            lrt_result err = LRT_RESULT_OK;
+            lrt_tri_scene *mm = lrt_tri_scene_open_mmap(path, &err);
+            if (mm) {
+                CHECK(lrt_tri_scene_refit(mm, v0, NT) ==
+                          LRT_RESULT_INVALID_ARGUMENT,
+                      "refit of mmapped scene should be rejected");
+                lrt_tri_scene_free(mm);
+            }
+            remove(path);
+        }
+        lrt_tri_scene_free(s);
+    }
+    free(v0);
+    free(v1);
+    free(vf);
+}
+
+static void xform_pt(const float m[12], const float p[3], float out[3]) {
+    for (int a = 0; a < 3; a++)
+        out[a] = m[a * 4 + 0] * p[0] + m[a * 4 + 1] * p[1] +
+                 m[a * 4 + 2] * p[2] + m[a * 4 + 3];
+}
+
+static void test_tlas(void) {
+    g_rng = 0x70A5ull;
+    enum { NT = 200, NI = 12 };
+    float *blas_v = make_random_soup(NT, 0.25f);
+    lrt_result err = LRT_RESULT_OK;
+    lrt_tri_scene *blas = lrt_tri_scene_build(blas_v, NT, NULL, &err);
+    CHECK(blas != NULL, "tlas: BLAS build failed");
+    if (!blas) {
+        free(blas_v);
+        return;
+    }
+
+    lrt_instance insts[NI];
+    float *world_v = (float *)malloc((size_t)NI * NT * 9 * sizeof(float));
+    for (int i = 0; i < NI; i++) {
+        float sx = rnd_f(0.5f, 1.5f), sy = rnd_f(0.5f, 1.5f),
+              sz = rnd_f(0.5f, 1.5f);
+        float ang = rnd_f(0.0f, 6.2831853f), ca = cosf(ang), sa = sinf(ang);
+        float tx = rnd_f(-2, 2), ty = rnd_f(-2, 2), tz = rnd_f(-2, 2);
+        float m[12] = {ca * sx, -sa * sy, 0, tx, sa * sx, ca * sy, 0,
+                       ty,      0,        0, sz, tz};
+        memcpy(insts[i].obj2world, m, sizeof(m));
+        insts[i].blas_id = 0;
+        insts[i].instance_id = (uint32_t)(100 + i);
+        insts[i].mask = 0xFFFFFFFFu;
+        for (int j = 0; j < NT * 3; j++) {
+            float p[3] = {blas_v[j * 3 + 0], blas_v[j * 3 + 1], blas_v[j * 3 + 2]};
+            float w[3];
+            xform_pt(m, p, w);
+            size_t base = (size_t)i * NT * 9 + (size_t)j * 3;
+            world_v[base + 0] = w[0];
+            world_v[base + 1] = w[1];
+            world_v[base + 2] = w[2];
+        }
+    }
+    lrt_tlas *tlas = lrt_tlas_build(&blas, 1, insts, NI, NULL, &err);
+    lrt_tri_scene *flat = lrt_tri_scene_build(world_v, (size_t)NI * NT, NULL, &err);
+    CHECK(tlas && flat, "tlas/flat build failed");
+    if (tlas && flat) {
+        size_t mism = 0, occl = 0;
+        for (int i = 0; i < 20000; i++) {
+            lrt_ray r;
+            make_random_ray(&r);
+            lrt_tlas_hit th;
+            int a = lrt_tlas_intersect1(tlas, &r, 0xFFFFFFFFu, &th);
+            lrt_hit fh;
+            int b = lrt_tri_intersect1(flat, &r, &fh);
+            if (a != b) {
+                mism++;
+            } else if (a && fabs((double)th.t - (double)fh.t) >
+                                2e-3 * (1.0 + fabs((double)fh.t))) {
+                mism++;
+            }
+            if (lrt_tlas_occluded1(tlas, &r, 0xFFFFFFFFu) != b) occl++;
+        }
+        CHECK(mism <= 20000 / 300, "tlas: %zu closest mismatches vs flattened",
+              mism);
+        CHECK(occl <= 20000 / 300, "tlas: %zu occluded mismatches vs flattened",
+              occl);
+    }
+    lrt_tlas_free(tlas);
+    lrt_tri_scene_free(flat);
+    free(world_v);
+
+    /* identity instance must match the BLAS exactly; mask=0 excludes it. */
+    lrt_instance id;
+    float im[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+    memcpy(id.obj2world, im, sizeof(im));
+    id.blas_id = 0;
+    id.instance_id = 7;
+    id.mask = 0xFFFFFFFFu;
+    lrt_tlas *t1 = lrt_tlas_build(&blas, 1, &id, 1, NULL, &err);
+    if (t1) {
+        size_t bad = 0, mask_bad = 0;
+        for (int i = 0; i < 8000; i++) {
+            lrt_ray r;
+            make_random_ray(&r);
+            lrt_tlas_hit th;
+            lrt_hit bh;
+            int a = lrt_tlas_intersect1(t1, &r, 0xFFFFFFFFu, &th);
+            int b = lrt_tri_intersect1(blas, &r, &bh);
+            if (a != b) bad++;
+            else if (a && th.t != bh.t) bad++;
+            else if (a && th.inst_id != 7) bad++;
+            if (a && lrt_tlas_intersect1(t1, &r, 0u, &th) != 0) mask_bad++;
+        }
+        CHECK(bad == 0, "tlas identity: %zu mismatches vs BLAS", bad);
+        CHECK(mask_bad == 0, "tlas mask=0 still hit on %zu rays", mask_bad);
+
+        /* refit identity -> a translated transform, vs a freshly built TLAS. */
+        float tm[12] = {1, 0, 0, 1.5f, 0, 1, 0, -0.5f, 0, 0, 1, 0.7f};
+        memcpy(id.obj2world, tm, sizeof(tm));
+        CHECK(lrt_tlas_refit(t1, &id, 1) == LRT_RESULT_OK, "tlas refit failed");
+        lrt_tlas *t2 = lrt_tlas_build(&blas, 1, &id, 1, NULL, &err);
+        if (t2) {
+            size_t rbad = 0;
+            for (int i = 0; i < 6000; i++) {
+                lrt_ray r;
+                make_random_ray(&r);
+                lrt_tlas_hit a, b;
+                int x = lrt_tlas_intersect1(t1, &r, 0xFFFFFFFFu, &a);
+                int y = lrt_tlas_intersect1(t2, &r, 0xFFFFFFFFu, &b);
+                if (x != y || (x && a.t != b.t)) rbad++;
+            }
+            CHECK(rbad == 0, "tlas refit: %zu mismatches vs rebuild", rbad);
+            lrt_tlas_free(t2);
+        }
+        lrt_tlas_free(t1);
+    }
+    lrt_tri_scene_free(blas);
+    free(blas_v);
+}
+
+static void test_packets(void) {
+    g_rng = 0x9ACE9ACEull;
+    enum { NT = 1500 };
+    float *verts = make_random_soup(NT, 0.15f);
+    lrt_tri_layout layouts[3] = {LRT_TRI_LAYOUT_BVH4, LRT_TRI_LAYOUT_BVH8,
+                                 LRT_TRI_LAYOUT_BVH8Q};
+    for (int l = 0; l < 3; l++) {
+        lrt_tri_build_options o = {.quality = LRT_TRI_BUILD_DEFAULT,
+                                   .layout = layouts[l]};
+        lrt_tri_scene *s = lrt_tri_scene_build(verts, NT, &o, NULL);
+        if (!s) {
+            CHECK(0, "packet build failed");
+            continue;
+        }
+        size_t bad_i = 0, bad_o = 0, nb = 0;
+        for (int batch = 0; batch < 4000; batch++) {
+            lrt_ray singles[8];
+            lrt_ray8 r8;
+            for (int k = 0; k < 8; k++) {
+                make_random_ray(&singles[k]);
+                r8.orgx[k] = singles[k].org[0];
+                r8.orgy[k] = singles[k].org[1];
+                r8.orgz[k] = singles[k].org[2];
+                r8.dirx[k] = singles[k].dir[0];
+                r8.diry[k] = singles[k].dir[1];
+                r8.dirz[k] = singles[k].dir[2];
+                r8.tmin[k] = singles[k].tmin;
+                r8.tmax[k] = singles[k].tmax;
+            }
+            lrt_hit8 h8;
+            uint8_t o8[8];
+            lrt_tri_intersect8(s, &r8, &h8);
+            lrt_tri_occluded8(s, &r8, o8);
+            for (int k = 0; k < 8; k++, nb++) {
+                lrt_hit h1;
+                int x = lrt_tri_intersect1(s, &singles[k], &h1);
+                int y = (h8.prim_id[k] != LRT_TRI_NO_HIT);
+                if (x != y) {
+                    bad_i++;
+                } else if (x && fabs((double)h1.t - (double)h8.t[k]) >
+                                   1e-4 * (1.0 + fabs((double)h1.t))) {
+                    bad_i++;
+                }
+                if ((uint8_t)lrt_tri_occluded1(s, &singles[k]) != o8[k]) bad_o++;
+            }
+        }
+        CHECK(bad_i <= nb / 1000, "packet intersect8 layout %d: %zu/%zu differ",
+              l, bad_i, nb);
+        CHECK(bad_o <= nb / 1000, "packet occluded8 layout %d: %zu/%zu differ",
+              l, bad_o, nb);
+        lrt_tri_scene_free(s);
+    }
+    free(verts);
+}
+
+static int filter_opaque(void *u, uint32_t p, float t, float uu, float vv) {
+    (void)u; (void)p; (void)t; (void)uu; (void)vv;
+    return 1;
+}
+static int filter_transparent(void *u, uint32_t p, float t, float uu,
+                              float vv) {
+    (void)u; (void)p; (void)t; (void)uu; (void)vv;
+    return 0;
+}
+static int filter_even(void *u, uint32_t p, float t, float uu, float vv) {
+    (void)u; (void)t; (void)uu; (void)vv;
+    return (p & 1u) == 0u;
+}
+
+static void test_anyhit_filter(void) {
+    g_rng = 0xF117ull;
+    enum { NT = 800 };
+    float *verts = make_random_soup(NT, 0.2f);
+    lrt_tri_scene *s = lrt_tri_scene_build(verts, NT, NULL, NULL);
+    if (!s) {
+        free(verts);
+        return;
+    }
+    size_t bad1 = 0, bad2 = 0, bad3 = 0;
+    for (int i = 0; i < 12000; i++) {
+        lrt_ray r;
+        make_random_ray(&r);
+        int plain = lrt_tri_occluded1(s, &r);
+        if (lrt_tri_occluded1_filtered(s, &r, filter_opaque, NULL) != plain)
+            bad1++;
+        if (lrt_tri_occluded1_filtered(s, &r, filter_transparent, NULL) != 0)
+            bad2++;
+        int be = 0;
+        for (int j = 0; j < NT && !be; j++) {
+            if (j & 1) continue;
+            float t, u, v;
+            if (ref_isect(&verts[j * 9], &r, &t, &u, &v)) be = 1;
+        }
+        if (lrt_tri_occluded1_filtered(s, &r, filter_even, NULL) != be) bad3++;
+    }
+    CHECK(bad1 == 0, "filter opaque != occluded1 on %zu rays", bad1);
+    CHECK(bad2 == 0, "filter transparent hit on %zu rays", bad2);
+    CHECK(bad3 <= 12000 / 1000, "filter parity vs brute force: %zu", bad3);
+    lrt_tri_scene_free(s);
+    free(verts);
+}
+
 int main(void) {
     printf("lightrt_c_tri test\n");
 
     test_edge_cases();
     test_curve_scene();
+    test_sphere_scene();
+    test_user_geometry();
+    test_sdf_standalone();
+    test_sdf_scene();
+    test_closest_point_knn();
+    test_region_queries();
+    test_frustum();
+    test_multihit();
+    test_query_layouts();
+    test_serialization();
+    test_refit();
+    test_tlas();
+    test_packets();
+    test_anyhit_filter();
 
     /* Small soup: every leaf shape exercised. */
     g_rng = 0x9E3779B97F4A7C15ull;

@@ -662,6 +662,53 @@ Quantized primitives trade precision for memory savings:
 
 Quantized types require a global bounding box for coordinate reconstruction. Use `quantize()` to compress and `dequantize()` to restore full precision before intersection testing.
 
+## C11 Production Ray-Tracing Kernel (`lightrt_c_tri.h`)
+
+A standalone, dependency-free C11 fp32 wide-BVH kernel (separate from the C++
+`lightrt` library and from the fp64 generic callback API in `lightrt_c.h`).
+Build a scene once, then query it from any number of threads concurrently
+(stateless, lock-free). Compiled scalar + SSE4 (BVH4) + AVX2 (BVH8) with
+compile-time dispatch; `lrt_tri_kernel_name()` reports the selection. Tests:
+`tests/test_lightrt_c_tri.c` (brute-force oracles across BVH4/BVH8/BVH8Q ×
+FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
+
+### Scene types (all share the `lrt_tri_scene` handle and the `lrt_tri_*` queries)
+- `lrt_tri_scene_build` — triangles (BVH4/BVH8/BVH8Q; LBVH/SAH/SBVH).
+- `lrt_curve_scene_build` — hair/curve capsules.
+- `lrt_sphere_scene_build` — built-in fully-SIMD analytic spheres (`cx cy cz r`).
+- `lrt_user_scene_build` — **efficient custom geometry**: an fp32 BVH broad
+  phase over caller AABBs, with a per-candidate intersect/occluded callback
+  invoked only after a 4-wide AABB pretest. Far faster than the fp64
+  `lightrt_c.h` path. Callbacks must be re-entrant for concurrent queries.
+
+### Implicit surfaces / SDF (`lrt_sdf_*`)
+- `lrt_sdf_sphere_trace` — standalone enhanced sphere tracing (over-relaxation
+  with safe fallback, relative epsilon, tetrahedron-difference normal). The SDF
+  must be a Lipschitz≤1 distance bound.
+- `lrt_sdf_scene_build` — BVH-accelerated field of SDF blobs (built on the
+  custom-geometry path; for overlaps, each blob's callback evaluates the global
+  union field).
+
+### Queries (triangle scenes)
+- Closest hit `lrt_tri_intersect1`, any-hit `lrt_tri_occluded1`, batched
+  `*1N` (with `lrt_tri_batch_hint` for coherent vs incoherent).
+- Nearest-N multi-hit `lrt_tri_intersect_n` (transparency / CSG / volumes).
+- Point query `lrt_tri_closest_point`, kNN `lrt_tri_knn`.
+- Region queries `lrt_tri_query_aabb` / `_sphere` / `_frustum`
+  (+ `lrt_frustum_from_matrix`).
+- Coherent ray packets `lrt_tri_intersect4/8`, `lrt_tri_occluded4/8`.
+- Filtered any-hit `lrt_tri_occluded1_filtered` (alpha-tested shadows).
+
+### Production
+- Serialization: `lrt_tri_scene_save[_to_memory]` / `load[_from_memory]`, plus
+  zero-copy `lrt_tri_scene_open_mmap` (validates every child ref on load).
+  Triangle/curve scenes only.
+- Refit: `lrt_tri_scene_refit` updates vertices + node bounds in place (no
+  rebuild), for animation.
+- Instancing/TLAS: `lrt_tlas_build` / `lrt_tlas_intersect1` / `lrt_tlas_occluded1`
+  / `lrt_tlas_refit` — two-level BVH with per-instance 3×4 affine transforms,
+  `instance_id`, and a visibility `mask`.
+
 ## Code Conventions
 
 - C++17, no RTTI (`-fno-rtti`), no exceptions (`-fno-exceptions`)

@@ -57,7 +57,10 @@ static void usage(const char *argv0) {
             "  --backend LIST         all | comma list of: c11-cb,c11-bvh4,c11-bvh8,\n"
             "                         c11-lbvh4,c11-lbvh8 (Morton fast build),\n"
             "                         c11-bvh8q (quantized nodes), c11-sbvh4 (spatial\n"
-            "                         splits), embree, tinybvh, mm-bvh\n"
+            "                         splits), c11-user (custom geom), c11-tlas\n"
+            "                         (identity instance), c11-sphere, c11-sdf\n"
+            "                         (sphere/SDF per tri, explicit-only), embree,\n"
+            "                         tinybvh, mm-bvh\n"
             "  --rays LIST            all | comma list of: primary,incoherent,shadow\n"
             "  --nrays N              rays per workload (default 4000000)\n"
             "  --threads N            worker threads (default 1)\n"
@@ -285,9 +288,16 @@ int main(int argc, char **argv) {
             {"c11-lbvh8", backend_lightrt_lbvh8, 0},
             {"c11-bvh8q", backend_lightrt_bvh8q, 0},
             {"c11-sbvh4", backend_lightrt_sbvh4, 0},
-            /* capsule reinterpretation of thin triangles: geometry (and so
-             * hit fractions) intentionally differ from the tri backends */
+            /* custom-geometry + TLAS keep the same triangle geometry, so their
+             * hit fractions match the tri backends and they join "all" */
+            {"c11-user", backend_lightrt_user, 0},
+            {"c11-tlas", backend_lightrt_tlas, 0},
+            /* capsule/sphere/sdf reinterpret thin/whole triangles: geometry
+             * (and so hit fractions) intentionally differ from the tri
+             * backends, so they are explicit-only */
             {"c11-hair", backend_lightrt_hair, 1},
+            {"c11-sphere", backend_lightrt_sphere, 1},
+            {"c11-sdf", backend_lightrt_sdf, 1},
             {"embree", backend_embree, 0},
             {"tinybvh", backend_tinybvh, 0},
             {"mm-bvh", backend_madmann, 0},
