@@ -226,6 +226,49 @@ static void test_batch_matches_single(const float *verts, size_t ntris,
     lrt_tri_scene_free(s);
 }
 
+/* The N-ray batch queries fall back to a per-ray loop for non-triangle prim
+ * kinds (curve/point/sphere/user/qtri). Verify both batch hints reproduce the
+ * single-ray results exactly on an already-built scene — this guards the
+ * prim-kind dispatch list in intersect1N/occluded1N: a missing kind there would
+ * route these primitives into the triangle packet/interleaved kernels (garbage),
+ * and the COHERENT hint additionally exercises the BVH4 Ray4 packet selection. */
+static void check_batch_consistency(lrt_tri_scene *s, size_t nrays,
+                                    const char *label) {
+    if (!s) return;
+    lrt_ray *rays = (lrt_ray *)malloc(nrays * sizeof(lrt_ray));
+    lrt_hit *hits = (lrt_hit *)malloc(nrays * sizeof(lrt_hit));
+    uint8_t *occ = (uint8_t *)malloc(nrays * sizeof(uint8_t));
+    if (!rays || !hits || !occ) {
+        free(rays);
+        free(hits);
+        free(occ);
+        return;
+    }
+    for (size_t i = 0; i < nrays; i++) make_random_ray(&rays[i]);
+    lrt_tri_batch_hint hints[2] = {LRT_TRI_BATCH_INCOHERENT,
+                                   LRT_TRI_BATCH_COHERENT};
+    for (int hi = 0; hi < 2; hi++) {
+        lrt_tri_intersect1N(s, rays, hits, nrays, hints[hi]);
+        lrt_tri_occluded1N(s, rays, occ, nrays, hints[hi]);
+        size_t bad = 0, bado = 0;
+        for (size_t i = 0; i < nrays; i++) {
+            lrt_hit h1;
+            lrt_tri_intersect1(s, &rays[i], &h1);
+            if (h1.prim_id != hits[i].prim_id ||
+                (h1.prim_id != LRT_TRI_NO_HIT && h1.t != hits[i].t))
+                bad++;
+            if ((uint8_t)lrt_tri_occluded1(s, &rays[i]) != occ[i]) bado++;
+        }
+        CHECK(bad == 0, "%s: batch intersect1N (hint %d) differs from single on "
+              "%zu/%zu rays", label, hi, bad, nrays);
+        CHECK(bado == 0, "%s: batch occluded1N (hint %d) differs from single on "
+              "%zu/%zu rays", label, hi, bado, nrays);
+    }
+    free(rays);
+    free(hits);
+    free(occ);
+}
+
 /* BVH4 vs BVH8 (and their kernels) must agree with each other on hit/miss and
  * distances within fp32 noise. */
 static void test_layouts_agree(const float *verts, size_t ntris, size_t nrays) {
@@ -482,6 +525,26 @@ static int ref_roundcone(const float p0[3], float r0, const float p1[3],
     return hit;
 }
 
+/* Upper-bound invariant for round-linear / flat hits: the hit point must lie
+ * within the (clamped, radius-interpolated) capsule of the *reported* segment —
+ * the cone body sits at perpendicular distance r(u), and the rounded end caps
+ * stay within r of the clamped endpoint, so this holds for both. Validates that
+ * prim_id and t are mutually consistent, which the nearest-t oracle never does
+ * (it only checks the closest distance over all segments, not which was hit). */
+static int hit_within_segment(const float hp[3], const float p0[3],
+                              const float p1[3], float r0, float r1) {
+    float ax[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]};
+    float l2 = ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2];
+    float d0[3] = {hp[0] - p0[0], hp[1] - p0[1], hp[2] - p0[2]};
+    float u = l2 > 0.0f ? (d0[0] * ax[0] + d0[1] * ax[1] + d0[2] * ax[2]) / l2
+                        : 0.0f;
+    if (u < 0.0f) u = 0.0f; else if (u > 1.0f) u = 1.0f;
+    float perp[3] = {d0[0] - u * ax[0], d0[1] - u * ax[1], d0[2] - u * ax[2]};
+    float dist = sqrtf(perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]);
+    float rr = r0 + u * (r1 - r0);
+    return dist <= rr + 3e-3f * (1.0f + rr);
+}
+
 static void test_roundcurve_scene(void) {
     enum { NSTRAND = 80, PTS = 6, NRAYS = 20000 };
     size_t npoints = (size_t)NSTRAND * PTS;
@@ -529,7 +592,7 @@ static void test_roundcurve_scene(void) {
     }
     printf("  roundcurve scene [%s]\n", lrt_tri_kernel_name(s));
 
-    size_t mismatches = 0, occl_mismatches = 0;
+    size_t mismatches = 0, occl_mismatches = 0, surf_bad = 0;
     for (int i = 0; i < NRAYS; i++) {
         lrt_ray r;
         make_random_ray(&r);
@@ -555,6 +618,19 @@ static void test_roundcurve_scene(void) {
             mismatches++;
         }
         if (lrt_tri_occluded1(s, &r) != bvh) occl_mismatches++;
+        /* The reported segment must geometrically contain the hit point. */
+        if (bvh) {
+            uint32_t prim = h.prim_id, st = prim / (PTS - 1),
+                     sl = prim % (PTS - 1);
+            uint32_t i0 = st * PTS + sl;
+            float hp[3];
+            for (int a = 0; a < 3; a++) hp[a] = r.org[a] + h.t * r.dir[a];
+            if (prim >= (uint32_t)(NSTRAND * (PTS - 1)) ||
+                !hit_within_segment(hp, &pts[(size_t)i0 * 3],
+                                    &pts[(size_t)(i0 + 1) * 3], rad[i0],
+                                    rad[i0 + 1]))
+                surf_bad++;
+        }
     }
     /* A handful of grazing/joint rays flip by one ulp at fp32 (the cross-check
      * vs Embree on wCurly.hair shows the same ~5e-6 rate); allow the same
@@ -563,6 +639,10 @@ static void test_roundcurve_scene(void) {
           "brute-force cone+spheres", mismatches, NRAYS);
     CHECK(occl_mismatches == 0, "roundcurve: %zu occluded disagreements",
           occl_mismatches);
+    CHECK(surf_bad <= NRAYS / 1000,
+          "roundcurve: %zu/%d hits not on the reported segment", surf_bad,
+          NRAYS);
+    check_batch_consistency(s, 4000, "roundcurve");
 
     lrt_tri_scene_free(s);
     free(pts);
@@ -1898,7 +1978,7 @@ static void test_points_scene(void) {
             NULL);
         CHECK(s != NULL, "points(%s) build failed", names[ti]);
         if (!s) continue;
-        size_t mism = 0, occl = 0;
+        size_t mism = 0, occl = 0, surf = 0;
         for (int i = 0; i < NRAYS; i++) {
             lrt_ray r;
             make_random_ray(&r);
@@ -1926,11 +2006,37 @@ static void test_points_scene(void) {
                                1e-3 * (1.0 + fabs((double)bt)))
                 mism++;
             if (lrt_tri_occluded1(s, &r) != bvh) occl++;
+            /* The hit point must sit on the *reported* point: on the sphere
+             * shell, or within the disc radius of its center (validates
+             * prim_id, which the nearest-t oracle never checks). */
+            if (bvh) {
+                uint32_t prim = h.prim_id;
+                if (prim >= (uint32_t)NPTS) {
+                    surf++;
+                } else {
+                    const float *cc = &cen[prim * 3];
+                    float hp[3];
+                    for (int a = 0; a < 3; a++)
+                        hp[a] = r.org[a] + h.t * r.dir[a];
+                    float dx = hp[0] - cc[0], dy = hp[1] - cc[1],
+                          dz = hp[2] - cc[2];
+                    float d = sqrtf(dx * dx + dy * dy + dz * dz);
+                    float rr = rad[prim];
+                    int ok = (pt == LRT_POINT_SPHERE)
+                                 ? fabsf(d - rr) <= 3e-3f * (1.0f + rr)
+                                 : d <= rr + 3e-3f * (1.0f + rr);
+                    if (!ok) surf++;
+                }
+            }
         }
         CHECK(mism <= NRAYS / 1000, "points(%s): %zu/%d mismatches vs brute force",
               names[ti], mism, NRAYS);
         CHECK(occl == 0, "points(%s): %zu occluded disagreements", names[ti],
               occl);
+        CHECK(surf <= NRAYS / 1000,
+              "points(%s): %zu/%d hits not on the reported point", names[ti],
+              surf, NRAYS);
+        check_batch_consistency(s, 4000, names[ti]);
         printf("  points(%s) scene [%s]\n", names[ti], lrt_tri_kernel_name(s));
         lrt_tri_scene_free(s);
     }
@@ -2007,6 +2113,7 @@ static void test_flatcurve_scene(void) {
     CHECK(bad <= NRAYS / 1000, "flatcurve: %zu/%d hits off the ribbon", bad,
           NRAYS);
     CHECK(occl == 0, "flatcurve: %zu occluded disagreements", occl);
+    check_batch_consistency(s, 4000, "flatcurve");
     lrt_tri_scene_free(s);
     free(pts);
     free(rad);
@@ -2020,6 +2127,24 @@ static void bez_pos(const float cp[16], float u, float out[4]) {
     for (int c = 0; c < 4; c++)
         out[c] = u1 * u1 * u1 * cp[c] + 3.0f * u1 * u1 * u * cp[4 + c] +
                  3.0f * u1 * u * u * cp[8 + c] + u * u * u * cp[12 + c];
+}
+
+/* The reported segment's swept tube must contain the hit point: the minimum over
+ * a fine sampling of signed surface distance (|hp - C(u)| - r(u)) must be <= a
+ * small tolerance, i.e. the hit lies on (or, for an inside-start ray, within)
+ * the tube. Validates prim_id for the Newton sweep — the round-cone-fan oracle
+ * only checks the nearest t across all segments, not which segment was hit. */
+static int hit_on_bez_tube(const float cp[16], const float hp[3]) {
+    enum { M = 512 };
+    float best = 1e30f;
+    for (int j = 0; j <= M; j++) {
+        float pr[4];
+        bez_pos(cp, (float)j / (float)M, pr);
+        float dx = hp[0] - pr[0], dy = hp[1] - pr[1], dz = hp[2] - pr[2];
+        float d = sqrtf(dx * dx + dy * dy + dz * dz) - pr[3];
+        if (d < best) best = d;
+    }
+    return best <= 6e-3f;
 }
 
 /* Reference round-Bezier hit: the tube approximated by a fan of M tapered round
@@ -2070,7 +2195,7 @@ static void test_bezcurve_scene(void) {
         return;
     }
     printf("  bezcurve scene [%s]\n", lrt_tri_kernel_name(s));
-    size_t mism = 0, occl = 0;
+    size_t mism = 0, occl = 0, surf = 0;
     for (int i = 0; i < NRAYS; i++) {
         lrt_ray r;
         make_random_ray(&r);
@@ -2091,6 +2216,16 @@ static void test_bezcurve_scene(void) {
                            3e-3 * (1.0 + fabs((double)bt)))
             mism++;
         if (lrt_tri_occluded1(s, &r) != bvh) occl++;
+        /* The hit point must lie on the reported segment's tube. Unlike the fan
+         * oracle's nearest-t test, this pins down prim_id and the exact surface. */
+        if (bvh) {
+            uint32_t prim = h.prim_id;
+            float hp[3];
+            for (int a = 0; a < 3; a++) hp[a] = r.org[a] + h.t * r.dir[a];
+            if (prim >= (uint32_t)NSEG ||
+                !hit_on_bez_tube(&cps[(size_t)prim * 16], hp))
+                surf++;
+        }
     }
     /* The round-cone fan facets the smooth tube, so grazing rays differ more
      * from it than from the exact surface; the AUTHORITATIVE check is the Embree
@@ -2100,8 +2235,115 @@ static void test_bezcurve_scene(void) {
     CHECK(mism <= NRAYS / 40, "bezcurve: %zu/%d mismatches vs brute-force tube",
           mism, NRAYS);
     CHECK(occl == 0, "bezcurve: %zu occluded disagreements", occl);
+    /* prim_id/surface consistency is exact (the kernel never returns a hit off
+     * its own tube), so this budget is far tighter than the fan-oracle one. */
+    CHECK(surf <= NRAYS / 1000, "bezcurve: %zu/%d hits not on the reported tube",
+          surf, NRAYS);
+    check_batch_consistency(s, 4000, "bezcurve");
     lrt_tri_scene_free(s);
     free(cps);
+}
+
+/* Deterministic degenerate / boundary scenes for curves and points: an isolated
+ * (neighbor-less) round-linear segment, the constant-radius builder path, the
+ * cone->cylinder degeneracy (r0==r1), analytic sphere hits (incl. a ray whose
+ * origin is inside the sphere -> far root), an oriented-disc edge-on miss, and
+ * tmin/tmax/occluded clipping. The random hair-like scenes never reliably reach
+ * these (every interior segment there has two neighbors and varying radii). */
+static void test_curve_point_edge_cases(void) {
+    lrt_hit h;
+
+    /* (1) Single isolated round-linear segment: both neighbors absent (the
+     * sentinel CSG path) and r0==r1 (cone degenerates to a cylinder), built via
+     * the constant-radius path (radius == NULL). Cylinder axis +x, radius 0.2. */
+    {
+        float pts[6] = {0, 0, 0, 2, 0, 0};
+        uint32_t sf = 0, sc = 2;
+        lrt_hair_strands hs = {0};
+        hs.points = pts;
+        hs.radius = NULL;
+        hs.constant_radius = 0.2f;
+        hs.strand_first = &sf;
+        hs.strand_count = &sc;
+        hs.nstrands = 1;
+        hs.npoints = 2;
+        lrt_tri_scene *s = lrt_roundcurve_scene_build(&hs, NULL, NULL);
+        CHECK(s != NULL, "isolated roundcurve (constant radius) build");
+        if (s) {
+            /* +y ray at x=1 grazes the cylinder side at y=-0.2 -> t = 5 - 0.2. */
+            lrt_ray r = {{1, -5, 0}, 0.0f, {0, 1, 0}, 100.0f};
+            CHECK(lrt_tri_intersect1(s, &r, &h) == 1 &&
+                      fabsf(h.t - 4.8f) < 2e-3f && h.prim_id == 0,
+                  "isolated cylinder side hit (t=%f id=%u)", (double)h.t,
+                  h.prim_id);
+            r.tmax = 4.0f;
+            CHECK(lrt_tri_intersect1(s, &r, &h) == 0, "roundcurve tmax clips");
+            CHECK(lrt_tri_occluded1(s, &r) == 0,
+                  "roundcurve occluded respects tmax");
+            r.tmax = 100.0f;
+            CHECK(lrt_tri_occluded1(s, &r) == 1, "roundcurve occluded hit");
+            /* The +y ray passes through the cylinder (enter 4.8, exit 5.2), so
+             * tmin must clear both roots to clip the whole segment. */
+            r.tmin = 6.0f;
+            CHECK(lrt_tri_intersect1(s, &r, &h) == 0, "roundcurve tmin clips");
+            /* x=3 is past the +x end cap (x=2, r=0.2) by 0.8 -> clean miss. */
+            lrt_ray miss = {{3, -5, 0}, 0.0f, {0, 1, 0}, 100.0f};
+            CHECK(lrt_tri_intersect1(s, &miss, &h) == 0, "roundcurve clean miss");
+            lrt_tri_scene_free(s);
+        }
+    }
+
+    /* (2) Analytic sphere point: near-root hit, ray-origin-inside far root,
+     * radial miss, and tmax clipping. */
+    {
+        float c[3] = {0, 0, 5};
+        float rr = 1.0f;
+        lrt_tri_scene *s = lrt_points_scene_build(c, &rr, NULL, LRT_POINT_SPHERE,
+                                                  1, NULL, NULL);
+        CHECK(s != NULL, "sphere point build");
+        if (s) {
+            lrt_ray r = {{0, 0, 0}, 0.0f, {0, 0, 1}, 100.0f};
+            CHECK(lrt_tri_intersect1(s, &r, &h) == 1 && fabsf(h.t - 4.0f) < 1e-3f,
+                  "sphere near-root hit (t=%f)", (double)h.t);
+            lrt_ray ins = {{0, 0, 5}, 0.0f, {0, 0, 1}, 100.0f};
+            CHECK(lrt_tri_intersect1(s, &ins, &h) == 1 &&
+                      fabsf(h.t - 1.0f) < 1e-3f,
+                  "ray inside sphere -> far root (t=%f)", (double)h.t);
+            lrt_ray mr = {{0, 2, 0}, 0.0f, {0, 0, 1}, 100.0f};
+            CHECK(lrt_tri_intersect1(s, &mr, &h) == 0, "sphere radial miss");
+            r.tmax = 3.5f;
+            CHECK(lrt_tri_intersect1(s, &r, &h) == 0 &&
+                      lrt_tri_occluded1(s, &r) == 0,
+                  "sphere tmax clips");
+            lrt_tri_scene_free(s);
+        }
+    }
+
+    /* (3) Oriented disc (fixed normal): a ray perpendicular to the normal is
+     * parallel to the disc plane and must miss; a ray along the normal hits the
+     * plane, and a hit point outside the radius must be rejected. */
+    {
+        float c[3] = {0, 0, 5};
+        float rr = 1.0f;
+        float n[3] = {1, 0, 0};
+        lrt_tri_scene *s = lrt_points_scene_build(
+            c, &rr, n, LRT_POINT_ORIENTED_DISC, 1, NULL, NULL);
+        CHECK(s != NULL, "oriented-disc build");
+        if (s) {
+            lrt_ray edge = {{0, 0, 0}, 0.0f, {0, 0, 1}, 100.0f}; /* _|_ normal */
+            CHECK(lrt_tri_intersect1(s, &edge, &h) == 0,
+                  "oriented disc edge-on miss");
+            lrt_ray face = {{-5, 0, 5}, 0.0f, {1, 0, 0}, 100.0f};
+            CHECK(lrt_tri_intersect1(s, &face, &h) == 1 &&
+                      fabsf(h.t - 5.0f) < 1e-3f,
+                  "oriented disc face-on hit (t=%f)", (double)h.t);
+            /* hits the plane at (0,0,7), distance 2 from center -> outside r. */
+            lrt_ray off = {{-5, 0, 7}, 0.0f, {1, 0, 0}, 100.0f};
+            CHECK(lrt_tri_intersect1(s, &off, &h) == 0,
+                  "oriented disc outside radius");
+            lrt_tri_scene_free(s);
+        }
+    }
 }
 
 int main(void) {
@@ -2115,6 +2357,7 @@ int main(void) {
     test_flatcurve_scene();
     test_bezcurve_scene();
     test_points_scene();
+    test_curve_point_edge_cases();
     test_sphere_scene();
     test_user_geometry();
     test_sdf_standalone();
