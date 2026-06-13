@@ -121,11 +121,11 @@ grows it within its own plane; node bounds are recomputed from the decoded
 geometry so traversal never culls a hit leaf). A per-block grid (24 B) + the
 4 B prim id form the compression floor, so fp4 lands at 0.52×, not 4-bit.
 
-The current leaf **decode is scalar** (one lane at a time), so traversal is
-~2× slower than the fp32 SIMD leaf — the formats trade speed for memory today.
-A SIMD decode (`cvtepu8/16` + `fma` + the 4-wide Möller-Trumbore, as in the
-quantized-node slab) for q8/q16 is the documented next step to make them
-speed-competitive on bandwidth-bound large scenes.
+q8 and q16 decode their leaf 4-wide in SIMD (`cvtepu8/16` + `fma` then the
+shared Möller-Trumbore), reaching **~0.75× the fp32 primary throughput** (16.7
+vs 22.4 Mrays/s) at 0.60× memory — near-fp32 speed for a substantial memory cut.
+fp8/fp4 use the scalar reference decoder (E4M3 bit-expand / E2M1 table), ~0.4×
+fp32 speed, for the aggressive end of the LOD curve.
 
 ## How the single-thread incoherent gap was closed
 

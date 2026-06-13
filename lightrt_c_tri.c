@@ -3306,6 +3306,127 @@ static inline void tri_block_isect_sse(const lrt_tri4 *blk,
     }
 }
 
+/* 4-wide Moller-Trumbore on decoded SoA vertices (for quantized leaves).
+ * prim[] supplies the per-lane primitive ids. */
+static inline __m128 tri_fma4(__m128 a, __m128 b, __m128 c) {
+#if LRT_TRI_HAS_AVX2
+    return _mm_fmadd_ps(a, b, c);
+#else
+    return _mm_add_ps(_mm_mul_ps(a, b), c);
+#endif
+}
+static inline __m128 tri_load4_u8(const uint8_t *p) {
+    int v;
+    memcpy(&v, p, 4);
+    return _mm_cvtepi32_ps(_mm_cvtepu8_epi32(_mm_cvtsi32_si128(v)));
+}
+static inline __m128 tri_load4_u16(const uint16_t *p) {
+    return _mm_cvtepi32_ps(
+        _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(const void *)p)));
+}
+
+static inline void tri_mt4_decoded_sse(__m128 v0x, __m128 v0y, __m128 v0z,
+                                       __m128 v1x, __m128 v1y, __m128 v1z,
+                                       __m128 v2x, __m128 v2y, __m128 v2z,
+                                       const tri_sse_ctx *sc,
+                                       const uint32_t *prim, float *best_t,
+                                       float *best_u, float *best_v,
+                                       uint32_t *best_prim) {
+    __m128 e1x = _mm_sub_ps(v1x, v0x), e1y = _mm_sub_ps(v1y, v0y),
+           e1z = _mm_sub_ps(v1z, v0z);
+    __m128 e2x = _mm_sub_ps(v2x, v0x), e2y = _mm_sub_ps(v2y, v0y),
+           e2z = _mm_sub_ps(v2z, v0z);
+    __m128 px = _mm_sub_ps(_mm_mul_ps(sc->diry, e2z), _mm_mul_ps(sc->dirz, e2y));
+    __m128 py = _mm_sub_ps(_mm_mul_ps(sc->dirz, e2x), _mm_mul_ps(sc->dirx, e2z));
+    __m128 pz = _mm_sub_ps(_mm_mul_ps(sc->dirx, e2y), _mm_mul_ps(sc->diry, e2x));
+    __m128 det = _mm_add_ps(_mm_add_ps(_mm_mul_ps(e1x, px), _mm_mul_ps(e1y, py)),
+                            _mm_mul_ps(e1z, pz));
+    const __m128 abs_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+    __m128 valid = _mm_cmpgt_ps(_mm_and_ps(det, abs_mask), _mm_set1_ps(1e-12f));
+    if (!_mm_movemask_ps(valid)) return;
+    __m128 inv_det = _mm_div_ps(_mm_set1_ps(1.0f), det);
+    __m128 tvx = _mm_sub_ps(sc->orgx, v0x);
+    __m128 tvy = _mm_sub_ps(sc->orgy, v0y);
+    __m128 tvz = _mm_sub_ps(sc->orgz, v0z);
+    __m128 u = _mm_mul_ps(
+        _mm_add_ps(_mm_add_ps(_mm_mul_ps(tvx, px), _mm_mul_ps(tvy, py)),
+                   _mm_mul_ps(tvz, pz)),
+        inv_det);
+    valid = _mm_and_ps(valid, _mm_and_ps(_mm_cmpge_ps(u, _mm_setzero_ps()),
+                                         _mm_cmple_ps(u, _mm_set1_ps(1.0f))));
+    if (!_mm_movemask_ps(valid)) return;
+    __m128 qx = _mm_sub_ps(_mm_mul_ps(tvy, e1z), _mm_mul_ps(tvz, e1y));
+    __m128 qy = _mm_sub_ps(_mm_mul_ps(tvz, e1x), _mm_mul_ps(tvx, e1z));
+    __m128 qz = _mm_sub_ps(_mm_mul_ps(tvx, e1y), _mm_mul_ps(tvy, e1x));
+    __m128 v = _mm_mul_ps(
+        _mm_add_ps(_mm_add_ps(_mm_mul_ps(sc->dirx, qx), _mm_mul_ps(sc->diry, qy)),
+                   _mm_mul_ps(sc->dirz, qz)),
+        inv_det);
+    valid = _mm_and_ps(valid, _mm_and_ps(_mm_cmpge_ps(v, _mm_setzero_ps()),
+                                         _mm_cmple_ps(_mm_add_ps(u, v),
+                                                      _mm_set1_ps(1.0f))));
+    if (!_mm_movemask_ps(valid)) return;
+    __m128 t = _mm_mul_ps(
+        _mm_add_ps(_mm_add_ps(_mm_mul_ps(e2x, qx), _mm_mul_ps(e2y, qy)),
+                   _mm_mul_ps(e2z, qz)),
+        inv_det);
+    valid = _mm_and_ps(valid, _mm_cmpge_ps(t, sc->tmin));
+    valid = _mm_and_ps(valid, _mm_cmplt_ps(t, _mm_set1_ps(*best_t)));
+    int mask = _mm_movemask_ps(valid);
+    if (!mask) return;
+    float ta[4], ua[4], va[4];
+    _mm_storeu_ps(ta, t);
+    _mm_storeu_ps(ua, u);
+    _mm_storeu_ps(va, v);
+    while (mask) {
+        int lane = __builtin_ctz((unsigned)mask);
+        mask &= mask - 1;
+        if (ta[lane] < *best_t) {
+            *best_t = ta[lane];
+            *best_u = ua[lane];
+            *best_v = va[lane];
+            *best_prim = prim[lane];
+        }
+    }
+}
+
+/* q16/q8 SIMD decode (cvt + fma) then 4-wide MT. */
+static inline void tri_qtri16_isect_sse(const lrt_qtri16 *b,
+                                        const tri_sse_ctx *sc, const __m128 og[3],
+                                        const __m128 sg[3], float *bt, float *bu,
+                                        float *bv, uint32_t *bp) {
+    __m128 v0x = tri_fma4(tri_load4_u16(b->qv0x), sg[0], og[0]);
+    __m128 v0y = tri_fma4(tri_load4_u16(b->qv0y), sg[1], og[1]);
+    __m128 v0z = tri_fma4(tri_load4_u16(b->qv0z), sg[2], og[2]);
+    __m128 v1x = tri_fma4(tri_load4_u16(b->qv1x), sg[0], og[0]);
+    __m128 v1y = tri_fma4(tri_load4_u16(b->qv1y), sg[1], og[1]);
+    __m128 v1z = tri_fma4(tri_load4_u16(b->qv1z), sg[2], og[2]);
+    __m128 v2x = tri_fma4(tri_load4_u16(b->qv2x), sg[0], og[0]);
+    __m128 v2y = tri_fma4(tri_load4_u16(b->qv2y), sg[1], og[1]);
+    __m128 v2z = tri_fma4(tri_load4_u16(b->qv2z), sg[2], og[2]);
+    tri_mt4_decoded_sse(v0x, v0y, v0z, v1x, v1y, v1z, v2x, v2y, v2z, sc,
+                        b->prim_id, bt, bu, bv, bp);
+}
+static inline void tri_qtri8_isect_sse(const lrt_qtri8 *b, const tri_sse_ctx *sc,
+                                       float *bt, float *bu, float *bv,
+                                       uint32_t *bp) {
+    __m128 ox = _mm_set1_ps(b->org[0]), oy = _mm_set1_ps(b->org[1]),
+           oz = _mm_set1_ps(b->org[2]);
+    __m128 sx = _mm_set1_ps(b->scale[0]), sy = _mm_set1_ps(b->scale[1]),
+           sz = _mm_set1_ps(b->scale[2]);
+    __m128 v0x = tri_fma4(tri_load4_u8(b->qv0x), sx, ox);
+    __m128 v0y = tri_fma4(tri_load4_u8(b->qv0y), sy, oy);
+    __m128 v0z = tri_fma4(tri_load4_u8(b->qv0z), sz, oz);
+    __m128 v1x = tri_fma4(tri_load4_u8(b->qv1x), sx, ox);
+    __m128 v1y = tri_fma4(tri_load4_u8(b->qv1y), sy, oy);
+    __m128 v1z = tri_fma4(tri_load4_u8(b->qv1z), sz, oz);
+    __m128 v2x = tri_fma4(tri_load4_u8(b->qv2x), sx, ox);
+    __m128 v2y = tri_fma4(tri_load4_u8(b->qv2y), sy, oy);
+    __m128 v2z = tri_fma4(tri_load4_u8(b->qv2z), sz, oz);
+    tri_mt4_decoded_sse(v0x, v0y, v0z, v1x, v1y, v1z, v2x, v2y, v2z, sc,
+                        b->prim_id, bt, bu, bv, bp);
+}
+
 /* Any-hit variant: returns 1 if any lane hits within (tmin, tmax]. */
 static inline int tri_block_occluded_sse(const lrt_tri4 *blk,
                                          const tri_sse_ctx *sc, __m128 tmax) {
@@ -3882,6 +4003,12 @@ static int tri_qtri_intersect_bvh4(const lrt_tri_scene *s, const lrt_ray *ray,
     tri_ray_setup(ray, &rc);
     tri_sse_ctx sc;
     tri_sse_setup(&rc, &sc);
+    __m128 og[3], sg[3];
+    if (s->qfmt == LRT_QTRI_Q16)
+        for (int a = 0; a < 3; a++) {
+            og[a] = _mm_set1_ps(s->qgrid_org[a]);
+            sg[a] = _mm_set1_ps(s->qgrid_scale[a]);
+        }
     float best_t = ray->tmax, best_u = 0.0f, best_v = 0.0f;
     uint32_t best_prim = LRT_TRI_NO_HIT;
     tri_stack_entry stack[TRI_STACK_SIZE];
@@ -3894,10 +4021,18 @@ static int tri_qtri_intersect_bvh4(const lrt_tri_scene *s, const lrt_ray *ray,
         if (e.tnear >= best_t) continue;
         if (TRI_REF_IS_LEAF(e.ref)) {
             uint32_t blk0 = TRI_REF_BLOCK(e.ref), nblk = TRI_REF_NBLOCKS(e.ref);
-            for (uint32_t b = 0; b < nblk; b++)
-                tri_qtri_block_isect(
-                    s, tri_block_ptr(s->blocks, blk0 + b, s->block_stride), &rc,
-                    &best_t, &best_u, &best_v, &best_prim);
+            for (uint32_t b = 0; b < nblk; b++) {
+                void *blk = tri_block_ptr(s->blocks, blk0 + b, s->block_stride);
+                if (s->qfmt == LRT_QTRI_Q8)
+                    tri_qtri8_isect_sse((const lrt_qtri8 *)blk, &sc, &best_t,
+                                        &best_u, &best_v, &best_prim);
+                else if (s->qfmt == LRT_QTRI_Q16)
+                    tri_qtri16_isect_sse((const lrt_qtri16 *)blk, &sc, og, sg,
+                                         &best_t, &best_u, &best_v, &best_prim);
+                else
+                    tri_qtri_block_isect(s, blk, &rc, &best_t, &best_u, &best_v,
+                                         &best_prim);
+            }
             continue;
         }
         const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(e.ref)];
