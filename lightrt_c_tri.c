@@ -4223,6 +4223,56 @@ static void tri_set_err(lrt_result *err, lrt_result v) {
     if (err) *err = v;
 }
 
+/* Count the wide nodes and leaf blocks tri_collapse will emit, by mirroring its
+ * grouping logic exactly (no writes). Lets the builders allocate the exact
+ * sizes instead of the ntris worst-case upper bound, which otherwise reserves
+ * ~5x the address space the tree actually uses (resident memory is unaffected
+ * — the tail is never touched — but the virtual/committed reservation is). */
+static void tri_collapse_count(const tri_build_ctx *bc, int width,
+                               uint32_t b_idx, uint32_t *nodes,
+                               uint32_t *blocks) {
+    const tri_bnode *bn = &bc->bnodes[b_idx];
+    if (bn->count > 0) {
+        *blocks += (bn->count + (uint32_t)width - 1u) / (uint32_t)width;
+        return;
+    }
+    uint32_t set[8];
+    int n = 0;
+    set[n++] = bn->a;
+    set[n++] = bn->b;
+    while (n < width) {
+        int expand = -1;
+        float best_area = -1.0f;
+        for (int i = 0; i < n; i++) {
+            const tri_bnode *m = &bc->bnodes[set[i]];
+            if (m->count > 0) continue;
+            float area = tri_surface_area(m->lo, m->hi);
+            if (area > best_area) {
+                best_area = area;
+                expand = i;
+            }
+        }
+        if (expand < 0) break;
+        const tri_bnode *m = &bc->bnodes[set[expand]];
+        set[expand] = m->a;
+        set[n++] = m->b;
+    }
+    *nodes += 1;
+    for (int i = 0; i < n; i++)
+        tri_collapse_count(bc, width, set[i], nodes, blocks);
+}
+
+/* Exact (node_cap, block_cap) for a collapse of bc's tree rooted at b_root.
+ * Clamped to >= 1 so the allocations are never zero-sized. */
+static void tri_collapse_caps(const tri_build_ctx *bc, int width,
+                              uint32_t b_root, uint32_t *node_cap,
+                              uint32_t *block_cap) {
+    uint32_t nn = 0, bb = 0;
+    tri_collapse_count(bc, width, b_root, &nn, &bb);
+    *node_cap = nn ? nn : 1u;
+    *block_cap = bb ? bb : 1u;
+}
+
 /* Collapse bc's binary tree (root b_root) into s's already-allocated wide
  * nodes/blocks, fill stats + root AABB. s->layout/quantized must be set.
  * Returns 1 on failure (capacity overflow). Used by the AABB-driven builders
@@ -4409,10 +4459,11 @@ lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
     if (!bc.failed) {
         s->layout = layout;
         s->quantized = quantized;
-        uint32_t node_cap = emit_total;
-        if (node_cap < 1) node_cap = 1;
-        uint32_t block_cap = emit_total;
-        if (block_cap < 1) block_cap = 1;
+        /* Allocate exactly what the collapse will emit (vs the ntris worst-case
+         * bound, which over-reserves ~5x the address space). */
+        uint32_t node_cap, block_cap;
+        tri_collapse_caps(&bc, layout, b_root, &node_cap, &block_cap);
+        (void)emit_total;
         if (layout == 4) {
             s->nodes4 = (lrt_bvh4_node *)tri_aligned_alloc(
                 64, (size_t)node_cap * sizeof(lrt_bvh4_node));
@@ -5269,10 +5320,8 @@ lrt_tri_scene *lrt_curve_scene_build(const float *segments, const float *radii,
         s->layout = 4;
         s->curve = 1;
         s->prim_kind = TRI_PRIM_CURVE;
-        uint32_t node_cap = (uint32_t)nsub;
-        if (node_cap < 1) node_cap = 1;
-        uint32_t block_cap = (uint32_t)nsub;
-        if (block_cap < 1) block_cap = 1;
+        uint32_t node_cap, block_cap;
+        tri_collapse_caps(&bc, 4, b_root, &node_cap, &block_cap);
         s->nodes4 = (lrt_bvh4_node *)tri_aligned_alloc(
             64, (size_t)node_cap * sizeof(lrt_bvh4_node));
         s->blocks = tri_aligned_alloc(64, (size_t)block_cap * sizeof(lrt_crv4));
@@ -5366,10 +5415,9 @@ static lrt_tri_scene *tri_finish_aabb_build(tri_build_ctx *bc, size_t nprims,
     if (!bc->failed) {
         s->layout = 4;
         s->prim_kind = prim_kind;
-        uint32_t node_cap = (uint32_t)nprims;
-        if (node_cap < 1) node_cap = 1;
-        uint32_t block_cap = (uint32_t)nprims;
-        if (block_cap < 1) block_cap = 1;
+        uint32_t node_cap, block_cap;
+        tri_collapse_caps(bc, 4, b_root, &node_cap, &block_cap);
+        (void)nprims;
         s->nodes4 = (lrt_bvh4_node *)tri_aligned_alloc(
             64, (size_t)node_cap * sizeof(lrt_bvh4_node));
         s->blocks = tri_aligned_alloc(64, (size_t)block_cap * tri_block_size(4));

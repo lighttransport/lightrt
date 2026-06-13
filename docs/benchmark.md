@@ -64,6 +64,40 @@ matches Embree's TBB build throughput while costing ~10–15 % traversal.
 `LRT_TRI_BUILD_HQ` adds SBVH spatial splits (not shown: ~0.2 Mtris/s, only
 worthwhile for overlapping geometry).
 
+## Memory footprint
+
+Two numbers matter: the **resident** acceleration structure (what a built scene
+costs to keep around and query) and the **peak RSS during build** (the high-water
+mark, which decides whether a build fits in a memory budget).
+
+| @ 710k tris | resident AS | bytes/tri | peak RSS (build) |
+|---|---|---|---|
+| **c11-bvh4** | 36.8 MB | 52 | **104 MB** |
+| c11-bvh8q | 32.5 MB | 45 | ~100 MB |
+| tinybvh (CWBVH) | 15.1 MB | 21 | 247 MB |
+| madmann91/bvh | 57.7 MB | 81 | — |
+| Embree | (n/a) | — | 134 MB |
+
+`c11-bvh4` has the **lowest peak build RSS** of the measured libraries — tinybvh's
+compressed-wide-BVH build needs ~2.4× our peak. Our *resident* structure is
+larger than tinybvh's because we **copy each triangle into SIMD-swizzled leaf
+blocks** (v0 + two edges, 36 B + a 4 B original index = 40 B/tri, 79 % of the
+footprint); tinybvh instead stores a 4 B index into the caller's vertex array
+and gathers per intersection. That copy is exactly what buys our leaf-test speed
+(it is why we lead tinybvh on every workload), so it is kept. The remaining 21 %
+is BVH nodes (128 B per 4-wide node); `LRT_TRI_LAYOUT_BVH8Q` quantizes node
+bounds to 8 bits and trims the resident structure ~13 % (32.5 vs 36.8 MB) for a
+small any-hit cost — the memory-constrained layout.
+
+**Exact allocation.** The builder previously reserved the worst-case `ntris`
+nodes *and* `ntris` leaf blocks up front (a leaf can be as small as one
+primitive), ~195 MB of address space at 710k of which only ~35 MB is ever
+touched. A node/block counting pass over the collapsed tree now sizes the two
+arrays exactly, cutting the **virtual reservation ~5× (195 → 40 MB)** with no
+change to resident memory, build time, or traversal speed — it just stops
+over-committing address space (which matters under strict overcommit, in
+containers, or when many BVHs/instances coexist).
+
 ## How the single-thread incoherent gap was closed
 
 ![optimization progression](img/progression.svg)
