@@ -2014,6 +2014,96 @@ static void test_flatcurve_scene(void) {
     free(scount);
 }
 
+/* Cubic Bezier position + radius (component 3). */
+static void bez_pos(const float cp[16], float u, float out[4]) {
+    float u1 = 1.0f - u;
+    for (int c = 0; c < 4; c++)
+        out[c] = u1 * u1 * u1 * cp[c] + 3.0f * u1 * u1 * u * cp[4 + c] +
+                 3.0f * u1 * u * u * cp[8 + c] + u * u * u * cp[12 + c];
+}
+
+/* Reference round-Bezier hit: the tube approximated by a fan of M tapered round
+ * cones (varying radius, a tight fit to the smooth tube; independent of the
+ * kernel's Newton sweep). Converges to the exact tube as M grows. */
+static int ref_bezcurve(const float cp[16], const lrt_ray *r, float tmax,
+                        float *t_out) {
+    enum { M = 384 };
+    float best = tmax;
+    int hit = 0;
+    float prev[4];
+    bez_pos(cp, 0.0f, prev);
+    for (int j = 1; j <= M; j++) {
+        float cur[4];
+        bez_pos(cp, (float)j / (float)M, cur);
+        float p0[3] = {prev[0], prev[1], prev[2]};
+        float p1[3] = {cur[0], cur[1], cur[2]};
+        float t;
+        if (ref_roundcone(p0, prev[3], p1, cur[3], r, best, &t)) {
+            best = t;
+            hit = 1;
+        }
+        for (int c = 0; c < 4; c++) prev[c] = cur[c];
+    }
+    if (hit) *t_out = best;
+    return hit;
+}
+
+static void test_bezcurve_scene(void) {
+    enum { NSEG = 200, NRAYS = 20000 };
+    float *cps = (float *)malloc(NSEG * 16 * sizeof(float));
+    g_rng = 0xBE21E5ull;
+    for (int i = 0; i < NSEG; i++) {
+        /* a control polygon that stays smooth: random start, small steps */
+        float p[3] = {rnd_f(-2, 2), rnd_f(-2, 2), rnd_f(-2, 2)};
+        for (int k = 0; k < 4; k++) {
+            for (int a = 0; a < 3; a++) {
+                p[a] += rnd_f(-0.5f, 0.5f);
+                cps[i * 16 + k * 4 + a] = p[a];
+            }
+            cps[i * 16 + k * 4 + 3] = rnd_f(0.03f, 0.12f);
+        }
+    }
+    lrt_tri_scene *s = lrt_bezcurve_scene_build(cps, NSEG, NULL, NULL);
+    CHECK(s != NULL, "bezcurve build failed");
+    if (!s) {
+        free(cps);
+        return;
+    }
+    printf("  bezcurve scene [%s]\n", lrt_tri_kernel_name(s));
+    size_t mism = 0, occl = 0;
+    for (int i = 0; i < NRAYS; i++) {
+        lrt_ray r;
+        make_random_ray(&r);
+        float bt = r.tmax;
+        int bf = 0;
+        for (int j = 0; j < NSEG; j++) {
+            float t;
+            if (ref_bezcurve(&cps[j * 16], &r, bt, &t)) {
+                bt = t;
+                bf = 1;
+            }
+        }
+        lrt_hit h;
+        int bvh = lrt_tri_intersect1(s, &r, &h);
+        if (bf != bvh)
+            mism++;
+        else if (bf && fabs((double)h.t - (double)bt) >
+                           3e-3 * (1.0 + fabs((double)bt)))
+            mism++;
+        if (lrt_tri_occluded1(s, &r) != bvh) occl++;
+    }
+    /* The round-cone fan facets the smooth tube, so grazing rays differ more
+     * from it than from the exact surface; the AUTHORITATIVE check is the Embree
+     * ROUND_BEZIER_CURVE cross-check in hair_bench (~99.5% on the same geometry).
+     * This catches gross breakage (e.g. a bad Newton seed -> systematic misses,
+     * which ran ~2.8%). */
+    CHECK(mism <= NRAYS / 40, "bezcurve: %zu/%d mismatches vs brute-force tube",
+          mism, NRAYS);
+    CHECK(occl == 0, "bezcurve: %zu occluded disagreements", occl);
+    lrt_tri_scene_free(s);
+    free(cps);
+}
+
 int main(void) {
     printf("lightrt_c_tri test\n");
 
@@ -2023,6 +2113,7 @@ int main(void) {
     test_curve_scene();
     test_roundcurve_scene();
     test_flatcurve_scene();
+    test_bezcurve_scene();
     test_points_scene();
     test_sphere_scene();
     test_user_geometry();

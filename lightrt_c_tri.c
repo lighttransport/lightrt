@@ -233,6 +233,18 @@ typedef struct lrt_flat4 {
 } lrt_flat4;
 _Static_assert(sizeof(lrt_flat4) == 144, "lrt_flat4");
 
+/* Round cubic-Bezier curve leaf block: 4 curves, each 4 control points (xyz +
+ * radius). Own 272-byte stride (addressed via block_stride). Padding lanes:
+ * all radii 0, prim = LRT_TRI_NO_HIT. */
+typedef struct lrt_bez4 {
+    float b0x[4], b0y[4], b0z[4], b0r[4];
+    float b1x[4], b1y[4], b1z[4], b1r[4];
+    float b2x[4], b2y[4], b2z[4], b2r[4];
+    float b3x[4], b3y[4], b3z[4], b3r[4];
+    uint32_t prim[4];
+} lrt_bez4;
+_Static_assert(sizeof(lrt_bez4) == 272, "lrt_bez4");
+
 /* Quantized triangle leaf blocks (4 tris each; store quantized absolute
  * v0,v1,v2 → decode → e1=v1-v0, e2=v2-v0 → Moller-Trumbore). These have their
  * own (smaller, format-specific) stride; the scene carries block_stride and the
@@ -285,7 +297,8 @@ enum {
     TRI_PRIM_QTRI = 4,  /* quantized triangle leaves (lrt_qtri*)        */
     TRI_PRIM_RLCURVE = 5,/* round-linear curve leaves (lrt_rlc4)        */
     TRI_PRIM_POINT = 6, /* point leaves (lrt_point4): sphere/disc/odisc */
-    TRI_PRIM_FLATCURVE = 7 /* flat (ribbon) linear curve leaves (lrt_flat4) */
+    TRI_PRIM_FLATCURVE = 7, /* flat (ribbon) linear curve leaves (lrt_flat4) */
+    TRI_PRIM_BEZCURVE = 8 /* round cubic Bezier curve leaves (lrt_bez4) */
 };
 
 /* Point-primitive kind (lrt_tri_scene.point_type), mirroring Embree's point
@@ -401,6 +414,8 @@ typedef struct tri_build_ctx {
     const float *points_xyz; /* 3*nprims centers (TRI_PRIM_POINT) */
     const float *points_r;   /* nprims radii    (TRI_PRIM_POINT) */
     const float *points_n;   /* 3*nprims normals or NULL (TRI_PRIM_POINT) */
+    const float *bez_cps;    /* 16*nseg ORIGINAL Bezier CPs (TRI_PRIM_BEZCURVE) */
+    uint32_t bez_split;      /* build-time de Casteljau pieces per cubic (>=1) */
     int emit_kind;           /* TRI_PRIM_* */
 } tri_build_ctx;
 
@@ -2199,6 +2214,10 @@ static void tri_qtri_emit_block(lrt_tri_scene *s, void *blkv,
     }
 }
 
+/* de Casteljau sub-cubic extraction (defined with the Bezier intersector). */
+static void tri_bez_subcurve(const float cp[16], float a, float b,
+                             float out[16]);
+
 /* Emit the triangles of a binary leaf as SoA blocks of the scene's SIMD
  * width; returns a leaf ref. */
 static uint32_t tri_emit_leaf(tri_collapse_ctx *cc, const tri_bnode *bn) {
@@ -2414,6 +2433,46 @@ static uint32_t tri_emit_leaf(tri_collapse_ctx *cc, const tri_bnode *bn) {
                     blk->r1[lane] = 0.0f;
                     blk->prim[lane] = LRT_TRI_NO_HIT;
                 }
+            }
+        }
+        cc->leaf_count++;
+        cc->sah_leaf +=
+            (double)(tri_surface_area(bn->lo, bn->hi) / cc->root_area) *
+            (double)count;
+        return TRI_MAKE_LEAF_REF(first_block, nblocks);
+    }
+    if (bc->emit_kind == TRI_PRIM_BEZCURVE) { /* round Bezier curve leaves */
+        for (uint32_t b = 0; b < nblocks; b++) {
+            lrt_bez4 *blk =
+                (lrt_bez4 *)tri_block_ptr(s->blocks, s->block_count, s->block_stride);
+            s->block_count++;
+            for (uint32_t lane = 0; lane < 4u; lane++) {
+                uint32_t k = b * 4u + lane;
+                float v[16];
+                uint32_t prim;
+                if (k < count) {
+                    uint32_t sub = bc->indices[bn->a + k];
+                    uint32_t sp = bc->bez_split ? bc->bez_split : 1u;
+                    uint32_t seg = sub / sp, kk = sub % sp;
+                    /* materialize this leaf's sub-cubic from the original cubic
+                     * (no pre-stored sub-CP array). */
+                    tri_bez_subcurve(&bc->bez_cps[(size_t)seg * 16],
+                                     (float)kk / (float)sp,
+                                     (float)(kk + 1) / (float)sp, v);
+                    prim = seg;
+                } else {
+                    prim = LRT_TRI_NO_HIT;
+                    memset(v, 0, sizeof(v));
+                }
+                blk->b0x[lane] = v[0]; blk->b0y[lane] = v[1];
+                blk->b0z[lane] = v[2]; blk->b0r[lane] = v[3];
+                blk->b1x[lane] = v[4]; blk->b1y[lane] = v[5];
+                blk->b1z[lane] = v[6]; blk->b1r[lane] = v[7];
+                blk->b2x[lane] = v[8]; blk->b2y[lane] = v[9];
+                blk->b2z[lane] = v[10]; blk->b2r[lane] = v[11];
+                blk->b3x[lane] = v[12]; blk->b3y[lane] = v[13];
+                blk->b3z[lane] = v[14]; blk->b3r[lane] = v[15];
+                blk->prim[lane] = prim;
             }
         }
         cc->leaf_count++;
@@ -3274,6 +3333,331 @@ static inline void tri_flat4_isect(const lrt_flat4 *blk, const tri_ray_ctx *rc,
     }
 }
 
+/* ---- Round cubic Bezier curve (Embree sweep) ----------------------------- *
+ * Subdivide [0,1], seed a Newton (Jacobian) iteration from a bounding capsule
+ * per sub-interval, and converge to the exact tube surface. Port of embree's
+ * curve_intersector_sweep.h (intersect_bezier_iterative_jacobian). cp holds 4
+ * control points, each xyz + radius (16 floats). */
+/* Build-time pre-subdivision: split each input cubic into this many tight
+ * sub-arcs so the BVH culls well and the runtime sweep stays cheap. */
+#define TRI_BEZ_BUILD_SPLIT 2
+
+/* Cubic Bezier: position+radius P[4], 1st deriv dP[4], 2nd deriv ddP[4]. */
+static inline void tri_bez_eval(const float cp[16], float u, float P[4],
+                                float dP[4], float ddP[4]) {
+    float u1 = 1.0f - u;
+    for (int c = 0; c < 4; c++) {
+        float B0 = cp[c], B1 = cp[4 + c], B2 = cp[8 + c], B3 = cp[12 + c];
+        P[c] = u1 * u1 * u1 * B0 + 3.0f * u1 * u1 * u * B1 +
+               3.0f * u1 * u * u * B2 + u * u * u * B3;
+        float e0 = B1 - B0, e1 = B2 - B1, e2 = B3 - B2;
+        dP[c] = 3.0f * (u1 * u1 * e0 + 2.0f * u1 * u * e1 + u * u * e2);
+        ddP[c] = 6.0f * (u1 * (B2 - 2.0f * B1 + B0) + u * (B3 - 2.0f * B2 + B1));
+    }
+}
+
+/* de Casteljau split of a cubic (4 control points, xyz+radius) at parameter t
+ * into the two halves L (restriction to [0,t]) and R ([t,1]). */
+static void tri_bez_split(const float c[16], float t, float L[16], float R[16]) {
+    for (int k = 0; k < 4; k++) {
+        float P0 = c[k], P1 = c[4 + k], P2 = c[8 + k], P3 = c[12 + k];
+        float ab = P0 + (P1 - P0) * t, bc = P1 + (P2 - P1) * t,
+              cd = P2 + (P3 - P2) * t;
+        float abc = ab + (bc - ab) * t, bcd = bc + (cd - bc) * t;
+        float abcd = abc + (bcd - abc) * t;
+        L[k] = P0; L[4 + k] = ab; L[8 + k] = abc; L[12 + k] = abcd;
+        R[k] = abcd; R[4 + k] = bcd; R[8 + k] = cd; R[12 + k] = P3;
+    }
+}
+
+/* Control points of the sub-cubic restricted to [a,b] (0 <= a < b <= 1). */
+static void tri_bez_subcurve(const float cp[16], float a, float b,
+                             float out[16]) {
+    float L[16], R[16];
+    tri_bez_split(cp, b, L, R); /* L = restriction to [0,b] */
+    if (a > 0.0f) {
+        float L2[16];
+        tri_bez_split(L, a / b, L2, out); /* out = right part = [a,b] */
+    } else {
+        memcpy(out, L, 16 * sizeof(float));
+    }
+}
+
+/* 2D Newton on (u,t): f = dot(R,T) (perpendicular foot), g = dist-to-axis -
+ * radius (tube surface). cp is in ray-local space (ray origin at 0), dir = ray
+ * direction. Returns 1 and fills t,u on a converged in-range hit. */
+static int tri_bez_newton(const float cp[16], const float dir[3], float tmin,
+                          float u, float t, float best_t, float *t_out,
+                          float *u_out) {
+    for (int it = 0; it < 8; it++) {
+        float P[4], dP[4], ddP[4];
+        tri_bez_eval(cp, u, P, dP, ddP);
+        float Rx = t * dir[0] - P[0], Ry = t * dir[1] - P[1],
+              Rz = t * dir[2] - P[2];
+        float dpd = dP[0] * dP[0] + dP[1] * dP[1] + dP[2] * dP[2];
+        if (dpd < 1e-20f) return 0;
+        float rcpl = 1.0f / sqrtf(dpd);
+        float Tx = dP[0] * rcpl, Ty = dP[1] * rcpl, Tz = dP[2] * rcpl;
+        float Tdd = Tx * ddP[0] + Ty * ddP[1] + Tz * ddP[2];
+        float dTx = (ddP[0] - Tx * Tdd) * rcpl, dTy = (ddP[1] - Ty * Tdd) * rcpl,
+              dTz = (ddP[2] - Tz * Tdd) * rcpl;
+        float f = Rx * Tx + Ry * Ty + Rz * Tz;
+        float dfdu = (-dP[0] * Tx - dP[1] * Ty - dP[2] * Tz) +
+                     (Rx * dTx + Ry * dTy + Rz * dTz);
+        float dfdt = dir[0] * Tx + dir[1] * Ty + dir[2] * Tz;
+        float RR = Rx * Rx + Ry * Ry + Rz * Rz;
+        float K = RR - f * f;
+        if (K < 1e-20f) K = 1e-20f;
+        float sqrtK = sqrtf(K), rsK = 1.0f / sqrtK;
+        float r = P[3] > 0.0f ? P[3] : 0.0f;
+        float g = sqrtK - r;
+        float RdRdu = -(Rx * dP[0] + Ry * dP[1] + Rz * dP[2]);
+        float RdRdt = Rx * dir[0] + Ry * dir[1] + Rz * dir[2];
+        float dgdu = (RdRdu - f * dfdu) * rsK - dP[3];
+        float dgdt = (RdRdt - f * dfdt) * rsK;
+        float det = dfdu * dgdt - dfdt * dgdu;
+        if (fabsf(det) < 1e-20f) return 0;
+        float invd = 1.0f / det;
+        u -= (dgdt * f - dfdt * g) * invd;
+        t -= (dfdu * g - dgdu * f) * invd;
+        float lenR = sqrtf(RR);
+        float eps = 1e-5f * (1.0f + lenR);
+        if (fabsf(f) < eps && fabsf(g) < eps) {
+            if (t >= tmin && t < best_t && u >= 0.0f && u <= 1.0f) {
+                *t_out = t;
+                *u_out = u;
+                return 1;
+            }
+            return 0;
+        }
+    }
+    return 0;
+}
+
+/* Lean tapered-cone seed (cone tangent to spheres p0(r0)->p1(r1), no neighbor
+ * CSG and no begin/end conditionals): nearest ray hit in [tmin,best) over the
+ * cone (y in [0,g]) and the two end-sphere caps (y<0 at p0, y>g at p1). Ray
+ * origin is the local 0; returns t and the axial parameter s in [0,1]. A seed
+ * for the Bezier Newton, so it is only approximate. */
+static int tri_cone_seed(const float dir[3], float tmin, float best,
+                         const float p0[3], float r0, const float p1[3],
+                         float r1, float *t_out, float *s_out) {
+    float dOdO = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+    if (dOdO <= 0.0f) return 0;
+    float rcp_dOdO = 1.0f / dOdO;
+    /* re-center the (local) origin near the segment for stability */
+    float cx = 0.5f * (p0[0] + p1[0]), cy = 0.5f * (p0[1] + p1[1]),
+          cz = 0.5f * (p0[2] + p1[2]);
+    float dt = (cx * dir[0] + cy * dir[1] + cz * dir[2]) * rcp_dOdO;
+    float ox = dt * dir[0], oy = dt * dir[1], oz = dt * dir[2];
+    float dPx = p1[0] - p0[0], dPy = p1[1] - p0[1], dPz = p1[2] - p0[2];
+    float dPdP = dPx * dPx + dPy * dPy + dPz * dPz;
+    float dr = r1 - r0, r0dr = r0 * dr, g = dPdP - dr * dr;
+    float Ox = ox - p0[0], Oy = oy - p0[1], Oz = oz - p0[2];
+    float OdP = Ox * dPx + Oy * dPy + Oz * dPz;
+    float dOdP = dir[0] * dPx + dir[1] * dPy + dir[2] * dPz;
+    float yp = OdP + r0dr;
+
+    float lo = best, slo = 0.0f;
+    int hit = 0;
+    if (g > 0.0f) {
+        float OO = Ox * Ox + Oy * Oy + Oz * Oz;
+        float OdO = dir[0] * Ox + dir[1] * Oy + dir[2] * Oz;
+        float A = g * dOdO - dOdP * dOdP;
+        float B = 2.0f * (g * OdO - dOdP * yp);
+        float C = g * OO - OdP * OdP - r0 * r0 * dPdP - 2.0f * r0dr * OdP;
+        float D = B * B - 4.0f * A * C;
+        if (D >= 0.0f && (A > 1e-18f || A < -1e-18f)) {
+            float Q = sqrtf(D), rcp2A = 1.0f / (2.0f * A);
+            for (int k = 0; k < 2; k++) {
+                float tl = (k == 0 ? (-B - Q) : (-B + Q)) * rcp2A;
+                float y = yp + tl * dOdP;
+                if (y > -1.2e-7f && y <= g) {
+                    float tw = dt + tl;
+                    if (tw >= tmin && tw < lo) {
+                        lo = tw;
+                        float s = y / g;
+                        slo = s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s);
+                        hit = 1;
+                    }
+                }
+            }
+        }
+    }
+    for (int e = 0; e < 2; e++) { /* end-sphere caps: p0 (y<0), p1 (y>g) */
+        const float *c = e ? p1 : p0;
+        float rc = e ? r1 : r0;
+        float Ex = ox - c[0], Ey = oy - c[1], Ez = oz - c[2];
+        float EdO = Ex * dir[0] + Ey * dir[1] + Ez * dir[2];
+        float h2 = EdO * EdO - dOdO * (Ex * Ex + Ey * Ey + Ez * Ez - rc * rc);
+        if (h2 < 0.0f) continue;
+        float tl = (-EdO - sqrtf(h2)) * rcp_dOdO;
+        float y = yp + tl * dOdP;
+        if (e ? (y > g) : (y < 0.0f)) {
+            float tw = dt + tl;
+            if (tw >= tmin && tw < lo) {
+                lo = tw;
+                slo = e ? 1.0f : 0.0f;
+                hit = 1;
+            }
+        }
+    }
+    if (hit) {
+        *t_out = lo;
+        *s_out = slo;
+    }
+    return hit;
+}
+
+static int tri_bez_isect_one(const float cp_in[16], const tri_ray_ctx *rc,
+                             float best_t, float *t_out, float *u_out) {
+    /* translate control points to ray-local space (ray origin at 0) */
+    float cp[16];
+    for (int k = 0; k < 4; k++) {
+        cp[k * 4 + 0] = cp_in[k * 4 + 0] - rc->org[0];
+        cp[k * 4 + 1] = cp_in[k * 4 + 1] - rc->org[1];
+        cp[k * 4 + 2] = cp_in[k * 4 + 2] - rc->org[2];
+        cp[k * 4 + 3] = cp_in[k * 4 + 3];
+    }
+    tri_ray_ctx rcl = *rc;
+    rcl.org[0] = rcl.org[1] = rcl.org[2] = 0.0f;
+    const float dir[3] = {rc->dir[0], rc->dir[1], rc->dir[2]};
+    const float tmin = rc->tmin;
+
+    float best = best_t, bu = 0.0f;
+    int hit = 0;
+
+    /* Adaptive subdivision: recurse [a,b] only where the ray comes within the
+     * sub-arc's bounding capsule (chord Pa..Pb + control-polygon bulge + max
+     * radius), so far regions of the curve cost only a cheap reject. At max
+     * depth, seed a tapered cone over the leaf interval and refine with Newton.
+     * Binary recursion -> up to 2^BEZ_MAXDEPTH leaf intervals. */
+    enum { BEZ_MAXDEPTH = 5 };
+    struct {
+        float a, b;
+        int depth;
+    } stk[2 * BEZ_MAXDEPTH + 2];
+    int sp = 0;
+    stk[sp].a = 0.0f;
+    stk[sp].b = 1.0f;
+    stk[sp].depth = 0;
+    sp++;
+    while (sp > 0) {
+        float a = stk[--sp].a, b = stk[sp].b;
+        int depth = stk[sp].depth;
+        float h = b - a;
+        float Pa[4], dPa[4], dda[4], Pb[4], dPb[4], ddb[4];
+        tri_bez_eval(cp, a, Pa, dPa, dda);
+        tri_bez_eval(cp, b, Pb, dPb, ddb);
+        /* sub-arc bound (de Casteljau inner CPs P1=Pa+dPa*h/3, P2=Pb-dPb*h/3) */
+        float cxd = Pb[0] - Pa[0], cyd = Pb[1] - Pa[1], czd = Pb[2] - Pa[2];
+        float cl2 = cxd * cxd + cyd * cyd + czd * czd;
+        float maxperp = 0.0f;
+        if (cl2 > 1e-20f) {
+            float inv = 1.0f / cl2;
+            float mid[2][3] = {
+                {Pa[0] + dPa[0] * h / 3.0f, Pa[1] + dPa[1] * h / 3.0f,
+                 Pa[2] + dPa[2] * h / 3.0f},
+                {Pb[0] - dPb[0] * h / 3.0f, Pb[1] - dPb[1] * h / 3.0f,
+                 Pb[2] - dPb[2] * h / 3.0f}};
+            for (int m = 0; m < 2; m++) {
+                float wx = mid[m][0] - Pa[0], wy = mid[m][1] - Pa[1],
+                      wz = mid[m][2] - Pa[2];
+                float tt = (wx * cxd + wy * cyd + wz * czd) * inv;
+                float dx = wx - tt * cxd, dy = wy - tt * cyd, dz = wz - tt * czd;
+                float d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 > maxperp) maxperp = d2;
+            }
+            maxperp = sqrtf(maxperp);
+        }
+        float r1w = Pa[3] + dPa[3] * h / 3.0f, r2w = Pb[3] - dPb[3] * h / 3.0f;
+        float r0c = Pa[3] > r1w ? Pa[3] : r1w;
+        float r3c = Pb[3] > r2w ? Pb[3] : r2w;
+        r0c = (r0c > 0.0f ? r0c : 0.0f) + maxperp;
+        r3c = (r3c > 0.0f ? r3c : 0.0f) + maxperp;
+
+        /* cheap conservative reject: ray vs the bounding capsule (chord, rcap),
+         * via the closest ray-to-segment distance (robust for any orientation). */
+        float rcap = r0c > r3c ? r0c : r3c;
+        {
+            float a_ = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+            float bb = dir[0] * cxd + dir[1] * cyd + dir[2] * czd;
+            float cc = cl2;
+            float w0x = -Pa[0], w0y = -Pa[1], w0z = -Pa[2]; /* org=0 */
+            float dd = dir[0] * w0x + dir[1] * w0y + dir[2] * w0z;
+            float ed = cxd * w0x + cyd * w0y + czd * w0z;
+            float den = a_ * cc - bb * bb;
+            float ss = den > 1e-20f ? (a_ * ed - bb * dd) / den : 0.0f;
+            ss = ss < 0.0f ? 0.0f : (ss > 1.0f ? 1.0f : ss);
+            float tr = (bb * ss - dd) / (a_ > 1e-20f ? a_ : 1e-20f);
+            tr = tr < tmin ? tmin : (tr > best ? best : tr);
+            ss = (bb * tr + ed) / (cc > 1e-20f ? cc : 1e-20f);
+            ss = ss < 0.0f ? 0.0f : (ss > 1.0f ? 1.0f : ss);
+            float gx = tr * dir[0] - (Pa[0] + ss * cxd);
+            float gy = tr * dir[1] - (Pa[1] + ss * cyd);
+            float gz = tr * dir[2] - (Pa[2] + ss * czd);
+            if (gx * gx + gy * gy + gz * gz > rcap * rcap) continue;
+        }
+
+        if (depth >= BEZ_MAXDEPTH) {
+            /* leaf: tapered-cone seed + Newton over [a,b] */
+            if (r0c > 0.0f || r3c > 0.0f) {
+                float P0p[3] = {Pa[0], Pa[1], Pa[2]},
+                      P3p[3] = {Pb[0], Pb[1], Pb[2]};
+                float tseg, s;
+                if (tri_cone_seed(dir, tmin, best, P0p, r0c, P3p, r3c, &tseg,
+                                  &s)) {
+                    float th, uh;
+                    if (tri_bez_newton(cp, dir, tmin, a + s * h, tseg, best, &th,
+                                       &uh)) {
+                        best = th;
+                        bu = uh;
+                        hit = 1;
+                    } else {
+                        best = tseg;
+                        bu = a + s * h;
+                        hit = 1;
+                    }
+                }
+            }
+        } else {
+            float m = 0.5f * (a + b);
+            stk[sp].a = a;
+            stk[sp].b = m;
+            stk[sp].depth = depth + 1;
+            sp++;
+            stk[sp].a = m;
+            stk[sp].b = b;
+            stk[sp].depth = depth + 1;
+            sp++;
+        }
+    }
+    if (hit) {
+        *t_out = best;
+        *u_out = bu;
+    }
+    return hit;
+}
+
+static inline void tri_bez4_isect(const lrt_bez4 *blk, const tri_ray_ctx *rc,
+                                  float *best_t, float *best_u,
+                                  uint32_t *best_prim) {
+    for (int lane = 0; lane < 4; lane++) {
+        if (blk->prim[lane] == LRT_TRI_NO_HIT) continue;
+        float cp[16] = {
+            blk->b0x[lane], blk->b0y[lane], blk->b0z[lane], blk->b0r[lane],
+            blk->b1x[lane], blk->b1y[lane], blk->b1z[lane], blk->b1r[lane],
+            blk->b2x[lane], blk->b2y[lane], blk->b2z[lane], blk->b2r[lane],
+            blk->b3x[lane], blk->b3y[lane], blk->b3z[lane], blk->b3r[lane]};
+        float t, u;
+        if (tri_bez_isect_one(cp, rc, *best_t, &t, &u)) {
+            *best_t = t;
+            *best_u = u;
+            *best_prim = blk->prim[lane];
+        }
+    }
+}
+
 #define TRI_INV_2PI 0.15915494309189535f
 #define TRI_INV_PI 0.31830988618379067f
 
@@ -3420,6 +3804,14 @@ static int tri_intersect_scalar(const lrt_tri_scene *s, const lrt_ray *ray,
                 for (uint32_t b = 0; b < nblk; b++) {
                     tri_flat4_isect(&blocks[blk0 + b], &rc, &best_t, &best_u,
                                     &best_prim);
+                }
+                continue;
+            }
+            if (s->prim_kind == TRI_PRIM_BEZCURVE) {
+                const lrt_bez4 *blocks = (const lrt_bez4 *)s->blocks;
+                for (uint32_t b = 0; b < nblk; b++) {
+                    tri_bez4_isect(&blocks[blk0 + b], &rc, &best_t, &best_u,
+                                   &best_prim);
                 }
                 continue;
             }
@@ -3601,6 +3993,16 @@ static int tri_occluded_scalar(const lrt_tri_scene *s, const lrt_ray *ray) {
                     float t = t_max, u = 0.0f;
                     uint32_t prim = LRT_TRI_NO_HIT;
                     tri_flat4_isect(&blocks[blk0 + b], &rc, &t, &u, &prim);
+                    if (prim != LRT_TRI_NO_HIT) return 1;
+                }
+                continue;
+            }
+            if (s->prim_kind == TRI_PRIM_BEZCURVE) {
+                const lrt_bez4 *blocks = (const lrt_bez4 *)s->blocks;
+                for (uint32_t b = 0; b < nblk; b++) {
+                    float t = t_max, u = 0.0f;
+                    uint32_t prim = LRT_TRI_NO_HIT;
+                    tri_bez4_isect(&blocks[blk0 + b], &rc, &t, &u, &prim);
                     if (prim != LRT_TRI_NO_HIT) return 1;
                 }
                 continue;
@@ -5029,6 +5431,402 @@ static int tri_flatcurve_occluded_bvh4(const lrt_tri_scene *s,
                 float t = t_max, u = 0.0f;
                 uint32_t prim = LRT_TRI_NO_HIT;
                 tri_flat4_isect_sse(&blocks[blk0 + b], &sc, &t, &u, &prim);
+                if (prim != LRT_TRI_NO_HIT) return 1;
+            }
+            continue;
+        }
+        const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(ref)];
+        _Alignas(16) float tnear[4];
+        int mask = tri_bvh4_slab_sse(n, &sc, tmax4, tnear);
+        mask &= (1 << n->nchildren) - 1;
+        while (mask) {
+            int i = __builtin_ctz((unsigned)mask);
+            mask &= mask - 1;
+            tri_prefetch_ref(s, n->child[i], 4);
+            stack[sp++] = n->child[i];
+        }
+    }
+    return 0;
+}
+
+/* Evaluate ONE cubic (control points broadcast in C[16]) at 4 different u values
+ * (lanes of `u`): position+radius P[4] and derivative dP[4], each a 4-lane vec. */
+static inline void tri_bez_eval4u(const __m128 C[16], __m128 u, __m128 P[4],
+                                  __m128 dP[4]) {
+    const __m128 ONE = _mm_set1_ps(1.0f);
+    __m128 u1 = _mm_sub_ps(ONE, u);
+    __m128 u1u1 = _mm_mul_ps(u1, u1), uu = _mm_mul_ps(u, u);
+    __m128 b0 = _mm_mul_ps(u1u1, u1);
+    __m128 b1 = _mm_mul_ps(_mm_set1_ps(3.0f), _mm_mul_ps(u1u1, u));
+    __m128 b2 = _mm_mul_ps(_mm_set1_ps(3.0f), _mm_mul_ps(u1, uu));
+    __m128 b3 = _mm_mul_ps(uu, u);
+    __m128 e0 = _mm_mul_ps(_mm_set1_ps(3.0f), u1u1);
+    __m128 e1 = _mm_mul_ps(_mm_set1_ps(6.0f), _mm_mul_ps(u1, u));
+    __m128 e2 = _mm_mul_ps(_mm_set1_ps(3.0f), uu);
+    for (int c = 0; c < 4; c++) {
+        __m128 C0 = C[c], C1 = C[4 + c], C2 = C[8 + c], C3 = C[12 + c];
+        P[c] = _mm_add_ps(_mm_add_ps(_mm_mul_ps(b0, C0), _mm_mul_ps(b1, C1)),
+                          _mm_add_ps(_mm_mul_ps(b2, C2), _mm_mul_ps(b3, C3)));
+        __m128 d0 = _mm_sub_ps(C1, C0), d1 = _mm_sub_ps(C2, C1),
+               d2 = _mm_sub_ps(C3, C2);
+        dP[c] = _mm_add_ps(_mm_add_ps(_mm_mul_ps(e0, d0), _mm_mul_ps(e1, d1)),
+                           _mm_mul_ps(e2, d2));
+    }
+}
+
+/* SIMD adaptive sweep of ONE Bezier curve: recursively split [0,1], evaluating 4
+ * sub-intervals at a time (4-wide), pruning each whose bounding capsule the ray
+ * misses, and refining the surviving leaf intervals with the scalar cone+Newton.
+ * This vectorizes the broad phase that the scalar tri_bez_isect_one does one
+ * interval at a time, so low pre-subdivision (K small) stays fast. */
+static int tri_bez_sweep_sse(const float cp_world[16], const tri_ray_ctx *rc,
+                             float best_t, float *t_out, float *u_out) {
+    const __m128 Z = _mm_setzero_ps(), ONE = _mm_set1_ps(1.0f);
+    float cpl[16];
+    __m128 C[16];
+    for (int k = 0; k < 4; k++)
+        for (int c = 0; c < 4; c++) {
+            float v = cp_world[k * 4 + c] - (c < 3 ? rc->org[c] : 0.0f);
+            cpl[k * 4 + c] = v;
+            C[k * 4 + c] = _mm_set1_ps(v);
+        }
+    const float dir[3] = {rc->dir[0], rc->dir[1], rc->dir[2]};
+    __m128 dirx = _mm_set1_ps(dir[0]), diry = _mm_set1_ps(dir[1]),
+           dirz = _mm_set1_ps(dir[2]);
+    __m128 dOdO = _mm_set1_ps(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+    const float tmin = rc->tmin;
+    __m128 tmin4 = _mm_set1_ps(tmin);
+    float best = best_t, bu = 0.0f;
+    int hit = 0;
+
+    enum { BEZ_SIMD_DEPTH = 3 }; /* 4^3 = 64 leaf intervals (adaptively pruned) */
+    struct {
+        float a, b;
+        int depth;
+    } stk[4 * BEZ_SIMD_DEPTH + 8];
+    int sp = 0;
+    stk[sp].a = 0.0f;
+    stk[sp].b = 1.0f;
+    stk[sp].depth = 0;
+    sp++;
+    while (sp > 0) {
+        float a = stk[--sp].a, b = stk[sp].b;
+        int depth = stk[sp].depth;
+        float h = b - a, hw = h * 0.25f;
+        __m128 best4 = _mm_set1_ps(best);
+        __m128 us = _mm_setr_ps(a, a + hw, a + 2.0f * hw, a + 3.0f * hw);
+        __m128 ue = _mm_add_ps(us, _mm_set1_ps(hw));
+        __m128 PA[4], dPA[4], PB[4], dPB[4];
+        tri_bez_eval4u(C, us, PA, dPA);
+        tri_bez_eval4u(C, ue, PB, dPB);
+        __m128 cx = _mm_sub_ps(PB[0], PA[0]), cy = _mm_sub_ps(PB[1], PA[1]),
+               cz = _mm_sub_ps(PB[2], PA[2]);
+        __m128 cl2 = rlc_dot4(cx, cy, cz, cx, cy, cz);
+        __m128 invcl = _mm_div_ps(ONE, _mm_max_ps(cl2, _mm_set1_ps(1e-20f)));
+        __m128 hw3 = _mm_set1_ps(hw / 3.0f);
+        __m128 perp2 = Z;
+        for (int e = 0; e < 2; e++) {
+            __m128 mxp = e ? _mm_sub_ps(PB[0], _mm_mul_ps(dPB[0], hw3))
+                           : _mm_add_ps(PA[0], _mm_mul_ps(dPA[0], hw3));
+            __m128 myp = e ? _mm_sub_ps(PB[1], _mm_mul_ps(dPB[1], hw3))
+                           : _mm_add_ps(PA[1], _mm_mul_ps(dPA[1], hw3));
+            __m128 mzp = e ? _mm_sub_ps(PB[2], _mm_mul_ps(dPB[2], hw3))
+                           : _mm_add_ps(PA[2], _mm_mul_ps(dPA[2], hw3));
+            __m128 wx = _mm_sub_ps(mxp, PA[0]), wy = _mm_sub_ps(myp, PA[1]),
+                   wz = _mm_sub_ps(mzp, PA[2]);
+            __m128 tt = _mm_mul_ps(rlc_dot4(wx, wy, wz, cx, cy, cz), invcl);
+            __m128 px = _mm_sub_ps(wx, _mm_mul_ps(tt, cx));
+            __m128 py = _mm_sub_ps(wy, _mm_mul_ps(tt, cy));
+            __m128 pz = _mm_sub_ps(wz, _mm_mul_ps(tt, cz));
+            perp2 = _mm_max_ps(perp2, rlc_dot4(px, py, pz, px, py, pz));
+        }
+        __m128 maxperp = _mm_sqrt_ps(perp2);
+        __m128 r1w = _mm_add_ps(PA[3], _mm_mul_ps(dPA[3], hw3));
+        __m128 r2w = _mm_sub_ps(PB[3], _mm_mul_ps(dPB[3], hw3));
+        __m128 rmax = _mm_max_ps(_mm_max_ps(PA[3], PB[3]), _mm_max_ps(r1w, r2w));
+        __m128 rcap = _mm_add_ps(maxperp, _mm_max_ps(rmax, Z));
+        __m128 rc2 = _mm_mul_ps(rcap, rcap);
+        /* ray (org=0) vs segment PA..PB: closest distance <= rcap, t in range */
+        __m128 w0x = _mm_sub_ps(Z, PA[0]), w0y = _mm_sub_ps(Z, PA[1]),
+               w0z = _mm_sub_ps(Z, PA[2]);
+        __m128 bb = rlc_dot4(dirx, diry, dirz, cx, cy, cz);
+        __m128 dd = rlc_dot4(dirx, diry, dirz, w0x, w0y, w0z);
+        __m128 eee = rlc_dot4(cx, cy, cz, w0x, w0y, w0z);
+        __m128 den = _mm_sub_ps(_mm_mul_ps(dOdO, cl2), _mm_mul_ps(bb, bb));
+        __m128 par = _mm_cmple_ps(den, _mm_set1_ps(1e-20f));
+        __m128 invden = _mm_div_ps(ONE, _mm_max_ps(den, _mm_set1_ps(1e-20f)));
+        __m128 ss = _mm_mul_ps(_mm_sub_ps(_mm_mul_ps(dOdO, eee), _mm_mul_ps(bb, dd)), invden);
+        ss = _mm_blendv_ps(ss, Z, par);
+        ss = _mm_min_ps(ONE, _mm_max_ps(Z, ss));
+        __m128 inva = _mm_div_ps(ONE, _mm_max_ps(dOdO, _mm_set1_ps(1e-20f)));
+        __m128 tr = _mm_mul_ps(_mm_sub_ps(_mm_mul_ps(bb, ss), dd), inva);
+        tr = _mm_min_ps(best4, _mm_max_ps(tmin4, tr));
+        __m128 invc = _mm_div_ps(ONE, _mm_max_ps(cl2, _mm_set1_ps(1e-20f)));
+        ss = _mm_mul_ps(_mm_add_ps(_mm_mul_ps(bb, tr), eee), invc);
+        ss = _mm_min_ps(ONE, _mm_max_ps(Z, ss));
+        __m128 gx = _mm_sub_ps(_mm_mul_ps(tr, dirx), _mm_add_ps(PA[0], _mm_mul_ps(ss, cx)));
+        __m128 gy = _mm_sub_ps(_mm_mul_ps(tr, diry), _mm_add_ps(PA[1], _mm_mul_ps(ss, cy)));
+        __m128 gz = _mm_sub_ps(_mm_mul_ps(tr, dirz), _mm_add_ps(PA[2], _mm_mul_ps(ss, cz)));
+        __m128 fire = _mm_cmple_ps(rlc_dot4(gx, gy, gz, gx, gy, gz), rc2);
+        int mask = _mm_movemask_ps(fire);
+        if (!mask) continue;
+
+        _Alignas(16) float usa[4], uea[4], pax[4], pay[4], paz[4], par_[4],
+            pbx[4], pby[4], pbz[4], pbr[4], mpa[4], r1a[4], r2a[4];
+        _mm_store_ps(usa, us);
+        _mm_store_ps(uea, ue);
+        _mm_store_ps(pax, PA[0]); _mm_store_ps(pay, PA[1]);
+        _mm_store_ps(paz, PA[2]); _mm_store_ps(par_, PA[3]);
+        _mm_store_ps(pbx, PB[0]); _mm_store_ps(pby, PB[1]);
+        _mm_store_ps(pbz, PB[2]); _mm_store_ps(pbr, PB[3]);
+        _mm_store_ps(mpa, maxperp);
+        _mm_store_ps(r1a, r1w);
+        _mm_store_ps(r2a, r2w);
+        int leaf = (depth + 1 >= BEZ_SIMD_DEPTH);
+        while (mask) {
+            int L = __builtin_ctz((unsigned)mask);
+            mask &= mask - 1;
+            if (leaf) {
+                float u0 = usa[L], u1 = uea[L], hL = u1 - u0;
+                float P0p[3] = {pax[L], pay[L], paz[L]};
+                float P3p[3] = {pbx[L], pby[L], pbz[L]};
+                float r0c = (par_[L] > r1a[L] ? par_[L] : r1a[L]);
+                float r3c = (pbr[L] > r2a[L] ? pbr[L] : r2a[L]);
+                r0c = (r0c > 0.0f ? r0c : 0.0f) + mpa[L];
+                r3c = (r3c > 0.0f ? r3c : 0.0f) + mpa[L];
+                if (r0c > 0.0f || r3c > 0.0f) {
+                    float tseg, s;
+                    if (tri_cone_seed(dir, tmin, best, P0p, r0c, P3p, r3c, &tseg,
+                                      &s)) {
+                        float th, uh;
+                        if (tri_bez_newton(cpl, dir, tmin, u0 + s * hL, tseg,
+                                           best, &th, &uh)) {
+                            best = th;
+                            bu = uh;
+                            hit = 1;
+                        } else {
+                            best = tseg;
+                            bu = u0 + s * hL;
+                            hit = 1;
+                        }
+                    }
+                }
+            } else {
+                stk[sp].a = usa[L];
+                stk[sp].b = uea[L];
+                stk[sp].depth = depth + 1;
+                sp++;
+            }
+        }
+    }
+    if (hit) {
+        *t_out = best;
+        *u_out = bu;
+    }
+    return hit;
+}
+
+/* ---- Bezier curve leaf: 4-wide broad phase over the block's 4 curves -------
+ * The 4 curves share the runtime u-grid, so each sub-interval evaluates all 4
+ * cubics 4-wide (SoA) and seeds them 4-wide with a bounding capsule. Only lanes
+ * whose capsule the ray crosses pay the scalar Newton refinement, so misses (the
+ * common BVH-leaf case) cost just the vectorized broad phase. */
+
+static inline void tri_bez4_isect_sse(const lrt_bez4 *blk, const tri_ray_ctx *rc,
+                                      const tri_sse_ctx *sc, float *best_t,
+                                      float *best_u, uint32_t *best_prim) {
+    const __m128 Z = _mm_setzero_ps();
+    const __m128 ONE = _mm_set1_ps(1.0f);
+    __m128 dirx = sc->dirx, diry = sc->diry, dirz = sc->dirz;
+    __m128 orgx = sc->orgx, orgy = sc->orgy, orgz = sc->orgz;
+    __m128 tmin = sc->tmin;
+    __m128 best4 = _mm_set1_ps(*best_t);
+    __m128 dOdO = rlc_dot4(dirx, diry, dirz, dirx, diry, dirz);
+
+    /* control points (B0=cp0=curve(0), B3=cp3=curve(1); B1,B2 = inner CPs). */
+    __m128 B0x = _mm_loadu_ps(blk->b0x), B0y = _mm_loadu_ps(blk->b0y),
+           B0z = _mm_loadu_ps(blk->b0z), r0 = _mm_loadu_ps(blk->b0r);
+    __m128 B1x = _mm_loadu_ps(blk->b1x), B1y = _mm_loadu_ps(blk->b1y),
+           B1z = _mm_loadu_ps(blk->b1z), r1 = _mm_loadu_ps(blk->b1r);
+    __m128 B2x = _mm_loadu_ps(blk->b2x), B2y = _mm_loadu_ps(blk->b2y),
+           B2z = _mm_loadu_ps(blk->b2z), r2 = _mm_loadu_ps(blk->b2r);
+    __m128 B3x = _mm_loadu_ps(blk->b3x), B3y = _mm_loadu_ps(blk->b3y),
+           B3z = _mm_loadu_ps(blk->b3z), r3 = _mm_loadu_ps(blk->b3r);
+    __m128i primi = _mm_loadu_si128((const __m128i *)(const void *)blk->prim);
+    __m128 prim_ok = _mm_castsi128_ps(_mm_xor_si128(
+        _mm_cmpeq_epi32(primi, _mm_set1_epi32((int)0xFFFFFFFFu)),
+        _mm_set1_epi32(-1)));
+
+    /* Conservative whole-curve bounding CAPSULE around the chord LINE (much
+     * tighter than a sphere, so far fewer lanes survive to the scalar sweep).
+     * Axis extended to the control-point projection range + max radius (so a
+     * folded polygon / the radius-along-axis can't escape the caps); radius =
+     * max perpendicular CP distance + max CP radius. Numerically robust for the
+     * very short pre-subdivided arcs: the axial parameter is formed as
+     * (dot(m,n) + t*dot(dir,n)) / L with UNIT n and divided by L only at the end
+     * (O(dist) terms cancelling to O(L)), NOT md = dot(m,d)/L^2 (which is
+     * O(dist/L) and cancels catastrophically). Fired lanes are bit-identical to
+     * the scalar leaf. */
+    __m128 chx = _mm_sub_ps(B3x, B0x), chy = _mm_sub_ps(B3y, B0y),
+           chz = _mm_sub_ps(B3z, B0z);
+    __m128 cl2 = rlc_dot4(chx, chy, chz, chx, chy, chz);
+    __m128 rcpcl = _mm_div_ps(ONE, _mm_sqrt_ps(_mm_max_ps(cl2, _mm_set1_ps(1e-20f))));
+    __m128 nx = _mm_mul_ps(chx, rcpcl), ny = _mm_mul_ps(chy, rcpcl),
+           nz = _mm_mul_ps(chz, rcpcl); /* unit chord direction */
+    __m128 pmin = Z, pmax = Z, maxperp = Z;
+    __m128 maxr = _mm_max_ps(_mm_max_ps(r0, r1), _mm_max_ps(r2, r3));
+    {
+        __m128 cpx[4] = {B0x, B1x, B2x, B3x};
+        __m128 cpy[4] = {B0y, B1y, B2y, B3y};
+        __m128 cpz[4] = {B0z, B1z, B2z, B3z};
+        for (int k = 0; k < 4; k++) {
+            __m128 wx = _mm_sub_ps(cpx[k], B0x), wy = _mm_sub_ps(cpy[k], B0y),
+                   wz = _mm_sub_ps(cpz[k], B0z);
+            __m128 proj = rlc_dot4(wx, wy, wz, nx, ny, nz);
+            pmin = _mm_min_ps(pmin, proj);
+            pmax = _mm_max_ps(pmax, proj);
+            __m128 perp2 =
+                _mm_sub_ps(rlc_dot4(wx, wy, wz, wx, wy, wz), _mm_mul_ps(proj, proj));
+            maxperp = _mm_max_ps(maxperp, _mm_sqrt_ps(_mm_max_ps(perp2, Z)));
+        }
+    }
+    __m128 mr = _mm_max_ps(maxr, Z);
+    __m128 rcap = _mm_add_ps(maxperp, mr);
+    __m128 rc2 = _mm_mul_ps(rcap, rcap);
+    pmin = _mm_sub_ps(pmin, mr); /* tube extends +-maxr along the axis */
+    pmax = _mm_add_ps(pmax, mr);
+    __m128 A0x = _mm_add_ps(B0x, _mm_mul_ps(pmin, nx));
+    __m128 A0y = _mm_add_ps(B0y, _mm_mul_ps(pmin, ny));
+    __m128 A0z = _mm_add_ps(B0z, _mm_mul_ps(pmin, nz));
+    __m128 L = _mm_sub_ps(pmax, pmin);
+
+    /* Fire if the ray (t in [tmin, best]) comes within rcap of the axis SEGMENT
+     * A0..A1. Robust closest ray-segment distance (handles any orientation incl.
+     * exactly parallel — the cylinder's roots/axial param degenerate there and
+     * silently under-fired). E = A1 - A0 = n*L. */
+    __m128 Ex = _mm_mul_ps(nx, L), Ey = _mm_mul_ps(ny, L), Ez = _mm_mul_ps(nz, L);
+    __m128 w0x = _mm_sub_ps(orgx, A0x), w0y = _mm_sub_ps(orgy, A0y),
+           w0z = _mm_sub_ps(orgz, A0z);
+    __m128 a = dOdO;                                       /* D.D */
+    __m128 b = rlc_dot4(dirx, diry, dirz, Ex, Ey, Ez);    /* D.E */
+    __m128 cc = _mm_mul_ps(L, L);                          /* E.E */
+    __m128 d = rlc_dot4(dirx, diry, dirz, w0x, w0y, w0z); /* D.w0 */
+    __m128 ee = rlc_dot4(Ex, Ey, Ez, w0x, w0y, w0z);      /* E.w0 */
+    __m128 denom = _mm_sub_ps(_mm_mul_ps(a, cc), _mm_mul_ps(b, b));
+    __m128 par = _mm_cmple_ps(denom, _mm_set1_ps(1e-20f)); /* parallel-ish */
+    __m128 invden = _mm_div_ps(ONE, _mm_max_ps(denom, _mm_set1_ps(1e-20f)));
+    /* ss along the segment (parallel -> 0, refined by the clamp dance) */
+    __m128 ss = _mm_mul_ps(_mm_sub_ps(_mm_mul_ps(a, ee), _mm_mul_ps(b, d)), invden);
+    ss = _mm_blendv_ps(ss, Z, par);
+    ss = _mm_min_ps(ONE, _mm_max_ps(Z, ss));
+    /* tr along the ray for this ss, clamped to the live range */
+    __m128 inva = _mm_div_ps(ONE, _mm_max_ps(a, _mm_set1_ps(1e-20f)));
+    __m128 tr = _mm_mul_ps(_mm_sub_ps(_mm_mul_ps(b, ss), d), inva);
+    tr = _mm_min_ps(best4, _mm_max_ps(tmin, tr));
+    /* recompute ss for that tr */
+    __m128 invc = _mm_div_ps(ONE, _mm_max_ps(cc, _mm_set1_ps(1e-20f)));
+    ss = _mm_mul_ps(_mm_add_ps(_mm_mul_ps(b, tr), ee), invc);
+    ss = _mm_min_ps(ONE, _mm_max_ps(Z, ss));
+    __m128 px = _mm_add_ps(orgx, _mm_mul_ps(tr, dirx));
+    __m128 py = _mm_add_ps(orgy, _mm_mul_ps(tr, diry));
+    __m128 pz = _mm_add_ps(orgz, _mm_mul_ps(tr, dirz));
+    __m128 qx = _mm_add_ps(A0x, _mm_mul_ps(ss, Ex));
+    __m128 qy = _mm_add_ps(A0y, _mm_mul_ps(ss, Ey));
+    __m128 qz = _mm_add_ps(A0z, _mm_mul_ps(ss, Ez));
+    __m128 gx = _mm_sub_ps(px, qx), gy = _mm_sub_ps(py, qy), gz = _mm_sub_ps(pz, qz);
+    __m128 dist2 = rlc_dot4(gx, gy, gz, gx, gy, gz);
+    __m128 fire = _mm_and_ps(_mm_cmple_ps(dist2, rc2), prim_ok);
+    int mask = _mm_movemask_ps(fire);
+    if (!mask) return;
+
+    /* exact scalar Bezier sweep on the few surviving lanes */
+    const float *src[16] = {blk->b0x, blk->b0y, blk->b0z, blk->b0r,
+                            blk->b1x, blk->b1y, blk->b1z, blk->b1r,
+                            blk->b2x, blk->b2y, blk->b2z, blk->b2r,
+                            blk->b3x, blk->b3y, blk->b3z, blk->b3r};
+    while (mask) {
+        int lane = __builtin_ctz((unsigned)mask);
+        mask &= mask - 1;
+        float cp[16];
+        for (int k = 0; k < 16; k++) cp[k] = src[k][lane];
+        float t, u;
+        if (tri_bez_sweep_sse(cp, rc, *best_t, &t, &u)) {
+            *best_t = t;
+            *best_u = u;
+            *best_prim = blk->prim[lane];
+        }
+    }
+}
+
+/* ---- Bezier curve traversal: SSE node tests, 4-wide leaves ---------------- */
+static int tri_bezcurve_intersect_bvh4(const lrt_tri_scene *s,
+                                       const lrt_ray *ray, lrt_hit *hit) {
+    tri_ray_ctx rc;
+    tri_ray_setup(ray, &rc);
+    tri_sse_ctx sc;
+    tri_sse_setup(&rc, &sc);
+    float best_t = ray->tmax, best_u = 0.0f;
+    uint32_t best_prim = LRT_TRI_NO_HIT;
+
+    tri_stack_entry stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp].ref = s->root;
+    stack[sp].tnear = rc.tmin;
+    sp++;
+    while (sp > 0) {
+        tri_stack_entry e = stack[--sp];
+        if (e.tnear >= best_t) continue;
+        if (TRI_REF_IS_LEAF(e.ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(e.ref), nblk = TRI_REF_NBLOCKS(e.ref);
+            const lrt_bez4 *blocks = (const lrt_bez4 *)s->blocks;
+            for (uint32_t b = 0; b < nblk; b++)
+                tri_bez4_isect_sse(&blocks[blk0 + b], &rc, &sc, &best_t, &best_u,
+                                   &best_prim);
+            continue;
+        }
+        const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(e.ref)];
+        _Alignas(16) float tnear[4];
+        int mask = tri_bvh4_slab_sse(n, &sc, _mm_set1_ps(best_t), tnear);
+        mask &= (1 << n->nchildren) - 1;
+        uint8_t perm = n->perm[rc.octant];
+        for (int p = 3; p >= 0; p--) {
+            int slot = (perm >> (2 * p)) & 3;
+            if (!(mask & (1 << slot))) continue;
+            tri_prefetch_ref(s, n->child[slot], 4);
+            stack[sp].ref = n->child[slot];
+            stack[sp].tnear = tnear[slot];
+            sp++;
+        }
+    }
+    if (hit) {
+        hit->t = best_prim != LRT_TRI_NO_HIT ? best_t : 0.0f;
+        hit->u = best_u;
+        hit->v = 0.0f;
+        hit->prim_id = best_prim;
+    }
+    return best_prim != LRT_TRI_NO_HIT;
+}
+
+static int tri_bezcurve_occluded_bvh4(const lrt_tri_scene *s,
+                                      const lrt_ray *ray) {
+    tri_ray_ctx rc;
+    tri_ray_setup(ray, &rc);
+    tri_sse_ctx sc;
+    tri_sse_setup(&rc, &sc);
+    __m128 tmax4 = _mm_set1_ps(ray->tmax);
+    const float t_max = ray->tmax;
+    uint32_t stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp++] = s->root;
+    while (sp > 0) {
+        uint32_t ref = stack[--sp];
+        if (TRI_REF_IS_LEAF(ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(ref), nblk = TRI_REF_NBLOCKS(ref);
+            const lrt_bez4 *blocks = (const lrt_bez4 *)s->blocks;
+            for (uint32_t b = 0; b < nblk; b++) {
+                float t = t_max, u = 0.0f;
+                uint32_t prim = LRT_TRI_NO_HIT;
+                tri_bez4_isect_sse(&blocks[blk0 + b], &rc, &sc, &t, &u, &prim);
                 if (prim != LRT_TRI_NO_HIT) return 1;
             }
             continue;
@@ -6962,6 +7760,8 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
         return tri_point_intersect_bvh4(s, ray, hit);
     if (s->prim_kind == TRI_PRIM_FLATCURVE)
         return tri_flatcurve_intersect_bvh4(s, ray, hit);
+    if (s->prim_kind == TRI_PRIM_BEZCURVE)
+        return tri_bezcurve_intersect_bvh4(s, ray, hit);
     if (s->prim_kind == TRI_PRIM_SPHERE)
         return tri_sphere_intersect_bvh4(s, ray, hit);
     if (s->prim_kind == TRI_PRIM_USER)
@@ -6998,6 +7798,8 @@ int lrt_tri_occluded1(const lrt_tri_scene *s, const lrt_ray *ray) {
         return tri_point_occluded_bvh4(s, ray);
     if (s->prim_kind == TRI_PRIM_FLATCURVE)
         return tri_flatcurve_occluded_bvh4(s, ray);
+    if (s->prim_kind == TRI_PRIM_BEZCURVE)
+        return tri_bezcurve_occluded_bvh4(s, ray);
     if (s->prim_kind == TRI_PRIM_SPHERE) return tri_sphere_occluded_bvh4(s, ray);
     if (s->prim_kind == TRI_PRIM_USER) return tri_user_occluded_bvh4(s, ray);
 #endif
@@ -7031,7 +7833,8 @@ void lrt_tri_intersect1N(const lrt_tri_scene *s, const lrt_ray *rays,
     if (s->curve || s->prim_kind == TRI_PRIM_USER ||
         s->prim_kind == TRI_PRIM_SPHERE || s->prim_kind == TRI_PRIM_QTRI ||
         s->prim_kind == TRI_PRIM_RLCURVE || s->prim_kind == TRI_PRIM_POINT ||
-        s->prim_kind == TRI_PRIM_FLATCURVE || s->qnode != 0) {
+        s->prim_kind == TRI_PRIM_FLATCURVE || s->prim_kind == TRI_PRIM_BEZCURVE ||
+        s->qnode != 0) {
         /* interleaved pipelines are triangle-specific; loop per ray */
         for (size_t i = 0; i < n; i++) lrt_tri_intersect1(s, &rays[i], &hits[i]);
         return;
@@ -7092,7 +7895,8 @@ void lrt_tri_occluded1N(const lrt_tri_scene *s, const lrt_ray *rays,
     if (s->curve || s->prim_kind == TRI_PRIM_USER ||
         s->prim_kind == TRI_PRIM_SPHERE || s->prim_kind == TRI_PRIM_QTRI ||
         s->prim_kind == TRI_PRIM_RLCURVE || s->prim_kind == TRI_PRIM_POINT ||
-        s->prim_kind == TRI_PRIM_FLATCURVE || s->qnode != 0) {
+        s->prim_kind == TRI_PRIM_FLATCURVE || s->prim_kind == TRI_PRIM_BEZCURVE ||
+        s->qnode != 0) {
         for (size_t i = 0; i < n; i++) {
             occluded[i] = (uint8_t)lrt_tri_occluded1(s, &rays[i]);
         }
@@ -8159,6 +8963,124 @@ lrt_tri_scene *lrt_flatcurve_scene_build(const lrt_hair_strands *strands,
     s->kernel_name = "flatcurve-bvh4/sse4";
 #else
     s->kernel_name = "flatcurve-bvh4/scalar";
+#endif
+    return s;
+}
+
+/* Round cubic-Bezier curve scene. cps = 16*nseg floats (per segment: 4 control
+ * points, each xyz + radius). Each segment is an independent cubic tube; share
+ * endpoints across segments for C0 continuity. */
+lrt_tri_scene *lrt_bezcurve_scene_build(const float *cps, size_t nseg,
+                                        const lrt_tri_build_options *opts,
+                                        lrt_result *err) {
+    tri_set_err(err, LRT_RESULT_OK);
+    if (!cps || nseg == 0 || nseg > 0x07FFFFFFu) {
+        tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
+        return NULL;
+    }
+    lrt_tri_build_options o;
+    if (opts) o = *opts;
+    else memset(&o, 0, sizeof(o));
+    unsigned num_threads = o.num_threads ? o.num_threads : 1u;
+    uint32_t max_leaf = o.max_leaf_size ? o.max_leaf_size : TRI_DEFAULT_LEAF;
+    if (max_leaf > TRI_MAX_LEAF) max_leaf = TRI_MAX_LEAF;
+
+    /* Pre-subdivide each cubic into TRI_BEZ_BUILD_SPLIT tight sub-arcs (de
+     * Casteljau) so the BVH culls well. The sub-cubics are computed on the fly
+     * (here for AABBs, again in tri_emit_leaf) rather than materialized into a
+     * temporary array — the original cubics are the only geometry input. The hit
+     * keeps the ORIGINAL segment id (seg = sub / K). */
+    const uint32_t K = TRI_BEZ_BUILD_SPLIT;
+    if (nseg > 0x07FFFFFFu / K) {
+        tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+        return NULL;
+    }
+    size_t nsub = nseg * (size_t)K;
+
+    tri_build_ctx bc;
+    memset(&bc, 0, sizeof(bc));
+    bc.ntris = nsub;
+    bc.max_leaf = max_leaf;
+    bc.block_shift = 2u;
+    bc.quality = LRT_TRI_BUILD_DEFAULT;
+    bc.bez_cps = cps;
+    bc.bez_split = K;
+    bc.emit_kind = TRI_PRIM_BEZCURVE;
+    if (tri_alloc_aabb_scratch(&bc, nsub)) {
+        tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+        return NULL;
+    }
+
+    /* AABB = box around the sub-cubic's 4 control points dilated by their radii
+     * (the convex hull of the control polygon contains the curve). */
+    int bad = 0;
+    for (size_t i = 0; i < nsub; i++) {
+        float cp[16];
+        uint32_t seg = (uint32_t)(i / K), kk = (uint32_t)(i % K);
+        tri_bez_subcurve(&cps[(size_t)seg * 16], (float)kk / (float)K,
+                         (float)(kk + 1) / (float)K, cp);
+        float lo[3] = {TRI_INF_F, TRI_INF_F, TRI_INF_F};
+        float hi[3] = {-TRI_INF_F, -TRI_INF_F, -TRI_INF_F};
+        for (int k = 0; k < 4; k++) {
+            float rr = cp[k * 4 + 3] > 0.0f ? cp[k * 4 + 3] : 0.0f;
+            for (int a = 0; a < 3; a++) {
+                float c = cp[k * 4 + a];
+                if (!isfinite(c)) bad = 1;
+                if (c - rr < lo[a]) lo[a] = c - rr;
+                if (c + rr > hi[a]) hi[a] = c + rr;
+            }
+            if (!isfinite(cp[k * 4 + 3])) bad = 1;
+        }
+        for (int a = 0; a < 3; a++) {
+            bc.plo[i * 3 + a] = lo[a];
+            bc.phi[i * 3 + a] = hi[a];
+            bc.cen[i * 3 + a] = 0.5f * (lo[a] + hi[a]);
+        }
+        bc.indices[i] = (uint32_t)i;
+    }
+    if (bad) {
+        tri_free_aabb_scratch(&bc);
+        tri_set_err(err, LRT_RESULT_INVALID_BOUNDS);
+        return NULL;
+    }
+
+    lrt_tri_scene *s = NULL;
+#if !defined(__STDC_NO_THREADS__)
+    if (num_threads > 1 && nsub >= 4096) {
+        bc.par_threads = num_threads;
+        bc.par_scratch = (uint32_t *)malloc(nsub * sizeof(uint32_t));
+        if (!bc.par_scratch) bc.par_threads = 0;
+    }
+#endif
+    uint32_t b_root = tri_build_binary(&bc, num_threads);
+    if (!bc.failed) {
+        s = (lrt_tri_scene *)calloc(1, sizeof(lrt_tri_scene));
+        if (!s) bc.failed = 1;
+    }
+    if (!bc.failed) {
+        s->layout = 4;
+        s->prim_kind = TRI_PRIM_BEZCURVE;
+        s->block_stride = (uint32_t)sizeof(lrt_bez4);
+        uint32_t node_cap, block_cap;
+        tri_collapse_caps(&bc, 4, b_root, &node_cap, &block_cap);
+        s->nodes4 = (lrt_bvh4_node *)tri_aligned_alloc(
+            64, (size_t)node_cap * sizeof(lrt_bvh4_node));
+        s->blocks = tri_aligned_alloc(64, (size_t)block_cap * sizeof(lrt_bez4));
+        if (!s->nodes4 || !s->blocks)
+            bc.failed = 1;
+        else if (tri_collapse_into(s, &bc, b_root, node_cap, block_cap))
+            bc.failed = 1;
+    }
+    tri_free_aabb_scratch(&bc);
+    if (bc.failed) {
+        lrt_tri_scene_free(s);
+        tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+        return NULL;
+    }
+#if LRT_TRI_HAS_SSE4
+    s->kernel_name = "bezcurve-bvh4/sse4";
+#else
+    s->kernel_name = "bezcurve-bvh4/scalar";
 #endif
     return s;
 }

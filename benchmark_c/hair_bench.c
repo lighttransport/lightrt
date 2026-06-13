@@ -32,6 +32,7 @@
 enum prim_mode {
     PRIM_ROUND = 0, /* round-linear curves */
     PRIM_FLAT,      /* flat (ribbon) linear curves */
+    PRIM_BEZIER,    /* round cubic Bezier curves (Catmull-Rom through points) */
     PRIM_SPHERE,    /* sphere points */
     PRIM_DISC,      /* ray-facing disc points */
     PRIM_ODISC      /* oriented (fixed-normal) disc points */
@@ -39,12 +40,52 @@ enum prim_mode {
 static int parse_prim(const char *s) {
     if (!strcmp(s, "round")) return PRIM_ROUND;
     if (!strcmp(s, "flat")) return PRIM_FLAT;
+    if (!strcmp(s, "bezier")) return PRIM_BEZIER;
     if (!strcmp(s, "sphere")) return PRIM_SPHERE;
     if (!strcmp(s, "disc")) return PRIM_DISC;
     if (!strcmp(s, "odisc")) return PRIM_ODISC;
     return -1;
 }
-static int prim_is_curve(int p) { return p == PRIM_ROUND || p == PRIM_FLAT; }
+static int prim_is_curve(int p) {
+    return p == PRIM_ROUND || p == PRIM_FLAT || p == PRIM_BEZIER;
+}
+
+/* Catmull-Rom -> cubic-Bezier control points for every strand segment (16
+ * floats/seg: 4 CPs of xyz+radius), in the same global segment order as seg_i0.
+ * The curve interpolates the strand points; the same CPs feed lightrt and
+ * Embree's ROUND_BEZIER_CURVE so the geometry is identical. */
+static float *build_bezier_cps(const cyhair_t *h, size_t nstrands, size_t nseg) {
+    float *bez = (float *)malloc(nseg * 16 * sizeof(float));
+    if (!bez) return NULL;
+    size_t w = 0;
+    for (size_t i = 0; i < nstrands; i++) {
+        uint32_t first = h->strand_first[i], cnt = h->strand_count[i];
+        if (cnt < 2) continue;
+        for (uint32_t j = 0; j + 1u < cnt; j++, w++) {
+            uint32_t i0 = first + j, i1 = first + j + 1u;
+            uint32_t im1 = j > 0u ? first + j - 1u : i0;
+            uint32_t ip2 = (j + 2u < cnt) ? first + j + 2u : i1;
+            float *b = &bez[w * 16];
+            for (int a = 0; a < 3; a++) {
+                float p0 = h->points[(size_t)i0 * 3 + a];
+                float p1 = h->points[(size_t)i1 * 3 + a];
+                float pm = h->points[(size_t)im1 * 3 + a];
+                float pp = h->points[(size_t)ip2 * 3 + a];
+                b[0 * 4 + a] = p0;
+                b[1 * 4 + a] = p0 + (p1 - pm) * (1.0f / 6.0f);
+                b[2 * 4 + a] = p1 - (pp - p0) * (1.0f / 6.0f);
+                b[3 * 4 + a] = p1;
+            }
+            float r0 = h->radius[i0], r1 = h->radius[i1], rm = h->radius[im1],
+                  rp = h->radius[ip2];
+            b[0 * 4 + 3] = r0;
+            b[1 * 4 + 3] = r0 + (r1 - rm) * (1.0f / 6.0f);
+            b[2 * 4 + 3] = r1 - (rp - r0) * (1.0f / 6.0f);
+            b[3 * 4 + 3] = r1;
+        }
+    }
+    return bez;
+}
 
 /* ------------------------------------------------------------------------- */
 /* Small vec / RNG helpers.                                                  */
@@ -248,6 +289,36 @@ static em_scene *em_build_points(const float *centers4, const float *normals,
     }
     memcpy(vb, centers4, npts * 4 * sizeof(float));
     if (nb) memcpy(nb, normals, npts * 3 * sizeof(float));
+    rtcCommitGeometry(g);
+    rtcAttachGeometry(es->scene, g);
+    rtcReleaseGeometry(g);
+    rtcCommitScene(es->scene);
+    if (build_ms) *build_ms = bench_ns_to_ms(bench_time_ns() - t0);
+    return es;
+}
+
+/* Round cubic-Bezier scene from explicit control points (16 floats/seg). Each
+ * segment is 4 distinct vertices (index buffer steps by 4), identical to the
+ * CPs handed to lrt_bezcurve_scene_build. */
+static em_scene *em_build_bezier(const float *bez_cps, size_t nseg, int threads,
+                                 double *build_ms) {
+    em_scene *es = em_new(threads);
+    if (!es) return NULL;
+    uint64_t t0 = bench_time_ns();
+    RTCGeometry g =
+        rtcNewGeometry(es->device, RTC_GEOMETRY_TYPE_ROUND_BEZIER_CURVE);
+    size_t nvtx = nseg * 4;
+    float *vb = (float *)rtcSetNewGeometryBuffer(
+        g, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT4, 4 * sizeof(float), nvtx);
+    unsigned *ib = (unsigned *)rtcSetNewGeometryBuffer(
+        g, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT, sizeof(unsigned), nseg);
+    if (!vb || !ib) {
+        rtcReleaseGeometry(g);
+        em_destroy(es);
+        return NULL;
+    }
+    memcpy(vb, bez_cps, nvtx * 4 * sizeof(float));
+    for (size_t i = 0; i < nseg; i++) ib[i] = (unsigned)(i * 4);
     rtcCommitGeometry(g);
     rtcAttachGeometry(es->scene, g);
     rtcReleaseGeometry(g);
@@ -464,8 +535,8 @@ static void usage(const char *a0) {
             "  --gen furball      generate procedural fur instead of loading a file\n"
             "  --strands N        furball strand count (default 200000)\n"
             "  --segments N       furball segments per strand (default 8)\n"
-            "  --prim KIND        round (default) | flat | sphere | disc | odisc\n"
-            "                     (round/flat = curves; sphere/disc/odisc = points)\n"
+            "  --prim KIND        round (default) | flat | bezier | sphere | disc | odisc\n"
+            "                     (round/flat/bezier = curves; sphere/disc/odisc = points)\n"
             "  --width N          image width (default 1024)\n"
             "  --height N         image height (default 1024)\n"
             "  --radius-scale F   multiply hair radius (default 1.0)\n"
@@ -575,8 +646,8 @@ int main(int argc, char **argv) {
         }
     }
 
-    const char *prim_name[] = {"round-curve", "flat-curve", "sphere-point",
-                               "disc-point", "odisc-point"};
+    const char *prim_name[] = {"round-curve",  "flat-curve", "bezier-curve",
+                               "sphere-point", "disc-point", "odisc-point"};
     size_t nprim = prim_is_curve(prim) ? nseg : npts_used;
 
     /* Point clouds: float4 (xyz+r) vertices for Embree + per-point normals
@@ -620,6 +691,13 @@ int main(int argc, char **argv) {
     strands.nstrands = nstrands;
     strands.npoints = npts_used;
 
+    /* Catmull-Rom -> Bezier control points (shared with Embree) */
+    float *bez_cps = NULL;
+    if (prim == PRIM_BEZIER) {
+        bez_cps = build_bezier_cps(&hair, nstrands, nseg);
+        if (!bez_cps) { fprintf(stderr, "oom\n"); return 1; }
+    }
+
     lrt_tri_build_options opts = {0};
     opts.num_threads = (unsigned)threads;
     lrt_result err = LRT_RESULT_OK;
@@ -628,6 +706,7 @@ int main(int argc, char **argv) {
     switch (prim) {
         case PRIM_ROUND: scene = lrt_roundcurve_scene_build(&strands, &opts, &err); break;
         case PRIM_FLAT:  scene = lrt_flatcurve_scene_build(&strands, &opts, &err); break;
+        case PRIM_BEZIER: scene = lrt_bezcurve_scene_build(bez_cps, nseg, &opts, &err); break;
         case PRIM_SPHERE: scene = lrt_points_scene_build(hair.points, hair.radius, NULL, LRT_POINT_SPHERE, npts_used, &opts, &err); break;
         case PRIM_DISC:   scene = lrt_points_scene_build(hair.points, hair.radius, NULL, LRT_POINT_DISC, npts_used, &opts, &err); break;
         case PRIM_ODISC:  scene = lrt_points_scene_build(hair.points, hair.radius, pnormals, LRT_POINT_ORIENTED_DISC, npts_used, &opts, &err); break;
@@ -650,7 +729,9 @@ int main(int argc, char **argv) {
     void *embree = NULL;
     double em_build_ms = 0.0;
 #ifdef LRTBENCH_HAVE_EMBREE
-    if (prim_is_curve(prim)) {
+    if (prim == PRIM_BEZIER) {
+        embree = em_build_bezier(bez_cps, nseg, threads, &em_build_ms);
+    } else if (prim_is_curve(prim)) {
         enum RTCGeometryType gt = prim == PRIM_ROUND
                                  ? RTC_GEOMETRY_TYPE_ROUND_LINEAR_CURVE
                                  : RTC_GEOMETRY_TYPE_FLAT_LINEAR_CURVE;
@@ -770,6 +851,7 @@ int main(int argc, char **argv) {
     free(seg_flags);
     free(centers4);
     free(pnormals);
+    free(bez_cps);
     cyhair_free(&hair);
     return 0;
 }

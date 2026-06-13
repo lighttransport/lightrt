@@ -698,6 +698,36 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
   dir))` quad, two-triangle MT). `TRI_PRIM_FLATCURVE`, `lrt_flat4` leaf, scalar +
   4-wide SSE leaf `tri_flat4_isect_sse`. Matches Embree ~99.96% (the ribbon's
   ray-space-vs-world orientation differs at grazing edges).
+- `lrt_bezcurve_scene_build` — **true higher-order round cubic-Bézier curves**
+  (not tessellation): a port of Embree's sweep intersector
+  (`curve_intersector_sweep.h`, `RTC_GEOMETRY_TYPE_ROUND_BEZIER_CURVE`). Each
+  sub-interval seeds a 2D Newton/Jacobian iteration (`tri_bez_newton`: `f =
+  dot(R,T)` foot, `g = dist−radius` surface) that converges to the exact tube;
+  the seed comes from a round-linear cone, with a cone fallback when Newton is
+  ill-conditioned (grazing). Build-time de Casteljau **pre-subdivision**
+  (`TRI_BEZ_BUILD_SPLIT=4`) gives tight AABBs so the BVH culls well; the sub-arcs
+  are computed on the fly (no materialized temp array — low build memory), and
+  the leaf keeps the original segment id (`seg = sub/K`). `TRI_PRIM_BEZCURVE`,
+  `lrt_bez4` leaf (4 CPs xyz+r). The SSE leaf (`tri_bez4_isect_sse`) is a 4-wide
+  **ray-to-segment closest-distance cull** over the block's 4 curves (a tight
+  capsule that is robust for *all* ray orientations, including exactly parallel —
+  a cylinder-based capsule cull silently under-fired there, and a sphere cull was
+  correct but too loose) that gates the exact scalar sweep on the survivors
+  (bit-identical to scalar). The scalar sweep seeds Newton from a lean tapered
+  cone (`tri_cone_seed`, no neighbor CSG). Net: **beats Embree** on the trace
+  (~1.3–1.5× on primary and incoherent) at ~99.5% agreement. Input is explicit
+  cubic CPs (`16*nseg`); B-spline/Catmull-Rom convert to Bézier first (hair_bench
+  does Catmull-Rom→Bézier). Memory/build trade off against `TRI_BEZ_BUILD_SPLIT`
+  (K). The sweep is **adaptive and SIMD** (`tri_bez_sweep_sse`): it recursively
+  4-ary-subdivides each fired curve, evaluating/bounding/rejecting 4 sub-intervals
+  at a time (4-wide), pruning those whose bounding capsule the ray misses and
+  refining only the surviving leaves with cone+Newton — far regions cost a cheap
+  4-wide reject, and accuracy rises to ~99.9%. This lifts the whole speed/memory
+  Pareto: default `TRI_BEZ_BUILD_SPLIT=2` ≈Embree speed (and beats it on
+  incoherent) at ~94 MB; `K=4` ~13 Mrays/s at 191 MB; `K=1` matches Embree's
+  memory (~46 MB) and build (store-once) at ~half Embree's trace speed (looser
+  K=1 BVH boxes fire more curves). The scalar `tri_bez_isect_one` (also adaptive)
+  is the non-SSE fallback.
 - `lrt_points_scene_build(centers, radii, normals, point_type, n)` — **point
   primitives** mirroring Embree's point types (`lrt_tri_point_type`):
   `LRT_POINT_SPHERE` (ray-sphere), `LRT_POINT_DISC` (ray-facing disc),

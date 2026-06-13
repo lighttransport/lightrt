@@ -239,6 +239,18 @@ lrt_tri_scene *lrt_flatcurve_scene_build(const lrt_hair_strands *strands,
                                          const lrt_tri_build_options *opts,
                                          lrt_result *err);
 
+/* Round cubic-Bezier curves: a true higher-order tube intersector (recursive
+ * subdivision + 2D Newton, a port of Embree's curve_intersector_sweep.h —
+ * RTC_GEOMETRY_TYPE_ROUND_BEZIER_CURVE), not a tessellation. cps = 16*nseg
+ * floats: per segment, 4 cubic control points each (x,y,z,radius). Segments are
+ * independent cubics (share endpoints for C0 continuity). Higher-order bases
+ * (B-spline/Catmull-Rom) are supported by converting their control points to
+ * Bezier form before calling this. Hits report prim_id = segment index,
+ * u = curve parameter in [0,1], v = 0. */
+lrt_tri_scene *lrt_bezcurve_scene_build(const float *cps, size_t nseg,
+                                        const lrt_tri_build_options *opts,
+                                        lrt_result *err);
+
 /* --- Point primitives ------------------------------------------------------
  *
  * A cloud of point primitives, mirroring Embree's point geometry types:
