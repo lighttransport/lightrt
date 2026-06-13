@@ -303,6 +303,11 @@ int main(int argc, char **argv) {
             {"c11-bvh4-pkt", backend_lightrt_bvh4_pkt, 1},
             {"c11-bvh8-pkt", backend_lightrt_bvh8_pkt, 1},
             {"c11-bvh4-1ray", backend_lightrt_bvh4_1ray, 1},
+            /* quantized leaves (LOD/preview): lossy, so hit_frac drops slightly */
+            {"c11-qtri-q16", backend_lightrt_qtri_q16, 1},
+            {"c11-qtri-q8", backend_lightrt_qtri_q8, 1},
+            {"c11-qtri-fp8", backend_lightrt_qtri_fp8, 1},
+            {"c11-qtri-fp4", backend_lightrt_qtri_fp4, 1},
             {"embree", backend_embree, 0},
             {"tinybvh", backend_tinybvh, 0},
             {"mm-bvh", backend_madmann, 0},

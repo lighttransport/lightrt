@@ -61,6 +61,10 @@ const bench_backend *backend_lightrt_sdf(void);   /* SDF blob per tri */
 const bench_backend *backend_lightrt_bvh4_pkt(void); /* BVH4, Ray4 packet path */
 const bench_backend *backend_lightrt_bvh8_pkt(void); /* BVH8, Ray8 packet path */
 const bench_backend *backend_lightrt_bvh4_1ray(void); /* BVH4, plain per-ray */
+const bench_backend *backend_lightrt_qtri_q16(void); /* quantized leaf q16 */
+const bench_backend *backend_lightrt_qtri_q8(void);  /* quantized leaf q8  */
+const bench_backend *backend_lightrt_qtri_fp8(void); /* quantized leaf fp8 */
+const bench_backend *backend_lightrt_qtri_fp4(void); /* quantized leaf fp4 */
 const bench_backend *backend_embree(void);        /* Embree 4 (optional) */
 const bench_backend *backend_tinybvh(void);       /* jbikker/tinybvh BVH8_CPU */
 const bench_backend *backend_madmann(void);       /* madmann91/bvh v2 */

@@ -363,3 +363,45 @@ const bench_backend *backend_lightrt_user(void) { return &g_user_backend; }
 const bench_backend *backend_lightrt_sphere(void) { return &g_sphere_backend; }
 const bench_backend *backend_lightrt_tlas(void) { return &g_tlas_backend; }
 const bench_backend *backend_lightrt_sdf(void) { return &g_sdf_backend; }
+
+/* ---- c11-qtri-*: quantized triangle leaves (LOD/preview) ---------------- *
+ * Same geometry as the triangle backends but lossy-quantized, so the hit
+ * fraction drops slightly (the LOD error); explicit-only. */
+static void *qtri_build(const float *v, size_t n, int t, double *ms,
+                        lrt_qtri_format fmt) {
+    lrt_tri_build_options o = {
+        .quality = LRT_TRI_BUILD_DEFAULT,
+        .layout = LRT_TRI_LAYOUT_BVH4,
+        .max_leaf_size = 0,
+        .num_threads = (unsigned)(t > 0 ? t : 1),
+    };
+    uint64_t t0 = bench_time_ns();
+    lrt_tri_scene *s = lrt_qtri_scene_build(v, n, fmt, LRT_QTRI_LOSSY, &o, NULL);
+    uint64_t t1 = bench_time_ns();
+    if (ms) *ms = bench_ns_to_ms(t1 - t0);
+    return s;
+}
+static void *qtri_build_q16(const float *v, size_t n, int t, double *ms) {
+    return qtri_build(v, n, t, ms, LRT_QTRI_Q16);
+}
+static void *qtri_build_q8(const float *v, size_t n, int t, double *ms) {
+    return qtri_build(v, n, t, ms, LRT_QTRI_Q8);
+}
+static void *qtri_build_fp8(const float *v, size_t n, int t, double *ms) {
+    return qtri_build(v, n, t, ms, LRT_QTRI_FP8);
+}
+static void *qtri_build_fp4(const float *v, size_t n, int t, double *ms) {
+    return qtri_build(v, n, t, ms, LRT_QTRI_FP4);
+}
+static const bench_backend g_qtri_q16 = {"c11-qtri-q16", qtri_build_q16,
+    ext_intersect1N, ext_occluded1N, ext_memory_bytes, ext_destroy};
+static const bench_backend g_qtri_q8 = {"c11-qtri-q8", qtri_build_q8,
+    ext_intersect1N, ext_occluded1N, ext_memory_bytes, ext_destroy};
+static const bench_backend g_qtri_fp8 = {"c11-qtri-fp8", qtri_build_fp8,
+    ext_intersect1N, ext_occluded1N, ext_memory_bytes, ext_destroy};
+static const bench_backend g_qtri_fp4 = {"c11-qtri-fp4", qtri_build_fp4,
+    ext_intersect1N, ext_occluded1N, ext_memory_bytes, ext_destroy};
+const bench_backend *backend_lightrt_qtri_q16(void) { return &g_qtri_q16; }
+const bench_backend *backend_lightrt_qtri_q8(void) { return &g_qtri_q8; }
+const bench_backend *backend_lightrt_qtri_fp8(void) { return &g_qtri_fp8; }
+const bench_backend *backend_lightrt_qtri_fp4(void) { return &g_qtri_fp4; }

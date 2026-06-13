@@ -98,6 +98,35 @@ change to resident memory, build time, or traversal speed — it just stops
 over-committing address space (which matters under strict overcommit, in
 containers, or when many BVHs/instances coexist).
 
+## Quantized triangle leaves (approximate / LOD / preview)
+
+For large-scene preview and level-of-detail rendering, `lrt_qtri_scene_build`
+stores triangle vertices in low precision (the leaf geometry is ~79 % of the
+resident structure). Four formats, each in a LOSSY (smallest) or CONSERVATIVE
+(decoded triangle encloses the true one — no missed transverse hit) mode.
+Measured on the 710k mandelbulb, lossy, vs `c11-bvh4` (fp32):
+
+| format | resident | × fp32 | hit_frac | notes |
+|---|---|---|---|---|
+| fp32 | 36.8 MB | 1.00 | 0.1310 | baseline |
+| qtri-q16 | 23.5 MB | **0.64** | 0.1310 | 16-bit, scene grid; near-lossless |
+| qtri-q8 | 22.1 MB | **0.60** | 0.1310 | 8-bit, per-leaf grid |
+| qtri-fp8 | 22.1 MB | 0.60 | 0.1310 | 8-bit E4M3; precision-distribution variant |
+| qtri-fp4 | 19.1 MB | **0.52** | 0.1310 | 4-bit E2M1; aggressive |
+
+The hit fraction is unchanged on this scene (the LOD error is below the pixel
+grid); on coarser scenes lossy agreement runs 95–99.99 % and conservative
+essentially never misses a true hit (a homothety about each triangle's centroid
+grows it within its own plane; node bounds are recomputed from the decoded
+geometry so traversal never culls a hit leaf). A per-block grid (24 B) + the
+4 B prim id form the compression floor, so fp4 lands at 0.52×, not 4-bit.
+
+The current leaf **decode is scalar** (one lane at a time), so traversal is
+~2× slower than the fp32 SIMD leaf — the formats trade speed for memory today.
+A SIMD decode (`cvtepu8/16` + `fma` + the 4-wide Möller-Trumbore, as in the
+quantized-node slab) for q8/q16 is the documented next step to make them
+speed-competitive on bandwidth-bound large scenes.
+
 ## How the single-thread incoherent gap was closed
 
 ![optimization progression](img/progression.svg)
