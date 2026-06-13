@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <algorithm>
 
 namespace lightrt_viewer {
 
@@ -16,7 +17,8 @@ using namespace lightrt;
 // --- Key Indices (platform-independent) ---
 
 enum ViewerKey {
-    KEY_F = 0,
+    KEY_F,        // frameless toggle
+    KEY_R,        // reset/fit to scene
     KEY_S,
     KEY_PLUS,
     KEY_ESCAPE,
@@ -65,6 +67,7 @@ struct ViewerState {
     // Input
     bool keys[KEY_COUNT] = {};
     bool fKeyWasPressed = false;
+    bool rKeyWasPressed = false;
     bool sKeyWasPressed = false;
     bool plusKeyWasPressed = false;
     bool altPressed = false;
@@ -83,6 +86,14 @@ struct ViewerState {
     bool cameraDirty = true;
     Vec3 sunDirection;
     std::vector<uint32_t> pixels;
+
+    // Frameless / progressive rendering
+    bool framelessMode = true;
+    float frameBudgetMs = 33.0f;
+    uint32_t nextPixelIdx = 0;
+    std::vector<uint32_t> pixelOrder;
+    std::vector<uint32_t> pixelSampleCount;
+    float measuredPixelsPerMs = 10000.0f;
 
     // Stats
     float fps = 0;
@@ -119,6 +130,12 @@ void RenderFrame(ViewerState& state);
 
 // Resize framebuffer
 void ResizeFramebuffer(ViewerState& state, uint32_t w, uint32_t h);
+
+// Build shuffled pixel order for frameless rendering
+void BuildPixelOrder(ViewerState& state);
+
+// Tonemap accumBuffer → pixels[] using per-pixel sample counts
+void Tonemap(ViewerState& state);
 
 // --- Procedural Primitives ---
 

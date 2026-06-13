@@ -19,6 +19,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <random>
+
+#include "common/sss_render.hh"
 
 namespace lightrt_viewer {
 
@@ -79,6 +82,23 @@ static void addMeshToScene(scene::Scene& sc,
     inst.world_bounds = blas.local_bounds;
 
     sc.scene_bounds.expand(inst.world_bounds);
+}
+
+// Resolve material for a hit (inline, shared with SSS path)
+static const scene::MaterialData& resolveMaterial(const scene::Scene& scene,
+                                                   const scene::HitInfo& hit) {
+  static const scene::MaterialData kDefaultMat;
+  if (hit.instance_id == lightrt::kInvalidIndex) return kDefaultMat;
+  const auto& mesh = scene.meshes[scene.instances[hit.instance_id].mesh_id];
+  if (hit.triangle_id < mesh.tri_material_ids.size()) {
+    int32_t mat_id = mesh.tri_material_ids[hit.triangle_id];
+    if (mat_id >= 0 && static_cast<size_t>(mat_id) < scene.materials.size())
+      return scene.materials[static_cast<size_t>(mat_id)];
+  }
+  if (mesh.default_material_id >= 0 &&
+      static_cast<size_t>(mesh.default_material_id) < scene.materials.size())
+    return scene.materials[static_cast<size_t>(mesh.default_material_id)];
+  return kDefaultMat;
 }
 
 // Return the diffuse albedo for a scene hit.
@@ -329,9 +349,16 @@ bool ProcessInput(ViewerState& state, float /*dt*/) {
 
     bool fKeyPressed = state.keys[KEY_F];
     if (fKeyPressed && !state.fKeyWasPressed) {
-        FitToScene(state);
+        state.framelessMode = !state.framelessMode;
+        std::cout << "Frameless: " << (state.framelessMode ? "ON" : "OFF") << "\n";
     }
     state.fKeyWasPressed = fKeyPressed;
+
+    bool rKeyPressed = state.keys[KEY_R];
+    if (rKeyPressed && !state.rKeyWasPressed) {
+        FitToScene(state);
+    }
+    state.rKeyWasPressed = rKeyPressed;
 
     bool sKeyPressed = state.keys[KEY_S];
     if (sKeyPressed && !state.sKeyWasPressed) {
@@ -499,6 +526,40 @@ void PathTrace(ViewerState& state) {
                         Vec3 direct = sunColor * directLight;
                         Vec3 ambient = SampleSky(normal, sunDir) * 0.15f;
 
+                        // Subsurface scattering (random walk)
+                        Vec3 sss_contrib(0, 0, 0);
+                        float sss_weight = 0.0f;
+                        {
+                          const auto& mat = resolveMaterial(state.scene, hit);
+                          sss_weight = mat.subsurface_weight - 1e-4f;
+                          if (sss_weight > 0.0f) {
+                            std::mt19937 sss_rng(seed);
+                            std::uniform_real_distribution<float> sss_dist;
+                            auto sss_r = lightrt_common::sss_render::randomWalkSSS(
+                                state.scene, hitPos, normal, hit.instance_id, mat,
+                                sss_rng, sss_dist);
+                            if (sss_r.success) {
+                              float exit_NdotL = std::max(0.0f, sss_r.exit_normal.dot(shadowDir));
+                              float exit_direct = 0.0f;
+                              if (exit_NdotL > 0.0f && shadowMode != SHADOW_OFF) {
+                                Ray exit_shadow(sss_r.exit_pos + sss_r.exit_normal * 0.001f,
+                                                shadowDir, 0.0f, 1e10f);
+                                if (!scene::traceSceneAnyHit(state.scene, exit_shadow,
+                                      sss_r.exit_instance_id, sss_r.exit_triangle_id))
+                                  exit_direct = exit_NdotL;
+                              } else if (exit_NdotL > 0.0f) {
+                                exit_direct = exit_NdotL;
+                              }
+                              Vec3 exit_sun = sunColor * exit_direct;
+                              Vec3 exit_ambient = SampleSky(sss_r.exit_normal, sunDir) * 0.15f;
+                              sss_contrib = Vec3(
+                                (exit_sun.x + exit_ambient.x) * mat.base_color.x * sss_r.throughput.x,
+                                (exit_sun.y + exit_ambient.y) * mat.base_color.y * sss_r.throughput.y,
+                                (exit_sun.z + exit_ambient.z) * mat.base_color.z * sss_r.throughput.z);
+                            }
+                          }
+                        }
+
                         // Indirect (1 bounce)
                         Vec3 indirect(0, 0, 0);
                         {
@@ -537,7 +598,8 @@ void PathTrace(ViewerState& state) {
                             }
                         }
 
-                        color = vmul(direct + ambient + indirect, albedo);
+                        float brdf_scale = std::max(0.0f, 1.0f - sss_weight);
+                        color = vmul(direct + ambient + indirect, albedo) * brdf_scale + sss_contrib * (sss_weight > 0.0f ? 1.0f : 0.0f);
                     }
 
                     size_t idx = ((size_t)y * width + x) * 3;
@@ -610,7 +672,9 @@ void ResizeFramebuffer(ViewerState& state, uint32_t w, uint32_t h) {
     state.height = h;
     state.pixels.resize(w * h);
     state.accumBuffer.resize((size_t)w * h * 3, 0.0f);
+    state.pixelSampleCount.resize(w * h, 0u);
     state.cameraDirty = true;
+    BuildPixelOrder(state);
 }
 
 // --- Procedural Primitives ---
@@ -803,6 +867,52 @@ void CreateDefaultScene(scene::Scene& sc) {
     { std::vector<Triangle> tris; GenerateCone(tris, Vec3(0.4f,0,0), 0.4f, 0.9f);    addMeshToScene(sc, std::move(tris), Vec3(0.25f,0.85f,0.35f)); }
     { std::vector<Triangle> tris; GenerateTube(tris, Vec3(1.6f,0.45f,0), 0.3f, 0.9f); addMeshToScene(sc, std::move(tris), Vec3(0.85f,0.75f,0.25f)); }
     { std::vector<Triangle> tris; GenerateCapsule(tris, Vec3(2.8f,0.45f,0), 0.25f, 0.5f); addMeshToScene(sc, std::move(tris), Vec3(0.7f,0.35f,0.85f)); }
+}
+
+// --- Build pixel order for frameless rendering ---
+
+void BuildPixelOrder(ViewerState& state) {
+    uint32_t n = state.width * state.height;
+    state.pixelOrder.resize(n);
+    for (uint32_t i = 0; i < n; i++) state.pixelOrder[i] = i;
+    uint32_t seed = 42u;
+    for (uint32_t i = n - 1; i > 0; i--) {
+        uint32_t j = pcg_hash(seed + i) % (i + 1);
+        std::swap(state.pixelOrder[i], state.pixelOrder[j]);
+    }
+    state.nextPixelIdx = 0;
+}
+
+// --- Tonemap accumBuffer → pixels[] using per-pixel sample counts ---
+
+void Tonemap(ViewerState& state) {
+    int w = (int)state.width;
+    int h = (int)state.height;
+
+    using lightrt_common::shading::reinhardTonemap;
+    using lightrt_common::shading::linearToSRGB;
+
+    std::fill(state.pixels.begin(), state.pixels.end(), 0xFF000000u);
+
+    for (int i = 0; i < w * h; i++) {
+        uint32_t ns = state.pixelSampleCount[i];
+        if (ns == 0) continue;
+
+        float invSamples = 1.0f / (float)ns;
+        float r = reinhardTonemap(state.accumBuffer[i * 3 + 0] * invSamples);
+        float g = reinhardTonemap(state.accumBuffer[i * 3 + 1] * invSamples);
+        float b = reinhardTonemap(state.accumBuffer[i * 3 + 2] * invSamples);
+
+        r = linearToSRGB(r);
+        g = linearToSRGB(g);
+        b = linearToSRGB(b);
+
+        int ir = std::min(255, (int)(r * 255.0f + 0.5f));
+        int ig = std::min(255, (int)(g * 255.0f + 0.5f));
+        int ib = std::min(255, (int)(b * 255.0f + 0.5f));
+
+        state.pixels[i] = 0xFF000000u | ((uint32_t)ir << 16) | ((uint32_t)ig << 8) | (uint32_t)ib;
+    }
 }
 
 } // namespace lightrt_viewer

@@ -6,6 +6,8 @@
 #include "x11/lightrt_x11_loader.h"
 
 #include "common/viewer_common.h"
+#include "common/renderer.hh"
+#include "common/hair_bsdf.hh"
 #include "lightrt_c.h"
 
 #include <cmath>
@@ -14,6 +16,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <time.h>
 
 using namespace lightrt_viewer;
@@ -250,22 +253,35 @@ static Vec3 jitter_direction_impl(const Vec3& dir, float half_angle, uint32_t& s
             dir * cos_theta).normalize();
 }
 
-static void PathTraceX11(ViewerState& state, C11Scene& cs) {
+// Sample one pixel: trace ray + bounce, accumulate into accumBuffer
+static void SamplePixel(ViewerState& state, C11Scene& cs, lrt_scene* local_scene, uint32_t pixelIdx) {
     int width = (int)state.width;
-    int height = (int)state.height;
+    uint32_t x = pixelIdx % width;
+    uint32_t y = pixelIdx / width;
 
-    if (state.cameraDirty) {
-        std::fill(state.accumBuffer.begin(), state.accumBuffer.end(), 0.0f);
-        state.sampleCount = 0;
-        state.cameraDirty = false;
-    }
+    uint32_t seed = pcg_hash_impl(pixelIdx + state.pixelSampleCount[pixelIdx] * 1000003u);
 
-    float invWidth = 1.0f / width;
-    float invHeight = 1.0f / height;
-    float aspectRatio = (float)width / height;
+    float invWidth = 1.0f / (float)state.width;
+    float invHeight = 1.0f / (float)state.height;
+    float aspectRatio = (float)state.width / (float)state.height;
     float scale = tanf(state.camera.fov * 0.5f * (float)lightrt_common::shading::kPi / 180.0f);
 
-    uint32_t sampleIdx = state.sampleCount;
+    float jx = rand_float_impl(seed);
+    float jy = rand_float_impl(seed);
+
+    float px = (2.0f * (x + jx) * invWidth - 1.0f) * aspectRatio * scale;
+    float py = (1.0f - 2.0f * (y + jy) * invHeight) * scale;
+
+    Vec3 dir = (state.camera.forward + state.camera.right * px + state.camera.up * py).normalize();
+    Vec3 origin = state.camera.position;
+
+    double org[3] = {origin.x, origin.y, origin.z};
+    double ddir[3] = {dir.x, dir.y, dir.z};
+
+    double hit_t, hit_u, hit_v;
+    unsigned prim = lrt_scene_intersect(local_scene, org, ddir, 1e-6, 1e30, &hit_t, &hit_u, &hit_v);
+
+    Vec3 color(0, 0, 0);
     Vec3 sunDir = state.sunDirection;
     ShadowMode shadowMode = state.shadowMode;
 
@@ -273,174 +289,189 @@ static void PathTraceX11(ViewerState& state, C11Scene& cs) {
     if (shadowMode == SHADOW_SOFT) shadowConeAngle = 0.035f;
     else if (shadowMode == SHADOW_STRONG_SOFT) shadowConeAngle = 0.087f;
 
+    if (prim == LRT_NO_HIT) {
+        color = SampleSky(dir, sunDir);
+    } else {
+        float* verts = &cs.vertices[prim * 9];
+        Vec3 v0(verts[0], verts[1], verts[2]);
+        Vec3 v1(verts[3], verts[4], verts[5]);
+        Vec3 v2(verts[6], verts[7], verts[8]);
+        Vec3 normal = (v1 - v0).cross(v2 - v0).normalize();
+
+        if (normal.dot(dir) > 0.0f) normal = normal * -1.0f;
+
+        Vec3 hitPos(origin + dir * (float)hit_t);
+        Vec3 albedo(cs.colors[prim * 3], cs.colors[prim * 3 + 1], cs.colors[prim * 3 + 2]);
+
+        Vec3 shadowDir = sunDir;
+        if (shadowConeAngle > 0.0f)
+            shadowDir = jitter_direction_impl(sunDir, shadowConeAngle, seed);
+
+        float NdotL = std::max(0.0f, normal.dot(shadowDir));
+        float directLight = 0.0f;
+        if (NdotL > 0.0f) {
+            bool occluded = false;
+            if (shadowMode != SHADOW_OFF) {
+                double s_org[3] = {hitPos.x + normal.x * 0.001f,
+                                   hitPos.y + normal.y * 0.001f,
+                                   hitPos.z + normal.z * 0.001f};
+                double s_dir[3] = {shadowDir.x, shadowDir.y, shadowDir.z};
+                double s_t;
+                unsigned s_hit = lrt_scene_intersect(local_scene, s_org, s_dir,
+                                                     0.0, 1e10, &s_t, nullptr, nullptr);
+                occluded = (s_hit != LRT_NO_HIT);
+            }
+            if (!occluded) directLight = NdotL;
+        }
+
+        Vec3 sunColor(1.5f, 1.4f, 1.2f);
+        Vec3 direct = sunColor * directLight;
+        Vec3 ambient = SampleSky(normal, sunDir) * 0.15f;
+
+        Vec3 indirect(0, 0, 0);
+        {
+            float u1 = rand_float_impl(seed);
+            float u2 = rand_float_impl(seed);
+            Vec3 bounceDir = cosine_hemisphere_impl(u1, u2, normal);
+            Vec3 bOrg = hitPos + normal * 0.001f;
+
+            double b_org[3] = {bOrg.x, bOrg.y, bOrg.z};
+            double b_dir[3] = {bounceDir.x, bounceDir.y, bounceDir.z};
+
+            double b_t, b_u, b_v;
+            unsigned b_prim = lrt_scene_intersect(local_scene, b_org, b_dir,
+                                                   1e-6, 1e30, &b_t, &b_u, &b_v);
+
+            if (b_prim == LRT_NO_HIT) {
+                indirect = SampleSky(bounceDir, sunDir);
+            } else {
+                float* b_verts = &cs.vertices[b_prim * 9];
+                Vec3 bv0(b_verts[0], b_verts[1], b_verts[2]);
+                Vec3 bv1(b_verts[3], b_verts[4], b_verts[5]);
+                Vec3 bv2(b_verts[6], b_verts[7], b_verts[8]);
+                Vec3 bnorm = (bv1 - bv0).cross(bv2 - bv0).normalize();
+                if (bnorm.dot(bounceDir) > 0.0f) bnorm = bnorm * -1.0f;
+
+                Vec3 bHitPos(bOrg + bounceDir * (float)b_t);
+
+                Vec3 bShadowDir = sunDir;
+                if (shadowConeAngle > 0.0f)
+                    bShadowDir = jitter_direction_impl(sunDir, shadowConeAngle, seed);
+
+                float bNdotL = std::max(0.0f, bnorm.dot(bShadowDir));
+                float bDirect = 0.0f;
+                if (bNdotL > 0.0f) {
+                    bool bOcc = false;
+                    if (shadowMode != SHADOW_OFF) {
+                        double bs_org[3] = {bHitPos.x + bnorm.x * 0.001f,
+                                            bHitPos.y + bnorm.y * 0.001f,
+                                            bHitPos.z + bnorm.z * 0.001f};
+                        double bs_dir[3] = {bShadowDir.x, bShadowDir.y, bShadowDir.z};
+                        double bs_t;
+                        unsigned bs_hit = lrt_scene_intersect(local_scene, bs_org, bs_dir,
+                                                               0.0, 1e10, &bs_t, nullptr, nullptr);
+                        bOcc = (bs_hit != LRT_NO_HIT);
+                    }
+                    if (!bOcc) bDirect = bNdotL;
+                }
+                Vec3 bAlbedo(cs.colors[b_prim * 3], cs.colors[b_prim * 3 + 1], cs.colors[b_prim * 3 + 2]);
+                Vec3 bAmbient = SampleSky(bnorm, sunDir) * 0.15f;
+                indirect = vmul_impl(sunColor * bDirect + bAmbient, bAlbedo);
+            }
+        }
+
+        color = vmul_impl(direct + ambient + indirect, albedo);
+    }
+
+    size_t idx = ((size_t)y * state.width + x) * 3;
+    state.accumBuffer[idx + 0] += color.x;
+    state.accumBuffer[idx + 1] += color.y;
+    state.accumBuffer[idx + 2] += color.z;
+    state.pixelSampleCount[pixelIdx]++;
+}
+
+// Render all pixels (full frame), used by RenderFrameX11 and non-frameless mode
+static void RenderFullFrame(ViewerState& state, C11Scene& cs) {
+    if (state.cameraDirty) {
+        std::fill(state.accumBuffer.begin(), state.accumBuffer.end(), 0.0f);
+        std::fill(state.pixelSampleCount.begin(), state.pixelSampleCount.end(), 0u);
+        state.sampleCount = 0;
+        state.cameraDirty = false;
+    }
+
+    uint32_t total = state.width * state.height;
     int num_threads = cs.num_threads;
     std::vector<std::thread> threads;
 
     for (int t = 0; t < num_threads; ++t) {
-        threads.emplace_back([&, t, sampleIdx, sunDir, shadowMode, shadowConeAngle]() {
+        threads.emplace_back([&, t]() {
             lrt_scene* local_scene = cs.scenes[t];
-            int start_y = t * (height / num_threads);
-            int end_y = (t == num_threads - 1) ? height : (t + 1) * (height / num_threads);
-
-            for (int y = start_y; y < end_y; ++y) {
-                for (int x = 0; x < width; ++x) {
-                    uint32_t seed = pcg_hash_impl((uint32_t)x + (uint32_t)y * 65537u + sampleIdx * 1000003u);
-
-                    float jx = rand_float_impl(seed);
-                    float jy = rand_float_impl(seed);
-
-                    float px = (2.0f * (x + jx) * invWidth - 1.0f) * aspectRatio * scale;
-                    float py = (1.0f - 2.0f * (y + jy) * invHeight) * scale;
-
-                    Vec3 dir = (state.camera.forward + state.camera.right * px + state.camera.up * py).normalize();
-                    Vec3 origin = state.camera.position;
-
-                    double org[3] = {origin.x, origin.y, origin.z};
-                    double ddir[3] = {dir.x, dir.y, dir.z};
-
-                    double hit_t, hit_u, hit_v;
-                    unsigned prim = lrt_scene_intersect(local_scene, org, ddir,
-                                                        1e-6, 1e30, &hit_t, &hit_u, &hit_v);
-
-                    Vec3 color(0, 0, 0);
-
-                    if (prim == LRT_NO_HIT) {
-                        color = SampleSky(dir, sunDir);
-                    } else {
-                        // Compute face normal from world-space triangle vertices
-                        float* verts = &cs.vertices[prim * 9];
-                        Vec3 v0(verts[0], verts[1], verts[2]);
-                        Vec3 v1(verts[3], verts[4], verts[5]);
-                        Vec3 v2(verts[6], verts[7], verts[8]);
-                        Vec3 normal = (v1 - v0).cross(v2 - v0).normalize();
-
-                        if (normal.dot(dir) > 0.0f) normal = normal * -1.0f;
-
-                        Vec3 hitPos(origin + dir * (float)hit_t);
-                        Vec3 albedo(cs.colors[prim * 3], cs.colors[prim * 3 + 1], cs.colors[prim * 3 + 2]);
-
-                        // Direct lighting with optional soft shadow
-                        Vec3 shadowDir = sunDir;
-                        if (shadowConeAngle > 0.0f)
-                            shadowDir = jitter_direction_impl(sunDir, shadowConeAngle, seed);
-
-                        float NdotL = std::max(0.0f, normal.dot(shadowDir));
-                        float directLight = 0.0f;
-                        if (NdotL > 0.0f) {
-                            bool occluded = false;
-                            if (shadowMode != SHADOW_OFF) {
-                                double s_org[3] = {hitPos.x + normal.x * 0.001f,
-                                                   hitPos.y + normal.y * 0.001f,
-                                                   hitPos.z + normal.z * 0.001f};
-                                double s_dir[3] = {shadowDir.x, shadowDir.y, shadowDir.z};
-                                double s_t;
-                                unsigned s_hit = lrt_scene_intersect(local_scene, s_org, s_dir,
-                                                                      0.0, 1e10, &s_t, nullptr, nullptr);
-                                occluded = (s_hit != LRT_NO_HIT);
-                            }
-                            if (!occluded) directLight = NdotL;
-                        }
-
-                        Vec3 sunColor(1.5f, 1.4f, 1.2f);
-                        Vec3 direct = sunColor * directLight;
-                        Vec3 ambient = SampleSky(normal, sunDir) * 0.15f;
-
-                        // Indirect (1 bounce)
-                        Vec3 indirect(0, 0, 0);
-                        {
-                            float u1 = rand_float_impl(seed);
-                            float u2 = rand_float_impl(seed);
-                            Vec3 bounceDir = cosine_hemisphere_impl(u1, u2, normal);
-                            Vec3 bOrg = hitPos + normal * 0.001f;
-
-                            double b_org[3] = {bOrg.x, bOrg.y, bOrg.z};
-                            double b_dir[3] = {bounceDir.x, bounceDir.y, bounceDir.z};
-
-                            double b_t, b_u, b_v;
-                            unsigned b_prim = lrt_scene_intersect(local_scene, b_org, b_dir,
-                                                                   1e-6, 1e30, &b_t, &b_u, &b_v);
-
-                            if (b_prim == LRT_NO_HIT) {
-                                indirect = SampleSky(bounceDir, sunDir);
-                            } else {
-                                float* b_verts = &cs.vertices[b_prim * 9];
-                                Vec3 bv0(b_verts[0], b_verts[1], b_verts[2]);
-                                Vec3 bv1(b_verts[3], b_verts[4], b_verts[5]);
-                                Vec3 bv2(b_verts[6], b_verts[7], b_verts[8]);
-                                Vec3 bnorm = (bv1 - bv0).cross(bv2 - bv0).normalize();
-                                if (bnorm.dot(bounceDir) > 0.0f) bnorm = bnorm * -1.0f;
-
-                                Vec3 bHitPos(bOrg + bounceDir * (float)b_t);
-
-                                Vec3 bShadowDir = sunDir;
-                                if (shadowConeAngle > 0.0f)
-                                    bShadowDir = jitter_direction_impl(sunDir, shadowConeAngle, seed);
-
-                                float bNdotL = std::max(0.0f, bnorm.dot(bShadowDir));
-                                float bDirect = 0.0f;
-                                if (bNdotL > 0.0f) {
-                                    bool bOcc = false;
-                                    if (shadowMode != SHADOW_OFF) {
-                                        double bs_org[3] = {bHitPos.x + bnorm.x * 0.001f,
-                                                            bHitPos.y + bnorm.y * 0.001f,
-                                                            bHitPos.z + bnorm.z * 0.001f};
-                                        double bs_dir[3] = {bShadowDir.x, bShadowDir.y, bShadowDir.z};
-                                        double bs_t;
-                                        unsigned bs_hit = lrt_scene_intersect(local_scene, bs_org, bs_dir,
-                                                                               0.0, 1e10, &bs_t, nullptr, nullptr);
-                                        bOcc = (bs_hit != LRT_NO_HIT);
-                                    }
-                                    if (!bOcc) bDirect = bNdotL;
-                                }
-                                Vec3 bAlbedo(cs.colors[b_prim * 3], cs.colors[b_prim * 3 + 1], cs.colors[b_prim * 3 + 2]);
-                                Vec3 bAmbient = SampleSky(bnorm, sunDir) * 0.15f;
-                                indirect = vmul_impl(sunColor * bDirect + bAmbient, bAlbedo);
-                            }
-                        }
-
-                        color = vmul_impl(direct + ambient + indirect, albedo);
-                    }
-
-                    size_t idx = ((size_t)y * width + x) * 3;
-                    state.accumBuffer[idx + 0] += color.x;
-                    state.accumBuffer[idx + 1] += color.y;
-                    state.accumBuffer[idx + 2] += color.z;
-                }
+            uint32_t start = (uint32_t)((uint64_t)t * total / num_threads);
+            uint32_t end = (uint32_t)((uint64_t)(t + 1) * total / num_threads);
+            for (uint32_t i = start; i < end; i++) {
+                SamplePixel(state, cs, local_scene, state.pixelOrder[i]);
             }
         });
     }
-
     for (auto& th : threads) th.join();
 
     state.sampleCount++;
-
-    using lightrt_common::shading::reinhardTonemap;
-    using lightrt_common::shading::linearToSRGB;
-    float invSamples = 1.0f / (float)state.sampleCount;
-
-    for (int i = 0; i < width * height; ++i) {
-        float r = reinhardTonemap(state.accumBuffer[i * 3 + 0] * invSamples);
-        float g = reinhardTonemap(state.accumBuffer[i * 3 + 1] * invSamples);
-        float b = reinhardTonemap(state.accumBuffer[i * 3 + 2] * invSamples);
-
-        r = linearToSRGB(r);
-        g = linearToSRGB(g);
-        b = linearToSRGB(b);
-
-        int ir = std::min(255, (int)(r * 255.0f + 0.5f));
-        int ig = std::min(255, (int)(g * 255.0f + 0.5f));
-        int ib = std::min(255, (int)(b * 255.0f + 0.5f));
-
-        state.pixels[i] = 0xFF000000u | ((uint32_t)ir << 16) | ((uint32_t)ig << 8) | (uint32_t)ib;
-    }
 }
 
-static void RenderFrameX11(ViewerState& state, C11Scene& cs) {
+// Frameless rendering: render pixel subset within time budget
+static void RenderFrameless(ViewerState& state, C11Scene& cs) {
+    if (state.cameraDirty) {
+        std::fill(state.accumBuffer.begin(), state.accumBuffer.end(), 0.0f);
+        std::fill(state.pixelSampleCount.begin(), state.pixelSampleCount.end(), 0u);
+        state.sampleCount = 0;
+        state.nextPixelIdx = 0;
+        state.cameraDirty = false;
+    }
+
+    uint32_t total = state.width * state.height;
+
+    // Estimate pixels for this frame's budget
+    uint32_t maxPixels = (uint32_t)(state.measuredPixelsPerMs * state.frameBudgetMs);
+    if (maxPixels < total / 8) maxPixels = total / 8;
+    if (maxPixels > total) maxPixels = total;
+
+    uint64_t renderStart = GetTimeNs();
+    uint32_t startIdx = state.nextPixelIdx;
+    int num_threads = cs.num_threads;
+    uint32_t chunk = maxPixels / num_threads;
+    std::vector<std::thread> threads;
+
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&, t]() {
+            lrt_scene* local_scene = cs.scenes[t];
+            uint32_t begin = startIdx + (uint32_t)t * chunk;
+            uint32_t end = (t == num_threads - 1) ? startIdx + maxPixels : begin + chunk;
+            if (end > startIdx + maxPixels) end = startIdx + maxPixels;
+            for (uint32_t j = begin; j < end; j++) {
+                uint32_t pi = state.pixelOrder[j % total];
+                SamplePixel(state, cs, local_scene, pi);
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    state.nextPixelIdx = (startIdx + maxPixels) % total;
+
+    // Update throughput estimate
+    uint64_t renderEnd = GetTimeNs();
+    float elapsedMs = (float)(renderEnd - renderStart) / 1e6f;
+    if (elapsedMs > 0.1f) {
+        float throughput = (float)maxPixels / elapsedMs;
+        state.measuredPixelsPerMs = state.measuredPixelsPerMs * 0.9f + throughput * 0.1f;
+    }
+
+    state.sampleCount++;
+}
+
+// Draw HUD overlay (stats, controls help)
+static void DrawHUD(ViewerState& state, const C11Scene& cs) {
     int w = (int)state.width;
     int h = (int)state.height;
-
-    PathTraceX11(state, cs);
-
     int fs = state.fontScale;
     int lineH = 10 * fs;
 
@@ -460,8 +491,14 @@ static void RenderFrameX11(ViewerState& state, C11Scene& cs) {
     DrawString(10, h - lineH * 3, help.c_str(), 0xFFFFFF00, state.pixels.data(), w, h, fs);
 
     static const char* shadowModeNames[] = {"OFF", "HARD", "SOFT", "STRONG_SOFT"};
-    std::string help2 = "F: Fit, S: Shadow [" + std::string(shadowModeNames[state.shadowMode]) + "], +: Font 2x [" + std::string(fs == 2 ? "ON" : "OFF") + "], O: Open File";
+    std::string help2 = "F: Frame [" + std::string(state.framelessMode ? "ON" : "OFF") + "], R: Fit, S: Shadow [" + std::string(shadowModeNames[state.shadowMode]) + "], +: Font 2x [" + std::string(fs == 2 ? "ON" : "OFF") + "], O: Open File";
     DrawString(10, h - lineH * 2, help2.c_str(), 0xFFFFFF00, state.pixels.data(), w, h, fs);
+}
+
+static void RenderFrameX11(ViewerState& state, C11Scene& cs) {
+    RenderFullFrame(state, cs);
+    Tonemap(state);
+    DrawHUD(state, cs);
 }
 
 // --- Benchmark mode: procedural mandelbulb + rays/sec measurement ---
@@ -1027,6 +1064,296 @@ static void runBenchmarkMeasurement() {
     g_bench.num_rays = total_rays;
 }
 
+// --- SSS Validation Mode ---
+
+struct SSSPreset {
+  const char* name;
+  float weight;
+  float color[3];
+  float radius;
+  float radius_scale[3];
+  float anisotropy;
+  float base_color[3];
+};
+
+static const SSSPreset kSSSPresets[] = {
+  {"Skin",       0.8f, {0.85f,0.25f,0.08f}, 0.5f, {1.0f,0.35f,0.15f}, 0.3f, {0.85f,0.50f,0.35f}},
+  {"Jade",       0.9f, {0.10f,0.50f,0.20f}, 0.3f, {0.30f,1.0f,0.20f}, 0.0f, {0.30f,0.60f,0.35f}},
+  {"Wax",        0.7f, {0.90f,0.80f,0.50f}, 0.4f, {0.80f,0.70f,0.50f}, 0.2f, {0.90f,0.85f,0.70f}},
+  {"Milk",       0.95f,{0.95f,0.93f,0.88f}, 0.6f, {0.90f,0.92f,0.95f}, 0.1f, {0.95f,0.93f,0.88f}},
+};
+
+static int g_sss_preset = 0;
+static bool g_sss_mode = false;
+
+static void buildSSSScene(int preset_idx) {
+  if (preset_idx < 0 || preset_idx >= 4) preset_idx = 0;
+  const SSSPreset& p = kSSSPresets[preset_idx];
+
+  scene::Scene sc;
+  scene::MaterialData mat;
+  mat.base_color = Vec3(p.base_color[0], p.base_color[1], p.base_color[2]);
+  mat.base_roughness = 0.0f; mat.base_metalness = 0.0f;
+  mat.specular_weight = 1.0f;
+  mat.specular_color = Vec3(1,1,1); mat.specular_roughness = 0.35f; mat.specular_ior = 1.4f;
+  mat.subsurface_weight = p.weight;
+  mat.subsurface_color = Vec3(p.color[0], p.color[1], p.color[2]);
+  mat.subsurface_radius = p.radius;
+  mat.subsurface_radius_scale = Vec3(p.radius_scale[0], p.radius_scale[1], p.radius_scale[2]);
+  mat.subsurface_scale = 1.0f;
+  mat.subsurface_anisotropy = p.anisotropy;
+
+  int mat_id = (int)sc.materials.size();
+  sc.materials.push_back(mat);
+
+  // Sphere mesh (procedural)
+  std::vector<Triangle> tris;
+  for (int r = 0; r < 16; r++) {
+    for (int s = 0; s < 32; s++) {
+      float phi0 = 3.14159265f * r / 16, phi1 = 3.14159265f * (r+1) / 16;
+      float th0 = 6.2831853f * s / 32, th1 = 6.2831853f * (s+1) / 32;
+      auto vertex = [](float phi, float th) -> Vec3 {
+        return Vec3(sinf(phi)*cosf(th), cosf(phi), sinf(phi)*sinf(th));
+      };
+      Vec3 a0 = vertex(phi0, th0), a1 = vertex(phi0, th1);
+      Vec3 b0 = vertex(phi1, th0), b1 = vertex(phi1, th1);
+      tris.emplace_back(a0, b0, a1);
+      tris.emplace_back(a0, a1, b1);
+    }
+  }
+
+  sc.meshes.emplace_back();
+  auto& blas = sc.meshes.back();
+  blas.default_material_id = mat_id;
+  for (const auto& tri : tris) {
+    blas.local_bounds.expand(tri.v0);
+    blas.local_bounds.expand(tri.v1);
+    blas.local_bounds.expand(tri.v2);
+  }
+  BVHBuildConfig cfg;
+  blas.bvh.build(tris, cfg);
+
+  sc.instances.emplace_back();
+  auto& inst = sc.instances.back();
+  inst.mesh_id = 0;
+  float id[12] = {1,0,0,0, 0,1,0,0, 0,0,1,0};
+  memcpy(inst.transform, id, sizeof(id));
+  memcpy(inst.inv_transform, id, sizeof(id));
+  memcpy(inst.transform_close, id, sizeof(id));
+  memcpy(inst.inv_transform_close, id, sizeof(id));
+  inst.world_bounds = blas.local_bounds;
+  sc.scene_bounds = blas.local_bounds;
+
+  // Lights
+  auto addLight = [&](const Vec3& pos, const Vec3& col, float intensity, float radius) {
+    scene::LightData l;
+    l.type = scene::LightData::Sphere;
+    l.position = pos; l.color = col * intensity; l.radius = radius;
+    sc.lights.push_back(l);
+  };
+  addLight(Vec3(-2.5f,2.0f,3.0f), Vec3(1,0.92f,0.8f), 40.0f, 0.5f);
+  addLight(Vec3(0,0.5f,-3.5f), Vec3(0.6f,0.85f,1.0f), 80.0f, 0.3f);
+
+  g_state.scene = std::move(sc);
+  int num_threads = std::max(1, (int)std::thread::hardware_concurrency());
+  buildC11Scene(g_c11scene, g_state.scene, num_threads);
+  g_state.camera.orbitCenter = Vec3(0,0,0);
+  g_state.camera.orbitDistance = 4.0f;
+  g_state.camera.yaw = 90.0f;
+  g_state.camera.pitch = 25.0f;
+  UpdateCameraFromOrbit(g_state.camera);
+  std::fill(g_state.accumBuffer.begin(), g_state.accumBuffer.end(), 0.0f);
+  g_state.sampleCount = 0;
+  g_state.cameraDirty = true;
+}
+
+static void drawSSSOverlay(ViewerState& state) {
+  int w = (int)state.width;
+  int h = (int)state.height;
+  int fs = state.fontScale;
+  int lineH = 12 * fs;
+  int x = 10;
+  int y = h - lineH * 9;
+  if (y < 10) y = 10;
+  uint32_t col = 0xFF00FF00;
+
+  const SSSPreset& p = kSSSPresets[g_sss_preset];
+  DrawString(x, y, "[SSS VALIDATION]", col, state.pixels.data(), w, h, fs); y += lineH;
+  DrawString(x, y, ("Preset: " + std::string(p.name)).c_str(), col, state.pixels.data(), w, h, fs); y += lineH;
+  char buf[128];
+  snprintf(buf, sizeof(buf), "Weight: %.2f  Radius: %.2f  Aniso: %.2f", p.weight, p.radius, p.anisotropy);
+  DrawString(x, y, buf, col, state.pixels.data(), w, h, fs); y += lineH;
+  snprintf(buf, sizeof(buf), "Color: (%.2f,%.2f,%.2f)", p.color[0], p.color[1], p.color[2]);
+  DrawString(x, y, buf, col, state.pixels.data(), w, h, fs); y += lineH;
+  snprintf(buf, sizeof(buf), "Radius Scale: (%.2f,%.2f,%.2f)", p.radius_scale[0], p.radius_scale[1], p.radius_scale[2]);
+  DrawString(x, y, buf, col, state.pixels.data(), w, h, fs); y += lineH;
+  DrawString(x, y, "V: Exit  [ ]: Cycle preset", col, state.pixels.data(), w, h, fs);
+}
+
+// --- Hair Validation Mode ---
+
+struct HairPreset {
+  const char* name;
+  float roughness;
+  float azim_rough;
+  float ior;
+  float cuticle;
+  float color[3];
+  float absorption[3];
+};
+
+static const HairPreset kHairPresets[] = {
+  {"Dark",  0.4f, 0.3f, 1.55f, 3.0f, {0.10f,0.05f,0.02f}, {0.3f,0.7f,1.0f}},
+  {"Blonde",0.3f, 0.25f,1.55f, 3.0f, {0.75f,0.55f,0.20f},{0.1f,0.3f,0.6f}},
+  {"Red",   0.35f,0.3f, 1.55f, 3.0f, {0.65f,0.25f,0.08f},{0.15f,0.5f,0.9f}},
+  {"Gray",  0.2f, 0.2f, 1.55f, 2.5f, {0.85f,0.82f,0.78f},{0.05f,0.1f,0.15f}},
+  {"Rainbow",0.3f,0.3f, 1.55f, 3.5f, {0.30f,0.20f,0.10f},{0.0f,0.0f,0.0f}},
+};
+
+static int g_hair_preset = 0;
+static bool g_hair_mode = false;
+
+static void buildHairScene(int preset_idx) {
+  if (preset_idx < 0 || preset_idx >= 5) preset_idx = 0;
+  const HairPreset& p = kHairPresets[preset_idx];
+
+  // Build scene directly (not via ViewerState) — use renderFrame()
+  // to render and copy result to pixel buffer.
+  (void)p;
+  // Scene is built lazily — see below
+}
+
+// Renders hair scene and copies result to g_state.pixels
+static void renderHairFrame(ViewerState& state) {
+  const HairPreset& p = kHairPresets[g_hair_preset];
+
+  scene::Scene sc;
+
+  scene::MaterialData mat;
+  mat.hair_roughness_longitudinal = p.roughness;
+  mat.hair_roughness_azimuthal = p.azim_rough;
+  mat.hair_ior = p.ior;
+  mat.hair_cuticle_angle = p.cuticle;
+  mat.hair_color = Vec3(p.color[0], p.color[1], p.color[2]);
+  mat.hair_absorption = Vec3(p.absorption[0], p.absorption[1], p.absorption[2]);
+  mat.hair_weight = 1.0f;
+  mat.base_color = Vec3(p.color[0], p.color[1], p.color[2]);
+
+  int mat_id = (int)sc.materials.size();
+  sc.materials.push_back(mat);
+
+  // Generate hair strands
+  std::vector<Curve> curves;
+  int num_strands = 30;
+  int cols = 6;
+  float spacing = 0.35f;
+  float offset = (float)(cols - 1) * spacing * 0.5f;
+  for (int i = 0; i < num_strands; i++) {
+    int c = i % cols, r = i / cols;
+    float x = c * spacing - offset;
+    float z = r * spacing - offset + 0.5f;
+    float len = 0.8f + (float)i / (float)num_strands * 0.8f;
+    float rad = 0.008f + (float)i / (float)num_strands * 0.003f;
+    std::vector<Vec3> pts;
+    std::vector<float> rads;
+    int segs = 6;
+    for (int j = 0; j <= segs; j++) {
+      float t = (float)j / (float)segs;
+      float y = t * len;
+      float bx = sinf(t * 1.5708f) * 0.15f * x * 0.3f;
+      float bz = cosf(t * 1.5708f) * 0.15f * z * 0.3f;
+      pts.push_back(Vec3(x + bx, y - 0.5f, z + bz));
+      rads.push_back(rad * (1.0f - t * 0.5f));
+    }
+    curves.emplace_back(pts, rads, CurveType::Bezier);
+  }
+
+  sc.curve_meshes.emplace_back();
+  auto& cb = sc.curve_meshes.back();
+  cb.default_material_id = mat_id;
+  cb.build(curves);
+
+  sc.instances.emplace_back();
+  auto& inst = sc.instances.back();
+  inst.mesh_id = kInvalidIndex;
+  inst.curve_mesh_id = 0;
+  float id[12] = {1,0,0,0, 0,1,0,0, 0,0,1,0};
+  memcpy(inst.transform, id, sizeof(id));
+  memcpy(inst.inv_transform, id, sizeof(id));
+  memcpy(inst.transform_close, id, sizeof(id));
+  memcpy(inst.inv_transform_close, id, sizeof(id));
+  inst.world_bounds = cb.local_bounds;
+  sc.scene_bounds = cb.local_bounds;
+
+  // Lights
+  {
+    scene::LightData l;
+    l.type = scene::LightData::Sphere;
+    l.position = Vec3(-2.0f, 3.0f, 2.5f);
+    l.color = Vec3(1,0.95f,0.85f) * 60.0f;
+    l.radius = 0.5f;
+    sc.lights.push_back(l);
+  }
+  {
+    scene::LightData l;
+    l.type = scene::LightData::Sphere;
+    l.position = Vec3(1.5f, 1.0f, -2.5f);
+    l.color = Vec3(0.7f,0.8f,1.0f) * 40.0f;
+    l.radius = 0.3f;
+    sc.lights.push_back(l);
+  }
+
+  // Camera
+  lightrt_common::CameraView cam;
+  cam.position = Vec3(0, 1.2f, 3.0f);
+  cam.direction = (Vec3(0, 0.3f, 0) - cam.position).normalize();
+  cam.up = Vec3(0, 1, 0);
+  cam.right = cam.direction.cross(cam.up).normalize();
+  cam.up = cam.right.cross(cam.direction).normalize();
+  float fov_y = 40.0f * 3.14159265f / 180.0f;
+  float half_h = tanf(fov_y * 0.5f);
+  cam.half_width = half_h * (float)state.width / (float)state.height;
+  cam.half_height = half_h;
+  cam.half_width = 1.0f; // override for hair view
+
+  // Render using renderFrame (CPU renderer with hair BSDF support)
+  lightrt_common::RenderSettings rs;
+  rs.width = state.width;
+  rs.height = state.height;
+  rs.spp = std::max(1u, 4u);
+
+  std::vector<lightrt::RGB8> image(rs.width * rs.height);
+  lightrt_common::renderFrame(sc, rs, cam, image);
+
+  // Copy to pixel buffer for display
+  for (size_t i = 0; i < image.size(); i++) {
+    state.pixels[i] = 0xFF000000u | ((uint32_t)image[i].r << 16) | ((uint32_t)image[i].g << 8) | (uint32_t)image[i].b;
+  }
+}
+
+static void drawHairOverlay(ViewerState& state) {
+  int w = (int)state.width;
+  int h = (int)state.height;
+  int fs = state.fontScale;
+  int lineH = 12 * fs;
+  int x = 10;
+  int y = h - lineH * 8;
+  if (y < 10) y = 10;
+  uint32_t col = 0xFF00FF00;
+
+  const HairPreset& p = kHairPresets[g_hair_preset];
+  DrawString(x, y, "[HAIR BSDF VALIDATION]", col, state.pixels.data(), w, h, fs); y += lineH;
+  DrawString(x, y, ("Preset: " + std::string(p.name)).c_str(), col, state.pixels.data(), w, h, fs); y += lineH;
+  char buf[128];
+  snprintf(buf, sizeof(buf), "Roughness: %.2f  Azim: %.2f", p.roughness, p.azim_rough);
+  DrawString(x, y, buf, col, state.pixels.data(), w, h, fs); y += lineH;
+  snprintf(buf, sizeof(buf), "IOR: %.2f  Cuticle: %.1f", p.ior, p.cuticle);
+  DrawString(x, y, buf, col, state.pixels.data(), w, h, fs); y += lineH;
+  snprintf(buf, sizeof(buf), "Color: (%.2f,%.2f,%.2f)", p.color[0], p.color[1], p.color[2]);
+  DrawString(x, y, buf, col, state.pixels.data(), w, h, fs); y += lineH;
+  DrawString(x, y, "H: Exit  [ ]: Cycle preset", col, state.pixels.data(), w, h, fs);
+}
+
 // Overlay for benchmark mode (called from main loop after rendering)
 static void drawBenchmarkOverlay(ViewerState& state) {
     int w = (int)state.width;
@@ -1091,10 +1418,12 @@ int main(int argc, char* argv[]) {
     int num_threads = std::max(1, (int)std::thread::hardware_concurrency());
     buildC11Scene(g_c11scene, g_state.scene, num_threads);
 
-    // Initialize sun direction and accumulation buffer
+    // Initialize sun direction, accumulation, and frameless pixel order
     g_state.sunDirection = Vec3(1, 1, -0.5f).normalize();
     g_state.pixels.resize(g_state.width * g_state.height);
     g_state.accumBuffer.resize((size_t)g_state.width * g_state.height * 3, 0.0f);
+    g_state.pixelSampleCount.resize(g_state.width * g_state.height, 0u);
+    BuildPixelOrder(g_state);
     FitToScene(g_state);
 
     // Load X11 at runtime
@@ -1123,22 +1452,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // HiDPI detection: scale window and font for high-DPI displays (4K+)
+    // 4K display: 1.5x window (1920x1080), 2x font
     {
-        Screen* xscreen = ScreenOfDisplay(dpy, screen);
-        int w_px = WidthOfScreen(xscreen);
-        int h_px = HeightOfScreen(xscreen);
-        int w_mm = WidthMMOfScreen(xscreen);
-        double dpi = (w_mm > 0) ? (double)w_px * 25.4 / (double)w_mm : 96.0;
-
-        if (dpi > 150.0) {
-            // Scale window to ~80% of screen for high-DPI displays
-            uint32_t new_w = std::max(g_state.width, (uint32_t)((double)w_px * 0.8));
-            uint32_t new_h = std::max(g_state.height, (uint32_t)((double)h_px * 0.8));
-            ResizeFramebuffer(g_state, new_w, new_h);
-            // 2x font for 150-250 DPI, 3x for 250+
-            g_state.fontScale = (dpi > 250.0) ? 3 : 2;
-        }
+        ResizeFramebuffer(g_state, 1920, 1080);
+        g_state.fontScale = 2;
     }
 
     // Create window
@@ -1182,7 +1499,7 @@ int main(int argc, char* argv[]) {
     int fpsFrameCount = 0;
 
     std::cout << "Controls: Alt+LMB/Shift+LMB Orbit, Alt+MMB/Ctrl+LMB Pan, Alt+RMB/Ctrl+Shift+LMB/Tab+LMB Dolly\n";
-    std::cout << "          F: Fit, S: Shadow, +: Font 2x, O: Open File (zenity/kdialog)\n";
+    std::cout << "          F: Frameless toggle, R: Fit, S: Shadow, +: Font 2x, O: Open File (zenity/kdialog)\n";
 
     // Main loop
     while (g_running) {
@@ -1224,12 +1541,34 @@ int main(int argc, char* argv[]) {
                 switch (ks) {
                 case XK_f: case XK_F:
                     g_state.keys[KEY_F] = true; break;
+                case XK_r: case XK_R:
+                    g_state.keys[KEY_R] = true; break;
                 case XK_s: case XK_S:
                     g_state.keys[KEY_S] = true; break;
                 case XK_plus: case XK_equal:
                     g_state.keys[KEY_PLUS] = true; break;
                 case XK_o: case XK_O:
                     ShowOpenFileDialog(); break;
+                case XK_v: case XK_V:
+                    if (g_sss_mode) {
+                        g_sss_mode = false;
+                    } else {
+                        if (g_bench.active) exitBenchmarkMode();
+                        if (g_hair_mode) g_hair_mode = false;
+                        g_sss_preset = 0;
+                        g_sss_mode = true;
+                        buildSSSScene(g_sss_preset);
+                    }
+                    break;
+                case XK_h: case XK_H:
+                    g_hair_mode = !g_hair_mode;
+                    if (g_hair_mode) {
+                        if (g_bench.active) exitBenchmarkMode();
+                        if (g_sss_mode) g_sss_mode = false;
+                        g_hair_preset = 0;
+                        renderHairFrame(g_state);
+                    }
+                    break;
                 case XK_b: case XK_B:
                     if (g_bench.active) {
                         exitBenchmarkMode();
@@ -1238,13 +1577,25 @@ int main(int argc, char* argv[]) {
                     }
                     break;
                 case XK_bracketleft:
-                    if (g_bench.active && g_bench.fineness > 16) {
+                    if (g_hair_mode) {
+                        g_hair_preset = (g_hair_preset == 0) ? 4 : g_hair_preset - 1;
+                        renderHairFrame(g_state);
+                    } else if (g_sss_mode) {
+                        g_sss_preset = (g_sss_preset == 0) ? 3 : g_sss_preset - 1;
+                        buildSSSScene(g_sss_preset);
+                    } else if (g_bench.active && g_bench.fineness > 16) {
                         g_bench.fineness = std::max(16, g_bench.fineness / 2);
                         regenerateBenchmark();
                     }
                     break;
                 case XK_bracketright:
-                    if (g_bench.active && g_bench.fineness < 256) {
+                    if (g_hair_mode) {
+                        g_hair_preset = (g_hair_preset == 4) ? 0 : g_hair_preset + 1;
+                        renderHairFrame(g_state);
+                    } else if (g_sss_mode) {
+                        g_sss_preset = (g_sss_preset == 3) ? 0 : g_sss_preset + 1;
+                        buildSSSScene(g_sss_preset);
+                    } else if (g_bench.active && g_bench.fineness < 256) {
                         g_bench.fineness = std::min(256, g_bench.fineness * 2);
                         regenerateBenchmark();
                     }
@@ -1281,6 +1632,8 @@ int main(int argc, char* argv[]) {
                 switch (ks) {
                 case XK_f: case XK_F:
                     g_state.keys[KEY_F] = false; break;
+                case XK_r: case XK_R:
+                    g_state.keys[KEY_R] = false; break;
                 case XK_s: case XK_S:
                     g_state.keys[KEY_S] = false; break;
                 case XK_plus: case XK_equal:
@@ -1377,12 +1730,26 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        // Render (using C11 API for ray intersection)
+        uint64_t frameStart = GetTimeNs();
+
+        // Render
         if (g_bench.active) {
             RenderFrameX11(g_state, g_bench.c11scene);
             drawBenchmarkOverlay(g_state);
-        } else {
+        } else if (g_sss_mode) {
             RenderFrameX11(g_state, g_c11scene);
+            drawSSSOverlay(g_state);
+        } else if (g_hair_mode) {
+            drawHairOverlay(g_state);
+        } else {
+            // Normal interactive mode: frameless or full frame
+            if (g_state.framelessMode) {
+                RenderFrameless(g_state, g_c11scene);
+            } else {
+                RenderFullFrame(g_state, g_c11scene);
+            }
+            Tonemap(g_state);
+            DrawHUD(g_state, g_c11scene);
         }
 
         // Blit to window via XPutImage
@@ -1390,6 +1757,16 @@ int main(int argc, char* argv[]) {
         XPutImage(dpy, win, gc, ximg,
                   0, 0, 0, 0, g_state.width, g_state.height);
         XFlush(dpy);
+
+        // Frame rate limit: sleep remaining time in budget
+        uint64_t frameElapsed = GetTimeNs() - frameStart;
+        int64_t sleepNs = (int64_t)(g_state.frameBudgetMs * 1e6f) - (int64_t)frameElapsed;
+        if (sleepNs > 0) {
+            struct timespec ts;
+            ts.tv_sec = (long)(sleepNs / 1000000000L);
+            ts.tv_nsec = (long)(sleepNs % 1000000000L);
+            nanosleep(&ts, nullptr);
+        }
     }
 
     // Cleanup — set data to null so XDestroyImage doesn't free our buffer

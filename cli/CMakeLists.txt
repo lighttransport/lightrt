@@ -111,3 +111,41 @@ else()
   target_compile_definitions(lightrt_cli PRIVATE LIGHTRT_HAS_TINYUSDZ)
   message(STATUS "USD backend: tinyusdz + tydra (${TINYUSDZ_DIR})")
 endif()
+
+# === Hair BSDF validation test ===
+add_executable(lightrt_hair_test
+  hair_test.cc
+  "${LIGHTRT_DIR}/lightrt.cc"
+  "${LIGHTRT_DIR}/common/renderer.cc"
+)
+target_include_directories(lightrt_hair_test PRIVATE
+  "${LIGHTRT_DIR}"
+  "${LIGHTRT_DIR}/common"
+)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64)|(AMD64|amd64)|(^i.86$)")
+  include(CheckCXXCompilerFlag)
+  check_cxx_compiler_flag("-mavx2" HAS_AVX2)
+  if(HAS_AVX2)
+    target_compile_options(lightrt_hair_test PRIVATE -mavx2 -mfma -mf16c)
+  endif()
+endif()
+
+# === SSS validation test ===
+add_executable(lightrt_sss_test
+  sss_test.cc
+  "${LIGHTRT_DIR}/lightrt.cc"
+  "${LIGHTRT_DIR}/common/renderer.cc"
+)
+target_include_directories(lightrt_sss_test PRIVATE
+  "${LIGHTRT_DIR}"
+  "${LIGHTRT_DIR}/common"
+)
+target_link_libraries(lightrt_sss_test PRIVATE)
+# SIMD flags
+include(CheckCXXCompilerFlag)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64)|(AMD64|amd64)|(^i.86$)")
+  check_cxx_compiler_flag("-mavx2" HAS_AVX2)
+  if(HAS_AVX2)
+    target_compile_options(lightrt_sss_test PRIVATE -mavx2 -mfma -mf16c)
+  endif()
+endif()

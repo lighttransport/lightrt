@@ -276,6 +276,12 @@ typedef union _XEvent {
 #define XK_underscore           0x005f
 #define XK_b                    0x0062
 #define XK_B                    0x0042
+#define XK_v                    0x0076
+#define XK_V                    0x0056
+#define XK_h                    0x0068
+#define XK_H                    0x0048
+#define XK_r                    0x0072
+#define XK_R                    0x0052
 #define XK_bracketleft          0x005b
 #define XK_bracketright         0x005d
 

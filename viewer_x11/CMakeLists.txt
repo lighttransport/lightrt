@@ -17,6 +17,7 @@ set(SOURCES
     ../viewer/common/viewer_common.cc
     ../lightrt.cc
     ../lightrt_c.c
+    ../common/renderer.cc
     ../common/usd_loader.cc
 )
 
