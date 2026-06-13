@@ -298,6 +298,11 @@ int main(int argc, char **argv) {
             {"c11-hair", backend_lightrt_hair, 1},
             {"c11-sphere", backend_lightrt_sphere, 1},
             {"c11-sdf", backend_lightrt_sdf, 1},
+            /* same geometry as c11-bvh4/8 but via the Ray4/Ray8 packet path;
+             * explicit-only to keep "all" runs from doubling up */
+            {"c11-bvh4-pkt", backend_lightrt_bvh4_pkt, 1},
+            {"c11-bvh8-pkt", backend_lightrt_bvh8_pkt, 1},
+            {"c11-bvh4-1ray", backend_lightrt_bvh4_1ray, 1},
             {"embree", backend_embree, 0},
             {"tinybvh", backend_tinybvh, 0},
             {"mm-bvh", backend_madmann, 0},

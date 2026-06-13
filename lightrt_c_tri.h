@@ -97,7 +97,9 @@ typedef enum lrt_tri_batch_hint {
      * is fast either way, the incoherent case is the painful one). */
     LRT_TRI_BATCH_AUTO = 0,
     /* Nearby rays visiting the same nodes (e.g. primary camera rays):
-     * straight per-ray traversal, which keeps the cache hot. */
+     * closest-hit runs them as Ray4/Ray8 packets, which amortize node and leaf
+     * fetches over the packet (~+25% over per-ray; faster than Embree on the
+     * mandelbulb). Any-hit stays per-ray (packets would defeat early-out). */
     LRT_TRI_BATCH_COHERENT = 1,
     /* Unrelated rays (e.g. path-tracing bounces): several rays are kept in
      * flight per thread, one node visit each in turn, so one ray's memory

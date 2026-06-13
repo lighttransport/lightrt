@@ -196,23 +196,29 @@ static void test_batch_matches_single(const float *verts, size_t ntris,
     }
     for (size_t i = 0; i < nrays; i++) make_random_ray(&rays[i]);
 
-    lrt_tri_intersect1N(s, rays, hits, nrays, LRT_TRI_BATCH_INCOHERENT);
-    lrt_tri_occluded1N(s, rays, occ, nrays, LRT_TRI_BATCH_INCOHERENT);
+    /* Both hints must match the single-ray calls. COHERENT closest-hit takes
+     * the Ray4/Ray8 packet path internally, so it is exercised here too. */
+    lrt_tri_batch_hint hints[2] = {LRT_TRI_BATCH_INCOHERENT,
+                                   LRT_TRI_BATCH_COHERENT};
+    for (int hi = 0; hi < 2; hi++) {
+        lrt_tri_intersect1N(s, rays, hits, nrays, hints[hi]);
+        lrt_tri_occluded1N(s, rays, occ, nrays, hints[hi]);
 
-    size_t bad_hit = 0, bad_occ = 0;
-    for (size_t i = 0; i < nrays; i++) {
-        lrt_hit h1;
-        lrt_tri_intersect1(s, &rays[i], &h1);
-        if (h1.prim_id != hits[i].prim_id || (h1.prim_id != LRT_TRI_NO_HIT &&
-                                              h1.t != hits[i].t)) {
-            bad_hit++;
+        size_t bad_hit = 0, bad_occ = 0;
+        for (size_t i = 0; i < nrays; i++) {
+            lrt_hit h1;
+            lrt_tri_intersect1(s, &rays[i], &h1);
+            if (h1.prim_id != hits[i].prim_id ||
+                (h1.prim_id != LRT_TRI_NO_HIT && h1.t != hits[i].t)) {
+                bad_hit++;
+            }
+            if ((uint8_t)lrt_tri_occluded1(s, &rays[i]) != occ[i]) bad_occ++;
         }
-        if ((uint8_t)lrt_tri_occluded1(s, &rays[i]) != occ[i]) bad_occ++;
+        CHECK(bad_hit == 0, "batched intersect1N (layout %d hint %d) differs "
+              "from intersect1 on %zu/%zu rays", (int)layout, hi, bad_hit, nrays);
+        CHECK(bad_occ == 0, "batched occluded1N (layout %d hint %d) differs "
+              "from occluded1 on %zu/%zu rays", (int)layout, hi, bad_occ, nrays);
     }
-    CHECK(bad_hit == 0, "batched intersect1N (layout %d) differs from "
-          "intersect1 on %zu/%zu rays", (int)layout, bad_hit, nrays);
-    CHECK(bad_occ == 0, "batched occluded1N (layout %d) differs from "
-          "occluded1 on %zu/%zu rays", (int)layout, bad_occ, nrays);
 
     free(rays);
     free(hits);

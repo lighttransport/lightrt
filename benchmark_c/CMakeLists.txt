@@ -27,6 +27,7 @@ add_executable(bench_c
     backend_lightrt_cb.c
     backend_lightrt_tri.c
     backend_lightrt_ext.c
+    backend_lightrt_pkt.c
     backend_embree.c
     backend_tinybvh.cpp
     backend_madmann.cpp

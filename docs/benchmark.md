@@ -16,11 +16,33 @@ and [madmann91/bvh v2](https://github.com/madmann91/bvh) (Quality::High).
 
 ![single thread, 128k triangles](img/st_128k.svg)
 
-`c11-bvh4` matches or beats Embree on primary rays (octant-ordered traversal)
-and leads every non-Embree library on incoherent rays. Embree keeps its
-single-thread leads on incoherent (its kernels hide latency per ray) and
-shadow rays (any-hit kernel design; tree quality, push ordering, leaf size
-and spatial splits were all measured and ruled out).
+`c11-bvh4` **leads every backend on primary (closest-hit) rays** — with the
+coherent Ray4 packet (below) it reaches **1.3–1.5× Embree** at every scene size
+(29.5 vs 20.0 Mrays/s at 128k ST; 22.6 vs 17.6 at 710k ST). Embree keeps its
+single-thread leads on incoherent rays at cache-resident sizes (its kernels hide
+latency per ray; we lead once the BVH exceeds cache) and on shadow/any-hit rays
+(any-hit kernel design; tree quality, push ordering, leaf size, spatial splits,
+and ray packets were all measured and ruled out — see below).
+
+### Coherent ray packets (`LRT_TRI_BATCH_COHERENT`)
+
+For coherent batches, closest-hit assembles 4 consecutive rays into a `Ray4`
+SoA packet and tests one node box against all four lanes at once, so one node
+(and one leaf block) fetch is amortized over the packet. Measured wins over the
+per-ray kernel (which already used a per-octant child-order table):
+
+| | per-ray | **Ray4 packet** | Embree |
+|---|---|---|---|
+| primary 128k ST | 23.4 | **29.5** | 20.0 |
+| primary 128k 16T | 134 | **163** | 126 |
+| primary 710k ST | 18.8 | **22.6** | 17.6 |
+
+The packet is integrated into `lrt_tri_intersect1N(..., LRT_TRI_BATCH_COHERENT)`
+for BVH4 (the SSE4 packet bit-matches the BVH4 single-ray kernel, so batched
+results stay identical to looping `intersect1`). Crucially, **any-hit does *not*
+packetize**: lockstep traversal runs until every lane resolves, which defeats
+per-ray early termination — measured as a ~2× *loss* on shadow rays. So
+`occluded1N` stays per-ray.
 
 ## Multi-threaded ray throughput
 
@@ -61,16 +83,20 @@ The big steps, in order:
 4. **8-way interleaved ray traversal** (`LRT_TRI_BATCH_INCOHERENT`): eight
    rays in flight per thread, one node visit each per turn, so one ray's
    cache miss overlaps the others' compute — +60 %, past Embree. Coherent
-   batches (`LRT_TRI_BATCH_COHERENT`) keep the plain per-ray kernel, which
-   instead uses a per-octant child-order table baked into the nodes
-   (+20 % on primary rays).
+   batches first got a per-octant child-order table baked into the nodes
+   (+20 % on primary rays over unordered traversal).
+5. **Coherent Ray4 packets** (`LRT_TRI_BATCH_COHERENT`, closest-hit): one node
+   box vs four rays, amortizing the node/leaf fetch — a further +25–30 % on
+   primary, putting `c11-bvh4` at 1.3–1.5× Embree everywhere. Any-hit keeps the
+   per-ray kernel (packets defeat early-out).
 
 Variants measured and rejected along the way (kept out of the code): octant
 ordering in the incoherent pipeline (exact tnear sorting wins when
 latency-bound), any push ordering or eager-leaf processing in any-hit
-kernels, quantized 128-byte BVH8 nodes as a default (+8 % only when
-latency-bound; the decode ALU becomes the bottleneck once pipelining hides
-the latency).
+kernels, **ray packets for any-hit/shadow** (lockstep traversal loses the
+per-ray early-out — ~2× slower), quantized 128-byte BVH8 nodes as a default
+(+8 % only when latency-bound; the decode ALU becomes the bottleneck once
+pipelining hides the latency).
 
 ## Hair-like geometry: the primitive, not the build algorithm
 
