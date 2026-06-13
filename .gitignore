@@ -27,6 +27,10 @@ webgpu/softrt.wasm
 build/
 cmake-build-*/
 
+# Locally built toolchain (scripts/setup-and-build-glslang.sh)
+tools/
+build_glslang/
+
 # IDE files
 .vscode/
 .idea/

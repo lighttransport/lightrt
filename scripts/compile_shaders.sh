@@ -13,11 +13,23 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SH="${SCRIPT_DIR}/../vk/shaders"
-GLSLANG="${GLSLANG:-glslangValidator}"
+
+# Prefer the locally built glslang (scripts/setup-and-build-glslang.sh): the
+# trace_ray_query shader needs GL_EXT_ray_query, which older system glslang
+# (Vulkan SDK < 1.2 / glslang < 11) does not support.
+if [[ -z "${GLSLANG:-}" ]]; then
+    if [[ -x "${REPO_ROOT}/tools/bin/glslangValidator" ]]; then
+        GLSLANG="${REPO_ROOT}/tools/bin/glslangValidator"
+    else
+        GLSLANG="glslangValidator"
+    fi
+fi
 
 if ! command -v "${GLSLANG}" >/dev/null 2>&1; then
-    echo "error: ${GLSLANG} not found. Install the Vulkan SDK or set GLSLANG=..." >&2
+    echo "error: ${GLSLANG} not found. Run scripts/setup-and-build-glslang.sh," >&2
+    echo "       install the Vulkan SDK, or set GLSLANG=..." >&2
     exit 1
 fi
 
