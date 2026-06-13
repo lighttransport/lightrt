@@ -108,6 +108,25 @@ int lrt_vk_trace_scene_rtx(lrt_vk_engine *e, const float *vertices, uint32_t ntr
                            const lrt_ray *rays, uint32_t n, lrt_hit *out,
                            lrt_result *err);
 
+/* Resident ray-tracing scene: build the acceleration structure ONCE and trace
+ * many ray batches against it. Unlike the one-shot lrt_vk_trace_scene_rtx (which
+ * rebuilds the AS per call), the BLAS+TLAS stay device-resident and the trace
+ * uses device-local ray/hit buffers (bulk staged), so lrt_vk_rtx_scene_trace
+ * measures GPU traversal throughput rather than per-batch build + transfer cost.
+ * The engine must outlive the scene. */
+typedef struct lrt_vk_rtx_scene lrt_vk_rtx_scene;
+
+lrt_vk_rtx_scene *lrt_vk_rtx_scene_build(lrt_vk_engine *e, const float *vertices,
+                                         uint32_t ntris, lrt_result *err);
+
+/* Trace n rays against the resident AS. Returns #rays that hit, or -1 on error.
+ * Trace buffers are reused/grown across calls. */
+int lrt_vk_rtx_scene_trace(lrt_vk_engine *e, lrt_vk_rtx_scene *s,
+                           const lrt_ray *rays, uint32_t n, lrt_hit *out,
+                           lrt_result *err);
+
+void lrt_vk_rtx_scene_free(lrt_vk_engine *e, lrt_vk_rtx_scene *s);
+
 #ifdef __cplusplus
 }
 #endif

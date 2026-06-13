@@ -31,6 +31,15 @@
 #ifndef VK_ACCESS_HOST_READ_BIT
 #define VK_ACCESS_HOST_READ_BIT 0x00002000
 #endif
+#ifndef VK_PIPELINE_STAGE_TRANSFER_BIT
+#define VK_PIPELINE_STAGE_TRANSFER_BIT 0x00001000
+#endif
+#ifndef VK_ACCESS_TRANSFER_READ_BIT
+#define VK_ACCESS_TRANSFER_READ_BIT 0x00000800
+#endif
+#ifndef VK_ACCESS_TRANSFER_WRITE_BIT
+#define VK_ACCESS_TRANSFER_WRITE_BIT 0x00001000
+#endif
 
 /* GPU-assisted build hook implemented in lightrt_c_tri.c (not a public ABI). */
 extern lrt_tri_scene *lrt_tri_scene_build_lbvh_morton(const float *vertices,
@@ -1223,124 +1232,249 @@ static int vk_descriptors_bind_rtx(lrt_vk_engine *e, VkDescriptorSetLayout dsl,
     return 1;
 }
 
-int lrt_vk_trace_scene_rtx(lrt_vk_engine *e, const float *vertices, uint32_t ntris,
-                           const lrt_ray *rays, uint32_t n, lrt_hit *out,
-                           lrt_result *err) {
-    if (!e || !vertices || ntris == 0 || (n && (!rays || !out))) {
+/* Resident ray-tracing scene: the BLAS+TLAS are built once and kept on the
+ * device; the trace working set (device-local ray/hit buffers + host-visible
+ * staging) is allocated lazily and reused/grown across traces. This is what
+ * makes lrt_vk_rtx_scene_trace measure traversal, not per-call AS build. */
+struct lrt_vk_rtx_scene {
+    vk_accel blas;
+    vk_accel tlas;
+    vk_buffer rays_dev;   /* device-local STORAGE | TRANSFER_DST */
+    vk_buffer hits_dev;   /* device-local STORAGE | TRANSFER_SRC */
+    vk_buffer rays_stage; /* host-visible TRANSFER_SRC           */
+    vk_buffer hits_stage; /* host-visible TRANSFER_DST           */
+    uint32_t cap;         /* trace-buffer capacity in rays       */
+};
+
+lrt_vk_rtx_scene *lrt_vk_rtx_scene_build(lrt_vk_engine *e, const float *vertices,
+                                         uint32_t ntris, lrt_result *err) {
+    if (!e || !vertices || ntris == 0) {
         if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
-        return -1;
+        return NULL;
     }
     if (!(e->caps & LRT_VK_CAP_RAY_QUERY) || !vkCreateAccelerationStructureKHR) {
         vk_set_err(e, "ray_query unavailable (create the engine with "
                       "want_ray_tracing=1 on an RT-capable device)");
         if (err) *err = LRT_RESULT_NOT_BUILT;
+        return NULL;
+    }
+    if (!rtx_get_pipeline(e)) {
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return NULL;
+    }
+
+    lrt_vk_rtx_scene *s = (lrt_vk_rtx_scene *)calloc(1, sizeof(*s));
+    if (!s) {
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return NULL;
+    }
+
+    /* The vertex/instance build inputs are only needed during the build — once
+     * vkCmdBuildAccelerationStructures completes, the AS is self-contained, so
+     * they are freed here and the resident scene holds only the BLAS + TLAS. */
+    vk_buffer vbuf = {0}, ibuf = {0};
+    int ok = 0;
+    do {
+        if (!vk_buffer_create_ex(
+                e, (VkDeviceSize)ntris * 9u * sizeof(float),
+                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+                1, 1, &vbuf))
+            break;
+        if (!vk_buffer_write(e, &vbuf, vertices, (size_t)ntris * 9u * sizeof(float)))
+            break;
+        uint64_t vaddr = vk_device_address(e, &vbuf);
+
+        VkAccelerationStructureGeometryKHR tgeom;
+        memset(&tgeom, 0, sizeof(tgeom));
+        tgeom.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+        tgeom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        tgeom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+        tgeom.geometry.triangles.sType =
+            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+        tgeom.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        tgeom.geometry.triangles.vertexData.deviceAddress = vaddr;
+        tgeom.geometry.triangles.vertexStride = 3u * sizeof(float);
+        tgeom.geometry.triangles.maxVertex = ntris * 3u - 1u;
+        tgeom.geometry.triangles.indexType = VK_INDEX_TYPE_NONE_KHR;
+        if (!vk_build_accel(e, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+                            &tgeom, ntris, &s->blas))
+            break;
+
+        VkAccelerationStructureInstanceKHR inst;
+        memset(&inst, 0, sizeof(inst));
+        inst.transform.matrix[0][0] = 1.0f;
+        inst.transform.matrix[1][1] = 1.0f;
+        inst.transform.matrix[2][2] = 1.0f;
+        inst.mask = 0xFFu;
+        inst.accelerationStructureReference = s->blas.address;
+        if (!vk_buffer_create_ex(
+                e, sizeof(inst),
+                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+                1, 1, &ibuf))
+            break;
+        if (!vk_buffer_write(e, &ibuf, &inst, sizeof(inst))) break;
+        uint64_t iaddr = vk_device_address(e, &ibuf);
+
+        VkAccelerationStructureGeometryKHR igeom;
+        memset(&igeom, 0, sizeof(igeom));
+        igeom.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+        igeom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+        igeom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+        igeom.geometry.instances.sType =
+            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+        igeom.geometry.instances.arrayOfPointers = VK_FALSE;
+        igeom.geometry.instances.data.deviceAddress = iaddr;
+        if (!vk_build_accel(e, VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, &igeom,
+                            1, &s->tlas))
+            break;
+        ok = 1;
+    } while (0);
+
+    vk_buffer_destroy(e, &vbuf);
+    vk_buffer_destroy(e, &ibuf);
+    if (!ok) {
+        vk_accel_destroy(e, &s->tlas);
+        vk_accel_destroy(e, &s->blas);
+        free(s);
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return NULL;
+    }
+    if (err) *err = LRT_RESULT_OK;
+    return s;
+}
+
+/* Grow the device-local + staging trace buffers to hold at least n rays. */
+static int rtx_scene_ensure(lrt_vk_engine *e, lrt_vk_rtx_scene *s, uint32_t n) {
+    if (s->rays_dev.buf && n <= s->cap) return 1;
+    vk_buffer_destroy(e, &s->rays_dev);
+    vk_buffer_destroy(e, &s->hits_dev);
+    vk_buffer_destroy(e, &s->rays_stage);
+    vk_buffer_destroy(e, &s->hits_stage);
+    s->cap = 0;
+    VkDeviceSize rb = (VkDeviceSize)n * sizeof(lrt_ray);
+    VkDeviceSize hb = (VkDeviceSize)n * sizeof(lrt_hit);
+    if (!vk_buffer_create_ex(e, rb,
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                             0, 0, &s->rays_dev) ||
+        !vk_buffer_create_ex(e, hb,
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                             0, 0, &s->hits_dev) ||
+        !vk_buffer_create_ex(e, rb, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 1, 0,
+                             &s->rays_stage) ||
+        !vk_buffer_create_ex(e, hb, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1, 0,
+                             &s->hits_stage))
+        return 0;
+    s->cap = n;
+    return 1;
+}
+
+static void vk_buf_barrier(VkCommandBuffer cb, VkFlags src_stage, VkFlags dst_stage,
+                           VkFlags src_access, VkFlags dst_access) {
+    VkMemoryBarrier mb;
+    memset(&mb, 0, sizeof(mb));
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = src_access;
+    mb.dstAccessMask = dst_access;
+    vkCmdPipelineBarrier(cb, src_stage, dst_stage, 0, 1, &mb, 0, NULL, 0, NULL);
+}
+
+int lrt_vk_rtx_scene_trace(lrt_vk_engine *e, lrt_vk_rtx_scene *s,
+                           const lrt_ray *rays, uint32_t n, lrt_hit *out,
+                           lrt_result *err) {
+    if (!e || !s || (n && (!rays || !out))) {
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
         return -1;
     }
     if (n == 0) {
         if (err) *err = LRT_RESULT_OK;
         return 0;
     }
-
     vk_pipeline *pipe = rtx_get_pipeline(e);
-    if (!pipe) {
+    if (!pipe || !rtx_scene_ensure(e, s, n)) {
         if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
         return -1;
     }
 
-    vk_buffer vbuf = {0}, ibuf = {0}, rbuf = {0}, hbuf = {0};
-    vk_accel blas = {0}, tlas = {0};
-    int rc = -1;
-
-    /* Vertex buffer (BLAS build input). */
-    if (!vk_buffer_create_ex(
-            e, (VkDeviceSize)ntris * 9u * sizeof(float),
-            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, 1,
-            1, &vbuf))
-        goto done;
-    if (!vk_buffer_write(e, &vbuf, vertices, (size_t)ntris * 9u * sizeof(float)))
-        goto done;
-    uint64_t vaddr = vk_device_address(e, &vbuf);
-
-    /* BLAS over the triangles (vertex format R32G32B32, no index buffer). */
-    VkAccelerationStructureGeometryKHR tgeom;
-    memset(&tgeom, 0, sizeof(tgeom));
-    tgeom.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
-    tgeom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-    tgeom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
-    tgeom.geometry.triangles.sType =
-        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
-    tgeom.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-    tgeom.geometry.triangles.vertexData.deviceAddress = vaddr;
-    tgeom.geometry.triangles.vertexStride = 3u * sizeof(float);
-    tgeom.geometry.triangles.maxVertex = ntris * 3u - 1u;
-    tgeom.geometry.triangles.indexType = VK_INDEX_TYPE_NONE_KHR;
-    if (!vk_build_accel(e, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, &tgeom,
-                        ntris, &blas))
-        goto done;
-
-    /* One identity instance referencing the BLAS. */
-    VkAccelerationStructureInstanceKHR inst;
-    memset(&inst, 0, sizeof(inst));
-    inst.transform.matrix[0][0] = 1.0f;
-    inst.transform.matrix[1][1] = 1.0f;
-    inst.transform.matrix[2][2] = 1.0f;
-    inst.mask = 0xFFu;
-    inst.accelerationStructureReference = blas.address;
-    if (!vk_buffer_create_ex(
-            e, sizeof(inst),
-            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, 1,
-            1, &ibuf))
-        goto done;
-    if (!vk_buffer_write(e, &ibuf, &inst, sizeof(inst))) goto done;
-    uint64_t iaddr = vk_device_address(e, &ibuf);
-
-    /* TLAS over the single instance. */
-    VkAccelerationStructureGeometryKHR igeom;
-    memset(&igeom, 0, sizeof(igeom));
-    igeom.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
-    igeom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
-    igeom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
-    igeom.geometry.instances.sType =
-        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
-    igeom.geometry.instances.arrayOfPointers = VK_FALSE;
-    igeom.geometry.instances.data.deviceAddress = iaddr;
-    if (!vk_build_accel(e, VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, &igeom, 1,
-                        &tlas))
-        goto done;
-
-    /* Trace. */
-    if (!vk_buffer_create(e, (VkDeviceSize)n * sizeof(lrt_ray), &rbuf) ||
-        !vk_buffer_create(e, (VkDeviceSize)n * sizeof(lrt_hit), &hbuf))
-        goto done;
-    if (!vk_buffer_write(e, &rbuf, rays, (size_t)n * sizeof(lrt_ray))) goto done;
-
-    {
-        VkDescriptorPool pool;
-        VkDescriptorSet set;
-        if (!vk_descriptors_bind_rtx(e, pipe->dsl, tlas.as, &rbuf, &hbuf, &pool,
-                                     &set))
-            goto done;
-        rtx_push pc;
-        pc.ray_count = n;
-        int run_ok =
-            vk_dispatch(e, pipe, set, &pc, (uint32_t)sizeof(pc), (n + 63u) / 64u);
-        vkDestroyDescriptorPool(e->device, pool, NULL);
-        if (!run_ok) goto done;
-        if (!vk_buffer_read(e, &hbuf, out, (size_t)n * sizeof(lrt_hit))) goto done;
+    /* Host -> staging (bulk memcpy), then one command buffer does staging ->
+     * device-local rays, dispatch (reads/writes VRAM), device-local hits ->
+     * staging — all with barriers, a single submit. */
+    if (!vk_buffer_write(e, &s->rays_stage, rays, (size_t)n * sizeof(lrt_ray))) {
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return -1;
     }
 
-    rc = 0;
-    for (uint32_t i = 0; i < n; i++)
-        if (out[i].prim_id != LRT_TRI_NO_HIT) rc++;
-    if (err) *err = LRT_RESULT_OK;
+    VkDescriptorPool pool;
+    VkDescriptorSet set;
+    if (!vk_descriptors_bind_rtx(e, pipe->dsl, s->tlas.as, &s->rays_dev,
+                                 &s->hits_dev, &pool, &set)) {
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return -1;
+    }
 
-done:
-    vk_buffer_destroy(e, &rbuf);
-    vk_buffer_destroy(e, &hbuf);
-    vk_accel_destroy(e, &tlas);
-    vk_buffer_destroy(e, &ibuf);
-    vk_accel_destroy(e, &blas);
-    vk_buffer_destroy(e, &vbuf);
-    if (rc < 0 && err) *err = LRT_RESULT_OUT_OF_MEMORY;
+    int run_ok = 0;
+    VkCommandBuffer cb = vk_cmd_begin(e);
+    if (cb != VK_NULL_HANDLE) {
+        VkBufferCopy up = {0, 0, (VkDeviceSize)n * sizeof(lrt_ray)};
+        vkCmdCopyBuffer(cb, s->rays_stage.buf, s->rays_dev.buf, 1, &up);
+        vk_buf_barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        rtx_push pc;
+        pc.ray_count = n;
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->pipe);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->layout, 0,
+                                1, &set, 0, NULL);
+        vkCmdPushConstants(cb, pipe->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           (uint32_t)sizeof(pc), &pc);
+        vkCmdDispatch(cb, (n + 63u) / 64u, 1, 1);
+        vk_buf_barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                       VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferCopy down = {0, 0, (VkDeviceSize)n * sizeof(lrt_hit)};
+        vkCmdCopyBuffer(cb, s->hits_dev.buf, s->hits_stage.buf, 1, &down);
+        vk_buf_barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                       VK_ACCESS_HOST_READ_BIT);
+        run_ok = vk_cmd_end_submit(e, cb);
+    }
+    vkDestroyDescriptorPool(e->device, pool, NULL);
+    if (!run_ok) {
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return -1;
+    }
+    if (!vk_buffer_read(e, &s->hits_stage, out, (size_t)n * sizeof(lrt_hit))) {
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return -1;
+    }
+
+    int hits = 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (out[i].prim_id != LRT_TRI_NO_HIT) hits++;
+    if (err) *err = LRT_RESULT_OK;
+    return hits;
+}
+
+void lrt_vk_rtx_scene_free(lrt_vk_engine *e, lrt_vk_rtx_scene *s) {
+    if (!e || !s) return;
+    vkDeviceWaitIdle(e->device);
+    vk_buffer_destroy(e, &s->rays_dev);
+    vk_buffer_destroy(e, &s->hits_dev);
+    vk_buffer_destroy(e, &s->rays_stage);
+    vk_buffer_destroy(e, &s->hits_stage);
+    vk_accel_destroy(e, &s->tlas);
+    vk_accel_destroy(e, &s->blas);
+    free(s);
+}
+
+/* One-shot convenience: build a resident scene, trace once, free. */
+int lrt_vk_trace_scene_rtx(lrt_vk_engine *e, const float *vertices, uint32_t ntris,
+                           const lrt_ray *rays, uint32_t n, lrt_hit *out,
+                           lrt_result *err) {
+    lrt_vk_rtx_scene *s = lrt_vk_rtx_scene_build(e, vertices, ntris, err);
+    if (!s) return -1;
+    int rc = lrt_vk_rtx_scene_trace(e, s, rays, n, out, err);
+    lrt_vk_rtx_scene_free(e, s);
     return rc;
 }

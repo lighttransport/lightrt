@@ -733,7 +733,10 @@ device is present.
   raw triangles (the AS is vendor-opaque, so trace-only — it cannot feed Path B).
   Requires `lrt_vk_engine_caps() & LRT_VK_CAP_RAY_QUERY` (engine created with
   `want_ray_tracing=1` on an RT-capable device); hits match a Moller-Trumbore CPU
-  trace within fp tolerance.
+  trace within fp tolerance. For repeated tracing, build the AS once with the
+  resident API — `lrt_vk_rtx_scene_build` / `lrt_vk_rtx_scene_trace` /
+  `lrt_vk_rtx_scene_free` — which keeps the BLAS+TLAS device-resident and traces
+  via device-local ray/hit buffers (the one-shot call above is build+trace+free).
 
 ### Engine
 `lrt_vk_engine_create` (NULL → caller falls back to CPU), `_destroy`, `_caps`
@@ -774,9 +777,11 @@ cmake -S benchmark_c -B build_bench_c -DLRTBENCH_VK=ON
 ```
 
 ### Notes / current limits
-- `vk-trace`/`vk-rtx` benchmark throughput is per-batch-bound (`vk-trace` re-uploads
-  the BVH each call; `vk-rtx` rebuilds the AS each call); a resident-scene/AS mode
-  and a GPU any-hit/occlusion path are follow-ups.
+- `vk-rtx` uses the resident AS (built once) + device-local trace buffers, so its
+  benchmark number reflects traversal + per-batch ray/hit PCIe transfer (it beats
+  embree on incoherent rays on an RTX 3070). `vk-trace` still re-uploads the BVH
+  per call (a resident compute-trace mode and a GPU any-hit/occlusion path are
+  follow-ups).
 - Path B v1 is hybrid (GPU front end, CPU hierarchy); full-GPU LBVH (radix sort /
   Karras tree / collapse on GPU) is a planned v2/v3.
 
