@@ -709,6 +709,67 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
   / `lrt_tlas_refit` — two-level BVH with per-instance 3×4 affine transforms,
   `instance_id`, and a visibility `mask`.
 
+## Vulkan GPU Interop (`lightrt_c_vk.h`)
+
+Optional Vulkan-compute GPU interop for the C11 triangle kernel, in **both
+directions**. The Vulkan loader (`lightrt_vkew.{h,c}`) is a C11 port of vkew that
+`dlopen`s libvulkan at runtime: **no Vulkan SDK headers, no link-time `-lvulkan`,
+no `find_package(Vulkan)`**. Build is opt-in and the test skips (exit 0) when no
+device is present.
+
+### Directions
+- **Path A — CPU build → GPU trace**: `lrt_vk_trace_scene(engine, scene, rays, n,
+  out, err)`. Uploads a scene built by `lrt_tri_scene_build` and traverses it with
+  a compute shader that mirrors the scalar CPU kernel (identical hits within fp
+  tolerance). Plain triangle scenes, BVH4/BVH8 only.
+- **Path B — GPU build → CPU trace**: `lrt_vk_build_scene(engine, verts, ntris,
+  layout, &scene, err)`. Computes centroids + 30-bit Morton codes on the GPU,
+  finishes the LBVH (radix sort + collapse + leaf packing) on the CPU, and returns
+  a heap `lrt_tri_scene` usable with the normal `lrt_tri_*` queries. Matches a FAST
+  CPU build.
+
+### Engine
+`lrt_vk_engine_create` (NULL → caller falls back to CPU), `_destroy`, `_caps`
+(`LRT_VK_CAP_COMPUTE/BUFFER_ADDRESS/ACCEL_STRUCT/RAY_QUERY`), `_device_name`,
+`_last_error`. A single engine is reusable but not thread-safe (one queue).
+
+### How it works
+- Both directions bridge through the existing LRTS serialization blob
+  (`lrt_tri_scene_save_to_memory` / `load_from_memory`); the latter bounds-checks
+  every child ref, so GPU-built trees are validated for free. `block_stride` must
+  equal `tri_block_size(layout)`.
+- `vk/shaders/trace_bvh.comp` mirrors `tri_intersect_scalar` exactly over **raw
+  `uint[]` SSBOs with manual offset math** (not std430 structs), so the GPU sees
+  byte-identical `lrt_bvh{4,8}_node` / `lrt_tri{4,8}` data. Spec constant `W` (4/8)
+  + `STACK`; node stride = `8*W` words, block stride = `10*W` words, prim_id at
+  word `9*W`. Parity constants replicated: invd clamp `1e18`, MT det `±1e-12`,
+  slab `(bound-org)*invd`, deferred tnear culling.
+- Path B uses the internal hook `lrt_tri_scene_build_lbvh_morton` in
+  `lightrt_c_tri.c` (a refactor of the builder taking optional precomputed Morton
+  codes; not a public-ABI entry).
+- Shaders are **pre-compiled to checked-in SPIR-V** (`vk/shaders/*.spv.h`), so a
+  normal build needs no shader toolchain. Regenerate after editing a `.comp` with
+  `scripts/compile_shaders.sh` (needs `glslangValidator`).
+
+### Build / test / benchmark
+```bash
+cmake -S . -B build_vk -DLIGHTRT_BUILD_VK=ON -DBUILD_TESTING=ON
+cmake --build build_vk && ctest --test-dir build_vk -R lightrt_c_vk_test
+make vk_test && ./lightrt_c_vk_test          # Makefile path (opt-in)
+make shaders                                  # optional SPIR-V regen
+cmake -S benchmark_c -B build_bench_c -DLRTBENCH_VK=ON
+./build_bench_c/bench_c --backend vk-trace --verify   # GPU trace backend
+```
+
+### Notes / current limits
+- The optional `VK_KHR_ray_query` HW path has loader hooks + capability detection
+  only (a HW acceleration structure is vendor-opaque, so it can serve trace but
+  never feed Path B); the ray_query trace backend is a follow-up.
+- `vk-trace` benchmark throughput is upload-bound (one-shot upload+trace+download
+  per batch); a resident-scene mode and a GPU any-hit/occlusion path are follow-ups.
+- Path B v1 is hybrid (GPU front end, CPU hierarchy); full-GPU LBVH (radix sort /
+  Karras tree / collapse on GPU) is a planned v2/v3.
+
 ## Code Conventions
 
 - C++17, no RTTI (`-fno-rtti`), no exceptions (`-fno-exceptions`)

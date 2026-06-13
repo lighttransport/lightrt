@@ -31,6 +31,7 @@ add_executable(bench_c
     backend_embree.c
     backend_tinybvh.cpp
     backend_madmann.cpp
+    backend_lightrt_vk.c
     ../lightrt_c.c
     ../lightrt_c_tri.c
 )
@@ -53,6 +54,18 @@ endif()
 
 find_package(Threads REQUIRED)
 target_link_libraries(bench_c PRIVATE Threads::Threads m)
+
+# --- Optional Vulkan GPU trace backend (runtime dlopen; no SDK, no -lvulkan) ---
+# backend_lightrt_vk.c always compiles (NULL stub) unless LRTBENCH_VK is set.
+option(LRTBENCH_VK "Build the Vulkan GPU trace backend" OFF)
+if(LRTBENCH_VK)
+    target_sources(bench_c PRIVATE ../lightrt_vkew.c ../lightrt_c_vk.c)
+    target_compile_definitions(bench_c PRIVATE LRTBENCH_HAVE_VK)
+    target_link_libraries(bench_c PRIVATE ${CMAKE_DL_LIBS})
+    message(STATUS "bench_c: Vulkan GPU backend enabled (runtime dlopen)")
+else()
+    message(STATUS "bench_c: Vulkan GPU backend disabled (-DLRTBENCH_VK=ON to enable)")
+endif()
 
 # --- Optional jbikker/tinybvh (scripts/download_libs.sh) ---
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tinybvh/tiny_bvh.h")

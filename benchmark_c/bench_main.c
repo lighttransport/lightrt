@@ -313,6 +313,8 @@ int main(int argc, char **argv) {
             {"embree", backend_embree, 0},
             {"tinybvh", backend_tinybvh, 0},
             {"mm-bvh", backend_madmann, 0},
+            /* Vulkan GPU trace (Path A): explicit-only; per-batch upload+trace */
+            {"vk-trace", backend_lightrt_vk, 1},
         };
         int want_all = !strcmp(cfg.backends, "all");
         for (size_t r = 0; r < sizeof(registry) / sizeof(registry[0]); r++) {

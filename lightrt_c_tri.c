@@ -5335,9 +5335,10 @@ static int tri_collapse_into(lrt_tri_scene *s, tri_build_ctx *bc,
     return 0;
 }
 
-lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
-                                   const lrt_tri_build_options *opts,
-                                   lrt_result *err) {
+static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
+                                           const lrt_tri_build_options *opts,
+                                           const uint32_t *morton_override,
+                                           lrt_result *err) {
     tri_set_err(err, LRT_RESULT_OK);
     if (!vertices || ntris == 0 || ntris > 0x07FFFFFFu) {
         /* leaf-ref encoding: block index needs 27 bits -> <= ~134M blocks */
@@ -5464,7 +5465,16 @@ lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
             tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
             return NULL;
         }
-        tri_morton_encode(&bc, lbvh_keys, num_threads);
+        if (morton_override) {
+            /* GPU-assisted build: take the 30-bit Morton codes from the caller
+             * (computed on the GPU) instead of encoding them on the CPU. */
+            for (size_t i = 0; i < ntris; i++)
+                lbvh_keys[i] =
+                    ((uint64_t)(morton_override[i] & 0x3FFFFFFFu) << 32) |
+                    (uint64_t)i;
+        } else {
+            tri_morton_encode(&bc, lbvh_keys, num_threads);
+        }
         const uint64_t *sorted = tri_radix_sort_keys(lbvh_keys, lbvh_tmp, ntris);
         for (size_t i = 0; i < ntris; i++) {
             bc.indices[i] = (uint32_t)sorted[i];
@@ -5591,6 +5601,36 @@ lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
                                     : "bvh8/scalar";
 #endif
     return s;
+}
+
+lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
+                                   const lrt_tri_build_options *opts,
+                                   lrt_result *err) {
+    return tri_scene_build_impl(vertices, ntris, opts, NULL, err);
+}
+
+/* GPU-assisted build hook used by lightrt_c_vk.c (declared extern there; not in
+ * the public header). Build a FAST (LBVH) triangle scene from caller-supplied
+ * 30-bit Morton codes (morton[i] in [0, 2^30)) instead of encoding them on the
+ * CPU. Given identical codes this is byte-identical to lrt_tri_scene_build()
+ * with LRT_TRI_BUILD_FAST. layout must be BVH4 or BVH8. */
+lrt_tri_scene *lrt_tri_scene_build_lbvh_morton(const float *vertices,
+                                               size_t ntris,
+                                               const uint32_t *morton,
+                                               lrt_tri_layout layout,
+                                               unsigned max_leaf_size,
+                                               lrt_result *err) {
+    if (!morton) {
+        tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
+        return NULL;
+    }
+    lrt_tri_build_options o;
+    memset(&o, 0, sizeof(o));
+    o.quality = LRT_TRI_BUILD_FAST;
+    o.layout = layout;
+    o.max_leaf_size = max_leaf_size;
+    o.num_threads = 1;
+    return tri_scene_build_impl(vertices, ntris, &o, morton, err);
 }
 
 /* Release a memory-mapped scene's backing store. The mmap path is implemented
