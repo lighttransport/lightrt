@@ -727,6 +727,13 @@ device is present.
   finishes the LBVH (radix sort + collapse + leaf packing) on the CPU, and returns
   a heap `lrt_tri_scene` usable with the normal `lrt_tri_*` queries. Matches a FAST
   CPU build.
+- **Path C — hardware ray tracing**: `lrt_vk_trace_scene_rtx(engine, verts, ntris,
+  rays, n, out, err)`. Builds a real `VkAccelerationStructure` (BLAS + identity
+  TLAS) on the GPU and traces it with a `GL_EXT_ray_query` compute shader. Takes
+  raw triangles (the AS is vendor-opaque, so trace-only — it cannot feed Path B).
+  Requires `lrt_vk_engine_caps() & LRT_VK_CAP_RAY_QUERY` (engine created with
+  `want_ray_tracing=1` on an RT-capable device); hits match a Moller-Trumbore CPU
+  trace within fp tolerance.
 
 ### Engine
 `lrt_vk_engine_create` (NULL → caller falls back to CPU), `_destroy`, `_caps`
@@ -747,9 +754,14 @@ device is present.
 - Path B uses the internal hook `lrt_tri_scene_build_lbvh_morton` in
   `lightrt_c_tri.c` (a refactor of the builder taking optional precomputed Morton
   codes; not a public-ABI entry).
+- Path C builds the AS via the soft-loaded `VK_KHR_acceleration_structure` /
+  `ray_query` entry points (AS-input and scratch buffers use device addresses;
+  the `trace_ray_query.comp` descriptor set binds the TLAS + ray/hit SSBOs).
 - Shaders are **pre-compiled to checked-in SPIR-V** (`vk/shaders/*.spv.h`), so a
   normal build needs no shader toolchain. Regenerate after editing a `.comp` with
-  `scripts/compile_shaders.sh` (needs `glslangValidator`).
+  `scripts/compile_shaders.sh` — note `trace_ray_query.comp` needs a glslang with
+  `GL_EXT_ray_query` (Vulkan SDK ≥1.2 / glslang ≥11; the checked-in set was built
+  with one).
 
 ### Build / test / benchmark
 ```bash
@@ -758,15 +770,13 @@ cmake --build build_vk && ctest --test-dir build_vk -R lightrt_c_vk_test
 make vk_test && ./lightrt_c_vk_test          # Makefile path (opt-in)
 make shaders                                  # optional SPIR-V regen
 cmake -S benchmark_c -B build_bench_c -DLRTBENCH_VK=ON
-./build_bench_c/bench_c --backend vk-trace --verify   # GPU trace backend
+./build_bench_c/bench_c --backend vk-trace,vk-rtx --verify  # GPU trace + HW RT
 ```
 
 ### Notes / current limits
-- The optional `VK_KHR_ray_query` HW path has loader hooks + capability detection
-  only (a HW acceleration structure is vendor-opaque, so it can serve trace but
-  never feed Path B); the ray_query trace backend is a follow-up.
-- `vk-trace` benchmark throughput is upload-bound (one-shot upload+trace+download
-  per batch); a resident-scene mode and a GPU any-hit/occlusion path are follow-ups.
+- `vk-trace`/`vk-rtx` benchmark throughput is per-batch-bound (`vk-trace` re-uploads
+  the BVH each call; `vk-rtx` rebuilds the AS each call); a resident-scene/AS mode
+  and a GPU any-hit/occlusion path are follow-ups.
 - Path B v1 is hybrid (GPU front end, CPU hierarchy); full-GPU LBVH (radix sort /
   Karras tree / collapse on GPU) is a planned v2/v3.
 

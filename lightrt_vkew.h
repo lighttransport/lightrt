@@ -1452,6 +1452,18 @@ typedef struct VkPhysicalDeviceBufferDeviceAddressFeatures {
     VkBool32 bufferDeviceAddressMultiDevice;
 } VkPhysicalDeviceBufferDeviceAddressFeatures;
 
+// Chained into VkMemoryAllocateInfo.pNext to make a buffer's device address
+// usable (VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT) — required for AS-input and
+// scratch buffers fed to vkCmdBuildAccelerationStructuresKHR.
+#define VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO 1000060000
+#define VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT 0x00000002
+typedef struct VkMemoryAllocateFlagsInfo {
+    VkStructureType sType;
+    const void* pNext;
+    VkFlags flags;
+    uint32_t deviceMask;
+} VkMemoryAllocateFlagsInfo;
+
 typedef VkDeviceAddress (VKAPI_PTR *PFN_vkGetBufferDeviceAddress)(VkDevice, const VkBufferDeviceAddressInfo*);
 typedef VkDeviceAddress (VKAPI_PTR *PFN_vkGetBufferDeviceAddressKHR)(VkDevice, const VkBufferDeviceAddressInfo*);
 typedef void (VKAPI_PTR *PFN_vkGetAccelerationStructureBuildSizesKHR)(VkDevice, VkAccelerationStructureBuildTypeKHR, const VkAccelerationStructureBuildGeometryInfoKHR*, const uint32_t*, VkAccelerationStructureBuildSizesInfoKHR*);

@@ -20,8 +20,9 @@
 #include "lightrt_vkew.h"
 
 /* Embedded SPIR-V (checked in; regenerate with scripts/compile_shaders.sh). */
-#include "vk/shaders/trace_bvh.spv.h"     /* trace_bvh_spv[]    */
-#include "vk/shaders/build_morton.spv.h"  /* build_morton_spv[] */
+#include "vk/shaders/trace_bvh.spv.h"        /* trace_bvh_spv[]       */
+#include "vk/shaders/build_morton.spv.h"     /* build_morton_spv[]    */
+#include "vk/shaders/trace_ray_query.spv.h"  /* trace_ray_query_spv[] */
 
 /* Host-read sync flags not declared in lightrt_vkew.h. */
 #ifndef VK_PIPELINE_STAGE_HOST_BIT
@@ -91,6 +92,7 @@ struct lrt_vk_engine {
 
     vk_pipeline trace_pipes[VK_TRACE_PIPE_CACHE];
     vk_pipeline build_pipe; /* build_morton: no spec constants */
+    vk_pipeline rtx_pipe;   /* trace_ray_query: AS + 2 SSBO bindings */
 };
 
 static void vk_set_err(lrt_vk_engine *e, const char *msg) {
@@ -123,15 +125,21 @@ typedef struct vk_buffer {
     VkDeviceSize size;
 } vk_buffer;
 
-static int vk_buffer_create(lrt_vk_engine *e, VkDeviceSize size, vk_buffer *out) {
+/* Full buffer creation: arbitrary usage, host-visible (mappable) or device-local
+ * memory, and optionally device-address-capable (chains VkMemoryAllocateFlagsInfo
+ * + adds SHADER_DEVICE_ADDRESS usage) for AS-input / scratch buffers. */
+static int vk_buffer_create_ex(lrt_vk_engine *e, VkDeviceSize size,
+                               VkBufferUsageFlags usage, int host_visible,
+                               int device_addr, vk_buffer *out) {
     memset(out, 0, sizeof(*out));
     if (size == 0) size = 16;
     out->size = size;
+    if (device_addr) usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     VkBufferCreateInfo bi;
     memset(&bi, 0, sizeof(bi));
     bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bi.size = size;
-    bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bi.usage = usage;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VkResult r = vkCreateBuffer(e->device, &bi, NULL, &out->buf);
     if (r != VK_SUCCESS) {
@@ -140,18 +148,25 @@ static int vk_buffer_create(lrt_vk_engine *e, VkDeviceSize size, vk_buffer *out)
     }
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(e->device, out->buf, &req);
-    uint32_t mt = vk_find_memory_type(
-        e, req.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkMemoryPropertyFlags want =
+        host_visible ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+                     : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    uint32_t mt = vk_find_memory_type(e, req.memoryTypeBits, want);
     if (mt == UINT32_MAX) {
-        vk_set_err(e, "no host-visible coherent memory type");
+        vk_set_err(e, "no suitable memory type");
         vkDestroyBuffer(e->device, out->buf, NULL);
         out->buf = VK_NULL_HANDLE;
         return 0;
     }
+    VkMemoryAllocateFlagsInfo fi;
+    memset(&fi, 0, sizeof(fi));
+    fi.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+    fi.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
     VkMemoryAllocateInfo ai;
     memset(&ai, 0, sizeof(ai));
     ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.pNext = device_addr ? &fi : NULL;
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = mt;
     r = vkAllocateMemory(e->device, &ai, NULL, &out->mem);
@@ -163,6 +178,12 @@ static int vk_buffer_create(lrt_vk_engine *e, VkDeviceSize size, vk_buffer *out)
     }
     vkBindBufferMemory(e->device, out->buf, out->mem, 0);
     return 1;
+}
+
+/* Host-visible coherent storage buffer (Path A/B working set). */
+static int vk_buffer_create(lrt_vk_engine *e, VkDeviceSize size, vk_buffer *out) {
+    return vk_buffer_create_ex(e, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, 1, 0,
+                               out);
 }
 
 static void vk_buffer_destroy(lrt_vk_engine *e, vk_buffer *b) {
@@ -202,8 +223,8 @@ static int vk_buffer_read(lrt_vk_engine *e, vk_buffer *b, void *dst,
 /* ------------------------------------------------------------------------- */
 static int vk_pipeline_build(lrt_vk_engine *e, const uint32_t *spv,
                              size_t spv_bytes, uint32_t num_bindings,
-                             uint32_t push_size, const VkSpecializationInfo *spec,
-                             vk_pipeline *out) {
+                             const VkDescriptorType *types, uint32_t push_size,
+                             const VkSpecializationInfo *spec, vk_pipeline *out) {
     VkResult r;
     VkShaderModuleCreateInfo smi;
     memset(&smi, 0, sizeof(smi));
@@ -220,7 +241,8 @@ static int vk_pipeline_build(lrt_vk_engine *e, const uint32_t *spv,
     memset(binds, 0, sizeof(binds));
     for (uint32_t i = 0; i < num_bindings; i++) {
         binds[i].binding = i;
-        binds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        binds[i].descriptorType =
+            types ? types[i] : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         binds[i].descriptorCount = 1;
         binds[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
@@ -647,6 +669,7 @@ void lrt_vk_engine_destroy(lrt_vk_engine *e) {
         for (int i = 0; i < VK_TRACE_PIPE_CACHE; i++)
             vk_pipeline_destroy(e, &e->trace_pipes[i]);
         vk_pipeline_destroy(e, &e->build_pipe);
+        vk_pipeline_destroy(e, &e->rtx_pipe);
         if (e->cmd_pool) vkDestroyCommandPool(e->device, e->cmd_pool, NULL);
         vkDestroyDevice(e->device, NULL);
     }
@@ -715,7 +738,7 @@ static vk_pipeline *trace_get_pipeline(lrt_vk_engine *e, uint32_t w,
     spec.pMapEntries = ents;
     spec.dataSize = sizeof(spec_data);
     spec.pData = spec_data;
-    if (!vk_pipeline_build(e, trace_bvh_spv, sizeof(trace_bvh_spv), 4,
+    if (!vk_pipeline_build(e, trace_bvh_spv, sizeof(trace_bvh_spv), 4, NULL,
                            (uint32_t)sizeof(trace_push), &spec, slot))
         return NULL;
     slot->key_w = w;
@@ -833,7 +856,7 @@ typedef struct morton_push {
 
 static vk_pipeline *build_get_pipeline(lrt_vk_engine *e) {
     if (e->build_pipe.valid) return &e->build_pipe;
-    if (!vk_pipeline_build(e, build_morton_spv, sizeof(build_morton_spv), 3,
+    if (!vk_pipeline_build(e, build_morton_spv, sizeof(build_morton_spv), 3, NULL,
                            (uint32_t)sizeof(morton_push), NULL, &e->build_pipe))
         return NULL;
     return &e->build_pipe;
@@ -960,4 +983,364 @@ fail:
     free(morton);
     if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
     return -1;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Hardware ray tracing (VK_KHR_ray_query): build a real acceleration         */
+/* structure on the GPU and trace it. Separate from Path A/B (the AS is        */
+/* vendor-opaque, so it can only serve the trace direction).                  */
+/* ------------------------------------------------------------------------- */
+
+static uint64_t vk_device_address(lrt_vk_engine *e, const vk_buffer *b) {
+    VkBufferDeviceAddressInfo i;
+    memset(&i, 0, sizeof(i));
+    i.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+    i.buffer = b->buf;
+    return (uint64_t)vkGetBufferDeviceAddressKHR(e->device, &i);
+}
+
+/* One-shot command buffer helpers (for AS builds; the trace reuses vk_dispatch). */
+static VkCommandBuffer vk_cmd_begin(lrt_vk_engine *e) {
+    VkCommandBufferAllocateInfo cbai;
+    memset(&cbai, 0, sizeof(cbai));
+    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbai.commandPool = e->cmd_pool;
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    VkCommandBuffer cb;
+    if (vkAllocateCommandBuffers(e->device, &cbai, &cb) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    VkCommandBufferBeginInfo bbi;
+    memset(&bbi, 0, sizeof(bbi));
+    bbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cb, &bbi);
+    return cb;
+}
+
+static int vk_cmd_end_submit(lrt_vk_engine *e, VkCommandBuffer cb) {
+    vkEndCommandBuffer(cb);
+    VkFenceCreateInfo fci;
+    memset(&fci, 0, sizeof(fci));
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VkFence fence;
+    if (vkCreateFence(e->device, &fci, NULL, &fence) != VK_SUCCESS) {
+        vkFreeCommandBuffers(e->device, e->cmd_pool, 1, &cb);
+        return 0;
+    }
+    VkSubmitInfo si;
+    memset(&si, 0, sizeof(si));
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cb;
+    VkResult r = vkQueueSubmit(e->queue, 1, &si, fence);
+    if (r == VK_SUCCESS) r = vkWaitForFences(e->device, 1, &fence, VK_TRUE, ~0ULL);
+    vkDestroyFence(e->device, fence, NULL);
+    vkFreeCommandBuffers(e->device, e->cmd_pool, 1, &cb);
+    return r == VK_SUCCESS;
+}
+
+typedef struct vk_accel {
+    VkAccelerationStructureKHR as;
+    vk_buffer storage;
+    uint64_t address;
+} vk_accel;
+
+/* Build one acceleration structure (BLAS or TLAS) on the device from a single
+ * geometry. Allocates the AS backing store + a transient scratch buffer, records
+ * the build, and resolves the AS device address. */
+static int vk_build_accel(lrt_vk_engine *e, VkAccelerationStructureTypeKHR type,
+                          const VkAccelerationStructureGeometryKHR *geom,
+                          uint32_t prim_count, vk_accel *out) {
+    memset(out, 0, sizeof(*out));
+    VkAccelerationStructureBuildGeometryInfoKHR bgi;
+    memset(&bgi, 0, sizeof(bgi));
+    bgi.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    bgi.type = type;
+    bgi.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    bgi.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    bgi.geometryCount = 1;
+    bgi.pGeometries = geom;
+
+    VkAccelerationStructureBuildSizesInfoKHR sizes;
+    memset(&sizes, 0, sizeof(sizes));
+    sizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+    vkGetAccelerationStructureBuildSizesKHR(
+        e->device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bgi,
+        &prim_count, &sizes);
+
+    if (!vk_buffer_create_ex(e, sizes.accelerationStructureSize,
+                             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
+                             0, 0, &out->storage))
+        return 0;
+
+    VkAccelerationStructureCreateInfoKHR ci;
+    memset(&ci, 0, sizeof(ci));
+    ci.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+    ci.buffer = out->storage.buf;
+    ci.offset = 0;
+    ci.size = sizes.accelerationStructureSize;
+    ci.type = type;
+    VkResult r = vkCreateAccelerationStructureKHR(e->device, &ci, NULL, &out->as);
+    if (r != VK_SUCCESS) {
+        vk_set_errf(e, "vkCreateAccelerationStructureKHR", r);
+        vk_buffer_destroy(e, &out->storage);
+        return 0;
+    }
+
+    /* Scratch: over-allocate 256 bytes so we can 256-align the device address
+     * (a safe upper bound for minAccelerationStructureScratchOffsetAlignment). */
+    vk_buffer scratch;
+    if (!vk_buffer_create_ex(e, sizes.buildScratchSize + 256u,
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, 0, 1, &scratch)) {
+        vkDestroyAccelerationStructureKHR(e->device, out->as, NULL);
+        vk_buffer_destroy(e, &out->storage);
+        return 0;
+    }
+    uint64_t scratch_addr = vk_device_address(e, &scratch);
+    scratch_addr = (scratch_addr + 255u) & ~(uint64_t)255u;
+
+    bgi.dstAccelerationStructure = out->as;
+    bgi.scratchData.deviceAddress = scratch_addr;
+    VkAccelerationStructureBuildRangeInfoKHR range;
+    range.primitiveCount = prim_count;
+    range.primitiveOffset = 0;
+    range.firstVertex = 0;
+    range.transformOffset = 0;
+    const VkAccelerationStructureBuildRangeInfoKHR *pranges = &range;
+
+    VkCommandBuffer cb = vk_cmd_begin(e);
+    int ok = cb != VK_NULL_HANDLE;
+    if (ok) {
+        vkCmdBuildAccelerationStructuresKHR(cb, 1, &bgi, &pranges);
+        ok = vk_cmd_end_submit(e, cb);
+    }
+    vk_buffer_destroy(e, &scratch);
+    if (!ok) {
+        vk_set_err(e, "acceleration-structure build submit failed");
+        vkDestroyAccelerationStructureKHR(e->device, out->as, NULL);
+        vk_buffer_destroy(e, &out->storage);
+        return 0;
+    }
+
+    VkAccelerationStructureDeviceAddressInfoKHR ai;
+    memset(&ai, 0, sizeof(ai));
+    ai.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
+    ai.accelerationStructure = out->as;
+    out->address =
+        (uint64_t)vkGetAccelerationStructureDeviceAddressKHR(e->device, &ai);
+    return 1;
+}
+
+static void vk_accel_destroy(lrt_vk_engine *e, vk_accel *a) {
+    if (a->as) vkDestroyAccelerationStructureKHR(e->device, a->as, NULL);
+    vk_buffer_destroy(e, &a->storage);
+    memset(a, 0, sizeof(*a));
+}
+
+typedef struct rtx_push {
+    uint32_t ray_count;
+} rtx_push;
+
+static vk_pipeline *rtx_get_pipeline(lrt_vk_engine *e) {
+    if (e->rtx_pipe.valid) return &e->rtx_pipe;
+    VkDescriptorType types[3] = {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
+                                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+    if (!vk_pipeline_build(e, trace_ray_query_spv, sizeof(trace_ray_query_spv), 3,
+                           types, (uint32_t)sizeof(rtx_push), NULL, &e->rtx_pipe))
+        return NULL;
+    return &e->rtx_pipe;
+}
+
+/* TLAS + 2 storage buffers (rays, hits). The AS write is chained via pNext. */
+static int vk_descriptors_bind_rtx(lrt_vk_engine *e, VkDescriptorSetLayout dsl,
+                                   VkAccelerationStructureKHR tlas,
+                                   const vk_buffer *rays, const vk_buffer *hits,
+                                   VkDescriptorPool *out_pool,
+                                   VkDescriptorSet *out_set) {
+    VkDescriptorPoolSize ps[2];
+    ps[0].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    ps[0].descriptorCount = 1;
+    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    ps[1].descriptorCount = 2;
+    VkDescriptorPoolCreateInfo dpci;
+    memset(&dpci, 0, sizeof(dpci));
+    dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpci.maxSets = 1;
+    dpci.poolSizeCount = 2;
+    dpci.pPoolSizes = ps;
+    VkResult r = vkCreateDescriptorPool(e->device, &dpci, NULL, out_pool);
+    if (r != VK_SUCCESS) {
+        vk_set_errf(e, "vkCreateDescriptorPool(rtx)", r);
+        return 0;
+    }
+    VkDescriptorSetAllocateInfo dsai;
+    memset(&dsai, 0, sizeof(dsai));
+    dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsai.descriptorPool = *out_pool;
+    dsai.descriptorSetCount = 1;
+    dsai.pSetLayouts = &dsl;
+    r = vkAllocateDescriptorSets(e->device, &dsai, out_set);
+    if (r != VK_SUCCESS) {
+        vk_set_errf(e, "vkAllocateDescriptorSets(rtx)", r);
+        vkDestroyDescriptorPool(e->device, *out_pool, NULL);
+        return 0;
+    }
+    VkWriteDescriptorSetAccelerationStructureKHR asw;
+    memset(&asw, 0, sizeof(asw));
+    asw.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+    asw.accelerationStructureCount = 1;
+    asw.pAccelerationStructures = &tlas;
+    VkDescriptorBufferInfo bi[2];
+    bi[0].buffer = rays->buf;
+    bi[0].offset = 0;
+    bi[0].range = VK_WHOLE_SIZE;
+    bi[1].buffer = hits->buf;
+    bi[1].offset = 0;
+    bi[1].range = VK_WHOLE_SIZE;
+    VkWriteDescriptorSet w[3];
+    memset(w, 0, sizeof(w));
+    w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[0].pNext = &asw;
+    w[0].dstSet = *out_set;
+    w[0].dstBinding = 0;
+    w[0].descriptorCount = 1;
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[1].dstSet = *out_set;
+    w[1].dstBinding = 1;
+    w[1].descriptorCount = 1;
+    w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w[1].pBufferInfo = &bi[0];
+    w[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[2].dstSet = *out_set;
+    w[2].dstBinding = 2;
+    w[2].descriptorCount = 1;
+    w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w[2].pBufferInfo = &bi[1];
+    vkUpdateDescriptorSets(e->device, 3, w, 0, NULL);
+    return 1;
+}
+
+int lrt_vk_trace_scene_rtx(lrt_vk_engine *e, const float *vertices, uint32_t ntris,
+                           const lrt_ray *rays, uint32_t n, lrt_hit *out,
+                           lrt_result *err) {
+    if (!e || !vertices || ntris == 0 || (n && (!rays || !out))) {
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return -1;
+    }
+    if (!(e->caps & LRT_VK_CAP_RAY_QUERY) || !vkCreateAccelerationStructureKHR) {
+        vk_set_err(e, "ray_query unavailable (create the engine with "
+                      "want_ray_tracing=1 on an RT-capable device)");
+        if (err) *err = LRT_RESULT_NOT_BUILT;
+        return -1;
+    }
+    if (n == 0) {
+        if (err) *err = LRT_RESULT_OK;
+        return 0;
+    }
+
+    vk_pipeline *pipe = rtx_get_pipeline(e);
+    if (!pipe) {
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return -1;
+    }
+
+    vk_buffer vbuf = {0}, ibuf = {0}, rbuf = {0}, hbuf = {0};
+    vk_accel blas = {0}, tlas = {0};
+    int rc = -1;
+
+    /* Vertex buffer (BLAS build input). */
+    if (!vk_buffer_create_ex(
+            e, (VkDeviceSize)ntris * 9u * sizeof(float),
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, 1,
+            1, &vbuf))
+        goto done;
+    if (!vk_buffer_write(e, &vbuf, vertices, (size_t)ntris * 9u * sizeof(float)))
+        goto done;
+    uint64_t vaddr = vk_device_address(e, &vbuf);
+
+    /* BLAS over the triangles (vertex format R32G32B32, no index buffer). */
+    VkAccelerationStructureGeometryKHR tgeom;
+    memset(&tgeom, 0, sizeof(tgeom));
+    tgeom.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    tgeom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    tgeom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    tgeom.geometry.triangles.sType =
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+    tgeom.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    tgeom.geometry.triangles.vertexData.deviceAddress = vaddr;
+    tgeom.geometry.triangles.vertexStride = 3u * sizeof(float);
+    tgeom.geometry.triangles.maxVertex = ntris * 3u - 1u;
+    tgeom.geometry.triangles.indexType = VK_INDEX_TYPE_NONE_KHR;
+    if (!vk_build_accel(e, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, &tgeom,
+                        ntris, &blas))
+        goto done;
+
+    /* One identity instance referencing the BLAS. */
+    VkAccelerationStructureInstanceKHR inst;
+    memset(&inst, 0, sizeof(inst));
+    inst.transform.matrix[0][0] = 1.0f;
+    inst.transform.matrix[1][1] = 1.0f;
+    inst.transform.matrix[2][2] = 1.0f;
+    inst.mask = 0xFFu;
+    inst.accelerationStructureReference = blas.address;
+    if (!vk_buffer_create_ex(
+            e, sizeof(inst),
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, 1,
+            1, &ibuf))
+        goto done;
+    if (!vk_buffer_write(e, &ibuf, &inst, sizeof(inst))) goto done;
+    uint64_t iaddr = vk_device_address(e, &ibuf);
+
+    /* TLAS over the single instance. */
+    VkAccelerationStructureGeometryKHR igeom;
+    memset(&igeom, 0, sizeof(igeom));
+    igeom.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    igeom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    igeom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    igeom.geometry.instances.sType =
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    igeom.geometry.instances.arrayOfPointers = VK_FALSE;
+    igeom.geometry.instances.data.deviceAddress = iaddr;
+    if (!vk_build_accel(e, VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, &igeom, 1,
+                        &tlas))
+        goto done;
+
+    /* Trace. */
+    if (!vk_buffer_create(e, (VkDeviceSize)n * sizeof(lrt_ray), &rbuf) ||
+        !vk_buffer_create(e, (VkDeviceSize)n * sizeof(lrt_hit), &hbuf))
+        goto done;
+    if (!vk_buffer_write(e, &rbuf, rays, (size_t)n * sizeof(lrt_ray))) goto done;
+
+    {
+        VkDescriptorPool pool;
+        VkDescriptorSet set;
+        if (!vk_descriptors_bind_rtx(e, pipe->dsl, tlas.as, &rbuf, &hbuf, &pool,
+                                     &set))
+            goto done;
+        rtx_push pc;
+        pc.ray_count = n;
+        int run_ok =
+            vk_dispatch(e, pipe, set, &pc, (uint32_t)sizeof(pc), (n + 63u) / 64u);
+        vkDestroyDescriptorPool(e->device, pool, NULL);
+        if (!run_ok) goto done;
+        if (!vk_buffer_read(e, &hbuf, out, (size_t)n * sizeof(lrt_hit))) goto done;
+    }
+
+    rc = 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (out[i].prim_id != LRT_TRI_NO_HIT) rc++;
+    if (err) *err = LRT_RESULT_OK;
+
+done:
+    vk_buffer_destroy(e, &rbuf);
+    vk_buffer_destroy(e, &hbuf);
+    vk_accel_destroy(e, &tlas);
+    vk_buffer_destroy(e, &ibuf);
+    vk_accel_destroy(e, &blas);
+    vk_buffer_destroy(e, &vbuf);
+    if (rc < 0 && err) *err = LRT_RESULT_OUT_OF_MEMORY;
+    return rc;
 }

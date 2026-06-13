@@ -68,6 +68,7 @@ const bench_backend *backend_lightrt_qtri_fp4(void); /* quantized leaf fp4 */
 const bench_backend *backend_lightrt_bvh8q4(void);  /* 4-bit nodes */
 const bench_backend *backend_lightrt_bvh8qf8(void); /* fp8 nodes  */
 const bench_backend *backend_lightrt_vk(void);    /* Vulkan GPU trace (optional) */
+const bench_backend *backend_lightrt_vk_rtx(void);/* Vulkan HW ray_query (optional) */
 const bench_backend *backend_embree(void);        /* Embree 4 (optional) */
 const bench_backend *backend_tinybvh(void);       /* jbikker/tinybvh BVH8_CPU */
 const bench_backend *backend_madmann(void);       /* madmann91/bvh v2 */

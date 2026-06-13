@@ -29,7 +29,8 @@ gen() {
     echo "generated ${SH}/${base}.spv.h  (${sym})"
 }
 
-gen trace_bvh    trace_bvh_spv
-gen build_morton build_morton_spv
+gen trace_bvh        trace_bvh_spv
+gen build_morton     build_morton_spv
+gen trace_ray_query  trace_ray_query_spv  # needs VK_KHR_ray_query (SPIR-V 1.4)
 
 echo "done."

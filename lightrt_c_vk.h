@@ -91,6 +91,23 @@ int lrt_vk_build_scene(lrt_vk_engine *e, const float *vertices, uint32_t ntris,
                        lrt_tri_layout layout, lrt_tri_scene **out,
                        lrt_result *err);
 
+/* --- Hardware ray tracing (VK_KHR_ray_query) ------------------------------
+ *
+ * Build a real acceleration structure (BLAS + identity-instance TLAS) on the GPU
+ * from the triangle soup (9*ntris floats) and trace n rays against it with a
+ * ray_query compute shader. Writes n hits to out; returns the number of rays
+ * that hit, or -1 on error. Requires an engine created with want_ray_tracing=1
+ * on an RT-capable device (check lrt_vk_engine_caps() & LRT_VK_CAP_RAY_QUERY);
+ * otherwise returns -1 with LRT_RESULT_NOT_BUILT.
+ *
+ * Hits match a Moller-Trumbore CPU trace within fp tolerance: t is in units of
+ * |dir|, (u,v) are hit barycentrics, prim_id is the triangle index. Unlike Path
+ * A/B this takes raw triangles (the AS is a vendor-opaque blob and cannot be fed
+ * back into lrt_tri_scene), so it is a trace-only backend. */
+int lrt_vk_trace_scene_rtx(lrt_vk_engine *e, const float *vertices, uint32_t ntris,
+                           const lrt_ray *rays, uint32_t n, lrt_hit *out,
+                           lrt_result *err);
+
 #ifdef __cplusplus
 }
 #endif

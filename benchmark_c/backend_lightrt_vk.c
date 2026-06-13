@@ -33,7 +33,7 @@ static lrt_vk_engine *vk_engine(void) {
         lrt_vk_engine_options o = {0};
         o.device_index = -1;
         o.prefer_discrete = 1;
-        o.want_ray_tracing = 0;
+        o.want_ray_tracing = 1; /* enables the vk-rtx backend; harmless for vk-trace */
         g_engine = lrt_vk_engine_create(&o, NULL);
         g_engine_tried = 1;
     }
@@ -102,8 +102,79 @@ static const bench_backend g_vk_backend = {
 
 const bench_backend *backend_lightrt_vk(void) { return &g_vk_backend; }
 
+/* --- vk-rtx: hardware ray tracing (VK_KHR_ray_query) ----------------------
+ * Builds an acceleration structure on the GPU and traces it per ray batch
+ * (BLAS+TLAS build + trace are included in the timed call). The "scene" just
+ * holds the triangle soup the harness keeps alive for the run. */
+typedef struct rtx_scene {
+    const float *verts;
+    size_t ntris;
+} rtx_scene;
+
+static void *rtx_build(const float *vertices, size_t ntris, int num_threads,
+                       double *build_ms) {
+    (void)num_threads;
+    if (build_ms) *build_ms = 0.0;
+    pthread_mutex_lock(&g_lock);
+    lrt_vk_engine *e = vk_engine();
+    pthread_mutex_unlock(&g_lock);
+    if (!e || !(lrt_vk_engine_caps(e) & LRT_VK_CAP_RAY_QUERY))
+        return NULL; /* no RT device: harness reports unavailable */
+    rtx_scene *s = (rtx_scene *)malloc(sizeof(*s));
+    if (!s) return NULL;
+    s->verts = vertices;
+    s->ntris = ntris;
+    return s;
+}
+
+static void rtx_intersect1N(void *scene, int thread_idx, const lrt_ray *rays,
+                            lrt_hit *hits, size_t n, int coherent) {
+    (void)thread_idx;
+    (void)coherent;
+    if (!scene || n == 0) return;
+    rtx_scene *s = (rtx_scene *)scene;
+    pthread_mutex_lock(&g_lock);
+    if (g_engine)
+        lrt_vk_trace_scene_rtx(g_engine, s->verts, (uint32_t)s->ntris, rays,
+                               (uint32_t)n, hits, NULL);
+    pthread_mutex_unlock(&g_lock);
+}
+
+static void rtx_occluded1N(void *scene, int thread_idx, const lrt_ray *rays,
+                           uint8_t *occluded, size_t n, int coherent) {
+    (void)thread_idx;
+    (void)coherent;
+    if (!scene || n == 0) return;
+    rtx_scene *s = (rtx_scene *)scene;
+    lrt_hit *tmp = (lrt_hit *)malloc(n * sizeof(lrt_hit));
+    if (!tmp) return;
+    pthread_mutex_lock(&g_lock);
+    int ok = g_engine && lrt_vk_trace_scene_rtx(g_engine, s->verts,
+                                                (uint32_t)s->ntris, rays,
+                                                (uint32_t)n, tmp, NULL) >= 0;
+    pthread_mutex_unlock(&g_lock);
+    for (size_t i = 0; i < n; i++)
+        occluded[i] = (ok && tmp[i].prim_id != LRT_TRI_NO_HIT) ? 1u : 0u;
+    free(tmp);
+}
+
+static size_t rtx_memory_bytes(void *scene) {
+    (void)scene; /* AS is transient (rebuilt per batch) */
+    return 0;
+}
+
+static void rtx_destroy(void *scene) { free(scene); }
+
+static const bench_backend g_rtx_backend = {
+    "vk-rtx", rtx_build, rtx_intersect1N, rtx_occluded1N, rtx_memory_bytes,
+    rtx_destroy,
+};
+
+const bench_backend *backend_lightrt_vk_rtx(void) { return &g_rtx_backend; }
+
 #else /* !LRTBENCH_HAVE_VK */
 
 const bench_backend *backend_lightrt_vk(void) { return 0; }
+const bench_backend *backend_lightrt_vk_rtx(void) { return 0; }
 
 #endif

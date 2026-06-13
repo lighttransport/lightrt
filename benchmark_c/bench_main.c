@@ -315,6 +315,8 @@ int main(int argc, char **argv) {
             {"mm-bvh", backend_madmann, 0},
             /* Vulkan GPU trace (Path A): explicit-only; per-batch upload+trace */
             {"vk-trace", backend_lightrt_vk, 1},
+            /* Vulkan HW ray tracing (VK_KHR_ray_query); per-batch AS build+trace */
+            {"vk-rtx", backend_lightrt_vk_rtx, 1},
         };
         int want_all = !strcmp(cfg.backends, "all");
         for (size_t r = 0; r < sizeof(registry) / sizeof(registry[0]); r++) {
