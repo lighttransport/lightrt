@@ -87,7 +87,12 @@ and gathers per intersection. That copy is exactly what buys our leaf-test speed
 (it is why we lead tinybvh on every workload), so it is kept. The remaining 21 %
 is BVH nodes (128 B per 4-wide node); `LRT_TRI_LAYOUT_BVH8Q` quantizes node
 bounds to 8 bits and trims the resident structure ~13 % (32.5 vs 36.8 MB) for a
-small any-hit cost — the memory-constrained layout.
+small any-hit cost — the memory-constrained layout. Two further **conservative
+(exact)** node encodings exist: `BVH8_Q4` packs bounds to 4 bits (96 B nodes,
+~2 % smaller still, slower from coarser bounds) and `BVH8_QF8` stores them as
+8-bit floats (E4M3, same 128 B — a tighter bound *fit*, not a memory win). Nodes
+are only ~21 % of the footprint, so these are low-ROI next to the leaf formats
+and are AVX2-only.
 
 **Exact allocation.** The builder previously reserved the worst-case `ntris`
 nodes *and* `ntris` leaf blocks up front (a leaf can be as small as one

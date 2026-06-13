@@ -64,7 +64,13 @@ typedef enum lrt_tri_layout {
     /* 8-wide with 8-bit quantized child bounds (128-byte nodes vs 256):
      * halves node bandwidth at the cost of extra decode ALU; intended for
      * memory-latency-bound incoherent rays on large scenes. */
-    LRT_TRI_LAYOUT_BVH8Q = 9
+    LRT_TRI_LAYOUT_BVH8Q = 9,
+    /* 8-wide with 4-bit quantized child bounds (96-byte nodes): coarser bounds
+     * (a few % more node tests) for ~25% smaller nodes. */
+    LRT_TRI_LAYOUT_BVH8_Q4 = 10,
+    /* 8-wide with 8-bit-FLOAT (E4M3) child bounds (128-byte nodes, same size as
+     * BVH8Q): a tighter bound fit for skewed extents, not a memory win. */
+    LRT_TRI_LAYOUT_BVH8_QF8 = 11
 } lrt_tri_layout;
 
 typedef struct lrt_tri_build_options {

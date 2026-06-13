@@ -51,6 +51,14 @@ static void *tri_build_sbvh4(const float *v, size_t n, int t, double *ms) {
     return tri_build_layout(v, n, t, ms, LRT_TRI_LAYOUT_BVH4,
                             LRT_TRI_BUILD_HQ);
 }
+static void *tri_build_bvh8q4(const float *v, size_t n, int t, double *ms) {
+    return tri_build_layout(v, n, t, ms, LRT_TRI_LAYOUT_BVH8_Q4,
+                            LRT_TRI_BUILD_DEFAULT);
+}
+static void *tri_build_bvh8qf8(const float *v, size_t n, int t, double *ms) {
+    return tri_build_layout(v, n, t, ms, LRT_TRI_LAYOUT_BVH8_QF8,
+                            LRT_TRI_BUILD_DEFAULT);
+}
 
 /* Hair backend: reinterpret each thin sliver triangle as a capsule. The
  * thinspan generator emits v0 = one end, v1/v2 = other end +/- width, so
@@ -153,6 +161,17 @@ const bench_backend *backend_lightrt_lbvh4(void) { return &g_lbvh4_backend; }
 const bench_backend *backend_lightrt_lbvh8(void) { return &g_lbvh8_backend; }
 const bench_backend *backend_lightrt_bvh8q(void) { return &g_bvh8q_backend; }
 const bench_backend *backend_lightrt_sbvh4(void) { return &g_sbvh4_backend; }
+
+static const bench_backend g_bvh8q4_backend = {
+    "c11-bvh8q4", tri_build_bvh8q4, tri_intersect1N, tri_occluded1N,
+    tri_memory_bytes, tri_destroy,
+};
+static const bench_backend g_bvh8qf8_backend = {
+    "c11-bvh8qf8", tri_build_bvh8qf8, tri_intersect1N, tri_occluded1N,
+    tri_memory_bytes, tri_destroy,
+};
+const bench_backend *backend_lightrt_bvh8q4(void) { return &g_bvh8q4_backend; }
+const bench_backend *backend_lightrt_bvh8qf8(void) { return &g_bvh8qf8_backend; }
 
 static const bench_backend g_hair_backend = {
     "c11-hair", hair_build, tri_intersect1N, tri_occluded1N, tri_memory_bytes,

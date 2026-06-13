@@ -1637,10 +1637,65 @@ static void test_qtri(void) {
     free(v);
 }
 
+static void test_qnodes(void) {
+#if defined(__AVX2__) && defined(__FMA__)
+    g_rng = 0xB0DE5ull;
+    enum { NT = 3000, NR = 15000 };
+    float *v = make_random_soup(NT, 0.15f);
+    lrt_result err = LRT_RESULT_OK;
+    lrt_tri_scene *ref = lrt_tri_scene_build(v, NT, NULL, &err); /* fp32 BVH4 */
+    lrt_tri_build_options o8 = {.layout = LRT_TRI_LAYOUT_BVH8};
+    lrt_tri_scene *bvh8 = lrt_tri_scene_build(v, NT, &o8, &err);
+    if (!ref || !bvh8) {
+        CHECK(0, "qnodes: ref/bvh8 build failed");
+        free(v);
+        return;
+    }
+    lrt_tri_stats b8;
+    lrt_tri_scene_stats(bvh8, &b8);
+    lrt_tri_layout L[2] = {LRT_TRI_LAYOUT_BVH8_QF8, LRT_TRI_LAYOUT_BVH8_Q4};
+    const char *nm[2] = {"qf8", "q4"};
+    for (int l = 0; l < 2; l++) {
+        lrt_tri_build_options o = {.layout = L[l]};
+        lrt_tri_scene *q = lrt_tri_scene_build(v, NT, &o, &err);
+        CHECK(q != NULL, "qnode %s build failed (err=%d)", nm[l], (int)err);
+        if (!q) continue;
+        lrt_tri_stats st;
+        lrt_tri_scene_stats(q, &st);
+        CHECK(st.memory_bytes <= b8.memory_bytes, "qnode %s not <= bvh8 memory",
+              nm[l]);
+        /* conservative node bounds => exact closest hits (ties aside). */
+        size_t mism = 0, occl = 0;
+        g_rng = 0x5151ull;
+        for (int i = 0; i < NR; i++) {
+            lrt_ray r;
+            make_random_ray(&r);
+            lrt_hit hr, hq;
+            int a = lrt_tri_intersect1(ref, &r, &hr);
+            int b = lrt_tri_intersect1(q, &r, &hq);
+            if (a != b) {
+                mism++;
+            } else if (a && fabs((double)hr.t - (double)hq.t) >
+                               1e-4 * (1.0 + fabs((double)hr.t))) {
+                mism++;
+            }
+            if ((int)lrt_tri_occluded1(q, &r) != b) occl++;
+        }
+        CHECK(mism == 0, "qnode %s: %zu closest mismatches vs fp32", nm[l], mism);
+        CHECK(occl == 0, "qnode %s: %zu occluded mismatches", nm[l], occl);
+        lrt_tri_scene_free(q);
+    }
+    lrt_tri_scene_free(ref);
+    lrt_tri_scene_free(bvh8);
+    free(v);
+#endif
+}
+
 int main(void) {
     printf("lightrt_c_tri test\n");
 
     test_qtri();
+    test_qnodes();
     test_edge_cases();
     test_curve_scene();
     test_sphere_scene();

@@ -288,6 +288,8 @@ int main(int argc, char **argv) {
             {"c11-lbvh8", backend_lightrt_lbvh8, 0},
             {"c11-bvh8q", backend_lightrt_bvh8q, 0},
             {"c11-sbvh4", backend_lightrt_sbvh4, 0},
+            {"c11-bvh8q4", backend_lightrt_bvh8q4, 1},
+            {"c11-bvh8qf8", backend_lightrt_bvh8qf8, 1},
             /* custom-geometry + TLAS keep the same triangle geometry, so their
              * hit fractions match the tri backends and they join "all" */
             {"c11-user", backend_lightrt_user, 0},
