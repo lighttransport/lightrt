@@ -1841,6 +1841,179 @@ static void test_qnodes(void) {
 #endif
 }
 
+/* Reference ray-facing disc (embree DISC_POINT). */
+static int ref_disc(const float c[3], float r, const lrt_ray *ray, float tmax,
+                    float *t_out) {
+    float dx = ray->dir[0], dy = ray->dir[1], dz = ray->dir[2];
+    float dOdO = dx * dx + dy * dy + dz * dz;
+    if (dOdO <= 0.0f) return 0;
+    float c0x = c[0] - ray->org[0], c0y = c[1] - ray->org[1],
+          c0z = c[2] - ray->org[2];
+    float proj = (c0x * dx + c0y * dy + c0z * dz) / dOdO;
+    if (proj < ray->tmin || proj >= tmax) return 0;
+    float px = c0x - proj * dx, py = c0y - proj * dy, pz = c0z - proj * dz;
+    if (px * px + py * py + pz * pz > r * r) return 0;
+    *t_out = proj;
+    return 1;
+}
+
+/* Reference oriented disc (embree ORIENTED_DISC_POINT). */
+static int ref_odisc(const float c[3], float r, const float n[3],
+                     const lrt_ray *ray, float tmax, float *t_out) {
+    float dx = ray->dir[0], dy = ray->dir[1], dz = ray->dir[2];
+    float div = dx * n[0] + dy * n[1] + dz * n[2];
+    if (div == 0.0f) return 0;
+    float t = ((c[0] - ray->org[0]) * n[0] + (c[1] - ray->org[1]) * n[1] +
+               (c[2] - ray->org[2]) * n[2]) / div;
+    if (t < ray->tmin || t >= tmax) return 0;
+    float hx = ray->org[0] + t * dx - c[0], hy = ray->org[1] + t * dy - c[1],
+          hz = ray->org[2] + t * dz - c[2];
+    if (hx * hx + hy * hy + hz * hz >= r * r) return 0;
+    *t_out = t;
+    return 1;
+}
+
+static void test_points_scene(void) {
+    enum { NPTS = 400, NRAYS = 20000 };
+    float *cen = (float *)malloc(NPTS * 3 * sizeof(float));
+    float *rad = (float *)malloc(NPTS * sizeof(float));
+    float *nrm = (float *)malloc(NPTS * 3 * sizeof(float));
+    g_rng = 0x9015E5ull;
+    for (int i = 0; i < NPTS; i++) {
+        for (int a = 0; a < 3; a++) cen[i * 3 + a] = rnd_f(-2.0f, 2.0f);
+        rad[i] = rnd_f(0.03f, 0.15f);
+        float n[3] = {rnd_f(-1, 1), rnd_f(-1, 1), rnd_f(-1, 1)};
+        float l = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (l < 1e-6f) { n[2] = 1.0f; l = 1.0f; }
+        for (int a = 0; a < 3; a++) nrm[i * 3 + a] = n[a] / l;
+    }
+
+    const int types[3] = {LRT_POINT_SPHERE, LRT_POINT_DISC,
+                          LRT_POINT_ORIENTED_DISC};
+    const char *names[3] = {"sphere", "disc", "odisc"};
+    for (int ti = 0; ti < 3; ti++) {
+        int pt = types[ti];
+        lrt_tri_scene *s = lrt_points_scene_build(
+            cen, rad, pt == LRT_POINT_ORIENTED_DISC ? nrm : NULL, pt, NPTS, NULL,
+            NULL);
+        CHECK(s != NULL, "points(%s) build failed", names[ti]);
+        if (!s) continue;
+        size_t mism = 0, occl = 0;
+        for (int i = 0; i < NRAYS; i++) {
+            lrt_ray r;
+            make_random_ray(&r);
+            float bt = r.tmax;
+            int bf = 0;
+            for (int j = 0; j < NPTS; j++) {
+                const float *c = &cen[j * 3];
+                float t;
+                int h;
+                if (pt == LRT_POINT_SPHERE) {
+                    float sp[4] = {c[0], c[1], c[2], rad[j]};
+                    h = ref_sphere(sp, &r, bt, &t);
+                } else if (pt == LRT_POINT_DISC) {
+                    h = ref_disc(c, rad[j], &r, bt, &t);
+                } else {
+                    h = ref_odisc(c, rad[j], &nrm[j * 3], &r, bt, &t);
+                }
+                if (h) { bt = t; bf = 1; }
+            }
+            lrt_hit h;
+            int bvh = lrt_tri_intersect1(s, &r, &h);
+            if (bf != bvh)
+                mism++;
+            else if (bf && fabs((double)h.t - (double)bt) >
+                               1e-3 * (1.0 + fabs((double)bt)))
+                mism++;
+            if (lrt_tri_occluded1(s, &r) != bvh) occl++;
+        }
+        CHECK(mism <= NRAYS / 1000, "points(%s): %zu/%d mismatches vs brute force",
+              names[ti], mism, NRAYS);
+        CHECK(occl == 0, "points(%s): %zu occluded disagreements", names[ti],
+              occl);
+        printf("  points(%s) scene [%s]\n", names[ti], lrt_tri_kernel_name(s));
+        lrt_tri_scene_free(s);
+    }
+    free(cen);
+    free(rad);
+    free(nrm);
+}
+
+/* Flat (ribbon) curves: every hit must lie within the segment's interpolated
+ * half-width of the segment axis (an invariant of the ray-facing ribbon that
+ * doesn't replicate the intersector), and occluded must agree with intersect. */
+static void test_flatcurve_scene(void) {
+    enum { NSTRAND = 80, PTS = 6, NRAYS = 20000 };
+    size_t npoints = (size_t)NSTRAND * PTS;
+    float *pts = (float *)malloc(npoints * 3 * sizeof(float));
+    float *rad = (float *)malloc(npoints * sizeof(float));
+    uint32_t *sfirst = (uint32_t *)malloc(NSTRAND * sizeof(uint32_t));
+    uint32_t *scount = (uint32_t *)malloc(NSTRAND * sizeof(uint32_t));
+    g_rng = 0xF1A7ull;
+    for (int st = 0; st < NSTRAND; st++) {
+        sfirst[st] = (uint32_t)(st * PTS);
+        scount[st] = PTS;
+        float p[3] = {rnd_f(-2, 2), rnd_f(-2, 2), rnd_f(-2, 2)};
+        for (int k = 0; k < PTS; k++) {
+            size_t idx = (size_t)st * PTS + k;
+            for (int a = 0; a < 3; a++) {
+                p[a] += rnd_f(-0.9f, 0.9f);
+                pts[idx * 3 + a] = p[a];
+            }
+            rad[idx] = rnd_f(0.02f, 0.08f);
+        }
+    }
+    lrt_hair_strands hs = {0};
+    hs.points = pts;
+    hs.radius = rad;
+    hs.strand_first = sfirst;
+    hs.strand_count = scount;
+    hs.nstrands = NSTRAND;
+    hs.npoints = npoints;
+    lrt_tri_scene *s = lrt_flatcurve_scene_build(&hs, NULL, NULL);
+    CHECK(s != NULL, "flatcurve build failed");
+    if (!s) {
+        free(pts); free(rad); free(sfirst); free(scount);
+        return;
+    }
+    printf("  flatcurve scene [%s]\n", lrt_tri_kernel_name(s));
+    size_t bad = 0, occl = 0;
+    for (int i = 0; i < NRAYS; i++) {
+        lrt_ray r;
+        make_random_ray(&r);
+        lrt_hit h;
+        int bvh = lrt_tri_intersect1(s, &r, &h);
+        if (lrt_tri_occluded1(s, &r) != bvh) occl++;
+        if (!bvh) continue;
+        uint32_t prim = h.prim_id;
+        uint32_t i0 = (uint32_t)((prim / (PTS - 1)) * PTS + prim % (PTS - 1));
+        const float *p0 = &pts[(size_t)i0 * 3];
+        const float *p1 = &pts[(size_t)(i0 + 1) * 3];
+        float hp[3];
+        for (int a = 0; a < 3; a++) hp[a] = r.org[a] + h.t * r.dir[a];
+        float ax[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]};
+        float al2 = ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2];
+        float d0[3] = {hp[0] - p0[0], hp[1] - p0[1], hp[2] - p0[2]};
+        float u = al2 > 0.0f ? (d0[0] * ax[0] + d0[1] * ax[1] + d0[2] * ax[2]) / al2
+                             : 0.0f;
+        if (u < 0.0f) u = 0.0f; else if (u > 1.0f) u = 1.0f;
+        float perp[3];
+        for (int a = 0; a < 3; a++) perp[a] = d0[a] - u * ax[a];
+        float dist = sqrtf(perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]);
+        float rr = rad[i0] + u * (rad[i0 + 1] - rad[i0]);
+        if (h.t < r.tmin || h.t > r.tmax) bad++;
+        else if (dist > rr + 1e-3f * (1.0f + rr)) bad++;
+    }
+    CHECK(bad <= NRAYS / 1000, "flatcurve: %zu/%d hits off the ribbon", bad,
+          NRAYS);
+    CHECK(occl == 0, "flatcurve: %zu occluded disagreements", occl);
+    lrt_tri_scene_free(s);
+    free(pts);
+    free(rad);
+    free(sfirst);
+    free(scount);
+}
+
 int main(void) {
     printf("lightrt_c_tri test\n");
 
@@ -1849,6 +2022,8 @@ int main(void) {
     test_edge_cases();
     test_curve_scene();
     test_roundcurve_scene();
+    test_flatcurve_scene();
+    test_points_scene();
     test_sphere_scene();
     test_user_geometry();
     test_sdf_standalone();

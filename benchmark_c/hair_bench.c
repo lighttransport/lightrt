@@ -27,6 +27,24 @@
 
 #define MAX_THREADS 256
 
+/* Primitive families this tool can build (lightrt + Embree, cross-checked). */
+enum prim_mode {
+    PRIM_ROUND = 0, /* round-linear curves */
+    PRIM_FLAT,      /* flat (ribbon) linear curves */
+    PRIM_SPHERE,    /* sphere points */
+    PRIM_DISC,      /* ray-facing disc points */
+    PRIM_ODISC      /* oriented (fixed-normal) disc points */
+};
+static int parse_prim(const char *s) {
+    if (!strcmp(s, "round")) return PRIM_ROUND;
+    if (!strcmp(s, "flat")) return PRIM_FLAT;
+    if (!strcmp(s, "sphere")) return PRIM_SPHERE;
+    if (!strcmp(s, "disc")) return PRIM_DISC;
+    if (!strcmp(s, "odisc")) return PRIM_ODISC;
+    return -1;
+}
+static int prim_is_curve(int p) { return p == PRIM_ROUND || p == PRIM_FLAT; }
+
 /* ------------------------------------------------------------------------- */
 /* Small vec / RNG helpers.                                                  */
 /* ------------------------------------------------------------------------- */
@@ -148,12 +166,9 @@ static void em_error_cb(void *u, enum RTCError code, const char *str) {
     (void)u;
     fprintf(stderr, "embree error %d: %s\n", (int)code, str ? str : "");
 }
+static void em_destroy(em_scene *es); /* fwd */
 
-/* Build a round-linear-curve scene. seg_i0[i] is the first vertex index of
- * segment i; flags[i] carries the NEIGHBOR_LEFT/RIGHT bits. */
-static em_scene *em_build(const cyhair_t *h, size_t npts_used,
-                          const uint32_t *seg_i0, const uint8_t *flags,
-                          size_t nseg, int threads, double *build_ms) {
+static em_scene *em_new(int threads) {
     em_scene *es = (em_scene *)calloc(1, sizeof(em_scene));
     if (!es) return NULL;
     char cfg[64];
@@ -161,24 +176,34 @@ static em_scene *em_build(const cyhair_t *h, size_t npts_used,
     es->device = rtcNewDevice(cfg);
     if (!es->device) { free(es); return NULL; }
     rtcSetDeviceErrorFunction(es->device, em_error_cb, NULL);
-
-    uint64_t t0 = bench_time_ns();
     es->scene = rtcNewScene(es->device);
-    RTCGeometry g = rtcNewGeometry(es->device, RTC_GEOMETRY_TYPE_ROUND_LINEAR_CURVE);
+    return es;
+}
 
+/* Build a linear-curve scene (round or flat). gtype selects the curve type;
+ * seg_i0[i] is the first vertex index of segment i; flags (or NULL) carries the
+ * NEIGHBOR_LEFT/RIGHT bits used by round curves at the joints. */
+static em_scene *em_build_curve(const cyhair_t *h, size_t npts_used,
+                                const uint32_t *seg_i0, const uint8_t *flags,
+                                size_t nseg, enum RTCGeometryType gtype, int threads,
+                                double *build_ms) {
+    em_scene *es = em_new(threads);
+    if (!es) return NULL;
+    uint64_t t0 = bench_time_ns();
+    RTCGeometry g = rtcNewGeometry(es->device, gtype);
     float *vb = (float *)rtcSetNewGeometryBuffer(
         g, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT4, 4 * sizeof(float),
         npts_used);
     unsigned *ib = (unsigned *)rtcSetNewGeometryBuffer(
         g, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT, sizeof(unsigned), nseg);
-    unsigned char *fb = (unsigned char *)rtcSetNewGeometryBuffer(
-        g, RTC_BUFFER_TYPE_FLAGS, 0, RTC_FORMAT_UCHAR, sizeof(unsigned char),
-        nseg);
-    if (!vb || !ib || !fb) {
+    unsigned char *fb = NULL;
+    if (flags)
+        fb = (unsigned char *)rtcSetNewGeometryBuffer(
+            g, RTC_BUFFER_TYPE_FLAGS, 0, RTC_FORMAT_UCHAR, sizeof(unsigned char),
+            nseg);
+    if (!vb || !ib || (flags && !fb)) {
         rtcReleaseGeometry(g);
-        rtcReleaseScene(es->scene);
-        rtcReleaseDevice(es->device);
-        free(es);
+        em_destroy(es);
         return NULL;
     }
     for (size_t i = 0; i < npts_used; i++) {
@@ -189,8 +214,39 @@ static em_scene *em_build(const cyhair_t *h, size_t npts_used,
     }
     for (size_t i = 0; i < nseg; i++) {
         ib[i] = seg_i0[i];
-        fb[i] = flags[i];
+        if (fb) fb[i] = flags[i];
     }
+    rtcCommitGeometry(g);
+    rtcAttachGeometry(es->scene, g);
+    rtcReleaseGeometry(g);
+    rtcCommitScene(es->scene);
+    if (build_ms) *build_ms = bench_ns_to_ms(bench_time_ns() - t0);
+    return es;
+}
+
+/* Build a point-cloud scene (sphere / disc / oriented-disc). centers is the
+ * float4 (xyz+radius) vertex source; normals (or NULL) feeds oriented discs. */
+static em_scene *em_build_points(const float *centers4, const float *normals,
+                                 size_t npts, enum RTCGeometryType gtype, int threads,
+                                 double *build_ms) {
+    em_scene *es = em_new(threads);
+    if (!es) return NULL;
+    uint64_t t0 = bench_time_ns();
+    RTCGeometry g = rtcNewGeometry(es->device, gtype);
+    float *vb = (float *)rtcSetNewGeometryBuffer(
+        g, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT4, 4 * sizeof(float), npts);
+    float *nb = NULL;
+    if (normals)
+        nb = (float *)rtcSetNewGeometryBuffer(g, RTC_BUFFER_TYPE_NORMAL, 0,
+                                              RTC_FORMAT_FLOAT3, 3 * sizeof(float),
+                                              npts);
+    if (!vb || (normals && !nb)) {
+        rtcReleaseGeometry(g);
+        em_destroy(es);
+        return NULL;
+    }
+    memcpy(vb, centers4, npts * 4 * sizeof(float));
+    if (nb) memcpy(nb, normals, npts * 3 * sizeof(float));
     rtcCommitGeometry(g);
     rtcAttachGeometry(es->scene, g);
     rtcReleaseGeometry(g);
@@ -371,12 +427,41 @@ static void shade_image(const cyhair_t *h, const uint32_t *seg_i0,
     }
 }
 
+/* Shade point-primitive hits (prim_id = point index) by the radial normal. */
+static void shade_image_points(const cyhair_t *h, const lrt_ray *rays,
+                               const lrt_hit *hits, int w, int hgt,
+                               unsigned char *rgb) {
+    for (int i = 0; i < w * hgt; i++) {
+        float r = 0.04f, g = 0.05f, b = 0.07f;
+        const lrt_hit *hit = &hits[i];
+        if (hit->prim_id != LRT_TRI_NO_HIT) {
+            const lrt_ray *ray = &rays[i];
+            const float *c = &h->points[(size_t)hit->prim_id * 3];
+            float nrm[3];
+            for (int a = 0; a < 3; a++)
+                nrm[a] = ray->org[a] + hit->t * ray->dir[a] - c[a];
+            v3norm(nrm);
+            float ndotv = -v3dot(nrm, ray->dir);
+            if (ndotv < 0.0f) ndotv = -ndotv;
+            float shade = 0.15f + 0.85f * ndotv;
+            r = shade * 0.80f;
+            g = shade * 0.58f;
+            b = shade * 0.40f;
+        }
+        rgb[i * 3 + 0] = (unsigned char)(255.0f * (r > 1 ? 1 : r));
+        rgb[i * 3 + 1] = (unsigned char)(255.0f * (g > 1 ? 1 : g));
+        rgb[i * 3 + 2] = (unsigned char)(255.0f * (b > 1 ? 1 : b));
+    }
+}
+
 /* ------------------------------------------------------------------------- */
 
 static void usage(const char *a0) {
     fprintf(stderr,
             "usage: %s [options]\n"
             "  --hair FILE        CyHair model (default data/wCurly.hair)\n"
+            "  --prim KIND        round (default) | flat | sphere | disc | odisc\n"
+            "                     (round/flat = curves; sphere/disc/odisc = points)\n"
             "  --width N          image width (default 1024)\n"
             "  --height N         image height (default 1024)\n"
             "  --radius-scale F   multiply hair radius (default 1.0)\n"
@@ -398,11 +483,16 @@ int main(int argc, char **argv) {
     size_t nrays = 4000000;
     int threads = 1, repeat = 5;
     uint32_t seed = 1234;
+    int prim = PRIM_ROUND;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         const char *nx = (i + 1 < argc) ? argv[i + 1] : NULL;
         if (!strcmp(a, "--hair") && nx) hair_path = argv[++i];
+        else if (!strcmp(a, "--prim") && nx) {
+            prim = parse_prim(argv[++i]);
+            if (prim < 0) { fprintf(stderr, "bad --prim\n"); usage(argv[0]); return 1; }
+        }
         else if (!strcmp(a, "--out") && nx) out_path = argv[++i];
         else if (!strcmp(a, "--width") && nx) width = atoi(argv[++i]);
         else if (!strcmp(a, "--height") && nx) height = atoi(argv[++i]);
@@ -465,7 +555,42 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* --- Build lightrt round-linear scene --- */
+    const char *prim_name[] = {"round-curve", "flat-curve", "sphere-point",
+                               "disc-point", "odisc-point"};
+    size_t nprim = prim_is_curve(prim) ? nseg : npts_used;
+
+    /* Point clouds: float4 (xyz+r) vertices for Embree + per-point normals
+     * (oriented disc only), normal = radial direction from the bbox center. */
+    float *centers4 = NULL, *pnormals = NULL;
+    if (!prim_is_curve(prim)) {
+        centers4 = (float *)malloc(npts_used * 4 * sizeof(float));
+        if (!centers4) { fprintf(stderr, "oom\n"); return 1; }
+        for (size_t i = 0; i < npts_used; i++) {
+            centers4[i * 4 + 0] = hair.points[i * 3 + 0];
+            centers4[i * 4 + 1] = hair.points[i * 3 + 1];
+            centers4[i * 4 + 2] = hair.points[i * 3 + 2];
+            centers4[i * 4 + 3] = hair.radius[i];
+        }
+        if (prim == PRIM_ODISC) {
+            float ctr[3];
+            for (int a = 0; a < 3; a++)
+                ctr[a] = 0.5f * (hair.bbox_min[a] + hair.bbox_max[a]);
+            pnormals = (float *)malloc(npts_used * 3 * sizeof(float));
+            if (!pnormals) { fprintf(stderr, "oom\n"); return 1; }
+            for (size_t i = 0; i < npts_used; i++) {
+                float n[3] = {hair.points[i * 3 + 0] - ctr[0],
+                              hair.points[i * 3 + 1] - ctr[1],
+                              hair.points[i * 3 + 2] - ctr[2]};
+                v3norm(n);
+                if (n[0] == 0.0f && n[1] == 0.0f && n[2] == 0.0f) n[2] = 1.0f;
+                pnormals[i * 3 + 0] = n[0];
+                pnormals[i * 3 + 1] = n[1];
+                pnormals[i * 3 + 2] = n[2];
+            }
+        }
+    }
+
+    /* --- Build lightrt scene --- */
     lrt_hair_strands strands = {0};
     strands.points = hair.points;
     strands.radius = hair.radius;
@@ -479,17 +604,25 @@ int main(int argc, char **argv) {
     opts.num_threads = (unsigned)threads;
     lrt_result err = LRT_RESULT_OK;
     uint64_t b0 = bench_time_ns();
-    lrt_tri_scene *scene = lrt_roundcurve_scene_build(&strands, &opts, &err);
+    lrt_tri_scene *scene = NULL;
+    switch (prim) {
+        case PRIM_ROUND: scene = lrt_roundcurve_scene_build(&strands, &opts, &err); break;
+        case PRIM_FLAT:  scene = lrt_flatcurve_scene_build(&strands, &opts, &err); break;
+        case PRIM_SPHERE: scene = lrt_points_scene_build(hair.points, hair.radius, NULL, LRT_POINT_SPHERE, npts_used, &opts, &err); break;
+        case PRIM_DISC:   scene = lrt_points_scene_build(hair.points, hair.radius, NULL, LRT_POINT_DISC, npts_used, &opts, &err); break;
+        case PRIM_ODISC:  scene = lrt_points_scene_build(hair.points, hair.radius, pnormals, LRT_POINT_ORIENTED_DISC, npts_used, &opts, &err); break;
+    }
     uint64_t b1 = bench_time_ns();
     if (!scene) {
-        fprintf(stderr, "lrt_roundcurve_scene_build failed (err %d)\n", (int)err);
+        fprintf(stderr, "lightrt scene build failed (err %d)\n", (int)err);
         return 1;
     }
     lrt_tri_stats st;
     lrt_tri_scene_stats(scene, &st);
     double lrt_build_ms = bench_ns_to_ms(b1 - b0);
-    printf("\nlightrt  build %8.1f ms (%6.2f Mseg/s)  mem %7.2f MB  [%s]\n",
-           lrt_build_ms, (double)nseg / lrt_build_ms / 1e3,
+    printf("\nprim: %s  (%zu primitives)\n", prim_name[prim], nprim);
+    printf("lightrt  build %8.1f ms (%6.2f Mprim/s)  mem %7.2f MB  [%s]\n",
+           lrt_build_ms, (double)nprim / lrt_build_ms / 1e3,
            (double)st.memory_bytes / (1024.0 * 1024.0),
            lrt_tri_kernel_name(scene));
 
@@ -497,11 +630,25 @@ int main(int argc, char **argv) {
     void *embree = NULL;
     double em_build_ms = 0.0;
 #ifdef LRTBENCH_HAVE_EMBREE
-    embree = em_build(&hair, npts_used, seg_i0, seg_flags, nseg, threads,
-                      &em_build_ms);
+    if (prim_is_curve(prim)) {
+        enum RTCGeometryType gt = prim == PRIM_ROUND
+                                 ? RTC_GEOMETRY_TYPE_ROUND_LINEAR_CURVE
+                                 : RTC_GEOMETRY_TYPE_FLAT_LINEAR_CURVE;
+        const uint8_t *fl = prim == PRIM_ROUND ? seg_flags : NULL;
+        embree = em_build_curve(&hair, npts_used, seg_i0, fl, nseg, gt, threads,
+                                &em_build_ms);
+    } else {
+        enum RTCGeometryType gt = prim == PRIM_SPHERE
+                                 ? RTC_GEOMETRY_TYPE_SPHERE_POINT
+                                 : prim == PRIM_DISC
+                                       ? RTC_GEOMETRY_TYPE_DISC_POINT
+                                       : RTC_GEOMETRY_TYPE_ORIENTED_DISC_POINT;
+        embree = em_build_points(centers4, prim == PRIM_ODISC ? pnormals : NULL,
+                                 npts_used, gt, threads, &em_build_ms);
+    }
     if (embree)
-        printf("embree   build %8.1f ms (%6.2f Mseg/s)\n", em_build_ms,
-               (double)nseg / em_build_ms / 1e3);
+        printf("embree   build %8.1f ms (%6.2f Mprim/s)\n", em_build_ms,
+               (double)nprim / em_build_ms / 1e3);
     else
         fprintf(stderr, "embree scene build failed (continuing lightrt-only)\n");
 #else
@@ -579,7 +726,10 @@ int main(int argc, char **argv) {
     /* --- Shaded image (from lightrt hits) --- */
     unsigned char *rgb = (unsigned char *)malloc(npix * 3);
     if (rgb) {
-        shade_image(&hair, seg_i0, primary, hits, width, height, rgb);
+        if (prim_is_curve(prim))
+            shade_image(&hair, seg_i0, primary, hits, width, height, rgb);
+        else
+            shade_image_points(&hair, primary, hits, width, height, rgb);
         if (write_ppm(out_path, rgb, width, height) == 0)
             printf("\nwrote %s (%dx%d)\n", out_path, width, height);
         else
@@ -598,6 +748,8 @@ int main(int argc, char **argv) {
     free(ihits);
     free(seg_i0);
     free(seg_flags);
+    free(centers4);
+    free(pnormals);
     cyhair_free(&hair);
     return 0;
 }

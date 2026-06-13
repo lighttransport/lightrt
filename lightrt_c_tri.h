@@ -229,6 +229,38 @@ lrt_tri_scene *lrt_roundcurve_scene_build(const lrt_hair_strands *strands,
                                           const lrt_tri_build_options *opts,
                                           lrt_result *err);
 
+/* Flat (ribbon) linear curves: each strand segment is drawn as a ray-facing
+ * ribbon of width 2*radius (varying r0->r1) — Embree's
+ * RTC_GEOMETRY_TYPE_FLAT_LINEAR_CURVE for the linear case. Same lrt_hair_strands
+ * input as lrt_roundcurve_scene_build; hits report prim_id = segment index,
+ * u = parameter along the segment, v = 0. Queried via the lrt_tri_* functions;
+ * no serialization / refit / mmap. */
+lrt_tri_scene *lrt_flatcurve_scene_build(const lrt_hair_strands *strands,
+                                         const lrt_tri_build_options *opts,
+                                         lrt_result *err);
+
+/* --- Point primitives ------------------------------------------------------
+ *
+ * A cloud of point primitives, mirroring Embree's point geometry types:
+ *   LRT_POINT_SPHERE         analytic sphere      (RTC_GEOMETRY_TYPE_SPHERE_POINT)
+ *   LRT_POINT_DISC           ray-facing disc      (RTC_GEOMETRY_TYPE_DISC_POINT)
+ *   LRT_POINT_ORIENTED_DISC  fixed-normal disc    (ORIENTED_DISC_POINT)
+ *
+ * centers = 3*nprims xyz, radii = nprims. normals = 3*nprims (required only for
+ * LRT_POINT_ORIENTED_DISC, else may be NULL). Queried via the lrt_tri_*
+ * functions; hits report prim_id = point index, u = v = 0. */
+typedef enum lrt_tri_point_type {
+    LRT_POINT_SPHERE = 0,
+    LRT_POINT_DISC = 1,
+    LRT_POINT_ORIENTED_DISC = 2
+} lrt_tri_point_type;
+
+lrt_tri_scene *lrt_points_scene_build(const float *centers, const float *radii,
+                                      const float *normals, int point_type,
+                                      size_t nprims,
+                                      const lrt_tri_build_options *opts,
+                                      lrt_result *err);
+
 /* --- Custom (user) geometry -----------------------------------------------
  *
  * An efficient fp32 custom-primitive path: the BVH broad phase (wide SoA nodes,
