@@ -182,12 +182,56 @@ typedef struct lrt_sph4 {
 _Static_assert(sizeof(lrt_user4) == 160, "lrt_user4 must equal tri_block_size(4)");
 _Static_assert(sizeof(lrt_sph4) == 160, "lrt_sph4 must equal tri_block_size(4)");
 
+/* Quantized triangle leaf blocks (4 tris each; store quantized absolute
+ * v0,v1,v2 → decode → e1=v1-v0, e2=v2-v0 → Moller-Trumbore). These have their
+ * own (smaller, format-specific) stride; the scene carries block_stride and the
+ * qtri kernels address blocks by it instead of tri_block_size(). */
+typedef struct lrt_qtri16 { /* 16-bit, scene-global grid. 88 bytes. */
+    uint16_t qv0x[4], qv0y[4], qv0z[4];
+    uint16_t qv1x[4], qv1y[4], qv1z[4];
+    uint16_t qv2x[4], qv2y[4], qv2z[4];
+    uint32_t prim_id[4];
+} lrt_qtri16;
+_Static_assert(sizeof(lrt_qtri16) == 88, "lrt_qtri16");
+
+typedef struct lrt_qtri8 { /* 8-bit (q8 uniform / fp8 E4M3), per-block grid. 80 bytes. */
+    float org[3], scale[3];
+    uint8_t qv0x[4], qv0y[4], qv0z[4];
+    uint8_t qv1x[4], qv1y[4], qv1z[4];
+    uint8_t qv2x[4], qv2y[4], qv2z[4];
+    uint32_t prim_id[4];
+    uint32_t _pad;
+} lrt_qtri8;
+_Static_assert(sizeof(lrt_qtri8) == 80, "lrt_qtri8");
+
+typedef struct lrt_qtri4 { /* 4-bit E2M1, per-block grid (org=center, scale=halfext). 64 bytes. */
+    float org[3], scale[3];
+    uint8_t nib[18]; /* 9 coords x 4 nibble-lanes (2 lanes/byte) */
+    uint8_t _pad6[6];
+    uint32_t prim_id[4];
+} lrt_qtri4;
+_Static_assert(sizeof(lrt_qtri4) == 64, "lrt_qtri4");
+
+static inline uint32_t lrt_qtri_block_stride(int fmt) {
+    switch (fmt) {
+        case LRT_QTRI_Q16: return (uint32_t)sizeof(lrt_qtri16);
+        case LRT_QTRI_FP4: return (uint32_t)sizeof(lrt_qtri4);
+        default: return (uint32_t)sizeof(lrt_qtri8); /* Q8, FP8 */
+    }
+}
+
+/* Byte-typed block addressing by explicit stride (for quantized leaves). */
+static inline void *tri_block_ptr(void *blocks, uint32_t idx, uint32_t stride) {
+    return (char *)blocks + (size_t)idx * stride;
+}
+
 /* Primitive kind stored in lrt_tri_scene.prim_kind / selected by the builders. */
 enum {
     TRI_PRIM_TRI = 0,   /* triangle leaves (lrt_tri4 / lrt_tri8)        */
     TRI_PRIM_CURVE = 1, /* capsule leaves (lrt_crv4); legacy s->curve   */
     TRI_PRIM_USER = 2,  /* user callback leaves (lrt_user4)             */
-    TRI_PRIM_SPHERE = 3 /* analytic sphere leaves (lrt_sph4)            */
+    TRI_PRIM_SPHERE = 3,/* analytic sphere leaves (lrt_sph4)            */
+    TRI_PRIM_QTRI = 4   /* quantized triangle leaves (lrt_qtri*)        */
 };
 
 /* Build-time sub-segment (after hair subdivision). */
@@ -209,8 +253,14 @@ struct lrt_tri_scene {
     uint32_t node_count;
     void *blocks; /* lrt_tri4[] when layout==4, lrt_tri8[] when layout==8 */
     uint32_t block_count;
+    uint32_t block_stride; /* bytes per leaf block (varies for quantized leaves) */
     lrt_tri_stats stats;
     const char *kernel_name;
+    /* Quantized-triangle leaves (prim_kind == TRI_PRIM_QTRI). */
+    int qfmt;           /* lrt_qtri_format */
+    uint32_t qflags;    /* LRT_QTRI_* */
+    float qgrid_org[3]; /* scene-global grid (q16 only) */
+    float qgrid_scale[3];
     /* Custom-geometry callbacks (prim_kind == TRI_PRIM_USER, incl. SDF). */
     lrt_user_intersect_cb user_isect;
     lrt_user_occluded_cb user_occ; /* NULL => reuse user_isect */
@@ -1786,6 +1836,289 @@ static inline uint8_t tri_quantize_hi(float v, float org, float scale,
     return (uint8_t)q;
 }
 
+/* ---- Quantized-triangle vertex codecs (scalar reference) ---------------- */
+
+/* E2M1 (4-bit float) value table: codes 0..7 positive, 8..15 negated. */
+static const float g_tri_e2m1[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,
+                                     3.0f,  4.0f,  6.0f,  0.0f,  -0.5f,
+                                     -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+#define TRI_E2M1_MAX 6.0f
+
+/* E4M3 (1-4-3, bias 7) decode of a nonnegative code to float. */
+static inline float tri_e4m3_decode(uint8_t q) {
+    uint32_t e = (uint32_t)(q >> 3) & 0xFu, m = (uint32_t)q & 0x7u;
+    if (e == 0u) return (float)m * (1.0f / 512.0f); /* subnormal: m * 2^-9 */
+    uint32_t bits = ((e + 120u) << 23) | (m << 20);
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+static inline uint8_t tri_e4m3_encode(float n) {
+    if (!(n > 0.0f)) return 0u;
+    if (n >= 448.0f) return 0x7Eu;
+    uint32_t b;
+    memcpy(&b, &n, 4);
+    int E = (int)((b >> 23) & 0xFFu) - 127 + 7;
+    uint32_t m = (b >> 20) & 0x7u;
+    uint32_t rnd = (b >> 19) & 1u;
+    if (E >= 1) {
+        uint32_t code = ((uint32_t)E << 3) | m;
+        code += rnd;
+        if (code > 0x7Eu) code = 0x7Eu;
+        return (uint8_t)code;
+    }
+    int q = (int)(n * 512.0f + 0.5f); /* subnormal region */
+    if (q > 7) q = 7;
+    if (q < 0) q = 0;
+    return (uint8_t)q;
+}
+/* nearest E2M1 code for a signed normalized value in [-1,1] (×TRI_E2M1_MAX). */
+static inline uint8_t tri_e2m1_encode(float n) {
+    float t = n * TRI_E2M1_MAX;
+    int best = 0;
+    float bestd = 1e30f;
+    for (int i = 0; i < 16; i++) {
+        float d = g_tri_e2m1[i] - t;
+        d = d < 0 ? -d : d;
+        if (d < bestd) {
+            bestd = d;
+            best = i;
+        }
+    }
+    return (uint8_t)best;
+}
+
+static inline uint8_t tri_nib_get(const uint8_t *nib, int idx) {
+    uint8_t byte = nib[idx >> 1];
+    return (idx & 1) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0x0F);
+}
+static inline void tri_nib_set(uint8_t *nib, int idx, uint8_t v) {
+    uint8_t *byte = &nib[idx >> 1];
+    if (idx & 1)
+        *byte = (uint8_t)((*byte & 0x0F) | (v << 4));
+    else
+        *byte = (uint8_t)((*byte & 0xF0) | (v & 0x0F));
+}
+
+/* Decode the 3 vertices of quantized-leaf lane `lane`, format-dispatched. */
+static inline void tri_qtri_decode_lane(const lrt_tri_scene *s, const void *blkv,
+                                        int lane, float v0[3], float v1[3],
+                                        float v2[3]) {
+    float *vv[3] = {v0, v1, v2};
+    if (s->qfmt == LRT_QTRI_Q16) {
+        const lrt_qtri16 *b = (const lrt_qtri16 *)blkv;
+        const uint16_t *q[9] = {b->qv0x, b->qv0y, b->qv0z, b->qv1x, b->qv1y,
+                                b->qv1z, b->qv2x, b->qv2y, b->qv2z};
+        for (int t = 0; t < 3; t++)
+            for (int a = 0; a < 3; a++)
+                vv[t][a] = s->qgrid_org[a] +
+                           (float)q[t * 3 + a][lane] * s->qgrid_scale[a];
+        return;
+    }
+    if (s->qfmt == LRT_QTRI_FP4) {
+        const lrt_qtri4 *b = (const lrt_qtri4 *)blkv;
+        for (int t = 0; t < 3; t++)
+            for (int a = 0; a < 3; a++) {
+                int c = t * 3 + a;
+                uint8_t code = tri_nib_get(b->nib, c * 4 + lane);
+                vv[t][a] = b->org[a] +
+                           g_tri_e2m1[code] * (1.0f / TRI_E2M1_MAX) * b->scale[a];
+            }
+        return;
+    }
+    /* Q8 / FP8 */
+    const lrt_qtri8 *b = (const lrt_qtri8 *)blkv;
+    const uint8_t *q[9] = {b->qv0x, b->qv0y, b->qv0z, b->qv1x, b->qv1y,
+                           b->qv1z, b->qv2x, b->qv2y, b->qv2z};
+    int fp8 = (s->qfmt == LRT_QTRI_FP8);
+    for (int t = 0; t < 3; t++)
+        for (int a = 0; a < 3; a++) {
+            uint8_t code = q[t * 3 + a][lane];
+            float u = fp8 ? tri_e4m3_decode(code) : (float)code;
+            vv[t][a] = b->org[a] + u * b->scale[a];
+        }
+}
+
+/* Conservative dilation margin as a fraction of the leaf extent, per format
+ * (covers the worst-case decode level spacing; tuned so the no-miss test
+ * passes). Lossy uses 0. */
+static inline float tri_qtri_mfrac(int fmt) {
+    switch (fmt) {
+        case LRT_QTRI_Q16: return 0.0005f;
+        case LRT_QTRI_Q8: return 0.02f;
+        case LRT_QTRI_FP8: return 0.10f;
+        default: return 0.35f; /* FP4 */
+    }
+}
+
+static inline int tri_iround(float f) {
+    int q = (int)(f + (f >= 0.0f ? 0.5f : -0.5f));
+    return q;
+}
+
+/* Encode one (already-dilated) coordinate into the format's integer code. */
+static inline uint16_t tri_qtri_enc(int fmt, float v, float org, float scale,
+                                    float half) {
+    if (fmt == LRT_QTRI_Q16) {
+        if (scale <= 0.0f) return 0;
+        int q = tri_iround((v - org) / scale);
+        if (q < 0) q = 0;
+        if (q > 65535) q = 65535;
+        return (uint16_t)q;
+    }
+    if (fmt == LRT_QTRI_FP4) {
+        if (half <= 0.0f) return 0;
+        float n = (v - org) / half; /* org=center, half=halfext, n in [-1,1] */
+        if (n < -1.0f) n = -1.0f;
+        if (n > 1.0f) n = 1.0f;
+        return tri_e2m1_encode(n);
+    }
+    if (fmt == LRT_QTRI_FP8) {
+        if (scale <= 0.0f) return 0;
+        float n = (v - org) / scale; /* [0,1] */
+        if (n < 0.0f) n = 0.0f;
+        if (n > 1.0f) n = 1.0f;
+        return tri_e4m3_encode(n);
+    }
+    /* Q8 */
+    if (scale <= 0.0f) return 0;
+    int q = tri_iround((v - org) / scale);
+    if (q < 0) q = 0;
+    if (q > 255) q = 255;
+    return (uint8_t)q;
+}
+
+/* Emit one quantized-triangle block (up to 4 tris). prims[k]=NO_HIT marks a
+ * padding lane. */
+static void tri_qtri_emit_block(lrt_tri_scene *s, void *blkv,
+                                const float vtx[4][9], const uint32_t prims[4]) {
+    const int fmt = s->qfmt;
+    const int cons = (s->qflags & LRT_QTRI_CONSERVATIVE) != 0;
+    float work[4][9];
+    /* 1. block bbox over true vertices. */
+    float lo[3] = {TRI_INF_F, TRI_INF_F, TRI_INF_F};
+    float hi[3] = {-TRI_INF_F, -TRI_INF_F, -TRI_INF_F};
+    for (int k = 0; k < 4; k++) {
+        if (prims[k] == LRT_TRI_NO_HIT) continue;
+        for (int j = 0; j < 9; j++) {
+            int a = j % 3;
+            float c = vtx[k][j];
+            if (c < lo[a]) lo[a] = c;
+            if (c > hi[a]) hi[a] = c;
+        }
+    }
+    for (int a = 0; a < 3; a++)
+        if (lo[a] > hi[a]) { lo[a] = 0.0f; hi[a] = 0.0f; }
+    float margin[3];
+    float mf = cons ? tri_qtri_mfrac(fmt) : 0.0f;
+    for (int a = 0; a < 3; a++) {
+        float ext = hi[a] - lo[a];
+        float m = mf * (ext > 1e-20f ? ext : 1.0f);
+        margin[a] = m;
+    }
+    /* 2. dilate (conservative): scale each triangle about its centroid by sigma
+     *    (a homothety about an in-plane point — it grows the triangle WITHIN its
+     *    own plane, so the decoded triangle contains the true one without
+     *    tilting the plane, which would otherwise make grazing rays miss). */
+    float M = margin[0] > margin[1] ? margin[0] : margin[1];
+    if (margin[2] > M) M = margin[2];
+    for (int k = 0; k < 4; k++) {
+        if (prims[k] == LRT_TRI_NO_HIT) {
+            for (int j = 0; j < 9; j++) work[k][j] = 0.0f;
+            continue;
+        }
+        if (!cons) {
+            for (int j = 0; j < 9; j++) work[k][j] = vtx[k][j];
+            continue;
+        }
+        float cen[3];
+        for (int a = 0; a < 3; a++)
+            cen[a] = (vtx[k][a] + vtx[k][3 + a] + vtx[k][6 + a]) / 3.0f;
+        float dmin = TRI_INF_F;
+        for (int i = 0; i < 3; i++) {
+            float d2 = 0.0f;
+            for (int a = 0; a < 3; a++) {
+                float d = vtx[k][i * 3 + a] - cen[a];
+                d2 += d * d;
+            }
+            if (d2 < dmin) dmin = d2;
+        }
+        dmin = sqrtf(dmin);
+        float sigma = 1.0f + M / (dmin > 1e-6f ? dmin : 1e-6f);
+        if (sigma > 8.0f) sigma = 8.0f; /* clamp for slivers */
+        for (int j = 0; j < 9; j++) {
+            int a = j % 3;
+            work[k][j] = cen[a] + sigma * (vtx[k][j] - cen[a]);
+        }
+    }
+    /* 3. grid from (dilated) work verts. */
+    float glo[3] = {TRI_INF_F, TRI_INF_F, TRI_INF_F};
+    float ghi[3] = {-TRI_INF_F, -TRI_INF_F, -TRI_INF_F};
+    for (int k = 0; k < 4; k++) {
+        if (prims[k] == LRT_TRI_NO_HIT) continue;
+        for (int j = 0; j < 9; j++) {
+            int a = j % 3;
+            float c = work[k][j];
+            if (c < glo[a]) glo[a] = c;
+            if (c > ghi[a]) ghi[a] = c;
+        }
+    }
+    for (int a = 0; a < 3; a++)
+        if (glo[a] > ghi[a]) { glo[a] = 0.0f; ghi[a] = 0.0f; }
+    float org[3], scale[3], half[3];
+    for (int a = 0; a < 3; a++) {
+        float ext = ghi[a] - glo[a];
+        if (fmt == LRT_QTRI_FP4) {
+            org[a] = 0.5f * (glo[a] + ghi[a]); /* center */
+            half[a] = ext > 0.0f ? 0.5f * ext * (1.0f + 4e-7f) : 0.0f;
+            scale[a] = half[a];
+        } else if (fmt == LRT_QTRI_FP8) {
+            org[a] = glo[a];
+            scale[a] = ext > 0.0f ? ext * (1.0f + 4e-7f) : 0.0f; /* normalize to [0,1] */
+            half[a] = 0.0f;
+        } else { /* Q8, Q16 (Q16 grid is the scene grid; org/scale below unused) */
+            org[a] = glo[a];
+            scale[a] = ext > 0.0f ? (ext / 255.0f) * (1.0f + 4e-7f) : 0.0f;
+            half[a] = 0.0f;
+        }
+    }
+    /* 4. store grid + encode. */
+    if (fmt == LRT_QTRI_Q16) {
+        lrt_qtri16 *b = (lrt_qtri16 *)blkv;
+        uint16_t *q[9] = {b->qv0x, b->qv0y, b->qv0z, b->qv1x, b->qv1y,
+                          b->qv1z, b->qv2x, b->qv2y, b->qv2z};
+        for (int k = 0; k < 4; k++) {
+            for (int j = 0; j < 9; j++)
+                q[j][k] = tri_qtri_enc(fmt, work[k][j], s->qgrid_org[j % 3],
+                                       s->qgrid_scale[j % 3], 0.0f);
+            b->prim_id[k] = prims[k];
+        }
+    } else if (fmt == LRT_QTRI_FP4) {
+        lrt_qtri4 *b = (lrt_qtri4 *)blkv;
+        for (int a = 0; a < 3; a++) { b->org[a] = org[a]; b->scale[a] = scale[a]; }
+        memset(b->nib, 0, sizeof(b->nib));
+        for (int k = 0; k < 4; k++) {
+            for (int j = 0; j < 9; j++) {
+                uint8_t code = (uint8_t)tri_qtri_enc(fmt, work[k][j], org[j % 3],
+                                                     scale[j % 3], half[j % 3]);
+                tri_nib_set(b->nib, j * 4 + k, code);
+            }
+            b->prim_id[k] = prims[k];
+        }
+    } else { /* Q8, FP8 */
+        lrt_qtri8 *b = (lrt_qtri8 *)blkv;
+        for (int a = 0; a < 3; a++) { b->org[a] = org[a]; b->scale[a] = scale[a]; }
+        uint8_t *q[9] = {b->qv0x, b->qv0y, b->qv0z, b->qv1x, b->qv1y,
+                         b->qv1z, b->qv2x, b->qv2y, b->qv2z};
+        for (int k = 0; k < 4; k++) {
+            for (int j = 0; j < 9; j++)
+                q[j][k] = (uint8_t)tri_qtri_enc(fmt, work[k][j], org[j % 3],
+                                                scale[j % 3], 0.0f);
+            b->prim_id[k] = prims[k];
+        }
+    }
+}
+
 /* Emit the triangles of a binary leaf as SoA blocks of the scene's SIMD
  * width; returns a leaf ref. */
 static uint32_t tri_emit_leaf(tri_collapse_ctx *cc, const tri_bnode *bn) {
@@ -1887,6 +2220,32 @@ static uint32_t tri_emit_leaf(tri_collapse_ctx *cc, const tri_bnode *bn) {
                     blk->prim[lane] = LRT_TRI_NO_HIT;
                 }
             }
+        }
+        cc->leaf_count++;
+        cc->sah_leaf +=
+            (double)(tri_surface_area(bn->lo, bn->hi) / cc->root_area) *
+            (double)count;
+        return TRI_MAKE_LEAF_REF(first_block, nblocks);
+    }
+    if (bc->emit_kind == TRI_PRIM_QTRI) { /* quantized triangle leaves (BVH4) */
+        for (uint32_t b = 0; b < nblocks; b++) {
+            void *blk = tri_block_ptr(s->blocks, s->block_count, s->block_stride);
+            s->block_count++;
+            float vtx[4][9];
+            uint32_t prims[4];
+            for (uint32_t lane = 0; lane < 4u; lane++) {
+                uint32_t k = b * 4u + lane;
+                if (k < count) {
+                    uint32_t prim = bc->indices[bn->a + k];
+                    prims[lane] = prim;
+                    memcpy(vtx[lane], &bc->verts[(size_t)prim * 9],
+                           9 * sizeof(float));
+                } else {
+                    prims[lane] = LRT_TRI_NO_HIT;
+                    memset(vtx[lane], 0, 9 * sizeof(float));
+                }
+            }
+            tri_qtri_emit_block(s, blk, vtx, prims);
         }
         cc->leaf_count++;
         cc->sah_leaf +=
@@ -2134,9 +2493,10 @@ typedef struct tri_stack_entry {
  * of a leaf. Incoherent rays make these fetches the critical path. */
 static inline void tri_prefetch_ref(const lrt_tri_scene *s, uint32_t ref,
                                     int width) {
+    (void)width;
     if (TRI_REF_IS_LEAF(ref)) {
-        const char *b = (const char *)tri_block_floats(s->blocks,
-                                                       TRI_REF_BLOCK(ref), width);
+        const char *b = (const char *)tri_block_ptr(
+            s->blocks, TRI_REF_BLOCK(ref), s->block_stride);
         _mm_prefetch(b, _MM_HINT_T0);
         _mm_prefetch(b + 64, _MM_HINT_T0);
         return;
@@ -2649,6 +3009,170 @@ static int tri_occluded_scalar(const lrt_tri_scene *s, const lrt_ray *ray) {
     }
     return 0;
 }
+
+/* ---- Quantized-triangle leaves: scalar decode + Moller-Trumbore --------- */
+
+static inline uint32_t tri_qtri_prim(const lrt_tri_scene *s, const void *blk,
+                                     int lane) {
+    if (s->qfmt == LRT_QTRI_Q16) return ((const lrt_qtri16 *)blk)->prim_id[lane];
+    if (s->qfmt == LRT_QTRI_FP4) return ((const lrt_qtri4 *)blk)->prim_id[lane];
+    return ((const lrt_qtri8 *)blk)->prim_id[lane];
+}
+
+/* Moller-Trumbore on explicit v0,e1,e2 (same epsilon/semantics as
+ * tri_isect_lane). */
+static inline int tri_mt_scalar(const float v0[3], const float e1[3],
+                                const float e2[3], const tri_ray_ctx *rc,
+                                float t_best, float *t, float *u, float *v) {
+    float px = rc->dir[1] * e2[2] - rc->dir[2] * e2[1];
+    float py = rc->dir[2] * e2[0] - rc->dir[0] * e2[2];
+    float pz = rc->dir[0] * e2[1] - rc->dir[1] * e2[0];
+    float det = e1[0] * px + e1[1] * py + e1[2] * pz;
+    if (det > -1e-12f && det < 1e-12f) return 0;
+    float inv = 1.0f / det;
+    float tvx = rc->org[0] - v0[0], tvy = rc->org[1] - v0[1],
+          tvz = rc->org[2] - v0[2];
+    float uu = (tvx * px + tvy * py + tvz * pz) * inv;
+    if (uu < 0.0f || uu > 1.0f) return 0;
+    float qx = tvy * e1[2] - tvz * e1[1];
+    float qy = tvz * e1[0] - tvx * e1[2];
+    float qz = tvx * e1[1] - tvy * e1[0];
+    float vv = (rc->dir[0] * qx + rc->dir[1] * qy + rc->dir[2] * qz) * inv;
+    if (vv < 0.0f || uu + vv > 1.0f) return 0;
+    float tt = (e2[0] * qx + e2[1] * qy + e2[2] * qz) * inv;
+    if (tt < rc->tmin || tt >= t_best) return 0;
+    *t = tt;
+    *u = uu;
+    *v = vv;
+    return 1;
+}
+
+static inline void tri_qtri_block_isect(const lrt_tri_scene *s, const void *blk,
+                                        const tri_ray_ctx *rc, float *best_t,
+                                        float *best_u, float *best_v,
+                                        uint32_t *best_prim) {
+    for (int lane = 0; lane < 4; lane++) {
+        uint32_t prim = tri_qtri_prim(s, blk, lane);
+        if (prim == LRT_TRI_NO_HIT) continue;
+        float v0[3], v1[3], v2[3];
+        tri_qtri_decode_lane(s, blk, lane, v0, v1, v2);
+        float e1[3] = {v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]};
+        float e2[3] = {v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]};
+        float t, u, v;
+        if (tri_mt_scalar(v0, e1, e2, rc, *best_t, &t, &u, &v)) {
+            *best_t = t;
+            *best_u = u;
+            *best_v = v;
+            *best_prim = prim;
+        }
+    }
+}
+
+static inline int tri_qtri_block_occluded(const lrt_tri_scene *s,
+                                          const void *blk, const tri_ray_ctx *rc,
+                                          float t_max) {
+    for (int lane = 0; lane < 4; lane++) {
+        uint32_t prim = tri_qtri_prim(s, blk, lane);
+        if (prim == LRT_TRI_NO_HIT) continue;
+        float v0[3], v1[3], v2[3];
+        tri_qtri_decode_lane(s, blk, lane, v0, v1, v2);
+        float e1[3] = {v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]};
+        float e2[3] = {v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]};
+        float t, u, v;
+        if (tri_mt_scalar(v0, e1, e2, rc, t_max, &t, &u, &v)) return 1;
+    }
+    return 0;
+}
+
+#if !LRT_TRI_HAS_SSE4
+/* Scalar BVH4 traversal over quantized leaves (non-SSE fallback). */
+static int tri_qtri_intersect_scalar(const lrt_tri_scene *s, const lrt_ray *ray,
+                                     lrt_hit *hit) {
+    tri_ray_ctx rc;
+    tri_ray_setup(ray, &rc);
+    float best_t = ray->tmax, best_u = 0.0f, best_v = 0.0f;
+    uint32_t best_prim = LRT_TRI_NO_HIT;
+    tri_stack_entry stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp].ref = s->root;
+    stack[sp].tnear = rc.tmin;
+    sp++;
+    while (sp > 0) {
+        tri_stack_entry e = stack[--sp];
+        if (e.tnear >= best_t) continue;
+        if (TRI_REF_IS_LEAF(e.ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(e.ref), nblk = TRI_REF_NBLOCKS(e.ref);
+            for (uint32_t b = 0; b < nblk; b++)
+                tri_qtri_block_isect(
+                    s, tri_block_ptr(s->blocks, blk0 + b, s->block_stride), &rc,
+                    &best_t, &best_u, &best_v, &best_prim);
+            continue;
+        }
+        const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(e.ref)];
+        int nch = (int)n->nchildren;
+        uint32_t hit_ref[4];
+        float hit_tn[4];
+        int nhit = 0;
+        for (int i = 0; i < nch; i++) {
+            float tnear;
+            if (tri_slab_scalar(n->lo_x, n->lo_y, n->lo_z, n->hi_x, n->hi_y,
+                                n->hi_z, i, &rc, best_t, &tnear)) {
+                int j = nhit++;
+                while (j > 0 && hit_tn[j - 1] > tnear) {
+                    hit_tn[j] = hit_tn[j - 1];
+                    hit_ref[j] = hit_ref[j - 1];
+                    j--;
+                }
+                hit_tn[j] = tnear;
+                hit_ref[j] = n->child[i];
+            }
+        }
+        for (int i = nhit - 1; i >= 0; i--) {
+            stack[sp].ref = hit_ref[i];
+            stack[sp].tnear = hit_tn[i];
+            sp++;
+        }
+    }
+    if (hit) {
+        hit->t = best_prim != LRT_TRI_NO_HIT ? best_t : 0.0f;
+        hit->u = best_u;
+        hit->v = best_v;
+        hit->prim_id = best_prim;
+    }
+    return best_prim != LRT_TRI_NO_HIT;
+}
+
+static int tri_qtri_occluded_scalar(const lrt_tri_scene *s, const lrt_ray *ray) {
+    tri_ray_ctx rc;
+    tri_ray_setup(ray, &rc);
+    const float t_max = ray->tmax;
+    uint32_t stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp++] = s->root;
+    while (sp > 0) {
+        uint32_t ref = stack[--sp];
+        if (TRI_REF_IS_LEAF(ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(ref), nblk = TRI_REF_NBLOCKS(ref);
+            for (uint32_t b = 0; b < nblk; b++)
+                if (tri_qtri_block_occluded(
+                        s, tri_block_ptr(s->blocks, blk0 + b, s->block_stride),
+                        &rc, t_max))
+                    return 1;
+            continue;
+        }
+        const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(ref)];
+        int nch = (int)n->nchildren;
+        for (int i = 0; i < nch; i++) {
+            float tnear;
+            if (tri_slab_scalar(n->lo_x, n->lo_y, n->lo_z, n->hi_x, n->hi_y,
+                                n->hi_z, i, &rc, t_max, &tnear)) {
+                if (sp < TRI_STACK_SIZE) stack[sp++] = n->child[i];
+            }
+        }
+    }
+    return 0;
+}
+#endif /* !LRT_TRI_HAS_SSE4 */
 
 /* ------------------------------------------------------------------------- */
 /* SSE4 kernels (BVH4).                                                      */
@@ -3335,6 +3859,89 @@ static int tri_user_occluded_bvh4(const lrt_tri_scene *s, const lrt_ray *ray) {
                     }
                 }
             }
+            continue;
+        }
+        const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(ref)];
+        _Alignas(16) float tnear[4];
+        int mask = tri_bvh4_slab_sse(n, &sc, tmax4, tnear);
+        mask &= (1 << n->nchildren) - 1;
+        while (mask) {
+            int i = __builtin_ctz((unsigned)mask);
+            mask &= mask - 1;
+            tri_prefetch_ref(s, n->child[i], 4);
+            stack[sp++] = n->child[i];
+        }
+    }
+    return 0;
+}
+
+/* ---- Quantized-triangle traversal: SSE node tests + scalar decoded leaf -- */
+static int tri_qtri_intersect_bvh4(const lrt_tri_scene *s, const lrt_ray *ray,
+                                   lrt_hit *hit) {
+    tri_ray_ctx rc;
+    tri_ray_setup(ray, &rc);
+    tri_sse_ctx sc;
+    tri_sse_setup(&rc, &sc);
+    float best_t = ray->tmax, best_u = 0.0f, best_v = 0.0f;
+    uint32_t best_prim = LRT_TRI_NO_HIT;
+    tri_stack_entry stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp].ref = s->root;
+    stack[sp].tnear = rc.tmin;
+    sp++;
+    while (sp > 0) {
+        tri_stack_entry e = stack[--sp];
+        if (e.tnear >= best_t) continue;
+        if (TRI_REF_IS_LEAF(e.ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(e.ref), nblk = TRI_REF_NBLOCKS(e.ref);
+            for (uint32_t b = 0; b < nblk; b++)
+                tri_qtri_block_isect(
+                    s, tri_block_ptr(s->blocks, blk0 + b, s->block_stride), &rc,
+                    &best_t, &best_u, &best_v, &best_prim);
+            continue;
+        }
+        const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(e.ref)];
+        _Alignas(16) float tnear[4];
+        int mask = tri_bvh4_slab_sse(n, &sc, _mm_set1_ps(best_t), tnear);
+        mask &= (1 << n->nchildren) - 1;
+        uint8_t perm = n->perm[rc.octant];
+        for (int p = 3; p >= 0; p--) {
+            int slot = (perm >> (2 * p)) & 3;
+            if (!(mask & (1 << slot))) continue;
+            tri_prefetch_ref(s, n->child[slot], 4);
+            stack[sp].ref = n->child[slot];
+            stack[sp].tnear = tnear[slot];
+            sp++;
+        }
+    }
+    if (hit) {
+        hit->t = best_prim != LRT_TRI_NO_HIT ? best_t : 0.0f;
+        hit->u = best_u;
+        hit->v = best_v;
+        hit->prim_id = best_prim;
+    }
+    return best_prim != LRT_TRI_NO_HIT;
+}
+
+static int tri_qtri_occluded_bvh4(const lrt_tri_scene *s, const lrt_ray *ray) {
+    tri_ray_ctx rc;
+    tri_ray_setup(ray, &rc);
+    tri_sse_ctx sc;
+    tri_sse_setup(&rc, &sc);
+    __m128 tmax4 = _mm_set1_ps(ray->tmax);
+    const float t_max = ray->tmax;
+    uint32_t stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp++] = s->root;
+    while (sp > 0) {
+        uint32_t ref = stack[--sp];
+        if (TRI_REF_IS_LEAF(ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(ref), nblk = TRI_REF_NBLOCKS(ref);
+            for (uint32_t b = 0; b < nblk; b++)
+                if (tri_qtri_block_occluded(
+                        s, tri_block_ptr(s->blocks, blk0 + b, s->block_stride),
+                        &rc, t_max))
+                    return 1;
             continue;
         }
         const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(ref)];
@@ -4308,7 +4915,7 @@ static int tri_collapse_into(lrt_tri_scene *s, tri_build_ctx *bc,
                        : s->quantized    ? sizeof(lrt_bvh8q_node)
                                          : sizeof(lrt_bvh8_node);
     s->stats.memory_bytes = (size_t)s->node_count * node_size +
-                            (size_t)s->block_count * tri_block_size(s->layout);
+                            (size_t)s->block_count * s->block_stride;
     s->stats.sah_cost = (float)(TRI_TRAV_COST * cc.sah_inner +
                                 TRI_ISECT_COST * cc.sah_leaf);
     return 0;
@@ -4459,6 +5066,7 @@ lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
     if (!bc.failed) {
         s->layout = layout;
         s->quantized = quantized;
+        s->block_stride = (uint32_t)tri_block_size(layout);
         /* Allocate exactly what the collapse will emit (vs the ntris worst-case
          * bound, which over-reserves ~5x the address space). */
         uint32_t node_cap, block_cap;
@@ -4475,7 +5083,7 @@ lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
                 64, (size_t)node_cap * sizeof(lrt_bvh8_node));
         }
         s->blocks = tri_aligned_alloc(
-            64, (size_t)block_cap * tri_block_size(layout));
+            64, (size_t)block_cap * s->block_stride);
         if ((!s->nodes4 && !s->nodes8 && !s->nodes8q) || !s->blocks) {
             bc.failed = 1;
         } else {
@@ -4511,7 +5119,7 @@ lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
                                                : sizeof(lrt_bvh8_node);
                 s->stats.memory_bytes =
                     (size_t)s->node_count * node_size +
-                    (size_t)s->block_count * tri_block_size(layout);
+                    (size_t)s->block_count * s->block_stride;
                 s->stats.sah_cost = (float)(TRI_TRAV_COST * cc.sah_inner +
                                             TRI_ISECT_COST * cc.sah_leaf);
             }
@@ -4581,6 +5189,13 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
         if (hit) hit->prim_id = LRT_TRI_NO_HIT;
         return 0;
     }
+    if (s->prim_kind == TRI_PRIM_QTRI) {
+#if LRT_TRI_HAS_SSE4
+        return tri_qtri_intersect_bvh4(s, ray, hit);
+#else
+        return tri_qtri_intersect_scalar(s, ray, hit);
+#endif
+    }
 #if LRT_TRI_HAS_SSE4
     if (s->curve) return tri_curve_intersect_bvh4(s, ray, hit);
     if (s->prim_kind == TRI_PRIM_SPHERE)
@@ -4602,6 +5217,13 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
 
 int lrt_tri_occluded1(const lrt_tri_scene *s, const lrt_ray *ray) {
     if (!s || !ray) return 0;
+    if (s->prim_kind == TRI_PRIM_QTRI) {
+#if LRT_TRI_HAS_SSE4
+        return tri_qtri_occluded_bvh4(s, ray);
+#else
+        return tri_qtri_occluded_scalar(s, ray);
+#endif
+    }
 #if LRT_TRI_HAS_SSE4
     if (s->curve) return tri_curve_occluded_bvh4(s, ray);
     if (s->prim_kind == TRI_PRIM_SPHERE) return tri_sphere_occluded_bvh4(s, ray);
@@ -4633,7 +5255,7 @@ void lrt_tri_intersect1N(const lrt_tri_scene *s, const lrt_ray *rays,
     if (!s || !rays || !hits) return;
     (void)hint; /* unused in scalar-only builds */
     if (s->curve || s->prim_kind == TRI_PRIM_USER ||
-        s->prim_kind == TRI_PRIM_SPHERE) {
+        s->prim_kind == TRI_PRIM_SPHERE || s->prim_kind == TRI_PRIM_QTRI) {
         /* interleaved pipelines are triangle-specific; loop per ray */
         for (size_t i = 0; i < n; i++) lrt_tri_intersect1(s, &rays[i], &hits[i]);
         return;
@@ -4692,7 +5314,7 @@ void lrt_tri_occluded1N(const lrt_tri_scene *s, const lrt_ray *rays,
     if (!s || !rays || !occluded) return;
     (void)hint; /* unused in scalar-only builds */
     if (s->curve || s->prim_kind == TRI_PRIM_USER ||
-        s->prim_kind == TRI_PRIM_SPHERE) {
+        s->prim_kind == TRI_PRIM_SPHERE || s->prim_kind == TRI_PRIM_QTRI) {
         for (size_t i = 0; i < n; i++) {
             occluded[i] = (uint8_t)lrt_tri_occluded1(s, &rays[i]);
         }
@@ -5320,6 +5942,7 @@ lrt_tri_scene *lrt_curve_scene_build(const float *segments, const float *radii,
         s->layout = 4;
         s->curve = 1;
         s->prim_kind = TRI_PRIM_CURVE;
+        s->block_stride = (uint32_t)sizeof(lrt_crv4);
         uint32_t node_cap, block_cap;
         tri_collapse_caps(&bc, 4, b_root, &node_cap, &block_cap);
         s->nodes4 = (lrt_bvh4_node *)tri_aligned_alloc(
@@ -5415,12 +6038,13 @@ static lrt_tri_scene *tri_finish_aabb_build(tri_build_ctx *bc, size_t nprims,
     if (!bc->failed) {
         s->layout = 4;
         s->prim_kind = prim_kind;
+        if (!s->block_stride) s->block_stride = (uint32_t)tri_block_size(4);
         uint32_t node_cap, block_cap;
         tri_collapse_caps(bc, 4, b_root, &node_cap, &block_cap);
         (void)nprims;
         s->nodes4 = (lrt_bvh4_node *)tri_aligned_alloc(
             64, (size_t)node_cap * sizeof(lrt_bvh4_node));
-        s->blocks = tri_aligned_alloc(64, (size_t)block_cap * tri_block_size(4));
+        s->blocks = tri_aligned_alloc(64, (size_t)block_cap * s->block_stride);
         if (!s->nodes4 || !s->blocks) {
             bc->failed = 1;
         } else if (tri_collapse_into(s, bc, b_root, node_cap, block_cap)) {
@@ -5594,6 +6218,180 @@ lrt_tri_scene *lrt_sphere_scene_build(const float *spheres, size_t nprims,
     lrt_tri_scene *s =
         tri_finish_aabb_build(&bc, nprims, TRI_PRIM_SPHERE, num_threads, err);
     tri_free_aabb_scratch(&bc);
+    return s;
+}
+
+/* --------------------------------------------------------------------------
+ * Quantized triangle scenes (approximate / LOD / preview).
+ * ------------------------------------------------------------------------ */
+
+/* AABB of a quantized leaf, decoded (used to set node bounds that enclose the
+ * decoded — and, conservative-mode, dilated — geometry). */
+static void tri_qtri_leaf_box(const lrt_tri_scene *s, uint32_t ref, float lo[3],
+                              float hi[3]) {
+    lo[0] = lo[1] = lo[2] = TRI_INF_F;
+    hi[0] = hi[1] = hi[2] = -TRI_INF_F;
+    uint32_t blk0 = TRI_REF_BLOCK(ref), nblk = TRI_REF_NBLOCKS(ref);
+    for (uint32_t b = 0; b < nblk; b++) {
+        const void *blk = tri_block_ptr(s->blocks, blk0 + b, s->block_stride);
+        for (int lane = 0; lane < 4; lane++) {
+            if (tri_qtri_prim(s, blk, lane) == LRT_TRI_NO_HIT) continue;
+            float v0[3], v1[3], v2[3];
+            tri_qtri_decode_lane(s, blk, lane, v0, v1, v2);
+            for (int a = 0; a < 3; a++) {
+                float mn = v0[a] < v1[a] ? v0[a] : v1[a];
+                mn = mn < v2[a] ? mn : v2[a];
+                float mx = v0[a] > v1[a] ? v0[a] : v1[a];
+                mx = mx > v2[a] ? mx : v2[a];
+                if (mn < lo[a]) lo[a] = mn;
+                if (mx > hi[a]) hi[a] = mx;
+            }
+        }
+    }
+}
+
+/* Recompute every BVH4 node's child bounds from the DECODED leaf geometry
+ * (mandatory: quantized/dilated verts drift outside the true AABB, so the build
+ * bounds could cull the leaf holding the closest hit). Reverse-index bottom-up
+ * (children have higher node indices). Returns 1 on OOM. */
+static int tri_qtri_recompute_node_bounds(lrt_tri_scene *s) {
+    if (s->node_count == 0) {
+        tri_qtri_leaf_box(s, s->root, s->root_lo, s->root_hi);
+        return 0;
+    }
+    float *nlo = (float *)malloc((size_t)s->node_count * 3 * sizeof(float));
+    float *nhi = (float *)malloc((size_t)s->node_count * 3 * sizeof(float));
+    if (!nlo || !nhi) {
+        free(nlo);
+        free(nhi);
+        return 1;
+    }
+    for (uint32_t i = s->node_count; i-- > 0;) {
+        lrt_bvh4_node *w = &s->nodes4[i];
+        float blo[3] = {TRI_INF_F, TRI_INF_F, TRI_INF_F};
+        float bhi[3] = {-TRI_INF_F, -TRI_INF_F, -TRI_INF_F};
+        for (uint32_t c = 0; c < w->nchildren; c++) {
+            float clo[3], chi[3];
+            if (TRI_REF_IS_LEAF(w->child[c])) {
+                tri_qtri_leaf_box(s, w->child[c], clo, chi);
+            } else {
+                uint32_t M = TRI_REF_NODE(w->child[c]);
+                for (int a = 0; a < 3; a++) {
+                    clo[a] = nlo[(size_t)M * 3 + a];
+                    chi[a] = nhi[(size_t)M * 3 + a];
+                }
+            }
+            w->lo_x[c] = clo[0]; w->lo_y[c] = clo[1]; w->lo_z[c] = clo[2];
+            w->hi_x[c] = chi[0]; w->hi_y[c] = chi[1]; w->hi_z[c] = chi[2];
+            for (int a = 0; a < 3; a++) {
+                if (clo[a] < blo[a]) blo[a] = clo[a];
+                if (chi[a] > bhi[a]) bhi[a] = chi[a];
+            }
+        }
+        for (int a = 0; a < 3; a++) {
+            nlo[(size_t)i * 3 + a] = blo[a];
+            nhi[(size_t)i * 3 + a] = bhi[a];
+        }
+    }
+    if (TRI_REF_IS_LEAF(s->root)) {
+        tri_qtri_leaf_box(s, s->root, s->root_lo, s->root_hi);
+    } else {
+        uint32_t rn = TRI_REF_NODE(s->root);
+        for (int a = 0; a < 3; a++) {
+            s->root_lo[a] = nlo[(size_t)rn * 3 + a];
+            s->root_hi[a] = nhi[(size_t)rn * 3 + a];
+        }
+    }
+    free(nlo);
+    free(nhi);
+    return 0;
+}
+
+lrt_tri_scene *lrt_qtri_scene_build(const float *vertices, size_t ntris,
+                                    lrt_qtri_format fmt, unsigned flags,
+                                    const lrt_tri_build_options *opts,
+                                    lrt_result *err) {
+    tri_set_err(err, LRT_RESULT_OK);
+    if (!vertices || ntris == 0 || ntris > 0x07FFFFFFu || fmt < 0 ||
+        fmt > LRT_QTRI_FP4) {
+        tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
+        return NULL;
+    }
+    lrt_tri_build_options o;
+    if (opts) {
+        o = *opts;
+    } else {
+        memset(&o, 0, sizeof(o));
+    }
+    unsigned num_threads = o.num_threads ? o.num_threads : 1u;
+    uint32_t max_leaf = o.max_leaf_size ? o.max_leaf_size : TRI_DEFAULT_LEAF;
+    if (max_leaf > TRI_MAX_LEAF) max_leaf = TRI_MAX_LEAF;
+
+    tri_build_ctx bc;
+    memset(&bc, 0, sizeof(bc));
+    bc.verts = vertices;
+    bc.ntris = ntris;
+    bc.max_leaf = max_leaf;
+    bc.block_shift = 2u; /* BVH4 */
+    bc.quality = LRT_TRI_BUILD_DEFAULT;
+    bc.emit_kind = TRI_PRIM_QTRI;
+    if (tri_alloc_aabb_scratch(&bc, ntris)) {
+        tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+        return NULL;
+    }
+    if (tri_precompute(&bc, num_threads)) {
+        tri_free_aabb_scratch(&bc);
+        tri_set_err(err, LRT_RESULT_INVALID_BOUNDS);
+        return NULL;
+    }
+    uint32_t b_root = tri_build_binary(&bc, num_threads);
+
+    lrt_tri_scene *s = NULL;
+    if (!bc.failed) {
+        s = (lrt_tri_scene *)calloc(1, sizeof(lrt_tri_scene));
+        if (!s) bc.failed = 1;
+    }
+    if (!bc.failed) {
+        s->layout = 4;
+        s->prim_kind = TRI_PRIM_QTRI;
+        s->qfmt = (int)fmt;
+        s->qflags = flags;
+        s->block_stride = lrt_qtri_block_stride((int)fmt);
+        if (fmt == LRT_QTRI_Q16) {
+            const tri_bnode *rt = &bc.bnodes[b_root];
+            float mf = (flags & LRT_QTRI_CONSERVATIVE) ? tri_qtri_mfrac(fmt)
+                                                       : 0.0f;
+            for (int a = 0; a < 3; a++) {
+                float ext = rt->hi[a] - rt->lo[a];
+                float m = mf * (ext > 1e-20f ? ext : 1.0f);
+                float glo = rt->lo[a] - m, gext = ext + 2.0f * m;
+                s->qgrid_org[a] = glo;
+                s->qgrid_scale[a] =
+                    gext > 0.0f ? (gext / 65535.0f) * (1.0f + 4e-7f) : 0.0f;
+            }
+        }
+        uint32_t node_cap, block_cap;
+        tri_collapse_caps(&bc, 4, b_root, &node_cap, &block_cap);
+        s->nodes4 = (lrt_bvh4_node *)tri_aligned_alloc(
+            64, (size_t)node_cap * sizeof(lrt_bvh4_node));
+        s->blocks = tri_aligned_alloc(64, (size_t)block_cap * s->block_stride);
+        if (!s->nodes4 || !s->blocks) {
+            bc.failed = 1;
+        } else if (tri_collapse_into(s, &bc, b_root, node_cap, block_cap)) {
+            bc.failed = 1;
+        } else if (tri_qtri_recompute_node_bounds(s)) {
+            bc.failed = 1;
+        }
+    }
+    tri_free_aabb_scratch(&bc);
+    if (bc.failed) {
+        lrt_tri_scene_free(s);
+        tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+        return NULL;
+    }
+    static const char *names[4] = {"qtri-q16-bvh4", "qtri-q8-bvh4",
+                                   "qtri-fp8-bvh4", "qtri-fp4-bvh4"};
+    s->kernel_name = names[fmt];
     return s;
 }
 
@@ -5913,7 +6711,7 @@ static void tri_recompute_stats(lrt_tri_scene *s) {
     s->stats.max_depth = 0;
     s->stats.memory_bytes =
         (size_t)s->node_count * tri_node_stride(s->layout, s->quantized) +
-        (size_t)s->block_count * tri_block_size(s->layout);
+        (size_t)s->block_count * s->block_stride;
     s->stats.sah_cost = 0.0f;
 }
 
@@ -5925,7 +6723,7 @@ lrt_result lrt_tri_scene_save_to_memory(const lrt_tri_scene *s, void **buf,
     if (s->prim_kind != TRI_PRIM_TRI && s->prim_kind != TRI_PRIM_CURVE)
         return LRT_RESULT_INVALID_ARGUMENT; /* callbacks can't serialize */
     size_t nstride = tri_node_stride(s->layout, s->quantized);
-    size_t bstride = tri_block_size(s->layout);
+    size_t bstride = s->block_stride;
     size_t node_off =
         tri_align_up(sizeof(lrt_tri_file_header), LRT_TRI_FILE_ALIGN);
     size_t nodes_bytes = (size_t)s->node_count * nstride;
@@ -6026,6 +6824,7 @@ static lrt_tri_scene *tri_scene_from_buffer(const void *buf, size_t n, int copy,
     s->root = h->root;
     s->node_count = h->node_count;
     s->block_count = h->block_count;
+    s->block_stride = h->block_stride;
     for (int a = 0; a < 3; a++) {
         s->root_lo[a] = h->root_lo[a];
         s->root_hi[a] = h->root_hi[a];

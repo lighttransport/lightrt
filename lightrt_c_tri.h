@@ -243,6 +243,38 @@ lrt_tri_scene *lrt_sphere_scene_build(const float *spheres, size_t nprims,
                                       const lrt_tri_build_options *opts,
                                       lrt_result *err);
 
+/* --- Quantized triangle scenes (approximate / LOD / preview) ---------------
+ *
+ * Triangle vertices are stored in a low-precision format to cut memory and
+ * bandwidth, for large-scene preview / level-of-detail / approximate ray
+ * tracing where geometric precision is not required. BVH4 only; queried through
+ * the same lrt_tri_intersect1 / lrt_tri_occluded1 (and 1N). Hits report the
+ * original triangle index in prim_id; t/u/v are approximate.
+ *
+ * Spatial queries (closest_point/knn/region/intersect_n), refit, and
+ * serialization are NOT supported on quantized scenes.
+ */
+typedef enum lrt_qtri_format {
+    LRT_QTRI_Q16 = 0, /* 16-bit, scene-global grid; near-lossless (~22 B/tri) */
+    LRT_QTRI_Q8 = 1,  /* 8-bit uniform, per-leaf grid                (~20 B/tri) */
+    LRT_QTRI_FP8 = 2, /* 8-bit E4M3 float, per-leaf grid             (~20 B/tri) */
+    LRT_QTRI_FP4 = 3  /* 4-bit E2M1 float, per-leaf grid             (~16 B/tri) */
+} lrt_qtri_format;
+
+/* flags */
+#define LRT_QTRI_LOSSY 0u        /* smallest; hits are approximate            */
+#define LRT_QTRI_CONSERVATIVE 1u /* decoded triangle encloses the true one:
+                                  * a transverse ray that hit the true triangle
+                                  * never misses (only spurious near-edge hits) */
+
+/* Build a quantized-triangle scene. vertices = 9*ntris floats (v0 v1 v2 per
+ * triangle), copied. opts->layout is forced to BVH4, quality clamped to
+ * FAST/DEFAULT. */
+lrt_tri_scene *lrt_qtri_scene_build(const float *vertices, size_t ntris,
+                                    lrt_qtri_format fmt, unsigned flags,
+                                    const lrt_tri_build_options *opts,
+                                    lrt_result *err);
+
 /* --- Spatial queries (triangle scenes) ------------------------------------
  *
  * These operate on triangle scenes built with lrt_tri_scene_build. For

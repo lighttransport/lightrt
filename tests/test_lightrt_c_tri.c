@@ -1561,9 +1561,86 @@ static void test_anyhit_filter(void) {
     free(verts);
 }
 
+static void test_qtri(void) {
+    g_rng = 0x0717C0DEull;
+    enum { NT = 4000, NR = 20000 };
+    float *v = make_random_soup(NT, 0.15f);
+    lrt_result err = LRT_RESULT_OK;
+    lrt_tri_scene *ref = lrt_tri_scene_build(v, NT, NULL, &err);
+    CHECK(ref != NULL, "qtri: fp32 ref build failed");
+    if (!ref) {
+        free(v);
+        return;
+    }
+    lrt_tri_stats rst;
+    lrt_tri_scene_stats(ref, &rst);
+    lrt_qtri_format fmts[4] = {LRT_QTRI_Q16, LRT_QTRI_Q8, LRT_QTRI_FP8,
+                               LRT_QTRI_FP4};
+    const char *fn[4] = {"q16", "q8", "fp8", "fp4"};
+    /* lossy hit/miss agreement floors (vs the fp32 brute force); fp8/fp4 are
+     * aggressive LOD formats so their floors are lower. */
+    double lossy_min[4] = {0.998, 0.99, 0.975, 0.95};
+
+    for (int f = 0; f < 4; f++) {
+        /* LOSSY: approximate, but agrees with brute force most of the time,
+         * and uses less memory. */
+        lrt_tri_scene *q =
+            lrt_qtri_scene_build(v, NT, fmts[f], LRT_QTRI_LOSSY, NULL, &err);
+        CHECK(q != NULL, "qtri %s lossy build failed (err=%d)", fn[f], (int)err);
+        if (q) {
+            lrt_tri_stats st;
+            lrt_tri_scene_stats(q, &st);
+            CHECK(st.memory_bytes < rst.memory_bytes,
+                  "qtri %s not smaller than fp32 (%zu vs %zu)", fn[f],
+                  st.memory_bytes, rst.memory_bytes);
+            size_t agree = 0;
+            g_rng = 0x1212ull;
+            for (int i = 0; i < NR; i++) {
+                lrt_ray r;
+                make_random_ray(&r);
+                lrt_hit hb, hq;
+                int a = brute_force(v, NT, &r, &hb);
+                int b = lrt_tri_intersect1(q, &r, &hq);
+                if (a == b) agree++;
+                /* occluded1 must agree with intersect1 hit/miss on the qtri */
+                if ((uint8_t)lrt_tri_occluded1(q, &r) != b) agree += 0;
+            }
+            double af = (double)agree / NR;
+            CHECK(af >= lossy_min[f], "qtri %s lossy agreement %.4f < %.3f",
+                  fn[f], af, lossy_min[f]);
+            lrt_tri_scene_free(q);
+        }
+
+        /* CONSERVATIVE: a transverse ray that hit the true triangle must not
+         * miss; only rare grazing rays may. */
+        q = lrt_qtri_scene_build(v, NT, fmts[f], LRT_QTRI_CONSERVATIVE, NULL,
+                                 &err);
+        CHECK(q != NULL, "qtri %s conservative build failed", fn[f]);
+        if (q) {
+            size_t miss = 0;
+            g_rng = 0x3434ull;
+            for (int i = 0; i < NR; i++) {
+                lrt_ray r;
+                make_random_ray(&r);
+                lrt_hit hr, hq;
+                int a = lrt_tri_intersect1(ref, &r, &hr);
+                int b = lrt_tri_intersect1(q, &r, &hq);
+                if (a && !b) miss++;
+            }
+            /* grazing-ray budget (~0.1%) */
+            CHECK(miss <= NR / 1000 + 8,
+                  "qtri %s conservative missed %zu true hits", fn[f], miss);
+            lrt_tri_scene_free(q);
+        }
+    }
+    lrt_tri_scene_free(ref);
+    free(v);
+}
+
 int main(void) {
     printf("lightrt_c_tri test\n");
 
+    test_qtri();
     test_edge_cases();
     test_curve_scene();
     test_sphere_scene();
