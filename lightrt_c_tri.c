@@ -196,6 +196,21 @@ typedef struct lrt_sph4 {
 _Static_assert(sizeof(lrt_user4) == 160, "lrt_user4 must equal tri_block_size(4)");
 _Static_assert(sizeof(lrt_sph4) == 160, "lrt_sph4 must equal tri_block_size(4)");
 
+/* Round-linear curve leaf block (Embree round_linear_curve port): per lane a
+ * tapered cone v0=(p0,r0) -> v1=(p1,r1) tangent to its two end spheres, plus the
+ * strand neighbors vL,vR (xyz+radius) used to CSG-clip joints. A neighbor with
+ * px == +INF marks a strand endpoint (no neighbor). Unlike the capsule leaf this
+ * carries its own (larger) stride and is addressed via block_stride, like the
+ * quantized leaves. Padding lanes: prim = LRT_TRI_NO_HIT, r0=r1=0 (never hit). */
+typedef struct lrt_rlc4 {
+    float p0x[4], p0y[4], p0z[4], r0[4];
+    float p1x[4], p1y[4], p1z[4], r1[4];
+    float pLx[4], pLy[4], pLz[4], rL[4];
+    float pRx[4], pRy[4], pRz[4], rR[4];
+    uint32_t prim[4];
+} lrt_rlc4;
+_Static_assert(sizeof(lrt_rlc4) == 272, "lrt_rlc4");
+
 /* Quantized triangle leaf blocks (4 tris each; store quantized absolute
  * v0,v1,v2 → decode → e1=v1-v0, e2=v2-v0 → Moller-Trumbore). These have their
  * own (smaller, format-specific) stride; the scene carries block_stride and the
@@ -245,7 +260,8 @@ enum {
     TRI_PRIM_CURVE = 1, /* capsule leaves (lrt_crv4); legacy s->curve   */
     TRI_PRIM_USER = 2,  /* user callback leaves (lrt_user4)             */
     TRI_PRIM_SPHERE = 3,/* analytic sphere leaves (lrt_sph4)            */
-    TRI_PRIM_QTRI = 4   /* quantized triangle leaves (lrt_qtri*)        */
+    TRI_PRIM_QTRI = 4,  /* quantized triangle leaves (lrt_qtri*)        */
+    TRI_PRIM_RLCURVE = 5/* round-linear curve leaves (lrt_rlc4)         */
 };
 
 /* Build-time sub-segment (after hair subdivision). */
@@ -254,6 +270,16 @@ typedef struct tri_subseg {
     float r, u0, u1;
     uint32_t prim;
 } tri_subseg;
+
+/* Build-time round-linear curve segment: endpoints + radii + strand neighbors.
+ * pL[0]/pR[0] == +INF marks a strand start/end (no neighbor to clip against). */
+typedef struct tri_rlcseg {
+    float p0[3], r0;
+    float p1[3], r1;
+    float pL[3], rL;
+    float pR[3], rR;
+    uint32_t prim;
+} tri_rlcseg;
 
 struct lrt_tri_scene {
     int layout;    /* traversal width: 4 or 8 */
@@ -314,6 +340,7 @@ typedef struct tri_bnode {
 typedef struct tri_build_ctx {
     const float *verts; /* caller soup, 9*ntris (NULL for curve scenes) */
     const tri_subseg *subsegs; /* curve sub-segments (NULL for triangles) */
+    const tri_rlcseg *rlcsegs; /* round-linear curve segs (TRI_PRIM_RLCURVE) */
     size_t ntris;
     float *plo;      /* 3*ntris */
     float *phi;      /* 3*ntris */
@@ -2244,6 +2271,51 @@ static uint32_t tri_emit_leaf(tri_collapse_ctx *cc, const tri_bnode *bn) {
             (double)count;
         return TRI_MAKE_LEAF_REF(first_block, nblocks);
     }
+    if (bc->emit_kind == TRI_PRIM_RLCURVE) { /* round-linear curve leaves (BVH4) */
+        for (uint32_t b = 0; b < nblocks; b++) {
+            lrt_rlc4 *blk =
+                (lrt_rlc4 *)tri_block_ptr(s->blocks, s->block_count, s->block_stride);
+            s->block_count++;
+            for (uint32_t lane = 0; lane < 4u; lane++) {
+                uint32_t k = b * 4u + lane;
+                if (k < count) {
+                    const tri_rlcseg *rs = &bc->rlcsegs[bc->indices[bn->a + k]];
+                    blk->p0x[lane] = rs->p0[0];
+                    blk->p0y[lane] = rs->p0[1];
+                    blk->p0z[lane] = rs->p0[2];
+                    blk->r0[lane] = rs->r0;
+                    blk->p1x[lane] = rs->p1[0];
+                    blk->p1y[lane] = rs->p1[1];
+                    blk->p1z[lane] = rs->p1[2];
+                    blk->r1[lane] = rs->r1;
+                    blk->pLx[lane] = rs->pL[0];
+                    blk->pLy[lane] = rs->pL[1];
+                    blk->pLz[lane] = rs->pL[2];
+                    blk->rL[lane] = rs->rL;
+                    blk->pRx[lane] = rs->pR[0];
+                    blk->pRy[lane] = rs->pR[1];
+                    blk->pRz[lane] = rs->pR[2];
+                    blk->rR[lane] = rs->rR;
+                    blk->prim[lane] = rs->prim;
+                } else {
+                    blk->p0x[lane] = blk->p0y[lane] = blk->p0z[lane] = 0.0f;
+                    blk->r0[lane] = 0.0f;
+                    blk->p1x[lane] = blk->p1y[lane] = blk->p1z[lane] = 0.0f;
+                    blk->r1[lane] = 0.0f;
+                    blk->pLx[lane] = blk->pLy[lane] = blk->pLz[lane] = TRI_INF_F;
+                    blk->rL[lane] = 0.0f;
+                    blk->pRx[lane] = blk->pRy[lane] = blk->pRz[lane] = TRI_INF_F;
+                    blk->rR[lane] = 0.0f;
+                    blk->prim[lane] = LRT_TRI_NO_HIT;
+                }
+            }
+        }
+        cc->leaf_count++;
+        cc->sah_leaf +=
+            (double)(tri_surface_area(bn->lo, bn->hi) / cc->root_area) *
+            (double)count;
+        return TRI_MAKE_LEAF_REF(first_block, nblocks);
+    }
     if (bc->emit_kind == TRI_PRIM_QTRI) { /* quantized triangle leaves (BVH4) */
         for (uint32_t b = 0; b < nblocks; b++) {
             void *blk = tri_block_ptr(s->blocks, s->block_count, s->block_stride);
@@ -2743,6 +2815,207 @@ static inline void tri_crv4_isect(const lrt_crv4 *blk, const tri_ray_ctx *rc,
     }
 }
 
+/* ---- Round-linear curve (Embree round_linear_curve) intersection ---------- *
+ * Scalar port of embree kernels/geometry/roundline_intersector.h: each segment
+ * is a cone tangent to its two end spheres (varying radius r0->r1), CSG-clipped
+ * at the joints against the strand neighbors so abutting segments do not double
+ * up. A neighbor with px == +INF means "no neighbor" (strand start/end). */
+
+#define TRI_RLC_ULP 1.1920929e-7f
+#define TRI_RLC_MIN_A 1e-18f
+
+/* Is p inside the capped cone (cp0,cr0)->(cp1,cr1)? (ConeGeometry::isInsideCappedCone) */
+static inline int tri_rlc_inside_capped_cone(const float cp0[3], float cr0,
+                                             const float cp1[3], float cr1,
+                                             const float p[3]) {
+    if (!(cp1[0] < TRI_INF_F) || !(cp0[0] < TRI_INF_F)) return 0;
+    float dPx = cp1[0] - cp0[0], dPy = cp1[1] - cp0[1], dPz = cp1[2] - cp0[2];
+    float dPdP = dPx * dPx + dPy * dPy + dPz * dPz;
+    float dr = cr1 - cr0;
+    float r0dr = cr0 * dr;
+    float g = dPdP - dr * dr;
+    float p0px = p[0] - cp0[0], p0py = p[1] - cp0[1], p0pz = p[2] - cp0[2];
+    float y = p0px * dPx + p0py * dPy + p0pz * dPz;
+    if (!(y > -r0dr + TRI_RLC_ULP)) return 0; /* start plane */
+    if (!(y < -cr1 * dr + dPdP)) return 0;     /* end plane */
+    float p0p2 = p0px * p0px + p0py * p0py + p0pz * p0pz;
+    return (p0p2 * g - y * y) < (dPdP * cr0 * cr0 + 2.0f * r0dr * y);
+}
+
+/* Does the neighbor cone's start plane clip away p? (ConeGeometry::isClippedByPlane) */
+static inline int tri_rlc_clipped_by_plane(const float cp0[3], float cr0,
+                                           const float cp1[3], float cr1,
+                                           const float p[3]) {
+    if (!(cp1[0] < TRI_INF_F) || !(cp0[0] < TRI_INF_F)) return 0;
+    float dPx = cp1[0] - cp0[0], dPy = cp1[1] - cp0[1], dPz = cp1[2] - cp0[2];
+    float r0dr = cr0 * (cr1 - cr0);
+    float p0px = p[0] - cp0[0], p0py = p[1] - cp0[1], p0pz = p[2] - cp0[2];
+    float y = p0px * dPx + p0py * dPy + p0pz * dPz;
+    return y > -r0dr;
+}
+
+/* Closest round-linear curve hit for one segment. Returns 1 and fills t/u (u in
+ * [0,1] along the segment, 0 at p0) when a hit lies in [rc->tmin, best_t). */
+static int tri_rlc_isect_one(const tri_ray_ctx *rc, float best_t,
+                             const float p0[3], float r0, const float p1[3],
+                             float r1, const float pL[3], float rL,
+                             const float pR[3], float rR, float *t_out,
+                             float *u_out) {
+    const float POS_INF = TRI_INF_F;
+    const float NEG_INF = -TRI_INF_F;
+    float dirx = rc->dir[0], diry = rc->dir[1], dirz = rc->dir[2];
+    float dOdO = dirx * dirx + diry * diry + dirz * dirz;
+    if (dOdO <= 0.0f) return 0;
+    float rcp_dOdO = 1.0f / dOdO;
+
+    /* re-center ray origin near the segment for numerical stability; the final
+     * hit distance is dt + (t solved against the shifted origin). */
+    float cx = 0.5f * (p0[0] + p1[0]);
+    float cy = 0.5f * (p0[1] + p1[1]);
+    float cz = 0.5f * (p0[2] + p1[2]);
+    float dt = ((cx - rc->org[0]) * dirx + (cy - rc->org[1]) * diry +
+                (cz - rc->org[2]) * dirz) * rcp_dOdO;
+    float ox = rc->org[0] + dt * dirx;
+    float oy = rc->org[1] + dt * diry;
+    float oz = rc->org[2] + dt * dirz;
+
+    float dPx = p1[0] - p0[0], dPy = p1[1] - p0[1], dPz = p1[2] - p0[2];
+    float dPdP = dPx * dPx + dPy * dPy + dPz * dPz;
+    float dr = r1 - r0;
+    float r0dr = r0 * dr;
+    float g = dPdP - dr * dr;
+    float Ox = ox - p0[0], Oy = oy - p0[1], Oz = oz - p0[2];
+    float OdP = Ox * dPx + Oy * dPy + Oz * dPz;
+    float dOdP = dirx * dPx + diry * dPy + dirz * dPz;
+    float yp = OdP + r0dr;
+
+    /* cone hits (front/back), with the y in [0,g] clip planes */
+    float t_cone_lo = POS_INF, t_cone_hi = NEG_INF;
+    float y_cone_lo = 0.0f, y_cone_hi = 0.0f;
+    int cone_valid = 0;
+    {
+        float OO = Ox * Ox + Oy * Oy + Oz * Oz;
+        float OdO = dirx * Ox + diry * Oy + dirz * Oz;
+        float A = g * dOdO - dOdP * dOdP;
+        float B = 2.0f * (g * OdO - dOdP * yp);
+        float C = g * OO - OdP * OdP - r0 * r0 * dPdP - 2.0f * r0dr * OdP;
+        float D = B * B - 4.0f * A * C;
+        if (D >= 0.0f && g > 0.0f && (A > TRI_RLC_MIN_A || A < -TRI_RLC_MIN_A)) {
+            cone_valid = 1;
+            float Q = sqrtf(D);
+            float rcp_2A = 1.0f / (2.0f * A);
+            float tf = (-B - Q) * rcp_2A;
+            float yf = yp + tf * dOdP;
+            if (yf > -TRI_RLC_ULP && yf <= g) { t_cone_lo = tf; y_cone_lo = yf; }
+            float tb = (-B + Q) * rcp_2A;
+            float yb = yp + tb * dOdP;
+            if (yb > -TRI_RLC_ULP && yb <= g) { t_cone_hi = tb; y_cone_hi = yb; }
+        }
+    }
+    /* a proper cone (g>0) that the ray misses also misses the inscribed spheres */
+    if (!cone_valid && g > 0.0f) return 0;
+
+    /* clip cone hits that fall inside a neighbor segment (joint CSG) */
+    if (t_cone_lo != POS_INF) {
+        float hp[3] = {ox + t_cone_lo * dirx, oy + t_cone_lo * diry,
+                       oz + t_cone_lo * dirz};
+        if (tri_rlc_inside_capped_cone(p0, r0, pL, rL, hp) ||
+            tri_rlc_inside_capped_cone(p1, r1, pR, rR, hp))
+            t_cone_lo = POS_INF;
+    }
+    if (t_cone_hi != NEG_INF) {
+        float hp[3] = {ox + t_cone_hi * dirx, oy + t_cone_hi * diry,
+                       oz + t_cone_hi * dirz};
+        if (tri_rlc_inside_capped_cone(p0, r0, pL, rL, hp) ||
+            tri_rlc_inside_capped_cone(p1, r1, pR, rR, hp))
+            t_cone_hi = NEG_INF;
+    }
+
+    /* end sphere at p1 (its cap past y>g), clipped by the next segment's cone */
+    float t_sph1_lo = POS_INF, t_sph1_hi = NEG_INF;
+    {
+        float O1x = ox - p1[0], O1y = oy - p1[1], O1z = oz - p1[2];
+        float O1dO = O1x * dirx + O1y * diry + O1z * dirz;
+        float O1O1 = O1x * O1x + O1y * O1y + O1z * O1z;
+        float h2 = O1dO * O1dO - dOdO * (O1O1 - r1 * r1);
+        if (h2 >= 0.0f) {
+            float rhs = sqrtf(h2);
+            float tf = (-O1dO - rhs) * rcp_dOdO;
+            float hf[3] = {ox + tf * dirx, oy + tf * diry, oz + tf * dirz};
+            if (yp + tf * dOdP > g &&
+                !tri_rlc_clipped_by_plane(p1, r1, pR, rR, hf))
+                t_sph1_lo = tf;
+            float tb = (-O1dO + rhs) * rcp_dOdO;
+            float hb[3] = {ox + tb * dirx, oy + tb * diry, oz + tb * dirz};
+            if (yp + tb * dOdP > g &&
+                !tri_rlc_clipped_by_plane(p1, r1, pR, rR, hb))
+                t_sph1_hi = tb;
+        }
+    }
+
+    /* begin sphere at p0, only at a strand start (no left neighbor) */
+    float t_sph0_lo = POS_INF, t_sph0_hi = NEG_INF;
+    if (!(pL[0] < TRI_INF_F)) {
+        float O0x = ox - p0[0], O0y = oy - p0[1], O0z = oz - p0[2];
+        float O0dO = O0x * dirx + O0y * diry + O0z * dirz;
+        float O0O0 = O0x * O0x + O0y * O0y + O0z * O0z;
+        float h2 = O0dO * O0dO - dOdO * (O0O0 - r0 * r0);
+        if (h2 >= 0.0f) {
+            float rhs = sqrtf(h2);
+            float tf = (-O0dO - rhs) * rcp_dOdO;
+            if (yp + tf * dOdP < 0.0f) t_sph0_lo = tf;
+            float tb = (-O0dO + rhs) * rcp_dOdO;
+            if (yp + tb * dOdP < 0.0f) t_sph0_hi = tb;
+        }
+    }
+
+    /* CSG union: lower = nearest surface, upper = farthest */
+    float t_sph_lo = tri_minf(t_sph0_lo, t_sph1_lo);
+    float lo = tri_minf(t_cone_lo, t_sph_lo);
+    float t_sph_hi = tri_maxf(t_sph0_hi, t_sph1_hi);
+    float hi = tri_maxf(t_cone_hi, t_sph_hi);
+
+    float tmin = rc->tmin;
+    int lo_valid = (lo != POS_INF) && (dt + lo >= tmin) && (dt + lo < best_t);
+    int hi_valid = (hi != NEG_INF) && (dt + hi >= tmin) && (dt + hi < best_t);
+    if (!lo_valid && !hi_valid) return 0;
+
+    float tloc = lo_valid ? lo : hi;
+    float u;
+    if (tloc == t_cone_lo || tloc == t_cone_hi) {
+        float y = (tloc == t_cone_lo) ? y_cone_lo : y_cone_hi;
+        u = g > 0.0f ? y / g : 0.0f;
+        if (u < 0.0f) u = 0.0f; else if (u > 1.0f) u = 1.0f;
+    } else if (tloc == t_sph0_lo || tloc == t_sph0_hi) {
+        u = 0.0f;
+    } else {
+        u = 1.0f;
+    }
+    *t_out = dt + tloc;
+    *u_out = u;
+    return 1;
+}
+
+/* One round-linear leaf block (scalar lanes). Updates the best hit in place. */
+static inline void tri_rlc4_isect(const lrt_rlc4 *blk, const tri_ray_ctx *rc,
+                                  float *best_t, float *best_u,
+                                  uint32_t *best_prim) {
+    for (int lane = 0; lane < 4; lane++) {
+        if (blk->prim[lane] == LRT_TRI_NO_HIT) continue;
+        float p0[3] = {blk->p0x[lane], blk->p0y[lane], blk->p0z[lane]};
+        float p1[3] = {blk->p1x[lane], blk->p1y[lane], blk->p1z[lane]};
+        float pL[3] = {blk->pLx[lane], blk->pLy[lane], blk->pLz[lane]};
+        float pR[3] = {blk->pRx[lane], blk->pRy[lane], blk->pRz[lane]};
+        float t, u;
+        if (tri_rlc_isect_one(rc, *best_t, p0, blk->r0[lane], p1, blk->r1[lane],
+                              pL, blk->rL[lane], pR, blk->rR[lane], &t, &u)) {
+            *best_t = t;
+            *best_u = u;
+            *best_prim = blk->prim[lane];
+        }
+    }
+}
+
 #define TRI_INV_2PI 0.15915494309189535f
 #define TRI_INV_PI 0.31830988618379067f
 
@@ -2864,6 +3137,14 @@ static int tri_intersect_scalar(const lrt_tri_scene *s, const lrt_ray *ray,
                 const lrt_crv4 *blocks = (const lrt_crv4 *)s->blocks;
                 for (uint32_t b = 0; b < nblk; b++) {
                     tri_crv4_isect(&blocks[blk0 + b], &rc, &best_t, &best_u,
+                                   &best_prim);
+                }
+                continue;
+            }
+            if (s->prim_kind == TRI_PRIM_RLCURVE) {
+                const lrt_rlc4 *blocks = (const lrt_rlc4 *)s->blocks;
+                for (uint32_t b = 0; b < nblk; b++) {
+                    tri_rlc4_isect(&blocks[blk0 + b], &rc, &best_t, &best_u,
                                    &best_prim);
                 }
                 continue;
@@ -3015,6 +3296,16 @@ static int tri_occluded_scalar(const lrt_tri_scene *s, const lrt_ray *ray) {
                     float t = t_max, u = 0.0f;
                     uint32_t prim = LRT_TRI_NO_HIT;
                     tri_crv4_isect(&blocks[blk0 + b], &rc, &t, &u, &prim);
+                    if (prim != LRT_TRI_NO_HIT) return 1;
+                }
+                continue;
+            }
+            if (s->prim_kind == TRI_PRIM_RLCURVE) {
+                const lrt_rlc4 *blocks = (const lrt_rlc4 *)s->blocks;
+                for (uint32_t b = 0; b < nblk; b++) {
+                    float t = t_max, u = 0.0f;
+                    uint32_t prim = LRT_TRI_NO_HIT;
+                    tri_rlc4_isect(&blocks[blk0 + b], &rc, &t, &u, &prim);
                     if (prim != LRT_TRI_NO_HIT) return 1;
                 }
                 continue;
@@ -3748,6 +4039,342 @@ static int tri_curve_occluded_bvh4(const lrt_tri_scene *s, const lrt_ray *ray) {
                 float t = t_max, u = 0.0f;
                 uint32_t prim = LRT_TRI_NO_HIT;
                 tri_crv4_isect(&blocks[blk0 + b], &rc, &t, &u, &prim);
+                if (prim != LRT_TRI_NO_HIT) return 1;
+            }
+            continue;
+        }
+        const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(ref)];
+        _Alignas(16) float tnear[4];
+        int mask = tri_bvh4_slab_sse(n, &sc, tmax4, tnear);
+        mask &= (1 << n->nchildren) - 1;
+        while (mask) {
+            int i = __builtin_ctz((unsigned)mask);
+            mask &= mask - 1;
+            tri_prefetch_ref(s, n->child[i], 4);
+            stack[sp++] = n->child[i];
+        }
+    }
+    return 0;
+}
+
+/* ---- Round-linear curve leaf: 4-wide SSE (the lrt_rlc4 block is SoA-4) ----- *
+ * Lane-parallel port of tri_rlc_isect_one. Plain mul+add (no FMA) to track the
+ * scalar reference's rounding. */
+static inline __m128 rlc_dot4(__m128 ax, __m128 ay, __m128 az, __m128 bx,
+                              __m128 by, __m128 bz) {
+    return _mm_add_ps(_mm_add_ps(_mm_mul_ps(ax, bx), _mm_mul_ps(ay, by)),
+                      _mm_mul_ps(az, bz));
+}
+static inline __m128 rlc_madd4(__m128 a, __m128 b, __m128 c) { /* a*b + c */
+    return _mm_add_ps(_mm_mul_ps(a, b), c);
+}
+
+/* ConeGeometry::isInsideCappedCone, 4-wide (all-ones lanes = inside). */
+static inline __m128 rlc_inside_capped_cone4(__m128 cp0x, __m128 cp0y,
+                                             __m128 cp0z, __m128 cr0,
+                                             __m128 cp1x, __m128 cp1y,
+                                             __m128 cp1z, __m128 cr1, __m128 px,
+                                             __m128 py, __m128 pz) {
+    const __m128 INF = _mm_set1_ps(TRI_INF_F);
+    const __m128 Z = _mm_setzero_ps();
+    __m128 ok = _mm_and_ps(_mm_cmplt_ps(cp1x, INF), _mm_cmplt_ps(cp0x, INF));
+    __m128 dPx = _mm_sub_ps(cp1x, cp0x), dPy = _mm_sub_ps(cp1y, cp0y),
+           dPz = _mm_sub_ps(cp1z, cp0z);
+    __m128 dPdP = rlc_dot4(dPx, dPy, dPz, dPx, dPy, dPz);
+    __m128 dr = _mm_sub_ps(cr1, cr0);
+    __m128 r0dr = _mm_mul_ps(cr0, dr);
+    __m128 g = _mm_sub_ps(dPdP, _mm_mul_ps(dr, dr));
+    __m128 p0px = _mm_sub_ps(px, cp0x), p0py = _mm_sub_ps(py, cp0y),
+           p0pz = _mm_sub_ps(pz, cp0z);
+    __m128 y = rlc_dot4(p0px, p0py, p0pz, dPx, dPy, dPz);
+    __m128 cap0 = _mm_add_ps(_mm_sub_ps(Z, r0dr), _mm_set1_ps(TRI_RLC_ULP));
+    __m128 cap1 = _mm_add_ps(_mm_mul_ps(_mm_sub_ps(Z, cr1), dr), dPdP);
+    ok = _mm_and_ps(ok, _mm_cmpgt_ps(y, cap0));
+    ok = _mm_and_ps(ok, _mm_cmplt_ps(y, cap1));
+    __m128 p0p2 = rlc_dot4(p0px, p0py, p0pz, p0px, p0py, p0pz);
+    __m128 lhs = _mm_sub_ps(_mm_mul_ps(p0p2, g), _mm_mul_ps(y, y));
+    __m128 rhs = _mm_add_ps(_mm_mul_ps(dPdP, _mm_mul_ps(cr0, cr0)),
+                            _mm_mul_ps(_mm_set1_ps(2.0f), _mm_mul_ps(r0dr, y)));
+    return _mm_and_ps(ok, _mm_cmplt_ps(lhs, rhs));
+}
+
+/* ConeGeometry::isClippedByPlane, 4-wide. */
+static inline __m128 rlc_clipped_by_plane4(__m128 cp0x, __m128 cp0y,
+                                           __m128 cp0z, __m128 cr0, __m128 cp1x,
+                                           __m128 cp1y, __m128 cp1z, __m128 cr1,
+                                           __m128 px, __m128 py, __m128 pz) {
+    const __m128 INF = _mm_set1_ps(TRI_INF_F);
+    __m128 ok = _mm_and_ps(_mm_cmplt_ps(cp1x, INF), _mm_cmplt_ps(cp0x, INF));
+    __m128 dPx = _mm_sub_ps(cp1x, cp0x), dPy = _mm_sub_ps(cp1y, cp0y),
+           dPz = _mm_sub_ps(cp1z, cp0z);
+    __m128 r0dr = _mm_mul_ps(cr0, _mm_sub_ps(cr1, cr0));
+    __m128 p0px = _mm_sub_ps(px, cp0x), p0py = _mm_sub_ps(py, cp0y),
+           p0pz = _mm_sub_ps(pz, cp0z);
+    __m128 y = rlc_dot4(p0px, p0py, p0pz, dPx, dPy, dPz);
+    return _mm_and_ps(ok, _mm_cmpgt_ps(y, _mm_sub_ps(_mm_setzero_ps(), r0dr)));
+}
+
+static inline void tri_rlc4_isect_sse(const lrt_rlc4 *blk,
+                                      const tri_sse_ctx *sc, float *best_t,
+                                      float *best_u, uint32_t *best_prim) {
+    const __m128 INF = _mm_set1_ps(TRI_INF_F);
+    const __m128 NINF = _mm_set1_ps(-TRI_INF_F);
+    const __m128 Z = _mm_setzero_ps();
+    const __m128 ONE = _mm_set1_ps(1.0f);
+    const __m128 ulpneg = _mm_set1_ps(-TRI_RLC_ULP);
+
+    __m128 dirx = sc->dirx, diry = sc->diry, dirz = sc->dirz;
+    __m128 orgx = sc->orgx, orgy = sc->orgy, orgz = sc->orgz;
+    __m128 dOdO = rlc_dot4(dirx, diry, dirz, dirx, diry, dirz);
+    __m128 rcp_dOdO = _mm_div_ps(ONE, dOdO);
+
+    __m128 p0x = _mm_loadu_ps(blk->p0x), p0y = _mm_loadu_ps(blk->p0y),
+           p0z = _mm_loadu_ps(blk->p0z), r0 = _mm_loadu_ps(blk->r0);
+    __m128 p1x = _mm_loadu_ps(blk->p1x), p1y = _mm_loadu_ps(blk->p1y),
+           p1z = _mm_loadu_ps(blk->p1z), r1 = _mm_loadu_ps(blk->r1);
+    __m128 pLx = _mm_loadu_ps(blk->pLx), pLy = _mm_loadu_ps(blk->pLy),
+           pLz = _mm_loadu_ps(blk->pLz), rL = _mm_loadu_ps(blk->rL);
+    __m128 pRx = _mm_loadu_ps(blk->pRx), pRy = _mm_loadu_ps(blk->pRy),
+           pRz = _mm_loadu_ps(blk->pRz), rR = _mm_loadu_ps(blk->rR);
+
+    /* re-center ray origin near each segment */
+    __m128 cx = _mm_mul_ps(_mm_set1_ps(0.5f), _mm_add_ps(p0x, p1x));
+    __m128 cy = _mm_mul_ps(_mm_set1_ps(0.5f), _mm_add_ps(p0y, p1y));
+    __m128 cz = _mm_mul_ps(_mm_set1_ps(0.5f), _mm_add_ps(p0z, p1z));
+    __m128 dt = _mm_mul_ps(rlc_dot4(_mm_sub_ps(cx, orgx), _mm_sub_ps(cy, orgy),
+                                    _mm_sub_ps(cz, orgz), dirx, diry, dirz),
+                           rcp_dOdO);
+    __m128 ox = rlc_madd4(dt, dirx, orgx);
+    __m128 oy = rlc_madd4(dt, diry, orgy);
+    __m128 oz = rlc_madd4(dt, dirz, orgz);
+
+    __m128 dPx = _mm_sub_ps(p1x, p0x), dPy = _mm_sub_ps(p1y, p0y),
+           dPz = _mm_sub_ps(p1z, p0z);
+    __m128 dPdP = rlc_dot4(dPx, dPy, dPz, dPx, dPy, dPz);
+    __m128 dr = _mm_sub_ps(r1, r0);
+    __m128 r0dr = _mm_mul_ps(r0, dr);
+    __m128 g = _mm_sub_ps(dPdP, _mm_mul_ps(dr, dr));
+    __m128 Ox = _mm_sub_ps(ox, p0x), Oy = _mm_sub_ps(oy, p0y),
+           Oz = _mm_sub_ps(oz, p0z);
+    __m128 OdP = rlc_dot4(Ox, Oy, Oz, dPx, dPy, dPz);
+    __m128 dOdP = rlc_dot4(dirx, diry, dirz, dPx, dPy, dPz);
+    __m128 yp = _mm_add_ps(OdP, r0dr);
+
+    /* cone quadratic */
+    __m128 OO = rlc_dot4(Ox, Oy, Oz, Ox, Oy, Oz);
+    __m128 OdO = rlc_dot4(dirx, diry, dirz, Ox, Oy, Oz);
+    __m128 A = _mm_sub_ps(_mm_mul_ps(g, dOdO), _mm_mul_ps(dOdP, dOdP));
+    __m128 B = _mm_mul_ps(_mm_set1_ps(2.0f),
+                          _mm_sub_ps(_mm_mul_ps(g, OdO), _mm_mul_ps(dOdP, yp)));
+    __m128 C = _mm_sub_ps(
+        _mm_sub_ps(_mm_sub_ps(_mm_mul_ps(g, OO), _mm_mul_ps(OdP, OdP)),
+                   _mm_mul_ps(_mm_mul_ps(r0, r0), dPdP)),
+        _mm_mul_ps(_mm_mul_ps(_mm_set1_ps(2.0f), r0dr), OdP));
+    __m128 D = _mm_sub_ps(_mm_mul_ps(B, B),
+                          _mm_mul_ps(_mm_set1_ps(4.0f), _mm_mul_ps(A, C)));
+    const __m128 absmask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+    __m128 cone_ok = _mm_and_ps(
+        _mm_and_ps(_mm_cmpge_ps(D, Z), _mm_cmpgt_ps(g, Z)),
+        _mm_cmpgt_ps(_mm_and_ps(A, absmask), _mm_set1_ps(TRI_RLC_MIN_A)));
+    __m128 Q = _mm_sqrt_ps(_mm_max_ps(D, Z));
+    __m128 twoA = _mm_add_ps(A, A);
+    __m128 rcp2A = _mm_div_ps(ONE, _mm_blendv_ps(ONE, twoA, cone_ok));
+    __m128 nB = _mm_sub_ps(Z, B);
+    __m128 tf = _mm_mul_ps(_mm_sub_ps(nB, Q), rcp2A);
+    __m128 yf = rlc_madd4(tf, dOdP, yp);
+    __m128 lo_ok = _mm_and_ps(cone_ok, _mm_and_ps(_mm_cmpgt_ps(yf, ulpneg),
+                                                  _mm_cmple_ps(yf, g)));
+    __m128 t_cone_lo = _mm_blendv_ps(INF, tf, lo_ok);
+    __m128 tb = _mm_mul_ps(_mm_add_ps(nB, Q), rcp2A);
+    __m128 yb = rlc_madd4(tb, dOdP, yp);
+    __m128 hi_ok = _mm_and_ps(cone_ok, _mm_and_ps(_mm_cmpgt_ps(yb, ulpneg),
+                                                  _mm_cmple_ps(yb, g)));
+    __m128 t_cone_hi = _mm_blendv_ps(NINF, tb, hi_ok);
+
+    /* clip cone hits inside the neighbor cones */
+    __m128 hlx = rlc_madd4(t_cone_lo, dirx, ox), hly = rlc_madd4(t_cone_lo, diry, oy),
+           hlz = rlc_madd4(t_cone_lo, dirz, oz);
+    __m128 clip_lo = _mm_or_ps(
+        rlc_inside_capped_cone4(p0x, p0y, p0z, r0, pLx, pLy, pLz, rL, hlx, hly, hlz),
+        rlc_inside_capped_cone4(p1x, p1y, p1z, r1, pRx, pRy, pRz, rR, hlx, hly, hlz));
+    t_cone_lo = _mm_blendv_ps(t_cone_lo, INF, clip_lo);
+    __m128 hhx = rlc_madd4(t_cone_hi, dirx, ox), hhy = rlc_madd4(t_cone_hi, diry, oy),
+           hhz = rlc_madd4(t_cone_hi, dirz, oz);
+    __m128 clip_hi = _mm_or_ps(
+        rlc_inside_capped_cone4(p0x, p0y, p0z, r0, pLx, pLy, pLz, rL, hhx, hhy, hhz),
+        rlc_inside_capped_cone4(p1x, p1y, p1z, r1, pRx, pRy, pRz, rR, hhx, hhy, hhz));
+    t_cone_hi = _mm_blendv_ps(t_cone_hi, NINF, clip_hi);
+
+    /* end sphere at p1 (cap past y>g), clipped by the next segment's cone */
+    __m128 O1x = _mm_sub_ps(ox, p1x), O1y = _mm_sub_ps(oy, p1y),
+           O1z = _mm_sub_ps(oz, p1z);
+    __m128 O1dO = rlc_dot4(O1x, O1y, O1z, dirx, diry, dirz);
+    __m128 O1O1 = rlc_dot4(O1x, O1y, O1z, O1x, O1y, O1z);
+    __m128 h2 = _mm_sub_ps(_mm_mul_ps(O1dO, O1dO),
+                           _mm_mul_ps(dOdO, _mm_sub_ps(O1O1, _mm_mul_ps(r1, r1))));
+    __m128 h2ok = _mm_cmpge_ps(h2, Z);
+    __m128 rhs1 = _mm_sqrt_ps(_mm_max_ps(h2, Z));
+    __m128 nO1dO = _mm_sub_ps(Z, O1dO);
+    __m128 sf = _mm_mul_ps(_mm_sub_ps(nO1dO, rhs1), rcp_dOdO);
+    __m128 ysf = rlc_madd4(sf, dOdP, yp);
+    __m128 hsfx = rlc_madd4(sf, dirx, ox), hsfy = rlc_madd4(sf, diry, oy),
+           hsfz = rlc_madd4(sf, dirz, oz);
+    __m128 sf_ok = _mm_andnot_ps(
+        rlc_clipped_by_plane4(p1x, p1y, p1z, r1, pRx, pRy, pRz, rR, hsfx, hsfy, hsfz),
+        _mm_and_ps(h2ok, _mm_cmpgt_ps(ysf, g)));
+    __m128 t_sph1_lo = _mm_blendv_ps(INF, sf, sf_ok);
+    __m128 sb = _mm_mul_ps(_mm_add_ps(nO1dO, rhs1), rcp_dOdO);
+    __m128 ysb = rlc_madd4(sb, dOdP, yp);
+    __m128 hsbx = rlc_madd4(sb, dirx, ox), hsby = rlc_madd4(sb, diry, oy),
+           hsbz = rlc_madd4(sb, dirz, oz);
+    __m128 sb_ok = _mm_andnot_ps(
+        rlc_clipped_by_plane4(p1x, p1y, p1z, r1, pRx, pRy, pRz, rR, hsbx, hsby, hsbz),
+        _mm_and_ps(h2ok, _mm_cmpgt_ps(ysb, g)));
+    __m128 t_sph1_hi = _mm_blendv_ps(NINF, sb, sb_ok);
+
+    /* begin sphere at p0, only where there is no left neighbor */
+    __m128 isStart = _mm_cmpeq_ps(pLx, INF);
+    __m128 O0x = _mm_sub_ps(ox, p0x), O0y = _mm_sub_ps(oy, p0y),
+           O0z = _mm_sub_ps(oz, p0z);
+    __m128 O0dO = rlc_dot4(O0x, O0y, O0z, dirx, diry, dirz);
+    __m128 O0O0 = rlc_dot4(O0x, O0y, O0z, O0x, O0y, O0z);
+    __m128 h2b = _mm_sub_ps(_mm_mul_ps(O0dO, O0dO),
+                            _mm_mul_ps(dOdO, _mm_sub_ps(O0O0, _mm_mul_ps(r0, r0))));
+    __m128 h2bok = _mm_and_ps(isStart, _mm_cmpge_ps(h2b, Z));
+    __m128 rhs0 = _mm_sqrt_ps(_mm_max_ps(h2b, Z));
+    __m128 nO0dO = _mm_sub_ps(Z, O0dO);
+    __m128 b0f = _mm_mul_ps(_mm_sub_ps(nO0dO, rhs0), rcp_dOdO);
+    __m128 t_sph0_lo = _mm_blendv_ps(
+        INF, b0f, _mm_and_ps(h2bok, _mm_cmplt_ps(rlc_madd4(b0f, dOdP, yp), Z)));
+    __m128 b0b = _mm_mul_ps(_mm_add_ps(nO0dO, rhs0), rcp_dOdO);
+    __m128 t_sph0_hi = _mm_blendv_ps(
+        NINF, b0b, _mm_and_ps(h2bok, _mm_cmplt_ps(rlc_madd4(b0b, dOdP, yp), Z)));
+
+    /* CSG union; then kill lanes that miss a proper cone (scalar early-out) */
+    __m128 lo = _mm_min_ps(t_cone_lo, _mm_min_ps(t_sph0_lo, t_sph1_lo));
+    __m128 hi = _mm_max_ps(t_cone_hi, _mm_max_ps(t_sph0_hi, t_sph1_hi));
+    __m128 lane_alive = _mm_or_ps(cone_ok, _mm_cmple_ps(g, Z));
+    lo = _mm_blendv_ps(INF, lo, lane_alive);
+    hi = _mm_blendv_ps(NINF, hi, lane_alive);
+
+    __m128 tmin = sc->tmin;
+    __m128 best = _mm_set1_ps(*best_t);
+    __m128 glo = _mm_add_ps(dt, lo), ghi = _mm_add_ps(dt, hi);
+    __m128 lo_v = _mm_and_ps(_mm_cmpneq_ps(lo, INF),
+                             _mm_and_ps(_mm_cmpge_ps(glo, tmin), _mm_cmplt_ps(glo, best)));
+    __m128 hi_v = _mm_and_ps(_mm_cmpneq_ps(hi, NINF),
+                             _mm_and_ps(_mm_cmpge_ps(ghi, tmin), _mm_cmplt_ps(ghi, best)));
+    __m128 any = _mm_or_ps(lo_v, hi_v);
+
+    /* prim != NO_HIT (drops padding lanes) */
+    __m128i primi = _mm_loadu_si128((const __m128i *)(const void *)blk->prim);
+    __m128 prim_ok = _mm_castsi128_ps(_mm_xor_si128(
+        _mm_cmpeq_epi32(primi, _mm_set1_epi32((int)0xFFFFFFFFu)), _mm_set1_epi32(-1)));
+    __m128 hitmask = _mm_and_ps(any, prim_ok);
+    int mask = _mm_movemask_ps(hitmask);
+    if (!mask) return;
+
+    __m128 tloc = _mm_blendv_ps(hi, lo, lo_v);
+    __m128 tworld = _mm_add_ps(dt, tloc);
+    /* u = clamp((yp + tloc*dOdP)/g): y<0 -> 0 (begin), y>g -> 1 (end), else y/g */
+    __m128 yhit = rlc_madd4(tloc, dOdP, yp);
+    __m128 u = _mm_div_ps(yhit, _mm_max_ps(g, _mm_set1_ps(1e-20f)));
+    u = _mm_min_ps(ONE, _mm_max_ps(Z, u));
+
+    _Alignas(16) float ta[4], ua[4];
+    _Alignas(16) uint32_t pa[4];
+    _mm_store_ps(ta, tworld);
+    _mm_store_ps(ua, u);
+    _mm_store_si128((__m128i *)(void *)pa, primi);
+    while (mask) {
+        int lane = __builtin_ctz((unsigned)mask);
+        mask &= mask - 1;
+        if (ta[lane] < *best_t) {
+            *best_t = ta[lane];
+            *best_u = ua[lane];
+            *best_prim = pa[lane];
+        }
+    }
+}
+
+/* ---- Round-linear curve traversal: SSE node tests + 4-wide cone leaves ---- */
+static int tri_rlcurve_intersect_bvh4(const lrt_tri_scene *s, const lrt_ray *ray,
+                                      lrt_hit *hit) {
+    tri_ray_ctx rc;
+    tri_ray_setup(ray, &rc);
+    tri_sse_ctx sc;
+    tri_sse_setup(&rc, &sc);
+
+    float best_t = ray->tmax;
+    float best_u = 0.0f;
+    uint32_t best_prim = LRT_TRI_NO_HIT;
+
+    tri_stack_entry stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp].ref = s->root;
+    stack[sp].tnear = rc.tmin;
+    sp++;
+
+    while (sp > 0) {
+        tri_stack_entry e = stack[--sp];
+        if (e.tnear >= best_t) continue;
+        if (TRI_REF_IS_LEAF(e.ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(e.ref);
+            uint32_t nblk = TRI_REF_NBLOCKS(e.ref);
+            const lrt_rlc4 *blocks = (const lrt_rlc4 *)s->blocks;
+            for (uint32_t b = 0; b < nblk; b++) {
+                tri_rlc4_isect_sse(&blocks[blk0 + b], &sc, &best_t, &best_u,
+                                   &best_prim);
+            }
+            continue;
+        }
+
+        const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(e.ref)];
+        _Alignas(16) float tnear[4];
+        int mask = tri_bvh4_slab_sse(n, &sc, _mm_set1_ps(best_t), tnear);
+        mask &= (1 << n->nchildren) - 1;
+        uint8_t perm = n->perm[rc.octant];
+        for (int p = 3; p >= 0; p--) {
+            int slot = (perm >> (2 * p)) & 3;
+            if (!(mask & (1 << slot))) continue;
+            tri_prefetch_ref(s, n->child[slot], 4);
+            stack[sp].ref = n->child[slot];
+            stack[sp].tnear = tnear[slot];
+            sp++;
+        }
+    }
+
+    if (hit) {
+        hit->t = best_prim != LRT_TRI_NO_HIT ? best_t : 0.0f;
+        hit->u = best_u;
+        hit->v = 0.0f;
+        hit->prim_id = best_prim;
+    }
+    return best_prim != LRT_TRI_NO_HIT;
+}
+
+static int tri_rlcurve_occluded_bvh4(const lrt_tri_scene *s, const lrt_ray *ray) {
+    tri_ray_ctx rc;
+    tri_ray_setup(ray, &rc);
+    tri_sse_ctx sc;
+    tri_sse_setup(&rc, &sc);
+    __m128 tmax4 = _mm_set1_ps(ray->tmax);
+    const float t_max = ray->tmax;
+
+    uint32_t stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp++] = s->root;
+
+    while (sp > 0) {
+        uint32_t ref = stack[--sp];
+        if (TRI_REF_IS_LEAF(ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(ref);
+            uint32_t nblk = TRI_REF_NBLOCKS(ref);
+            const lrt_rlc4 *blocks = (const lrt_rlc4 *)s->blocks;
+            for (uint32_t b = 0; b < nblk; b++) {
+                float t = t_max, u = 0.0f;
+                uint32_t prim = LRT_TRI_NO_HIT;
+                tri_rlc4_isect_sse(&blocks[blk0 + b], &sc, &t, &u, &prim);
                 if (prim != LRT_TRI_NO_HIT) return 1;
             }
             continue;
@@ -5675,6 +6302,8 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
     }
 #if LRT_TRI_HAS_SSE4
     if (s->curve) return tri_curve_intersect_bvh4(s, ray, hit);
+    if (s->prim_kind == TRI_PRIM_RLCURVE)
+        return tri_rlcurve_intersect_bvh4(s, ray, hit);
     if (s->prim_kind == TRI_PRIM_SPHERE)
         return tri_sphere_intersect_bvh4(s, ray, hit);
     if (s->prim_kind == TRI_PRIM_USER)
@@ -5705,6 +6334,8 @@ int lrt_tri_occluded1(const lrt_tri_scene *s, const lrt_ray *ray) {
     }
 #if LRT_TRI_HAS_SSE4
     if (s->curve) return tri_curve_occluded_bvh4(s, ray);
+    if (s->prim_kind == TRI_PRIM_RLCURVE)
+        return tri_rlcurve_occluded_bvh4(s, ray);
     if (s->prim_kind == TRI_PRIM_SPHERE) return tri_sphere_occluded_bvh4(s, ray);
     if (s->prim_kind == TRI_PRIM_USER) return tri_user_occluded_bvh4(s, ray);
 #endif
@@ -5737,7 +6368,7 @@ void lrt_tri_intersect1N(const lrt_tri_scene *s, const lrt_ray *rays,
     (void)hint; /* unused in scalar-only builds */
     if (s->curve || s->prim_kind == TRI_PRIM_USER ||
         s->prim_kind == TRI_PRIM_SPHERE || s->prim_kind == TRI_PRIM_QTRI ||
-        s->qnode != 0) {
+        s->prim_kind == TRI_PRIM_RLCURVE || s->qnode != 0) {
         /* interleaved pipelines are triangle-specific; loop per ray */
         for (size_t i = 0; i < n; i++) lrt_tri_intersect1(s, &rays[i], &hits[i]);
         return;
@@ -5797,7 +6428,7 @@ void lrt_tri_occluded1N(const lrt_tri_scene *s, const lrt_ray *rays,
     (void)hint; /* unused in scalar-only builds */
     if (s->curve || s->prim_kind == TRI_PRIM_USER ||
         s->prim_kind == TRI_PRIM_SPHERE || s->prim_kind == TRI_PRIM_QTRI ||
-        s->qnode != 0) {
+        s->prim_kind == TRI_PRIM_RLCURVE || s->qnode != 0) {
         for (size_t i = 0; i < n; i++) {
             occluded[i] = (uint8_t)lrt_tri_occluded1(s, &rays[i]);
         }
@@ -6486,6 +7117,232 @@ lrt_tri_scene *lrt_curve_scene_build(const float *segments, const float *radii,
     s->kernel_name = "curve-bvh4/sse4";
 #else
     s->kernel_name = "curve-bvh4/scalar";
+#endif
+    return s;
+}
+
+/* Round-linear (Embree-style) hair scene: one tapered-cone segment per pair of
+ * consecutive strand points, capped by end spheres, with CSG joint clipping
+ * against the strand neighbors. No sub-segment subdivision (segments are short);
+ * each leaf primitive is a full segment and reports its global index. */
+lrt_tri_scene *lrt_roundcurve_scene_build(const lrt_hair_strands *strands,
+                                          const lrt_tri_build_options *opts,
+                                          lrt_result *err) {
+    tri_set_err(err, LRT_RESULT_OK);
+    if (!strands || !strands->points || !strands->strand_first ||
+        !strands->strand_count || strands->nstrands == 0 ||
+        strands->npoints == 0 ||
+        (!strands->radius && !(strands->constant_radius > 0.0f))) {
+        tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
+        return NULL;
+    }
+
+    const float *P = strands->points;
+    const float *R = strands->radius;
+    const float CR = strands->constant_radius;
+    const uint32_t *sf = strands->strand_first;
+    const uint32_t *scnt = strands->strand_count;
+    const size_t npts = strands->npoints;
+
+    lrt_tri_build_options o;
+    if (opts) o = *opts;
+    else memset(&o, 0, sizeof(o));
+    unsigned num_threads = o.num_threads ? o.num_threads : 1u;
+    uint32_t max_leaf = o.max_leaf_size ? o.max_leaf_size : TRI_DEFAULT_LEAF;
+    if (max_leaf > TRI_MAX_LEAF) max_leaf = TRI_MAX_LEAF;
+
+    /* Pass 1: count segments + range-check the strand offsets. */
+    size_t nseg = 0;
+    for (size_t i = 0; i < strands->nstrands; i++) {
+        uint32_t first = sf[i], cnt = scnt[i];
+        if (cnt < 2) continue;
+        if ((size_t)first + (size_t)cnt > npts) {
+            tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
+            return NULL;
+        }
+        nseg += (size_t)(cnt - 1u);
+    }
+    if (nseg == 0) {
+        tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
+        return NULL;
+    }
+    if (nseg > 0x07FFFFFFu) {
+        tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+        return NULL;
+    }
+
+    tri_rlcseg *segs = (tri_rlcseg *)malloc(nseg * sizeof(tri_rlcseg));
+    tri_build_ctx bc;
+    memset(&bc, 0, sizeof(bc));
+    bc.rlcsegs = segs;
+    bc.ntris = nseg;
+    bc.max_leaf = max_leaf;
+    bc.block_shift = 2u; /* round-linear blocks are 4-wide */
+    bc.quality = LRT_TRI_BUILD_DEFAULT;
+    bc.emit_kind = TRI_PRIM_RLCURVE;
+    bc.plo = (float *)malloc(nseg * 3 * sizeof(float));
+    bc.phi = (float *)malloc(nseg * 3 * sizeof(float));
+    bc.cen = (float *)malloc(nseg * 3 * sizeof(float));
+    bc.indices = (uint32_t *)malloc(nseg * sizeof(uint32_t));
+    uint32_t bnode_cap = (uint32_t)(2 * nseg) + 512u;
+    bc.node_next = 0;
+    bc.node_end = bnode_cap;
+    bc.bnodes = (tri_bnode *)malloc((size_t)bnode_cap * sizeof(tri_bnode));
+    if (!segs || !bc.plo || !bc.phi || !bc.cen || !bc.indices || !bc.bnodes) {
+        free(segs);
+        free(bc.plo);
+        free(bc.phi);
+        free(bc.cen);
+        free(bc.indices);
+        free(bc.bnodes);
+        tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+        return NULL;
+    }
+
+    /* Pass 2: build segments + per-segment cone AABBs (box around end spheres).
+     * Neighbor px == +INF marks a strand endpoint (no joint to clip against). */
+    const float INF = TRI_INF_F;
+    int bad_input = 0;
+    size_t w = 0;
+    for (size_t i = 0; i < strands->nstrands; i++) {
+        uint32_t first = sf[i], cnt = scnt[i];
+        if (cnt < 2) continue;
+        for (uint32_t j = 0; j + 1u < cnt; j++, w++) {
+            tri_rlcseg *rs = &segs[w];
+            uint32_t i0 = first + j, i1 = first + j + 1u;
+            float r0 = R ? R[i0] : CR;
+            float r1 = R ? R[i1] : CR;
+            for (int a = 0; a < 3; a++) {
+                rs->p0[a] = P[(size_t)i0 * 3 + a];
+                rs->p1[a] = P[(size_t)i1 * 3 + a];
+            }
+            rs->r0 = r0;
+            rs->r1 = r1;
+            if (j > 0u) {
+                uint32_t il = first + j - 1u;
+                for (int a = 0; a < 3; a++) rs->pL[a] = P[(size_t)il * 3 + a];
+                rs->rL = R ? R[il] : CR;
+            } else {
+                rs->pL[0] = rs->pL[1] = rs->pL[2] = INF;
+                rs->rL = 0.0f;
+            }
+            if (j + 2u < cnt) {
+                uint32_t ir = first + j + 2u;
+                for (int a = 0; a < 3; a++) rs->pR[a] = P[(size_t)ir * 3 + a];
+                rs->rR = R ? R[ir] : CR;
+            } else {
+                rs->pR[0] = rs->pR[1] = rs->pR[2] = INF;
+                rs->rR = 0.0f;
+            }
+            rs->prim = (uint32_t)w;
+
+            for (int a = 0; a < 3; a++) {
+                if (!isfinite(rs->p0[a]) || !isfinite(rs->p1[a])) bad_input = 1;
+            }
+            if (!isfinite(r0) || !isfinite(r1) || (r0 <= 0.0f && r1 <= 0.0f))
+                bad_input = 1;
+            float r0v = r0 > 0.0f ? r0 : 0.0f, r1v = r1 > 0.0f ? r1 : 0.0f;
+            for (int a = 0; a < 3; a++) {
+                float lo = tri_minf(rs->p0[a] - r0v, rs->p1[a] - r1v);
+                float hi = tri_maxf(rs->p0[a] + r0v, rs->p1[a] + r1v);
+                bc.plo[w * 3 + a] = lo;
+                bc.phi[w * 3 + a] = hi;
+                bc.cen[w * 3 + a] = 0.5f * (lo + hi);
+            }
+            bc.indices[w] = (uint32_t)w;
+        }
+    }
+    if (bad_input) {
+        free(segs);
+        free(bc.plo);
+        free(bc.phi);
+        free(bc.cen);
+        free(bc.indices);
+        free(bc.bnodes);
+        tri_set_err(err, LRT_RESULT_INVALID_BOUNDS);
+        return NULL;
+    }
+
+#if !defined(__STDC_NO_THREADS__)
+    if (num_threads > 1 && nseg >= 4096) {
+        bc.par_threads = num_threads;
+        bc.par_scratch = (uint32_t *)malloc(nseg * sizeof(uint32_t));
+        if (!bc.par_scratch) bc.par_threads = 0;
+    }
+#endif
+
+    uint32_t b_root = tri_build_binary(&bc, num_threads);
+
+    lrt_tri_scene *s = NULL;
+    if (!bc.failed) {
+        s = (lrt_tri_scene *)calloc(1, sizeof(lrt_tri_scene));
+        if (!s) bc.failed = 1;
+    }
+    if (!bc.failed) {
+        s->layout = 4;
+        s->curve = 0; /* dispatched via prim_kind, not the legacy curve flag */
+        s->prim_kind = TRI_PRIM_RLCURVE;
+        s->block_stride = (uint32_t)sizeof(lrt_rlc4);
+        uint32_t node_cap, block_cap;
+        tri_collapse_caps(&bc, 4, b_root, &node_cap, &block_cap);
+        s->nodes4 = (lrt_bvh4_node *)tri_aligned_alloc(
+            64, (size_t)node_cap * sizeof(lrt_bvh4_node));
+        s->blocks = tri_aligned_alloc(64, (size_t)block_cap * sizeof(lrt_rlc4));
+        if (!s->nodes4 || !s->blocks) {
+            bc.failed = 1;
+        } else {
+            tri_collapse_ctx cc;
+            memset(&cc, 0, sizeof(cc));
+            cc.bc = &bc;
+            cc.s = s;
+            cc.node_cap = node_cap;
+            cc.block_cap = block_cap;
+            cc.width = 4;
+            const tri_bnode *rootn = &bc.bnodes[b_root];
+            cc.root_area = tri_surface_area(rootn->lo, rootn->hi);
+            if (cc.root_area <= 0.0f) cc.root_area = 1.0f;
+            for (int a = 0; a < 3; a++) {
+                s->root_lo[a] = rootn->lo[a];
+                s->root_hi[a] = rootn->hi[a];
+            }
+            if (rootn->count > 0) {
+                s->root = tri_emit_leaf(&cc, rootn);
+            } else {
+                s->root = tri_collapse(&cc, b_root, 0);
+            }
+            if (cc.failed) {
+                bc.failed = 1;
+            } else {
+                s->stats.node_count = s->node_count;
+                s->stats.leaf_count = cc.leaf_count;
+                s->stats.max_depth = cc.max_depth;
+                s->stats.memory_bytes =
+                    (size_t)s->node_count * sizeof(lrt_bvh4_node) +
+                    (size_t)s->block_count * sizeof(lrt_rlc4);
+                s->stats.sah_cost = (float)(TRI_TRAV_COST * cc.sah_inner +
+                                            TRI_ISECT_COST * cc.sah_leaf);
+            }
+        }
+    }
+
+    free(segs);
+    free(bc.plo);
+    free(bc.phi);
+    free(bc.cen);
+    free(bc.indices);
+    free(bc.bnodes);
+    free(bc.par_scratch);
+
+    if (bc.failed) {
+        lrt_tri_scene_free(s);
+        tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+        return NULL;
+    }
+
+#if LRT_TRI_HAS_SSE4
+    s->kernel_name = "rlcurve-bvh4/sse4";
+#else
+    s->kernel_name = "rlcurve-bvh4/scalar";
 #endif
     return s;
 }

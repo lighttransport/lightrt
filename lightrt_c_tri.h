@@ -199,6 +199,36 @@ lrt_tri_scene *lrt_curve_scene_build(const float *segments, const float *radii,
                                      const lrt_tri_build_options *opts,
                                      lrt_result *err);
 
+/* --- Round-linear (Embree-style) hair / curve scenes ----------------------
+ *
+ * A higher-fidelity hair primitive than the capsule path above: each pair of
+ * consecutive points in a strand becomes a tapered cone (radius r0 -> r1)
+ * tangent to its two end spheres, and abutting segments are CSG-clipped at the
+ * shared joint so the surface does not double up (a direct port of Embree's
+ * round_linear_curve intersector). Varying per-point radius is supported.
+ *
+ * Input is strand-structured: `points` is 3*npoints xyz; `radius` is npoints
+ * (or NULL to use `constant_radius`); each strand i spans points
+ * [strand_first[i], strand_first[i] + strand_count[i]) and yields
+ * strand_count[i]-1 segments (strands with count < 2 are skipped). The scene is
+ * queried through the same lrt_tri_* functions; hits report prim_id = global
+ * segment index, u = parameter along the segment in [0,1], v = 0. opts: layout
+ * is forced to BVH4; max_leaf_size and num_threads apply as for triangles.
+ * Serialization / refit / mmap are not supported for these scenes. */
+typedef struct lrt_hair_strands {
+    const float *points;          /* 3*npoints (xyz) */
+    const float *radius;          /* npoints, or NULL to use constant_radius */
+    float constant_radius;        /* used when radius == NULL */
+    const uint32_t *strand_first; /* nstrands: first point index of each strand */
+    const uint32_t *strand_count; /* nstrands: points per strand (>= 2) */
+    size_t nstrands;
+    size_t npoints;
+} lrt_hair_strands;
+
+lrt_tri_scene *lrt_roundcurve_scene_build(const lrt_hair_strands *strands,
+                                          const lrt_tri_build_options *opts,
+                                          lrt_result *err);
+
 /* --- Custom (user) geometry -----------------------------------------------
  *
  * An efficient fp32 custom-primitive path: the BVH broad phase (wide SoA nodes,

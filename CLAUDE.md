@@ -674,7 +674,21 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
 
 ### Scene types (all share the `lrt_tri_scene` handle and the `lrt_tri_*` queries)
 - `lrt_tri_scene_build` — triangles (BVH4/BVH8/BVH8Q; LBVH/SAH/SBVH).
-- `lrt_curve_scene_build` — hair/curve capsules.
+- `lrt_curve_scene_build` — hair/curve capsules (constant radius per
+  sub-segment; cylinder + 2 end spheres).
+- `lrt_roundcurve_scene_build` — **Embree-style round-linear curves**: one
+  tapered cone (varying radius r0→r1) per strand segment, tangent to its two end
+  spheres, CSG-clipped at the joints against the strand neighbors (a port of
+  Embree's `roundline_intersector.h`, scalar `tri_rlc_isect_one` + a 4-wide SSE
+  leaf `tri_rlc4_isect_sse` over the SoA `lrt_rlc4` block; matches Embree's
+  `RTC_GEOMETRY_TYPE_ROUND_LINEAR_CURVE` to fp precision — see the wCurly.hair
+  cross-check in `benchmark_c/hair_bench.c`). Strand-structured input
+  (`lrt_hair_strands`: points + per-point radius + strand offsets); `prim_kind ==
+  TRI_PRIM_RLCURVE`, `lrt_rlc4` leaf (own 272-byte `block_stride`, stores
+  v0/v1/vL/vR), BVH4 only, no serialization/refit/mmap. The CyHair (.hair) loader
+  is `benchmark_c/cyhair.{h,c}`; `hair_bench` loads `data/wCurly.hair`, builds it
+  with both lightrt and Embree, reports build/throughput, cross-checks hits, and
+  writes a shaded PPM.
 - `lrt_sphere_scene_build` — built-in fully-SIMD analytic spheres (`cx cy cz r`).
 - `lrt_user_scene_build` — **efficient custom geometry**: an fp32 BVH broad
   phase over caller AABBs, with a per-candidate intersect/occluded callback

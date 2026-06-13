@@ -55,6 +55,23 @@ endif()
 find_package(Threads REQUIRED)
 target_link_libraries(bench_c PRIVATE Threads::Threads m)
 
+# --- hair_bench: CyHair loader + round-linear ray-curve benchmark/renderer ---
+add_executable(hair_bench
+    hair_bench.c
+    cyhair.c
+    ../lightrt_c_tri.c
+)
+target_include_directories(hair_bench PRIVATE ..)
+target_compile_options(hair_bench PRIVATE -O3 -Wall -Wextra)
+target_compile_definitions(hair_bench PRIVATE _POSIX_C_SOURCE=200809L)
+if(HAS_C_SSE41)
+    target_compile_options(hair_bench PRIVATE -msse4.1)
+endif()
+if(HAS_C_AVX2)
+    target_compile_options(hair_bench PRIVATE -mavx2 -mfma)
+endif()
+target_link_libraries(hair_bench PRIVATE Threads::Threads m)
+
 # --- Optional Vulkan GPU trace backend (runtime dlopen; no SDK, no -lvulkan) ---
 # backend_lightrt_vk.c always compiles (NULL stub) unless LRTBENCH_VK is set.
 option(LRTBENCH_VK "Build the Vulkan GPU trace backend" OFF)
@@ -101,8 +118,10 @@ find_package(embree 4 CONFIG QUIET
 if(embree_FOUND)
     target_link_libraries(bench_c PRIVATE embree)
     target_compile_definitions(bench_c PRIVATE LRTBENCH_HAVE_EMBREE)
+    target_link_libraries(hair_bench PRIVATE embree)
+    target_compile_definitions(hair_bench PRIVATE LRTBENCH_HAVE_EMBREE)
     # The SDK tarball bundles libembree4/libtbb in lib/; run from build dir.
-    set_target_properties(bench_c PROPERTIES
+    set_target_properties(bench_c hair_bench PROPERTIES
         BUILD_RPATH "${_embree_search}/lib"
         INSTALL_RPATH "${_embree_search}/lib")
     message(STATUS "bench_c: Embree found at ${_embree_search}")

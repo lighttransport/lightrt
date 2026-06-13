@@ -421,6 +421,156 @@ static void test_curve_scene(void) {
     free(radii);
 }
 
+/* Reference round-linear segment hit: nearest t over the tapered cone (clipped
+ * to its [0,g] slab) plus the two full end spheres. The union of these
+ * per-segment solids over a strand equals the kernel's CSG-clipped solid, so
+ * the nearest hull hit must match without replicating the neighbor clipping. */
+static int ref_roundcone(const float p0[3], float r0, const float p1[3],
+                         float r1, const lrt_ray *ray, float t_max,
+                         float *t_out) {
+    float dirx = ray->dir[0], diry = ray->dir[1], dirz = ray->dir[2];
+    float dOdO = dirx * dirx + diry * diry + dirz * dirz;
+    float best = t_max;
+    int hit = 0;
+
+    float dPx = p1[0] - p0[0], dPy = p1[1] - p0[1], dPz = p1[2] - p0[2];
+    float dPdP = dPx * dPx + dPy * dPy + dPz * dPz;
+    float dr = r1 - r0, r0dr = r0 * dr;
+    float g = dPdP - dr * dr;
+    float Ox = ray->org[0] - p0[0], Oy = ray->org[1] - p0[1],
+          Oz = ray->org[2] - p0[2];
+    float OdP = Ox * dPx + Oy * dPy + Oz * dPz;
+    float dOdP = dirx * dPx + diry * dPy + dirz * dPz;
+    float yp = OdP + r0dr;
+    if (g > 0.0f) {
+        float OO = Ox * Ox + Oy * Oy + Oz * Oz;
+        float OdO = dirx * Ox + diry * Oy + dirz * Oz;
+        float A = g * dOdO - dOdP * dOdP;
+        float B = 2.0f * (g * OdO - dOdP * yp);
+        float C = g * OO - OdP * OdP - r0 * r0 * dPdP - 2.0f * r0dr * OdP;
+        if (A > 1e-18f || A < -1e-18f) {
+            float D = B * B - 4.0f * A * C;
+            if (D >= 0.0f) {
+                float Q = sqrtf(D);
+                for (int k = 0; k < 2; k++) {
+                    float t = (k == 0 ? (-B - Q) : (-B + Q)) / (2.0f * A);
+                    if (t < ray->tmin || t >= best) continue;
+                    float y = yp + t * dOdP;
+                    if (y > -1.2e-7f && y <= g) { best = t; hit = 1; }
+                }
+            }
+        }
+    }
+    if (dOdO > 0.0f) {
+        for (int sgn = 0; sgn < 2; sgn++) {
+            const float *c = sgn ? p1 : p0;
+            float rc = sgn ? r1 : r0;
+            float ex = ray->org[0] - c[0], ey = ray->org[1] - c[1],
+                  ez = ray->org[2] - c[2];
+            float b = ex * dirx + ey * diry + ez * dirz;
+            float cc = ex * ex + ey * ey + ez * ez - rc * rc;
+            float disc = b * b - dOdO * cc;
+            if (disc < 0.0f) continue;
+            float sq = sqrtf(disc);
+            for (int k = 0; k < 2; k++) {
+                float t = (k == 0 ? (-b - sq) : (-b + sq)) / dOdO;
+                if (t >= ray->tmin && t < best) { best = t; hit = 1; }
+            }
+        }
+    }
+    if (hit) *t_out = best;
+    return hit;
+}
+
+static void test_roundcurve_scene(void) {
+    enum { NSTRAND = 80, PTS = 6, NRAYS = 20000 };
+    size_t npoints = (size_t)NSTRAND * PTS;
+    float *pts = (float *)malloc(npoints * 3 * sizeof(float));
+    float *rad = (float *)malloc(npoints * sizeof(float));
+    uint32_t *sfirst = (uint32_t *)malloc(NSTRAND * sizeof(uint32_t));
+    uint32_t *scount = (uint32_t *)malloc(NSTRAND * sizeof(uint32_t));
+    g_rng = 0xBEEFCAFEull;
+    for (int st = 0; st < NSTRAND; st++) {
+        sfirst[st] = (uint32_t)(st * PTS);
+        scount[st] = PTS;
+        float px = rnd_f(-2.0f, 2.0f), py = rnd_f(-2.0f, 2.0f),
+              pz = rnd_f(-2.0f, 2.0f);
+        for (int p = 0; p < PTS; p++) {
+            size_t idx = (size_t)st * PTS + p;
+            /* long-ish steps + thin radius keep segments hair-like (radius <<
+             * length), the regime the wCurly.hair vs Embree check validates;
+             * fat segments make the joint crease genuinely fp-ambiguous. */
+            px += rnd_f(-0.9f, 0.9f);
+            py += rnd_f(-0.9f, 0.9f);
+            pz += rnd_f(-0.9f, 0.9f);
+            pts[idx * 3 + 0] = px;
+            pts[idx * 3 + 1] = py;
+            pts[idx * 3 + 2] = pz;
+            rad[idx] = rnd_f(0.01f, 0.04f); /* varying radius exercises the cone */
+        }
+    }
+    lrt_hair_strands hs = {0};
+    hs.points = pts;
+    hs.radius = rad;
+    hs.constant_radius = 0.0f;
+    hs.strand_first = sfirst;
+    hs.strand_count = scount;
+    hs.nstrands = NSTRAND;
+    hs.npoints = npoints;
+
+    lrt_tri_scene *s = lrt_roundcurve_scene_build(&hs, NULL, NULL);
+    CHECK(s != NULL, "roundcurve build failed");
+    if (!s) {
+        free(pts);
+        free(rad);
+        free(sfirst);
+        free(scount);
+        return;
+    }
+    printf("  roundcurve scene [%s]\n", lrt_tri_kernel_name(s));
+
+    size_t mismatches = 0, occl_mismatches = 0;
+    for (int i = 0; i < NRAYS; i++) {
+        lrt_ray r;
+        make_random_ray(&r);
+        float bt = r.tmax;
+        int bf = 0;
+        for (int st = 0; st < NSTRAND; st++) {
+            for (int j = 0; j + 1 < PTS; j++) {
+                size_t i0 = (size_t)st * PTS + j;
+                float t;
+                if (ref_roundcone(&pts[i0 * 3], rad[i0], &pts[(i0 + 1) * 3],
+                                  rad[i0 + 1], &r, bt, &t)) {
+                    bt = t;
+                    bf = 1;
+                }
+            }
+        }
+        lrt_hit h;
+        int bvh = lrt_tri_intersect1(s, &r, &h);
+        if (bf != bvh) {
+            mismatches++;
+        } else if (bf && fabs((double)h.t - (double)bt) >
+                             1e-3 * (1.0 + fabs((double)bt))) {
+            mismatches++;
+        }
+        if (lrt_tri_occluded1(s, &r) != bvh) occl_mismatches++;
+    }
+    /* A handful of grazing/joint rays flip by one ulp at fp32 (the cross-check
+     * vs Embree on wCurly.hair shows the same ~5e-6 rate); allow the same
+     * budget the capsule and fp64 verifications use. */
+    CHECK(mismatches <= NRAYS / 1000, "roundcurve: %zu/%d mismatches vs "
+          "brute-force cone+spheres", mismatches, NRAYS);
+    CHECK(occl_mismatches == 0, "roundcurve: %zu occluded disagreements",
+          occl_mismatches);
+
+    lrt_tri_scene_free(s);
+    free(pts);
+    free(rad);
+    free(sfirst);
+    free(scount);
+}
+
 /* Reference ray-sphere (matches the library's root selection: near root in
  * [tmin, tmax) else the far root). */
 static int ref_sphere(const float *sp, const lrt_ray *r, float tmax,
@@ -1698,6 +1848,7 @@ int main(void) {
     test_qnodes();
     test_edge_cases();
     test_curve_scene();
+    test_roundcurve_scene();
     test_sphere_scene();
     test_user_geometry();
     test_sdf_standalone();
