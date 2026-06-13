@@ -59,6 +59,7 @@ target_link_libraries(bench_c PRIVATE Threads::Threads m)
 add_executable(hair_bench
     hair_bench.c
     cyhair.c
+    furball.c
     ../lightrt_c_tri.c
 )
 target_include_directories(hair_bench PRIVATE ..)

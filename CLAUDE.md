@@ -689,21 +689,24 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
   is `benchmark_c/cyhair.{h,c}`; `hair_bench` loads `data/wCurly.hair`, builds it
   with both lightrt and Embree, reports build/throughput, cross-checks hits, and
   writes a shaded PPM. `hair_bench --prim {round,flat,sphere,disc,odisc}` exercises
-  all the curve/point types below against the matching Embree geometry.
+  all the curve/point types below against the matching Embree geometry, and
+  `hair_bench --gen furball [--strands N --segments M]` generates procedural fur
+  (`benchmark_c/furball.{h,c}`, à la Embree's hair tutorial) instead of a file.
 - `lrt_flatcurve_scene_build` — **flat (ribbon) linear curves**: each strand
   segment is a ray-facing ribbon quad of width 2r (Embree
   `RTC_GEOMETRY_TYPE_FLAT_LINEAR_CURVE`; world-space `b = normalize(cross(p1-p0,
-  dir))` quad, two-triangle MT). `TRI_PRIM_FLATCURVE`, `lrt_flat4` leaf. Matches
-  Embree ~99.96% (the ribbon's ray-space-vs-world orientation differs at grazing
-  edges). Scalar leaf (SSE-leaf is a follow-up).
+  dir))` quad, two-triangle MT). `TRI_PRIM_FLATCURVE`, `lrt_flat4` leaf, scalar +
+  4-wide SSE leaf `tri_flat4_isect_sse`. Matches Embree ~99.96% (the ribbon's
+  ray-space-vs-world orientation differs at grazing edges).
 - `lrt_points_scene_build(centers, radii, normals, point_type, n)` — **point
   primitives** mirroring Embree's point types (`lrt_tri_point_type`):
   `LRT_POINT_SPHERE` (ray-sphere), `LRT_POINT_DISC` (ray-facing disc),
   `LRT_POINT_ORIENTED_DISC` (fixed-normal disc; normals required). `TRI_PRIM_POINT`,
-  `lrt_point4` leaf (160 B, reuses the default block path). Direct port of Embree's
+  `lrt_point4` leaf (160 B, reuses the default block path), scalar + 4-wide SSE
+  leaf `tri_point4_isect_sse`. Direct port of Embree's
   `sphere_intersector.h`/`disc_intersector.h`; matches Embree ≥99.99% and beats it
-  on sphere/oriented-disc throughput. (Sphere points overlap the older
-  `lrt_sphere_scene_build` path but add disc/oriented-disc + a normal buffer.)
+  on point throughput. (Sphere points overlap the older `lrt_sphere_scene_build`
+  path but add disc/oriented-disc + a normal buffer.)
 - `lrt_sphere_scene_build` — built-in fully-SIMD analytic spheres (`cx cy cz r`).
 - `lrt_user_scene_build` — **efficient custom geometry**: an fp32 BVH broad
   phase over caller AABBs, with a per-candidate intersect/occluded callback

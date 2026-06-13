@@ -19,6 +19,7 @@
 
 #include "../lightrt_c_tri.h"
 #include "cyhair.h"
+#include "furball.h"
 #include "timing.h"
 
 #ifdef LRTBENCH_HAVE_EMBREE
@@ -460,6 +461,9 @@ static void usage(const char *a0) {
     fprintf(stderr,
             "usage: %s [options]\n"
             "  --hair FILE        CyHair model (default data/wCurly.hair)\n"
+            "  --gen furball      generate procedural fur instead of loading a file\n"
+            "  --strands N        furball strand count (default 200000)\n"
+            "  --segments N       furball segments per strand (default 8)\n"
             "  --prim KIND        round (default) | flat | sphere | disc | odisc\n"
             "                     (round/flat = curves; sphere/disc/odisc = points)\n"
             "  --width N          image width (default 1024)\n"
@@ -484,11 +488,19 @@ int main(int argc, char **argv) {
     int threads = 1, repeat = 5;
     uint32_t seed = 1234;
     int prim = PRIM_ROUND;
+    int gen_furball = 0;
+    size_t fb_strands = 200000;
+    int fb_segs = 8;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         const char *nx = (i + 1 < argc) ? argv[i + 1] : NULL;
         if (!strcmp(a, "--hair") && nx) hair_path = argv[++i];
+        else if (!strcmp(a, "--gen") && nx) {
+            gen_furball = !strcmp(argv[++i], "furball");
+        }
+        else if (!strcmp(a, "--strands") && nx) fb_strands = (size_t)atoll(argv[++i]);
+        else if (!strcmp(a, "--segments") && nx) fb_segs = atoi(argv[++i]);
         else if (!strcmp(a, "--prim") && nx) {
             prim = parse_prim(argv[++i]);
             if (prim < 0) { fprintf(stderr, "bad --prim\n"); usage(argv[0]); return 1; }
@@ -510,13 +522,19 @@ int main(int argc, char **argv) {
     if (threads < 1) threads = 1;
     if (threads > MAX_THREADS) threads = MAX_THREADS;
 
-    /* --- Load --- */
+    /* --- Load or generate --- */
     cyhair_t hair;
     uint64_t l0 = bench_time_ns();
-    int lr = cyhair_load(hair_path, radius_scale, &hair);
+    int lr = gen_furball
+                 ? furball_generate(fb_strands, fb_segs, 0.006f, radius_scale,
+                                    seed, &hair)
+                 : cyhair_load(hair_path, radius_scale, &hair);
     uint64_t l1 = bench_time_ns();
     if (lr != 0) {
-        fprintf(stderr, "failed to load %s (error %d)\n", hair_path, lr);
+        if (gen_furball)
+            fprintf(stderr, "furball_generate failed (error %d)\n", lr);
+        else
+            fprintf(stderr, "failed to load %s (error %d)\n", hair_path, lr);
         return 1;
     }
     size_t nstrands = hair.nstrands;
@@ -528,8 +546,10 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < nstrands; i++)
         nseg += hair.strand_count[i] >= 2 ? hair.strand_count[i] - 1 : 0;
 
-    printf("loaded %s: %zu strands, %zu points, %zu segments (%.1f ms)\n",
-           hair_path, nstrands, npts_used, nseg, bench_ns_to_ms(l1 - l0));
+    printf("%s %s: %zu strands, %zu points, %zu segments (%.1f ms)\n",
+           gen_furball ? "generated" : "loaded",
+           gen_furball ? "furball" : hair_path, nstrands, npts_used, nseg,
+           bench_ns_to_ms(l1 - l0));
     printf("bbox: [%.3f %.3f %.3f] .. [%.3f %.3f %.3f]\n", hair.bbox_min[0],
            hair.bbox_min[1], hair.bbox_min[2], hair.bbox_max[0], hair.bbox_max[1],
            hair.bbox_max[2]);

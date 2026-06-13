@@ -4688,7 +4688,192 @@ static int tri_rlcurve_occluded_bvh4(const lrt_tri_scene *s, const lrt_ray *ray)
     return 0;
 }
 
-/* ---- Point + flat-curve traversal: SSE node tests, scalar leaves ---------- */
+/* ---- Point + flat-curve leaves: 4-wide SSE over the SoA blocks ------------ */
+
+/* 4-wide point intersection (sphere / ray-facing disc / oriented disc). */
+static inline void tri_point4_isect_sse(const lrt_point4 *blk,
+                                        const tri_sse_ctx *sc, int point_type,
+                                        float *best_t, float *best_u,
+                                        uint32_t *best_prim) {
+    const __m128 INF = _mm_set1_ps(TRI_INF_F);
+    const __m128 Z = _mm_setzero_ps();
+    const __m128 ONE = _mm_set1_ps(1.0f);
+    __m128 dirx = sc->dirx, diry = sc->diry, dirz = sc->dirz;
+    __m128 cx = _mm_loadu_ps(blk->cx), cy = _mm_loadu_ps(blk->cy),
+           cz = _mm_loadu_ps(blk->cz), r = _mm_loadu_ps(blk->r);
+    __m128 c0x = _mm_sub_ps(cx, sc->orgx), c0y = _mm_sub_ps(cy, sc->orgy),
+           c0z = _mm_sub_ps(cz, sc->orgz);
+    __m128 r2 = _mm_mul_ps(r, r);
+    __m128 tmin = sc->tmin, best = _mm_set1_ps(*best_t);
+    __m128 tcand;
+
+    if (point_type == TRI_POINT_ORIENTED_DISC) {
+        __m128 nx = _mm_loadu_ps(blk->nx), ny = _mm_loadu_ps(blk->ny),
+               nz = _mm_loadu_ps(blk->nz);
+        __m128 div = rlc_dot4(dirx, diry, dirz, nx, ny, nz);
+        __m128 nonpar = _mm_cmpneq_ps(div, Z);
+        __m128 divs = _mm_blendv_ps(ONE, div, nonpar);
+        __m128 t = _mm_div_ps(rlc_dot4(c0x, c0y, c0z, nx, ny, nz), divs);
+        __m128 hx = _mm_sub_ps(_mm_add_ps(sc->orgx, _mm_mul_ps(t, dirx)), cx);
+        __m128 hy = _mm_sub_ps(_mm_add_ps(sc->orgy, _mm_mul_ps(t, diry)), cy);
+        __m128 hz = _mm_sub_ps(_mm_add_ps(sc->orgz, _mm_mul_ps(t, dirz)), cz);
+        __m128 dd = rlc_dot4(hx, hy, hz, hx, hy, hz);
+        __m128 valid = _mm_and_ps(nonpar, _mm_and_ps(_mm_cmpge_ps(t, tmin),
+                                                     _mm_cmplt_ps(t, best)));
+        valid = _mm_and_ps(valid, _mm_cmplt_ps(dd, r2));
+        tcand = _mm_blendv_ps(INF, t, valid);
+    } else {
+        __m128 dOdO = rlc_dot4(dirx, diry, dirz, dirx, diry, dirz);
+        __m128 rd2 = _mm_div_ps(ONE, dOdO);
+        __m128 proj = _mm_mul_ps(rlc_dot4(c0x, c0y, c0z, dirx, diry, dirz), rd2);
+        __m128 px = _mm_sub_ps(c0x, _mm_mul_ps(proj, dirx));
+        __m128 py = _mm_sub_ps(c0y, _mm_mul_ps(proj, diry));
+        __m128 pz = _mm_sub_ps(c0z, _mm_mul_ps(proj, dirz));
+        __m128 l2 = rlc_dot4(px, py, pz, px, py, pz);
+        __m128 inside = _mm_cmple_ps(l2, r2);
+        if (point_type == TRI_POINT_DISC) {
+            __m128 valid = _mm_and_ps(inside, _mm_and_ps(_mm_cmpge_ps(proj, tmin),
+                                                         _mm_cmplt_ps(proj, best)));
+            tcand = _mm_blendv_ps(INF, proj, valid);
+        } else { /* sphere: nearest root */
+            __m128 td = _mm_sqrt_ps(_mm_max_ps(_mm_mul_ps(_mm_sub_ps(r2, l2), rd2), Z));
+            __m128 tf = _mm_sub_ps(proj, td), tb = _mm_add_ps(proj, td);
+            __m128 fok = _mm_and_ps(inside, _mm_and_ps(_mm_cmpge_ps(tf, tmin),
+                                                       _mm_cmplt_ps(tf, best)));
+            __m128 bok = _mm_and_ps(inside, _mm_and_ps(_mm_cmpge_ps(tb, tmin),
+                                                       _mm_cmplt_ps(tb, best)));
+            tcand = INF;
+            tcand = _mm_blendv_ps(tcand, tb, bok);
+            tcand = _mm_blendv_ps(tcand, tf, fok);
+        }
+    }
+
+    __m128i primi = _mm_loadu_si128((const __m128i *)(const void *)blk->prim);
+    __m128 prim_ok = _mm_castsi128_ps(_mm_xor_si128(
+        _mm_cmpeq_epi32(primi, _mm_set1_epi32((int)0xFFFFFFFFu)), _mm_set1_epi32(-1)));
+    __m128 hit = _mm_and_ps(_mm_cmpneq_ps(tcand, INF), prim_ok);
+    int mask = _mm_movemask_ps(hit);
+    if (!mask) return;
+    _Alignas(16) float ta[4];
+    _Alignas(16) uint32_t pa[4];
+    _mm_store_ps(ta, tcand);
+    _mm_store_si128((__m128i *)(void *)pa, primi);
+    while (mask) {
+        int lane = __builtin_ctz((unsigned)mask);
+        mask &= mask - 1;
+        if (ta[lane] < *best_t) {
+            *best_t = ta[lane];
+            *best_u = 0.0f;
+            *best_prim = pa[lane];
+        }
+    }
+}
+
+/* 4-wide Moller-Trumbore on one ribbon triangle; returns t per lane (or +INF).
+ * Double-sided; `bok` masks lanes whose ribbon is degenerate (ray || tangent). */
+static inline __m128 tri_flat_tri_sse(__m128 ax, __m128 ay, __m128 az,
+                                      __m128 e1x, __m128 e1y, __m128 e1z,
+                                      __m128 e2x, __m128 e2y, __m128 e2z,
+                                      const tri_sse_ctx *sc, __m128 best,
+                                      __m128 bok) {
+    const __m128 INF = _mm_set1_ps(TRI_INF_F);
+    const __m128 Z = _mm_setzero_ps();
+    const __m128 ONE = _mm_set1_ps(1.0f);
+    __m128 dirx = sc->dirx, diry = sc->diry, dirz = sc->dirz;
+    __m128 pvx = _mm_sub_ps(_mm_mul_ps(diry, e2z), _mm_mul_ps(dirz, e2y));
+    __m128 pvy = _mm_sub_ps(_mm_mul_ps(dirz, e2x), _mm_mul_ps(dirx, e2z));
+    __m128 pvz = _mm_sub_ps(_mm_mul_ps(dirx, e2y), _mm_mul_ps(diry, e2x));
+    __m128 det = rlc_dot4(e1x, e1y, e1z, pvx, pvy, pvz);
+    const __m128 absmask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+    __m128 detok = _mm_cmpgt_ps(_mm_and_ps(det, absmask), _mm_set1_ps(1e-12f));
+    __m128 inv = _mm_div_ps(ONE, _mm_blendv_ps(ONE, det, detok));
+    __m128 tvx = _mm_sub_ps(sc->orgx, ax), tvy = _mm_sub_ps(sc->orgy, ay),
+           tvz = _mm_sub_ps(sc->orgz, az);
+    __m128 u = _mm_mul_ps(rlc_dot4(tvx, tvy, tvz, pvx, pvy, pvz), inv);
+    __m128 valid = _mm_and_ps(_mm_and_ps(detok, bok),
+                              _mm_and_ps(_mm_cmpge_ps(u, Z), _mm_cmple_ps(u, ONE)));
+    __m128 qvx = _mm_sub_ps(_mm_mul_ps(tvy, e1z), _mm_mul_ps(tvz, e1y));
+    __m128 qvy = _mm_sub_ps(_mm_mul_ps(tvz, e1x), _mm_mul_ps(tvx, e1z));
+    __m128 qvz = _mm_sub_ps(_mm_mul_ps(tvx, e1y), _mm_mul_ps(tvy, e1x));
+    __m128 v = _mm_mul_ps(rlc_dot4(dirx, diry, dirz, qvx, qvy, qvz), inv);
+    valid = _mm_and_ps(valid, _mm_and_ps(_mm_cmpge_ps(v, Z),
+                                         _mm_cmple_ps(_mm_add_ps(u, v), ONE)));
+    __m128 t = _mm_mul_ps(rlc_dot4(e2x, e2y, e2z, qvx, qvy, qvz), inv);
+    valid = _mm_and_ps(valid, _mm_and_ps(_mm_cmpge_ps(t, sc->tmin),
+                                         _mm_cmplt_ps(t, best)));
+    return _mm_blendv_ps(INF, t, valid);
+}
+
+/* 4-wide flat (ribbon) curve intersection. */
+static inline void tri_flat4_isect_sse(const lrt_flat4 *blk,
+                                       const tri_sse_ctx *sc, float *best_t,
+                                       float *best_u, uint32_t *best_prim) {
+    const __m128 INF = _mm_set1_ps(TRI_INF_F);
+    const __m128 Z = _mm_setzero_ps();
+    const __m128 ONE = _mm_set1_ps(1.0f);
+    __m128 dirx = sc->dirx, diry = sc->diry, dirz = sc->dirz;
+    __m128 p0x = _mm_loadu_ps(blk->p0x), p0y = _mm_loadu_ps(blk->p0y),
+           p0z = _mm_loadu_ps(blk->p0z), r0 = _mm_loadu_ps(blk->r0);
+    __m128 p1x = _mm_loadu_ps(blk->p1x), p1y = _mm_loadu_ps(blk->p1y),
+           p1z = _mm_loadu_ps(blk->p1z), r1 = _mm_loadu_ps(blk->r1);
+    __m128 Tx = _mm_sub_ps(p1x, p0x), Ty = _mm_sub_ps(p1y, p0y),
+           Tz = _mm_sub_ps(p1z, p0z);
+    __m128 bx = _mm_sub_ps(_mm_mul_ps(Ty, dirz), _mm_mul_ps(Tz, diry));
+    __m128 by = _mm_sub_ps(_mm_mul_ps(Tz, dirx), _mm_mul_ps(Tx, dirz));
+    __m128 bz = _mm_sub_ps(_mm_mul_ps(Tx, diry), _mm_mul_ps(Ty, dirx));
+    __m128 bl2 = rlc_dot4(bx, by, bz, bx, by, bz);
+    __m128 bok = _mm_cmpgt_ps(bl2, _mm_set1_ps(1e-20f));
+    __m128 invb = _mm_div_ps(ONE, _mm_sqrt_ps(_mm_max_ps(bl2, _mm_set1_ps(1e-30f))));
+    bx = _mm_mul_ps(bx, invb); by = _mm_mul_ps(by, invb); bz = _mm_mul_ps(bz, invb);
+    __m128 r0b_x = _mm_mul_ps(r0, bx), r0b_y = _mm_mul_ps(r0, by), r0b_z = _mm_mul_ps(r0, bz);
+    __m128 r1b_x = _mm_mul_ps(r1, bx), r1b_y = _mm_mul_ps(r1, by), r1b_z = _mm_mul_ps(r1, bz);
+    /* corners q0=p0+r0b, q1=p1+r1b, q2=p1-r1b, q3=p0-r0b */
+    __m128 q0x = _mm_add_ps(p0x, r0b_x), q0y = _mm_add_ps(p0y, r0b_y), q0z = _mm_add_ps(p0z, r0b_z);
+    __m128 q1x = _mm_add_ps(p1x, r1b_x), q1y = _mm_add_ps(p1y, r1b_y), q1z = _mm_add_ps(p1z, r1b_z);
+    __m128 q2x = _mm_sub_ps(p1x, r1b_x), q2y = _mm_sub_ps(p1y, r1b_y), q2z = _mm_sub_ps(p1z, r1b_z);
+    __m128 q3x = _mm_sub_ps(p0x, r0b_x), q3y = _mm_sub_ps(p0y, r0b_y), q3z = _mm_sub_ps(p0z, r0b_z);
+    __m128 best = _mm_set1_ps(*best_t);
+    /* triangle A = (q0,q1,q2), triangle B = (q0,q2,q3) */
+    __m128 tA = tri_flat_tri_sse(q0x, q0y, q0z, _mm_sub_ps(q1x, q0x),
+                                 _mm_sub_ps(q1y, q0y), _mm_sub_ps(q1z, q0z),
+                                 _mm_sub_ps(q2x, q0x), _mm_sub_ps(q2y, q0y),
+                                 _mm_sub_ps(q2z, q0z), sc, best, bok);
+    __m128 tB = tri_flat_tri_sse(q0x, q0y, q0z, _mm_sub_ps(q2x, q0x),
+                                 _mm_sub_ps(q2y, q0y), _mm_sub_ps(q2z, q0z),
+                                 _mm_sub_ps(q3x, q0x), _mm_sub_ps(q3y, q0y),
+                                 _mm_sub_ps(q3z, q0z), sc, best, bok);
+    __m128 t = _mm_min_ps(tA, tB);
+    __m128i primi = _mm_loadu_si128((const __m128i *)(const void *)blk->prim);
+    __m128 prim_ok = _mm_castsi128_ps(_mm_xor_si128(
+        _mm_cmpeq_epi32(primi, _mm_set1_epi32((int)0xFFFFFFFFu)), _mm_set1_epi32(-1)));
+    __m128 hit = _mm_and_ps(_mm_cmpneq_ps(t, INF), prim_ok);
+    int mask = _mm_movemask_ps(hit);
+    if (!mask) return;
+    /* u = clamp(dot(hit - p0, T)/|T|^2) along the segment */
+    __m128 Tl2 = rlc_dot4(Tx, Ty, Tz, Tx, Ty, Tz);
+    __m128 hpx = _mm_sub_ps(_mm_add_ps(sc->orgx, _mm_mul_ps(t, dirx)), p0x);
+    __m128 hpy = _mm_sub_ps(_mm_add_ps(sc->orgy, _mm_mul_ps(t, diry)), p0y);
+    __m128 hpz = _mm_sub_ps(_mm_add_ps(sc->orgz, _mm_mul_ps(t, dirz)), p0z);
+    __m128 uu = _mm_div_ps(rlc_dot4(hpx, hpy, hpz, Tx, Ty, Tz),
+                           _mm_max_ps(Tl2, _mm_set1_ps(1e-20f)));
+    uu = _mm_min_ps(ONE, _mm_max_ps(Z, uu));
+    _Alignas(16) float ta[4], ua[4];
+    _Alignas(16) uint32_t pa[4];
+    _mm_store_ps(ta, t);
+    _mm_store_ps(ua, uu);
+    _mm_store_si128((__m128i *)(void *)pa, primi);
+    while (mask) {
+        int lane = __builtin_ctz((unsigned)mask);
+        mask &= mask - 1;
+        if (ta[lane] < *best_t) {
+            *best_t = ta[lane];
+            *best_u = ua[lane];
+            *best_prim = pa[lane];
+        }
+    }
+}
+
+/* ---- Point + flat-curve traversal: SSE node tests + 4-wide SSE leaves ----- */
 static int tri_point_intersect_bvh4(const lrt_tri_scene *s, const lrt_ray *ray,
                                     lrt_hit *hit) {
     tri_ray_ctx rc;
@@ -4711,8 +4896,8 @@ static int tri_point_intersect_bvh4(const lrt_tri_scene *s, const lrt_ray *ray,
             uint32_t blk0 = TRI_REF_BLOCK(e.ref), nblk = TRI_REF_NBLOCKS(e.ref);
             const lrt_point4 *blocks = (const lrt_point4 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++)
-                tri_point4_isect(&blocks[blk0 + b], &rc, ptype, &best_t, &best_u,
-                                 &best_prim);
+                tri_point4_isect_sse(&blocks[blk0 + b], &sc, ptype, &best_t,
+                                     &best_u, &best_prim);
             continue;
         }
         const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(e.ref)];
@@ -4757,7 +4942,7 @@ static int tri_point_occluded_bvh4(const lrt_tri_scene *s, const lrt_ray *ray) {
             for (uint32_t b = 0; b < nblk; b++) {
                 float t = t_max, u = 0.0f;
                 uint32_t prim = LRT_TRI_NO_HIT;
-                tri_point4_isect(&blocks[blk0 + b], &rc, ptype, &t, &u, &prim);
+                tri_point4_isect_sse(&blocks[blk0 + b], &sc, ptype, &t, &u, &prim);
                 if (prim != LRT_TRI_NO_HIT) return 1;
             }
             continue;
@@ -4797,8 +4982,8 @@ static int tri_flatcurve_intersect_bvh4(const lrt_tri_scene *s,
             uint32_t blk0 = TRI_REF_BLOCK(e.ref), nblk = TRI_REF_NBLOCKS(e.ref);
             const lrt_flat4 *blocks = (const lrt_flat4 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++)
-                tri_flat4_isect(&blocks[blk0 + b], &rc, &best_t, &best_u,
-                                &best_prim);
+                tri_flat4_isect_sse(&blocks[blk0 + b], &sc, &best_t, &best_u,
+                                    &best_prim);
             continue;
         }
         const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(e.ref)];
@@ -4843,7 +5028,7 @@ static int tri_flatcurve_occluded_bvh4(const lrt_tri_scene *s,
             for (uint32_t b = 0; b < nblk; b++) {
                 float t = t_max, u = 0.0f;
                 uint32_t prim = LRT_TRI_NO_HIT;
-                tri_flat4_isect(&blocks[blk0 + b], &rc, &t, &u, &prim);
+                tri_flat4_isect_sse(&blocks[blk0 + b], &sc, &t, &u, &prim);
                 if (prim != LRT_TRI_NO_HIT) return 1;
             }
             continue;
