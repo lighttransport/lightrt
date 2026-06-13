@@ -1,0 +1,25 @@
+{
+  "name": "@lighttransport/lightrt-wasm",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Lightweight ray tracing BVH library for WebAssembly",
+  "main": "./lightrt.js",
+  "types": "./lightrt.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lightrt.d.ts",
+      "import": "./lightrt.js"
+    },
+    "./lightrt.wasm": "./lightrt.wasm"
+  },
+  "files": [
+    "lightrt.js",
+    "lightrt.d.ts",
+    "lightrt.wasm",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
