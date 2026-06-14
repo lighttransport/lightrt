@@ -128,12 +128,8 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
     endif()
 endif()
 
-# C binding implementation. lightrt_c.cc is a thin C++ wrapper over the C++
-# BVH; lightrt_c.c is a standalone pure-C11 reimplementation. Both expose the
-# same lightrt_c.h API, so exactly one is linked into the library.
-option(LIGHTRT_PURE_C_BINDING
-       "Use the standalone pure-C11 binding (lightrt_c.c) instead of the C++ wrapper (lightrt_c.cc)"
-       OFF)
+# C binding implementation. lightrt_c.c is a standalone pure-C11 BVH +
+# callback implementation; the C API does not depend on the C++ BVH wrapper.
 option(LIGHTRT_BUILD_FUZZERS
        "Build libFuzzer harnesses for LightRT"
        OFF)
@@ -144,11 +140,7 @@ option(LIGHTRT_BUILD_FUZZERS
 option(LIGHTRT_BUILD_VK
        "Build the Vulkan GPU-interop trace/build backend"
        OFF)
-if(LIGHTRT_PURE_C_BINDING)
-    set(LIGHTRT_C_BINDING_SRC lightrt_c.c)
-else()
-    set(LIGHTRT_C_BINDING_SRC lightrt_c.cc)
-endif()
+set(LIGHTRT_C_BINDING_SRC lightrt_c.c)
 
 # Library target
 add_library(lightrt STATIC

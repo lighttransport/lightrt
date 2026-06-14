@@ -13,14 +13,9 @@ add_project_arguments(['-Wall', '-Wextra', '-O3'],
   language: 'cpp'
 )
 
-# C binding implementation. lightrt_c.cc is a thin C++ wrapper over the C++
-# BVH; lightrt_c.c is a standalone pure-C11 reimplementation. Both expose the
-# same lightrt_c.h API, so exactly one is compiled into the library.
-if get_option('pure_c_binding')
-  c_binding_src = 'lightrt_c.c'
-else
-  c_binding_src = 'lightrt_c.cc'
-endif
+# C binding implementation. lightrt_c.c is standalone pure C11 and does not
+# depend on the C++ BVH wrapper.
+c_binding_src = 'lightrt_c.c'
 
 # Library target
 static_lib = static_library('lightrt',

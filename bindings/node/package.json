@@ -1,0 +1,18 @@
+{
+  "name": "@lighttransport/lightrt-c",
+  "version": "0.1.0",
+  "description": "Node.js bindings for the LightRT C11 CPU callback BVH",
+  "main": "index.js",
+  "scripts": {
+    "build": "node build.js",
+    "test": "node test/smoke.js"
+  },
+  "files": [
+    "index.js",
+    "build.js",
+    "src/lightrt_c_node.c",
+    "build/Release/lightrt_c.node"
+  ],
+  "license": "Apache-2.0"
+}
+

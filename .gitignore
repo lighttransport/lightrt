@@ -2,9 +2,11 @@
 *.o
 *.a
 *.so
+*.node
 *.dylib
 *.dll
 *.exe
+__pycache__/
 
 # Compiled executables
 lightrt_example

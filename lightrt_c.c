@@ -2,15 +2,13 @@
  * lightrt_c.c — clean, self-contained C11 port of LightRT's generic BVH +
  * custom-primitive ray intersection.
  *
- * This is a pure C11 implementation of the lightrt_c.h API. Unlike
- * lightrt_c.cc (a thin C++ wrapper over lightrt::MMapGenericBVH), this file
- * has NO dependency on the C++ library or its headers — it builds and
- * traverses its own BVH. The two are interchangeable behind lightrt_c.h;
- * link exactly one of them.
+ * This is a pure C11 implementation of the lightrt_c.h API. It has NO
+ * dependency on the C++ library or its headers: it builds and traverses its
+ * own BVH.
  *
- * Design (matching lightrt_c.cc):
+ * Design:
  *   - The BVH is single precision (broad phase). Build uses a binned Surface
- *     Area Heuristic (16 bins per axis), ported from MMapGenericBVH.
+ *     Area Heuristic (16 bins per axis).
  *   - Traversal is stack-based with front-to-back child ordering, calling the
  *     user's fp64 intersection callback per candidate primitive. The
  *     authoritative fp64 ray and best hit are kept in fp64, so an analytic
@@ -29,6 +27,9 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(LRT_HAVE_SSE2)
+#include <emmintrin.h>
+#endif
 
 /* ------------------------------------------------------------------------- */
 /* Tunables (mirror lightrt's BVHBuildConfig defaults).                      */
@@ -85,8 +86,9 @@ struct lrt_scene {
 /* Build-time context: per-primitive fp32 bounds (freed after build). */
 typedef struct {
     lrt_scene   *s;
-    const float *prim_lo; /* nprims * 3 */
-    const float *prim_hi; /* nprims * 3 */
+    const float *prim_lo;  /* nprims * 3 */
+    const float *prim_hi;  /* nprims * 3 */
+    const float *prim_cen; /* nprims * 3 */
 } lrt_build_ctx;
 
 /* ------------------------------------------------------------------------- */
@@ -255,6 +257,7 @@ static uint32_t lrt_build_recursive(lrt_build_ctx *c, uint32_t *indices,
     lrt_scene *s = c->s;
     const float *plo = c->prim_lo;
     const float *phi = c->prim_hi;
+    const float *pcen = c->prim_cen;
 
     if (lrt_should_cancel(s)) return LRT_INVALID_NODE;
     if (depth > lrt_max_build_depth(s)) {
@@ -272,19 +275,33 @@ static uint32_t lrt_build_recursive(lrt_build_ctx *c, uint32_t *indices,
     lrt_box_reset(clo, chi);
     for (uint32_t i = 0; i < num; i++) {
         uint32_t p = indices[i];
-        lrt_box_expand(nlo, nhi, &plo[p * 3], &phi[p * 3]);
-        for (int a = 0; a < 3; a++) {
-            float cen = 0.5f * (plo[p * 3 + a] + phi[p * 3 + a]);
-            clo[a] = lrt_minf(clo[a], cen);
-            chi[a] = lrt_maxf(chi[a], cen);
-        }
+        const float *lo_p = &plo[p * 3];
+        const float *hi_p = &phi[p * 3];
+        const float *cen_p = &pcen[p * 3];
+
+        nlo[0] = lrt_minf(nlo[0], lo_p[0]);
+        nlo[1] = lrt_minf(nlo[1], lo_p[1]);
+        nlo[2] = lrt_minf(nlo[2], lo_p[2]);
+
+        nhi[0] = lrt_maxf(nhi[0], hi_p[0]);
+        nhi[1] = lrt_maxf(nhi[1], hi_p[1]);
+        nhi[2] = lrt_maxf(nhi[2], hi_p[2]);
+
+        clo[0] = lrt_minf(clo[0], cen_p[0]);
+        clo[1] = lrt_minf(clo[1], cen_p[1]);
+        clo[2] = lrt_minf(clo[2], cen_p[2]);
+
+        chi[0] = lrt_maxf(chi[0], cen_p[0]);
+        chi[1] = lrt_maxf(chi[1], cen_p[1]);
+        chi[2] = lrt_maxf(chi[2], cen_p[2]);
     }
 
     uint32_t node_idx = s->node_count++;
     lrt_report_progress(s, "build", (size_t)s->nprims + s->node_count,
                         (size_t)s->nprims + s->node_cap, 0);
     lrt_node *node = &s->nodes[node_idx];
-    for (int a = 0; a < 3; a++) { node->lo[a] = nlo[a]; node->hi[a] = nhi[a]; }
+    node->lo[0] = nlo[0]; node->lo[1] = nlo[1]; node->lo[2] = nlo[2];
+    node->hi[0] = nhi[0]; node->hi[1] = nhi[1]; node->hi[2] = nhi[2];
     node->flags = 0;
 
     uint32_t max_leaf_size = lrt_max_leaf_size(s);
@@ -318,11 +335,23 @@ static uint32_t lrt_build_recursive(lrt_build_ctx *c, uint32_t *indices,
 
         for (uint32_t i = 0; i < num; i++) {
             uint32_t p = indices[i];
-            float cen = 0.5f * (plo[p * 3 + axis] + phi[p * 3 + axis]);
+            float cen = pcen[p * 3 + axis];
             uint32_t b = (uint32_t)((cen - amin) / bin_size);
             if (b >= LRT_NUM_BINS) b = LRT_NUM_BINS - 1;
             bin_count[b]++;
-            lrt_box_expand(bin_lo[b], bin_hi[b], &plo[p * 3], &phi[p * 3]);
+
+            const float *lo_p = &plo[p * 3];
+            const float *hi_p = &phi[p * 3];
+            float *blo = bin_lo[b];
+            float *bhi = bin_hi[b];
+
+            blo[0] = lrt_minf(blo[0], lo_p[0]);
+            blo[1] = lrt_minf(blo[1], lo_p[1]);
+            blo[2] = lrt_minf(blo[2], lo_p[2]);
+
+            bhi[0] = lrt_maxf(bhi[0], hi_p[0]);
+            bhi[1] = lrt_maxf(bhi[1], hi_p[1]);
+            bhi[2] = lrt_maxf(bhi[2], hi_p[2]);
         }
 
         /* Left prefix sweep. */
@@ -332,9 +361,24 @@ static uint32_t lrt_build_recursive(lrt_build_ctx *c, uint32_t *indices,
         uint32_t run_cnt = 0;
         lrt_box_reset(run_lo, run_hi);
         for (uint32_t b = 0; b < LRT_NUM_BINS; b++) {
-            lrt_box_expand(run_lo, run_hi, bin_lo[b], bin_hi[b]);
+            run_lo[0] = lrt_minf(run_lo[0], bin_lo[b][0]);
+            run_lo[1] = lrt_minf(run_lo[1], bin_lo[b][1]);
+            run_lo[2] = lrt_minf(run_lo[2], bin_lo[b][2]);
+
+            run_hi[0] = lrt_maxf(run_hi[0], bin_hi[b][0]);
+            run_hi[1] = lrt_maxf(run_hi[1], bin_hi[b][1]);
+            run_hi[2] = lrt_maxf(run_hi[2], bin_hi[b][2]);
+
             run_cnt += bin_count[b];
-            for (int a = 0; a < 3; a++) { left_lo[b][a] = run_lo[a]; left_hi[b][a] = run_hi[a]; }
+
+            left_lo[b][0] = run_lo[0];
+            left_lo[b][1] = run_lo[1];
+            left_lo[b][2] = run_lo[2];
+
+            left_hi[b][0] = run_hi[0];
+            left_hi[b][1] = run_hi[1];
+            left_hi[b][2] = run_hi[2];
+
             left_cnt[b] = run_cnt;
         }
 
@@ -342,7 +386,14 @@ static uint32_t lrt_build_recursive(lrt_build_ctx *c, uint32_t *indices,
         lrt_box_reset(run_lo, run_hi);
         run_cnt = 0;
         for (uint32_t b = LRT_NUM_BINS - 1; b > 0; b--) {
-            lrt_box_expand(run_lo, run_hi, bin_lo[b], bin_hi[b]);
+            run_lo[0] = lrt_minf(run_lo[0], bin_lo[b][0]);
+            run_lo[1] = lrt_minf(run_lo[1], bin_lo[b][1]);
+            run_lo[2] = lrt_minf(run_lo[2], bin_lo[b][2]);
+
+            run_hi[0] = lrt_maxf(run_hi[0], bin_hi[b][0]);
+            run_hi[1] = lrt_maxf(run_hi[1], bin_hi[b][1]);
+            run_hi[2] = lrt_maxf(run_hi[2], bin_hi[b][2]);
+
             run_cnt += bin_count[b];
 
             uint32_t left_count = left_cnt[b - 1];
@@ -375,7 +426,7 @@ static uint32_t lrt_build_recursive(lrt_build_ctx *c, uint32_t *indices,
     uint32_t mid = 0;
     for (uint32_t i = 0; i < num; i++) {
         uint32_t p = indices[i];
-        float cen = 0.5f * (plo[p * 3 + best_axis] + phi[p * 3 + best_axis]);
+        float cen = pcen[p * 3 + best_axis];
         if (cen < best_pos) {
             uint32_t tmp = indices[i];
             indices[i] = indices[mid];
@@ -407,14 +458,44 @@ static uint32_t lrt_build_recursive(lrt_build_ctx *c, uint32_t *indices,
 static inline int lrt_aabb_intersect(const float lo[3], const float hi[3],
                                      const float org[3], const float invd[3],
                                      float tmin, float tmax, float *tmin_out) {
+#if defined(LRT_HAVE_SSE2)
+    /* SSE2 slab test.  lo/hi/org/invd are 3‑element arrays, so we must NOT
+     * use _mm_loadu_ps (which reads 4 floats and would go out‑of‑bounds on
+     * the struct members).  Instead we build the vectors from 3 scalars,
+     * keeping the 4th lane neutral (0 for differences, 1 for invd so the
+     * multiply yields 0). */
+    __m128 lo_vec  = _mm_set_ps(0.f, lo[2],  lo[1],  lo[0]);
+    __m128 hi_vec  = _mm_set_ps(0.f, hi[2],  hi[1],  hi[0]);
+    __m128 org_vec = _mm_set_ps(0.f, org[2], org[1], org[0]);
+    __m128 inv_vec = _mm_set_ps(1.f, invd[2],invd[1],invd[0]);
+
+    __m128 t0 = _mm_mul_ps(_mm_sub_ps(lo_vec, org_vec), inv_vec);
+    __m128 t1 = _mm_mul_ps(_mm_sub_ps(hi_vec, org_vec), inv_vec);
+    __m128 tmin_vec = _mm_min_ps(t0, t1);
+    __m128 tmax_vec = _mm_max_ps(t0, t1);
+
+    /* Horizontal reduce: tmin = max(tmin, tmin_vec[0..2]),
+     *                    tmax = min(tmax, tmax_vec[0..2]). */
+    _Alignas(16) float tmin_vals[4];
+    _Alignas(16) float tmax_vals[4];
+    _mm_store_ps(tmin_vals, tmin_vec);
+    _mm_store_ps(tmax_vals, tmax_vec);
+    if (tmin_vals[0] > tmin) tmin = tmin_vals[0];
+    if (tmin_vals[1] > tmin) tmin = tmin_vals[1];
+    if (tmin_vals[2] > tmin) tmin = tmin_vals[2];
+    if (tmax_vals[0] < tmax) tmax = tmax_vals[0];
+    if (tmax_vals[1] < tmax) tmax = tmax_vals[1];
+    if (tmax_vals[2] < tmax) tmax = tmax_vals[2];
+#else
     for (int a = 0; a < 3; a++) {
-        float t0 = (lo[a] - org[a]) * invd[a];
-        float t1 = (hi[a] - org[a]) * invd[a];
-        if (invd[a] < 0.0f) { float tmp = t0; t0 = t1; t1 = tmp; }
-        tmin = t0 > tmin ? t0 : tmin;
-        tmax = t1 < tmax ? t1 : tmax;
-        if (tmax < tmin) return 0;
+        float t0a = (lo[a] - org[a]) * invd[a];
+        float t1a = (hi[a] - org[a]) * invd[a];
+        if (t0a > t1a) { float tmp = t0a; t0a = t1a; t1a = tmp; }
+        if (t0a > tmin) tmin = t0a;
+        if (t1a < tmax) tmax = t1a;
     }
+#endif
+    if (tmax < tmin) return 0;
     *tmin_out = tmin;
     return 1;
 }
@@ -474,16 +555,18 @@ int lrt_scene_build(lrt_scene *s) {
     lrt_report_progress(s, "build", 0, build_total, 1);
     if (lrt_should_cancel(s)) return 0;
 
-    /* Per-primitive fp32 bounds (build-time only). */
-    float *prim_lo = (float *)malloc((size_t)s->nprims * 3 * sizeof(float));
-    float *prim_hi = (float *)malloc((size_t)s->nprims * 3 * sizeof(float));
+    /* Per-primitive fp32 bounds + centroids (build-time only). */
+    size_t float3_bytes = (size_t)s->nprims * 3 * sizeof(float);
+    float *prim_lo  = (float *)malloc(float3_bytes);
+    float *prim_hi  = (float *)malloc(float3_bytes);
+    float *prim_cen = (float *)malloc(float3_bytes);
     uint32_t *indices = (uint32_t *)malloc((size_t)s->nprims * sizeof(uint32_t));
 
     lrt_node *nodes = (lrt_node *)malloc(node_cap * sizeof(lrt_node));
     uint32_t *prim_indices = (uint32_t *)malloc((size_t)s->nprims * sizeof(uint32_t));
 
-    if (!prim_lo || !prim_hi || !indices || !nodes || !prim_indices) {
-        free(prim_lo); free(prim_hi); free(indices);
+    if (!prim_lo || !prim_hi || !prim_cen || !indices || !nodes || !prim_indices) {
+        free(prim_lo); free(prim_hi); free(prim_cen); free(indices);
         free(nodes); free(prim_indices);
         lrt_set_result(s, LRT_RESULT_OUT_OF_MEMORY, NULL);
         return 0;
@@ -491,20 +574,21 @@ int lrt_scene_build(lrt_scene *s) {
 
     for (unsigned i = 0; i < s->nprims; i++) {
         if (lrt_should_cancel(s)) {
-            free(prim_lo); free(prim_hi); free(indices);
+            free(prim_lo); free(prim_hi); free(prim_cen); free(indices);
             free(nodes); free(prim_indices);
             return 0;
         }
         lrt_aabb a = s->bounds_cb(i, s->user);
         if (!lrt_valid_aabb(&a)) {
-            free(prim_lo); free(prim_hi); free(indices);
+            free(prim_lo); free(prim_hi); free(prim_cen); free(indices);
             free(nodes); free(prim_indices);
             lrt_set_result(s, LRT_RESULT_INVALID_BOUNDS, "bounds callback returned invalid AABB");
             return 0;
         }
         for (int k = 0; k < 3; k++) {
-            prim_lo[i * 3 + k] = (float)a.lo[k];
-            prim_hi[i * 3 + k] = (float)a.hi[k];
+            prim_lo[i * 3 + k]  = (float)a.lo[k];
+            prim_hi[i * 3 + k]  = (float)a.hi[k];
+            prim_cen[i * 3 + k] = 0.5f * ((float)a.lo[k] + (float)a.hi[k]);
         }
         indices[i] = i;
         lrt_report_progress(s, "build", (size_t)i + 1u, build_total, 0);
@@ -520,11 +604,12 @@ int lrt_scene_build(lrt_scene *s) {
     s->prim_index_count = 0;
     s->built = 0;
 
-    lrt_build_ctx ctx = { s, prim_lo, prim_hi };
+    lrt_build_ctx ctx = { s, prim_lo, prim_hi, prim_cen };
     uint32_t root = lrt_build_recursive(&ctx, indices, s->nprims, 0);
     if (root == LRT_INVALID_NODE) {
         free(prim_lo);
         free(prim_hi);
+        free(prim_cen);
         free(indices);
         free(s->nodes);
         free(s->prim_indices);
@@ -542,6 +627,7 @@ int lrt_scene_build(lrt_scene *s) {
 
     free(prim_lo);
     free(prim_hi);
+    free(prim_cen);
     free(indices);
     return 1;
 }
@@ -584,14 +670,21 @@ unsigned lrt_scene_intersect(lrt_scene *s, const double org[3],
     uint32_t stack[LRT_STACK_SIZE];
     int sp = 0;
     stack[sp++] = 0; /* root */
-    size_t visited = 0;
-
+    size_t visited_nodes = 0;
+    size_t steps = 0;
+    size_t check_interval = s->options.progress_interval;
+    if (check_interval == 0) check_interval = LRT_DEFAULT_PROGRESS_INTERVAL;
+    size_t next_check = check_interval;
     while (sp > 0) {
-        if (lrt_should_cancel(s)) return LRT_NO_HIT;
         uint32_t node_idx = stack[--sp];
         const lrt_node *n = &s->nodes[node_idx];
-        visited++;
-        lrt_report_progress(s, "intersect", visited, s->node_count, 0);
+        visited_nodes++;
+        steps++;
+        if (steps >= next_check) {
+            if (lrt_should_cancel(s)) return LRT_NO_HIT;
+            lrt_report_progress(s, "intersect", visited_nodes, s->node_count, 0);
+            next_check = steps + check_interval;
+        }
 
         float box_tmin;
         if (!lrt_aabb_intersect(n->lo, n->hi, forg, finvd, ftmin, ftmax,
@@ -606,7 +699,12 @@ unsigned lrt_scene_intersect(lrt_scene *s, const double org[3],
             uint32_t offset = n->u.leaf.offset;
             uint32_t count = n->u.leaf.count;
             for (uint32_t i = 0; i < count; i++) {
-                if (lrt_should_cancel(s)) return LRT_NO_HIT;
+                steps++;
+                if (steps >= next_check) {
+                    if (lrt_should_cancel(s)) return LRT_NO_HIT;
+                    lrt_report_progress(s, "intersect", visited_nodes, s->node_count, 0);
+                    next_check = steps + check_interval;
+                }
                 uint32_t prim = s->prim_indices[offset + i];
                 double td = 0.0, ud = 0.0, vd = 0.0;
                 double cb_tmax = s->best_t < s->tmax ? s->best_t : s->tmax;
