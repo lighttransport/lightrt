@@ -335,6 +335,87 @@ static int run_dynamic_bench(const char *scene, size_t want_tris, int frames) {
     return 0;
 }
 
+/* ---- Surface shading-normals throughput ---------------------------------- */
+/* Build a bicubic-Bezier patch scene, then compare GPU trace-only vs
+ * trace+on-device-normals (lrt_hip_scene_trace_normals) throughput — the cost of
+ * the k_shade_normals post-pass — on primary and incoherent rays. */
+static int run_normals_bench(size_t npatch, size_t nrays, int iters) {
+    lrt_result er = LRT_RESULT_OK;
+    lrt_hip_engine *e = lrt_hip_engine_create(NULL, &er);
+    if (!e) {
+        printf("(no HIP device; skipping normals bench)\n");
+        return 0;
+    }
+    if (npatch == 0) npatch = 20000;
+    float *cps = (float *)malloc(npatch * 48 * sizeof(float));
+    uint64_t rng = 0xC0FFEEull;
+#define RF(lo, hi)                                                  \
+    ((lo) + ((hi) - (lo)) *                                         \
+                ((rng ^= rng << 13, rng ^= rng >> 7, rng ^= rng << 17, \
+                  (float)((rng >> 32) & 0xFFFFFF) / 16777216.0f)))
+    for (size_t p = 0; p < npatch; p++) {
+        float c[3] = {RF(-2, 2), RF(-2, 2), RF(-2, 2)};
+        float ax[3] = {RF(-1, 1), RF(-1, 1), RF(-1, 1)};
+        float ay[3] = {RF(-1, 1), RF(-1, 1), RF(-1, 1)};
+        float *cp = &cps[p * 48];
+        for (int j = 0; j < 4; j++)
+            for (int i = 0; i < 4; i++) {
+                float fu = (float)i / 3 - 0.5f, fv = (float)j / 3 - 0.5f;
+                for (int k = 0; k < 3; k++)
+                    cp[(j * 4 + i) * 3 + k] =
+                        c[k] + 0.5f * fu * ax[k] + 0.5f * fv * ay[k] + RF(-0.1f, 0.1f);
+            }
+    }
+    lrt_tri_build_options o;
+    memset(&o, 0, sizeof(o));
+    o.num_threads = 1;
+    lrt_tri_scene *cpu = lrt_bezpatch_scene_build(cps, npatch, &o, NULL);
+    lrt_hip_scene *gs = cpu ? lrt_hip_scene_upload(e, cpu, NULL) : NULL;
+    if (!gs) {
+        printf("normals bench: build/upload failed: %s\n",
+               lrt_hip_engine_last_error(e));
+        free(cps);
+        if (cpu) lrt_tri_scene_free(cpu);
+        lrt_hip_engine_destroy(e);
+        return 1;
+    }
+    lrt_ray *primary = (lrt_ray *)malloc(nrays * sizeof(lrt_ray));
+    lrt_ray *incoh = (lrt_ray *)malloc(nrays * sizeof(lrt_ray));
+    lrt_hit *gh = (lrt_hit *)malloc(nrays * sizeof(lrt_hit));
+    float *gn = (float *)malloc(nrays * 3 * sizeof(float));
+    rays_gen_primary(primary, nrays, 1u);
+    rays_gen_incoherent(incoh, nrays, 1u);
+
+    printf("normals bench: bezpatch npatch=%zu rays=%zu dev=%s\n", npatch, nrays,
+           lrt_hip_engine_device_name(e));
+    printf("  %-10s %14s %14s %10s\n", "workload", "trace Mray/s",
+           "trace+N Mray/s", "shade%");
+    struct { const char *name; lrt_ray *r; } wl[2] = {{"primary", primary},
+                                                      {"incoherent", incoh}};
+    for (int wi = 0; wi < 2; wi++) {
+        double t_only = TIME_BEST(iters, nrays, {
+            lrt_hip_scene_trace(e, gs, wl[wi].r, (uint32_t)nrays, gh, NULL);
+        });
+        double t_norm = TIME_BEST(iters, nrays, {
+            lrt_hip_scene_trace_normals(e, gs, wl[wi].r, (uint32_t)nrays, gh, gn,
+                                        NULL);
+        });
+        double overhead = t_norm > 0 ? (t_only / t_norm - 1.0) * 100.0 : 0.0;
+        printf("  %-10s %14.1f %14.1f %9.1f%%\n", wl[wi].name, t_only, t_norm,
+               overhead);
+    }
+#undef RF
+    free(cps);
+    free(primary);
+    free(incoh);
+    free(gh);
+    free(gn);
+    lrt_hip_scene_free(e, gs);
+    lrt_tri_scene_free(cpu);
+    lrt_hip_engine_destroy(e);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *scene = "mandelbulb";
     size_t want_tris = 200000;
@@ -342,12 +423,14 @@ int main(int argc, char **argv) {
     int iters = 5;
     int do_cpu = 1, do_fp32 = 1, do_build = 1, do_gpubuild = 1;
     int have_backend_filter = 0;
-    int leaf_mode = 0, dynamic_mode = 0, frames = 120;
+    int leaf_mode = 0, dynamic_mode = 0, normals_mode = 0, frames = 120;
     uint32_t leaf_blocks = 262144, leaf_tris = 8;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--leaf")) {
             leaf_mode = 1;
+        } else if (!strcmp(argv[i], "--normals")) {
+            normals_mode = 1;
         } else if (!strcmp(argv[i], "--dynamic")) {
             dynamic_mode = 1;
         } else if (!strcmp(argv[i], "--frames") && i + 1 < argc) {
@@ -376,8 +459,9 @@ int main(int argc, char **argv) {
             printf("usage: %s [--scene random|mandelbulb|thinspan] [--tris N] "
                    "[--rays N] [--iters N] [--backend cpu,hip-fp32,hip-build]\n"
                    "       %s --leaf [--leaf-blocks N] [--leaf-tris N] "
-                   "[--iters N]\n",
-                   argv[0], argv[0]);
+                   "[--iters N]\n"
+                   "       %s --normals [--tris N] [--rays N] [--iters N]\n",
+                   argv[0], argv[0], argv[0]);
             return 2;
         }
     }
@@ -385,6 +469,8 @@ int main(int argc, char **argv) {
 
     if (leaf_mode) return run_leaf_bench(leaf_blocks, leaf_tris, iters);
     if (dynamic_mode) return run_dynamic_bench(scene, want_tris, frames);
+    if (normals_mode) return run_normals_bench(want_tris ? want_tris / 10 : 0,
+                                               nrays, iters);
 
     size_t ntris = 0;
     float *verts = gen_scene(scene, want_tris, &ntris);

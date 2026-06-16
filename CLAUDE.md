@@ -1042,9 +1042,12 @@ intersector uses) and the radial normal for round-linear curves, mirroring the
 CPU `lrt_tri_surface_normal`/`lrt_tri_curve_frame`. Upload copies the CPU scene's
 per-prim shade control points to `d_shade_cps`/`d_shade_dom` (via the
 `lrt_tri_surface_shade_data` accessor); the kernel indexes them by the hit's
-`prim_id`. Verified on an RX 9070 XT: 100% normal agreement (min cos 1.00000) vs
-the CPU oracle across all four surface kinds + round-linear. Triangle/other
-scenes carry no shade data → `LRT_RESULT_UNSUPPORTED`.
+`prim_id`. Verified on an RX 9070 XT (host D2H *and* the device-resident
+`_device` path, bit-identical): 100% normal agreement (min cos 1.00000) vs the
+CPU oracle across all four surface kinds + round-linear. Triangle/other scenes
+carry no shade data → `LRT_RESULT_UNSUPPORTED`. `bench_hip --normals` reports the
+post-pass cost: on a 20k-patch bezpatch scene the `k_shade_normals` pass adds
+only ~5% on primary rays and <1% on incoherent (traversal-bound) over trace-only.
 
 ### Phase 2 (implemented): WMMA + int-quantized leaf kernels
 `lightrt_hip_wmma.hip` (compiled into `lightrt_hip` when rocWMMA is present;

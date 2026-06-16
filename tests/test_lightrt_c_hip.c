@@ -1177,6 +1177,34 @@ static void test_gpu_normals(lrt_hip_engine *e) {
         CHECK(hits > nr / 100, "%s: too few hits", cases[ci].name);
         CHECK(f >= 0.999, "%s: GPU normal agreement %.3f%%", cases[ci].name,
               f * 100.0);
+
+        /* Device-resident path (lrt_hip_scene_trace_normals_device): same kernel
+         * over dbuffer in/out — must produce bit-identical normals to the host
+         * D2H path above. */
+        lrt_hip_dbuffer *drays = lrt_hip_dbuffer_alloc(e, nr * sizeof(lrt_ray), NULL);
+        lrt_hip_dbuffer *dhits = lrt_hip_dbuffer_alloc(e, nr * sizeof(lrt_hit), NULL);
+        lrt_hip_dbuffer *dnrm = lrt_hip_dbuffer_alloc(e, nr * 3 * sizeof(float), NULL);
+        CHECK(drays && dhits && dnrm, "%s: dbuffer alloc", cases[ci].name);
+        if (drays && dhits && dnrm) {
+            lrt_hip_dbuffer_upload(e, drays, rays, nr * sizeof(lrt_ray), NULL);
+            lrt_result de = LRT_RESULT_OK;
+            int dr = lrt_hip_scene_trace_normals_device(e, gs, drays, (uint32_t)nr,
+                                                        dhits, dnrm, &de);
+            CHECK(dr == 0 && de == LRT_RESULT_OK,
+                  "%s: trace_normals_device err=%d", cases[ci].name, (int)de);
+            float *dn = (float *)malloc(nr * 3 * sizeof(float));
+            lrt_hip_dbuffer_download(e, dnrm, dn, nr * 3 * sizeof(float), NULL);
+            size_t mism = 0;
+            for (size_t i = 0; i < nr * 3; i++)
+                if (dn[i] != gn[i]) mism++; /* same kernel -> exact match */
+            CHECK(mism == 0, "%s: device-resident normals differ from host (%zu)",
+                  cases[ci].name, mism);
+            free(dn);
+        }
+        lrt_hip_dbuffer_free(e, drays);
+        lrt_hip_dbuffer_free(e, dhits);
+        lrt_hip_dbuffer_free(e, dnrm);
+
         free(rays); free(gh); free(gn);
         lrt_hip_scene_free(e, gs);
         lrt_tri_scene_free(cpu);
