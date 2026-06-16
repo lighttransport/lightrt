@@ -427,11 +427,76 @@ static void test_trimnurbs(void) {
           rem * 100.0);
 }
 
+/* LRTS v2: trimmed-NURBS scenes (with trim loops) must round-trip through
+ * save/load to memory and produce identical hits. */
+static void test_trim_serialize(void) {
+    const int degu = 3, degv = 3, nu = 4, nv = 4;
+    const float U[9] = {0, 0, 0, 0, 0.5f, 1, 1, 1, 1};
+    const int NG = 32;
+    float tp[32 * 2];
+    uint32_t ll[1] = {(uint32_t)NG};
+    for (int i = 0; i < NG; i++) {
+        float a = 6.2831853f * i / NG;
+        tp[i * 2] = 0.5f + 0.3f * cosf(a);
+        tp[i * 2 + 1] = 0.5f + 0.3f * sinf(a);
+    }
+    float net[25 * 3], w[25];
+    float c[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+    for (int j = 0; j < 5; j++)
+        for (int i = 0; i < 5; i++) {
+            int idx = j * 5 + i;
+            for (int k = 0; k < 3; k++)
+                net[idx * 3 + k] = c[k] + 0.5f * (i - 2) * (k == 0) +
+                                   0.5f * (j - 2) * (k == 1) + rf(-0.1f, 0.1f);
+            w[idx] = rf(0.6f, 1.8f);
+        }
+    lrt_tri_build_options o;
+    memset(&o, 0, sizeof(o));
+    o.num_threads = 1;
+    lrt_tri_scene *orig = lrt_trimnurbs_scene_build(net, nu, nv, U, U, w, degu,
+                                                    degv, tp, ll, 1, &o, NULL);
+    CHECK(orig != NULL, "trim serialize: build");
+    if (!orig) return;
+    void *buf = NULL;
+    size_t n = 0;
+    lrt_result sr = lrt_tri_scene_save_to_memory(orig, &buf, &n);
+    CHECK(sr == LRT_RESULT_OK && buf, "trim serialize: save (err=%d)", (int)sr);
+    lrt_tri_scene *loaded = buf ? lrt_tri_scene_load_from_memory(buf, n, NULL)
+                                : NULL;
+    CHECK(loaded != NULL, "trim serialize: load");
+    if (loaded) {
+        size_t nr = 40000, agree = 0;
+        for (size_t i = 0; i < nr; i++) {
+            lrt_ray r;
+            float o2[3] = {c[0] + rf(-3, 3), c[1] + rf(-3, 3), c[2] + rf(-3, 3)};
+            float d[3] = {c[0] - o2[0] + rf(-0.4f, 0.4f),
+                          c[1] - o2[1] + rf(-0.4f, 0.4f),
+                          c[2] - o2[2] + rf(-0.4f, 0.4f)};
+            float l = sqrtf(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]) + 1e-9f;
+            for (int k = 0; k < 3; k++) { r.org[k]=o2[k]; r.dir[k]=d[k]/l; }
+            r.tmin = 1e-4f; r.tmax = 1e9f;
+            lrt_hit a, b;
+            int ha = lrt_tri_intersect1(orig, &r, &a);
+            int hb = lrt_tri_intersect1(loaded, &r, &b);
+            if (ha == hb && (!ha || (a.prim_id == b.prim_id &&
+                                     fabsf(a.t - b.t) < 1e-5f)))
+                agree++;
+        }
+        double f = (double)agree / nr;
+        printf("trim-io:  save/load round-trip agree %.4f%%\n", f * 100.0);
+        CHECK(f >= 0.9999, "trim serialize: round-trip %.4f%%", f * 100.0);
+        lrt_tri_scene_free(loaded);
+    }
+    free(buf);
+    lrt_tri_scene_free(orig);
+}
+
 int main(void) {
     test_bilinear();
     test_bezpatch();
     test_nurbs();
     test_trimnurbs();
+    test_trim_serialize();
     if (g_fail) {
         printf("\n%d FAILURES\n", g_fail);
         return 1;

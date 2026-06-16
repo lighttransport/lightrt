@@ -393,8 +393,8 @@ lrt_tri_scene *lrt_nurbs_scene_build(const float *net, int nu, int nv,
  * holes — orientation-agnostic). trim_pts = concatenated (u,v) points of all
  * loops (2 floats each); loop_lengths[nloops] = points per loop (each loop is a
  * closed polyline; Bézier trim curves should be flattened to polylines by the
- * caller). nloops = 0 is identical to lrt_nurbs_scene_build. Not currently
- * serializable (trim loops are not in the v1 LRTS blob). */
+ * caller). nloops = 0 is identical to lrt_nurbs_scene_build. Serializes via the
+ * LRTS v2 aux region (the trim loops ride after the blocks). */
 lrt_tri_scene *lrt_trimnurbs_scene_build(
     const float *net, int nu, int nv, const float *knots_u,
     const float *knots_v, const float *weights, int degu, int degv,

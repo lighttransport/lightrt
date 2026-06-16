@@ -769,7 +769,9 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
     global (u,v) is visible; trimmed hits are rejected and the search continues
     for the nearest untrimmed hit. `TRI_PRIM_TRIMNURBS`, scene-owned trim side
     buffers. Verified by residual (surface point on the ray) + the trim
-    invariant (every hit inside the trim region).
+    invariant (every hit inside the trim region). Serializes via the **LRTS v2
+    aux region** (trim loops ride after the blocks; v1 files still load — their
+    zero padding reads as aux_size 0).
 
 ### Implicit surfaces / SDF (`lrt_sdf_*`)
 - `lrt_sdf_sphere_trace` — standalone enhanced sphere tracing (over-relaxation

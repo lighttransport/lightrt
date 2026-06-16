@@ -1987,7 +1987,7 @@ static int hip_grow(lrt_hip_engine *e, void **buf, size_t *cap, size_t need) {
 /* Resident scene upload / trace.                                            */
 /* ========================================================================= */
 /* Upload a trimmed-NURBS scene directly from its resident buffers + trim loops
- * (no LRTS blob; the trim side data is not serialized in v1). */
+ * (reads the scene directly rather than parsing the LRTS v2 aux region). */
 static lrt_hip_scene *hip_upload_trimnurbs(lrt_hip_engine *e,
                                            const lrt_tri_scene *s,
                                            lrt_result *err) {
@@ -2059,8 +2059,10 @@ extern "C" lrt_hip_scene *lrt_hip_scene_upload(lrt_hip_engine *e,
         if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
         return NULL;
     }
-    /* Trimmed NURBS is not in the v1 LRTS blob (its trim loops are scene side
-     * data); upload it directly from the live scene's resident buffers. */
+    /* Trimmed NURBS: upload directly from the live scene's resident buffers +
+     * trim loops (avoids parsing the LRTS v2 aux region in the GPU header
+     * mirror; works for both freshly-built and loaded-from-disk scenes, since
+     * load populates the scene's trim buffers). */
     {
         uint32_t pk = 0;
         lrt_tri_scene_raw(s, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, &pk,

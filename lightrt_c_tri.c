@@ -11287,7 +11287,7 @@ lrt_tri_scene *lrt_sdf_scene_build(const lrt_sdf_blob *blobs, size_t nblobs,
  * Nodes and blocks are POD with internal indices, so they serialize as raw
  * bytes. User/sphere/SDF scenes hold callbacks and cannot be serialized.
  * ------------------------------------------------------------------------ */
-#define LRT_TRI_FILE_VERSION 1u
+#define LRT_TRI_FILE_VERSION 2u
 #define LRT_TRI_FILE_ALIGN 64u
 
 typedef struct lrt_tri_file_header {
@@ -11308,8 +11308,20 @@ typedef struct lrt_tri_file_header {
     uint64_t node_offset;
     uint64_t block_offset;
     uint64_t file_size;
+    /* v2: optional aux region (after blocks) for side data not in nodes/blocks
+     * (trimmed-NURBS trim loops). aux_size == 0 => none (and v1 files read 0 here
+     * from their zero padding, so they load unchanged). */
+    uint64_t aux_offset;
+    uint64_t aux_size;
 } lrt_tri_file_header;
-_Static_assert(sizeof(lrt_tri_file_header) == 96, "file header must be 96 bytes");
+_Static_assert(sizeof(lrt_tri_file_header) == 112, "file header must be 112 bytes");
+
+/* On-disk aux sub-header (trimmed-NURBS trim loops), at h.aux_offset. */
+typedef struct lrt_tri_aux_header {
+    uint32_t nloops;
+    uint32_t npts; /* total (u,v) points */
+    /* followed by: uint32 loop_off[nloops+1]; float pts[2*npts]; */
+} lrt_tri_aux_header;
 
 static size_t tri_align_up(size_t x, size_t a) {
     return (x + a - 1u) & ~(a - 1u);
@@ -11453,7 +11465,8 @@ static uint32_t tri_kind_block_stride(int prim_kind, int layout) {
     case TRI_PRIM_TETRA:
     case TRI_PRIM_BILINEAR: return (uint32_t)sizeof(lrt_quad4);
     case TRI_PRIM_BEZPATCH: return (uint32_t)sizeof(lrt_bezpatch4);
-    case TRI_PRIM_RBEZPATCH: return (uint32_t)sizeof(lrt_rbezpatch4);
+    case TRI_PRIM_RBEZPATCH:
+    case TRI_PRIM_TRIMNURBS: return (uint32_t)sizeof(lrt_rbezpatch4);
     case TRI_PRIM_SDF: return (uint32_t)sizeof(lrt_sdf4);
     case TRI_PRIM_RLCURVE: return (uint32_t)sizeof(lrt_rlc4);
     case TRI_PRIM_FLATCURVE: return (uint32_t)sizeof(lrt_flat4);
@@ -11478,7 +11491,16 @@ lrt_result lrt_tri_scene_save_to_memory(const lrt_tri_scene *s, void **buf,
     size_t nodes_bytes = (size_t)s->node_count * nstride;
     size_t block_off = tri_align_up(node_off + nodes_bytes, LRT_TRI_FILE_ALIGN);
     size_t blocks_bytes = (size_t)s->block_count * bstride;
-    size_t total = block_off + blocks_bytes;
+    /* v2 aux region (trimmed-NURBS trim loops), after the blocks. */
+    size_t aux_off = 0, aux_bytes = 0, aux_npts = 0;
+    if (s->prim_kind == TRI_PRIM_TRIMNURBS && s->trim_nloops > 0) {
+        aux_npts = s->trim_loop_off ? s->trim_loop_off[s->trim_nloops] : 0;
+        aux_bytes = sizeof(lrt_tri_aux_header) +
+                    (size_t)(s->trim_nloops + 1) * sizeof(uint32_t) +
+                    aux_npts * 2 * sizeof(float);
+        aux_off = tri_align_up(block_off + blocks_bytes, LRT_TRI_FILE_ALIGN);
+    }
+    size_t total = aux_bytes ? aux_off + aux_bytes : block_off + blocks_bytes;
     unsigned char *out = (unsigned char *)calloc(1, total);
     if (!out) return LRT_RESULT_OUT_OF_MEMORY;
     lrt_tri_file_header h;
@@ -11506,9 +11528,22 @@ lrt_result lrt_tri_scene_save_to_memory(const lrt_tri_scene *s, void **buf,
     h.node_offset = node_off;
     h.block_offset = block_off;
     h.file_size = total;
+    h.aux_offset = aux_off;
+    h.aux_size = aux_bytes;
     memcpy(out, &h, sizeof(h));
     memcpy(out + node_off, tri_scene_nodes_ptr(s), nodes_bytes);
     memcpy(out + block_off, s->blocks, blocks_bytes);
+    if (aux_bytes) {
+        lrt_tri_aux_header ah;
+        ah.nloops = s->trim_nloops;
+        ah.npts = (uint32_t)aux_npts;
+        unsigned char *p = out + aux_off;
+        memcpy(p, &ah, sizeof(ah));
+        p += sizeof(ah);
+        memcpy(p, s->trim_loop_off, (size_t)(s->trim_nloops + 1) * sizeof(uint32_t));
+        p += (size_t)(s->trim_nloops + 1) * sizeof(uint32_t);
+        memcpy(p, s->trim_pts, aux_npts * 2 * sizeof(float));
+    }
     *buf = out;
     *n = total;
     return LRT_RESULT_OK;
@@ -11536,7 +11571,7 @@ static int tri_header_check(const lrt_tri_file_header *h, size_t n) {
     if (h->magic[0] != 'L' || h->magic[1] != 'R' || h->magic[2] != 'T' ||
         h->magic[3] != 'S')
         return 1;
-    if (h->version != LRT_TRI_FILE_VERSION) return 1;
+    if (h->version != 1u && h->version != 2u) return 1; /* v1 has no aux */
     if (h->endian != 0x01020304u) return 1;
     if (h->layout != 4 && h->layout != 8) return 1;
     uint32_t exp_bstride = tri_kind_block_stride((int)h->prim_kind, (int)h->layout);
@@ -11550,6 +11585,11 @@ static int tri_header_check(const lrt_tri_file_header *h, size_t n) {
     if (h->node_offset < sizeof(*h)) return 1;
     if (h->node_offset + nodes_bytes > h->block_offset) return 1;
     if (h->block_offset + blocks_bytes > h->file_size) return 1;
+    if (h->aux_size) { /* v2 aux region must sit after blocks, within the file */
+        if (h->aux_offset < h->block_offset + blocks_bytes) return 1;
+        if (h->aux_offset + h->aux_size > h->file_size) return 1;
+        if (h->aux_size < sizeof(lrt_tri_aux_header)) return 1;
+    }
     return 0;
 }
 
@@ -11626,6 +11666,30 @@ static lrt_tri_scene *tri_scene_from_buffer(const void *buf, size_t n, int copy,
         }
         tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
         return NULL;
+    }
+    /* v2 aux region: trimmed-NURBS trim loops (always heap-owned, even for
+     * mmap, so scene_free can release them uniformly). */
+    if (s->prim_kind == TRI_PRIM_TRIMNURBS &&
+        h->aux_size >= sizeof(lrt_tri_aux_header)) {
+        const unsigned char *ap = (const unsigned char *)buf + h->aux_offset;
+        lrt_tri_aux_header ah;
+        memcpy(&ah, ap, sizeof(ah));
+        size_t obytes = (size_t)(ah.nloops + 1) * sizeof(uint32_t);
+        size_t pbytes = (size_t)ah.npts * 2 * sizeof(float);
+        if (ah.nloops > 0 && sizeof(ah) + obytes + pbytes <= h->aux_size) {
+            uint32_t *off = (uint32_t *)malloc(obytes);
+            float *pts = (float *)malloc(pbytes);
+            if (off && pts) {
+                memcpy(off, ap + sizeof(ah), obytes);
+                memcpy(pts, ap + sizeof(ah) + obytes, pbytes);
+                s->trim_loop_off = off;
+                s->trim_pts = pts;
+                s->trim_nloops = ah.nloops;
+            } else {
+                free(off);
+                free(pts);
+            }
+        }
     }
     tri_set_kernel_name(s);
     tri_recompute_stats(s);
