@@ -12260,6 +12260,39 @@ static void tri_leaf_box(const lrt_tri_scene *s, uint32_t ref, float lo[3],
         }
         return;
     }
+    /* Linear curve leaves (BVH4): box = union of the two end spheres. */
+    if (s->prim_kind == TRI_PRIM_RLCURVE || s->prim_kind == TRI_PRIM_FLATCURVE) {
+        for (uint32_t b = 0; b < nblk; b++) {
+            const void *blk =
+                (const char *)s->blocks + (size_t)(blk0 + b) * s->block_stride;
+            for (int lane = 0; lane < 4; lane++) {
+                float p0[3], p1[3], r0, r1;
+                uint32_t pid;
+                if (s->prim_kind == TRI_PRIM_RLCURVE) {
+                    const lrt_rlc4 *c = (const lrt_rlc4 *)blk;
+                    pid = c->prim[lane];
+                    p0[0] = c->p0x[lane]; p0[1] = c->p0y[lane]; p0[2] = c->p0z[lane];
+                    p1[0] = c->p1x[lane]; p1[1] = c->p1y[lane]; p1[2] = c->p1z[lane];
+                    r0 = c->r0[lane]; r1 = c->r1[lane];
+                } else {
+                    const lrt_flat4 *c = (const lrt_flat4 *)blk;
+                    pid = c->prim[lane];
+                    p0[0] = c->p0x[lane]; p0[1] = c->p0y[lane]; p0[2] = c->p0z[lane];
+                    p1[0] = c->p1x[lane]; p1[1] = c->p1y[lane]; p1[2] = c->p1z[lane];
+                    r0 = c->r0[lane]; r1 = c->r1[lane];
+                }
+                if (pid == LRT_TRI_NO_HIT) continue;
+                float a0 = r0 > 0.0f ? r0 : 0.0f, a1 = r1 > 0.0f ? r1 : 0.0f;
+                for (int a = 0; a < 3; a++) {
+                    float plo = (p0[a] - a0 < p1[a] - a1) ? p0[a] - a0 : p1[a] - a1;
+                    float phi = (p0[a] + a0 > p1[a] + a1) ? p0[a] + a0 : p1[a] + a1;
+                    if (plo < lo[a]) lo[a] = plo;
+                    if (phi > hi[a]) hi[a] = phi;
+                }
+            }
+        }
+        return;
+    }
     int width = s->layout;
     for (uint32_t b = 0; b < nblk; b++) {
         const float *f = tri_block_floats(s->blocks, blk0 + b, width);
@@ -12460,6 +12493,122 @@ lrt_result lrt_tri_surface_refit(lrt_tri_scene *s, const float *cps,
     tri_build_shade_data(s);
 
     /* 3. Recompute node bounds bottom-up from the new control-point hulls. */
+    return tri_refit_propagate(s);
+}
+
+lrt_result lrt_curve_refit(lrt_tri_scene *s, const lrt_hair_strands *strands) {
+    if (!s || !strands || !strands->points || !strands->strand_first ||
+        !strands->strand_count)
+        return LRT_RESULT_INVALID_ARGUMENT;
+    if (s->mem_mapped) return LRT_RESULT_INVALID_ARGUMENT; /* read-only */
+    const int is_rl = (s->prim_kind == TRI_PRIM_RLCURVE);
+    if (!is_rl && s->prim_kind != TRI_PRIM_FLATCURVE)
+        return LRT_RESULT_INVALID_ARGUMENT;
+
+    const float *P = strands->points;
+    const float *R = strands->radius;
+    const float CR = strands->constant_radius;
+    const uint32_t *sf = strands->strand_first;
+    const uint32_t *scnt = strands->strand_count;
+    const size_t npts = strands->npoints;
+
+    /* Re-derive segments in the canonical prim order (sequential write index ==
+     * prim id), identical to lrt_roundcurve/flatcurve_scene_build. The segment
+     * topology must be unchanged from the original build (same count). */
+    size_t nseg = 0;
+    for (size_t i = 0; i < strands->nstrands; i++) {
+        uint32_t first = sf[i], cnt = scnt[i];
+        if (cnt < 2) continue;
+        if ((size_t)first + (size_t)cnt > npts)
+            return LRT_RESULT_INVALID_ARGUMENT;
+        nseg += (size_t)(cnt - 1u);
+    }
+    if (nseg == 0 || nseg != s->shade_nprims) return LRT_RESULT_INVALID_ARGUMENT;
+
+    tri_rlcseg *segs = (tri_rlcseg *)malloc(nseg * sizeof(tri_rlcseg));
+    if (!segs) return LRT_RESULT_OUT_OF_MEMORY;
+    const float INF = TRI_INF_F;
+    int bad = 0;
+    size_t w = 0;
+    for (size_t i = 0; i < strands->nstrands; i++) {
+        uint32_t first = sf[i], cnt = scnt[i];
+        if (cnt < 2) continue;
+        for (uint32_t j = 0; j + 1u < cnt; j++, w++) {
+            tri_rlcseg *rs = &segs[w];
+            uint32_t i0 = first + j, i1 = first + j + 1u;
+            float r0 = R ? R[i0] : CR, r1 = R ? R[i1] : CR;
+            for (int a = 0; a < 3; a++) {
+                rs->p0[a] = P[(size_t)i0 * 3 + a];
+                rs->p1[a] = P[(size_t)i1 * 3 + a];
+            }
+            rs->r0 = r0;
+            rs->r1 = r1;
+            if (j > 0u) {
+                uint32_t il = first + j - 1u;
+                for (int a = 0; a < 3; a++) rs->pL[a] = P[(size_t)il * 3 + a];
+                rs->rL = R ? R[il] : CR;
+            } else {
+                rs->pL[0] = rs->pL[1] = rs->pL[2] = INF;
+                rs->rL = 0.0f;
+            }
+            if (j + 2u < cnt) {
+                uint32_t ir = first + j + 2u;
+                for (int a = 0; a < 3; a++) rs->pR[a] = P[(size_t)ir * 3 + a];
+                rs->rR = R ? R[ir] : CR;
+            } else {
+                rs->pR[0] = rs->pR[1] = rs->pR[2] = INF;
+                rs->rR = 0.0f;
+            }
+            for (int a = 0; a < 3; a++)
+                if (!isfinite(rs->p0[a]) || !isfinite(rs->p1[a])) bad = 1;
+            if (!isfinite(r0) || !isfinite(r1) || (r0 <= 0.0f && r1 <= 0.0f))
+                bad = 1;
+        }
+    }
+    if (bad) {
+        free(segs);
+        return LRT_RESULT_INVALID_BOUNDS;
+    }
+
+    /* Scatter the new segment data into the leaf blocks by prim id. */
+    for (uint32_t bi = 0; bi < s->block_count; bi++) {
+        void *blk = (char *)s->blocks + (size_t)bi * s->block_stride;
+        for (int lane = 0; lane < 4; lane++) {
+            uint32_t pid =
+                is_rl ? ((lrt_rlc4 *)blk)->prim[lane] : ((lrt_flat4 *)blk)->prim[lane];
+            if (pid == LRT_TRI_NO_HIT) continue;
+            if ((size_t)pid >= nseg) {
+                free(segs);
+                return LRT_RESULT_INVALID_ARGUMENT;
+            }
+            const tri_rlcseg *rs = &segs[pid];
+            if (is_rl) {
+                lrt_rlc4 *c = (lrt_rlc4 *)blk;
+                c->p0x[lane] = rs->p0[0]; c->p0y[lane] = rs->p0[1]; c->p0z[lane] = rs->p0[2];
+                c->r0[lane] = rs->r0;
+                c->p1x[lane] = rs->p1[0]; c->p1y[lane] = rs->p1[1]; c->p1z[lane] = rs->p1[2];
+                c->r1[lane] = rs->r1;
+                c->pLx[lane] = rs->pL[0]; c->pLy[lane] = rs->pL[1]; c->pLz[lane] = rs->pL[2];
+                c->rL[lane] = rs->rL;
+                c->pRx[lane] = rs->pR[0]; c->pRy[lane] = rs->pR[1]; c->pRz[lane] = rs->pR[2];
+                c->rR[lane] = rs->rR;
+            } else {
+                lrt_flat4 *c = (lrt_flat4 *)blk;
+                c->p0x[lane] = rs->p0[0]; c->p0y[lane] = rs->p0[1]; c->p0z[lane] = rs->p0[2];
+                c->r0[lane] = rs->r0;
+                c->p1x[lane] = rs->p1[0]; c->p1y[lane] = rs->p1[1]; c->p1z[lane] = rs->p1[2];
+                c->r1[lane] = rs->r1;
+            }
+        }
+    }
+    free(segs);
+
+    /* Refresh the per-segment shade cache, then recompute node bounds. */
+    free(s->shade_cps);
+    s->shade_cps = NULL;
+    s->shade_nprims = 0;
+    s->shade_stride = 0;
+    tri_build_shade_data(s);
     return tri_refit_propagate(s);
 }
 

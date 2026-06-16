@@ -2531,6 +2531,96 @@ static void test_curve_tessellate(void) {
     free(sc);
 }
 
+/* ----- curve refit (lrt_curve_refit) ----------------------------------------
+ * Refit a hair scene from points A to points B (same strand topology) and verify
+ * it traces identically to a fresh build of B. Covers round-linear (CSG joints)
+ * and flat (ribbon). */
+static void curve_refit_check(int flat) {
+    enum { NSTRAND = 50, PTS = 5, NRAYS = 30000 };
+    size_t npoints = (size_t)NSTRAND * PTS;
+    float *A = (float *)malloc(npoints * 3 * sizeof(float));
+    float *B = (float *)malloc(npoints * 3 * sizeof(float));
+    float *rad = (float *)malloc(npoints * sizeof(float));
+    uint32_t *sf = (uint32_t *)malloc(NSTRAND * sizeof(uint32_t));
+    uint32_t *sc = (uint32_t *)malloc(NSTRAND * sizeof(uint32_t));
+    g_rng = flat ? 0xF1A7C0DEull : 0x12DEAD01ull; /* distinct seeds */
+    for (int st = 0; st < NSTRAND; st++) {
+        sf[st] = (uint32_t)(st * PTS);
+        sc[st] = PTS;
+        float ax = rnd_f(-2, 2), ay = rnd_f(-2, 2), az = rnd_f(-2, 2);
+        float bx = rnd_f(-2, 2), by = rnd_f(-2, 2), bz = rnd_f(-2, 2);
+        for (int p = 0; p < PTS; p++) {
+            size_t idx = (size_t)st * PTS + p;
+            ax += rnd_f(-0.8f, 0.8f); ay += rnd_f(-0.8f, 0.8f); az += rnd_f(-0.8f, 0.8f);
+            bx += rnd_f(-0.8f, 0.8f); by += rnd_f(-0.8f, 0.8f); bz += rnd_f(-0.8f, 0.8f);
+            A[idx * 3 + 0] = ax; A[idx * 3 + 1] = ay; A[idx * 3 + 2] = az;
+            B[idx * 3 + 0] = bx; B[idx * 3 + 1] = by; B[idx * 3 + 2] = bz;
+            rad[idx] = rnd_f(0.02f, 0.05f);
+        }
+    }
+    lrt_hair_strands ha = {0};
+    ha.radius = rad; ha.strand_first = sf; ha.strand_count = sc;
+    ha.nstrands = NSTRAND; ha.npoints = npoints;
+    lrt_hair_strands hb = ha;
+    ha.points = A; hb.points = B;
+
+    lrt_tri_scene *sa = flat ? lrt_flatcurve_scene_build(&ha, NULL, NULL)
+                             : lrt_roundcurve_scene_build(&ha, NULL, NULL);
+    lrt_tri_scene *sb = flat ? lrt_flatcurve_scene_build(&hb, NULL, NULL)
+                             : lrt_roundcurve_scene_build(&hb, NULL, NULL);
+    CHECK(sa && sb, "curve-refit[%s]: builds", flat ? "flat" : "round");
+    if (sa && sb) {
+        lrt_result r = lrt_curve_refit(sa, &hb);
+        CHECK(r == LRT_RESULT_OK, "curve-refit[%s]: result %d",
+              flat ? "flat" : "round", (int)r);
+        size_t hits = 0, agree = 0;
+        for (int i = 0; i < NRAYS; i++) {
+            lrt_ray ray;
+            make_random_ray(&ray);
+            lrt_hit xa, xb;
+            int a = lrt_tri_intersect1(sa, &ray, &xa);
+            int b = lrt_tri_intersect1(sb, &ray, &xb);
+            if (a || b) hits++;
+            if (a == b && (!a || (xa.prim_id == xb.prim_id &&
+                                  fabs((double)xa.t - xb.t) <=
+                                      1e-3 * (1.0 + fabs((double)xb.t)))))
+                agree++;
+        }
+        double af = (double)agree / NRAYS;
+        printf("  curve-refit[%s]: %zu hits, agree %.3f%%\n",
+               flat ? "flat" : "round", hits, af * 100);
+        CHECK(af >= 0.999, "curve-refit[%s]: agreement %.3f%%",
+              flat ? "flat" : "round", af * 100);
+    }
+    if (sa) lrt_tri_scene_free(sa);
+    if (sb) lrt_tri_scene_free(sb);
+    free(A); free(B); free(rad); free(sf); free(sc);
+}
+
+static void test_curve_refit(void) {
+    curve_refit_check(0); /* round-linear */
+    curve_refit_check(1); /* flat */
+    /* topology-change rejection: different segment count */
+    {
+        float pts[6] = {0, 0, 0, 1, 0, 0};
+        uint32_t sf1 = 0, sc1 = 2;
+        lrt_hair_strands h = {0};
+        h.points = pts; h.constant_radius = 0.1f;
+        h.strand_first = &sf1; h.strand_count = &sc1;
+        h.nstrands = 1; h.npoints = 2;
+        lrt_tri_scene *s = lrt_roundcurve_scene_build(&h, NULL, NULL);
+        if (s) {
+            float pts3[9] = {0, 0, 0, 1, 0, 0, 2, 0, 0};
+            uint32_t sc3 = 3;
+            lrt_hair_strands h3 = h;
+            h3.points = pts3; h3.strand_count = &sc3; h3.npoints = 3;
+            CHECK(lrt_curve_refit(s, &h3) == LRT_RESULT_INVALID_ARGUMENT,
+                  "curve-refit: topology change rejected");
+            lrt_tri_scene_free(s);
+        }
+    }
+}
+
 static void test_curve_point_edge_cases(void) {
     lrt_hit h;
 
@@ -2639,6 +2729,7 @@ int main(void) {
     test_bezcurve_scene();
     test_curve_frame();
     test_curve_tessellate();
+    test_curve_refit();
     test_points_scene();
     test_curve_point_edge_cases();
     test_sphere_scene();

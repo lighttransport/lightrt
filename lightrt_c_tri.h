@@ -717,6 +717,19 @@ lrt_result lrt_tri_scene_refit(lrt_tri_scene *s, const float *vertices,
 lrt_result lrt_tri_surface_refit(lrt_tri_scene *s, const float *cps,
                                  size_t nprims);
 
+/* Refit a round-linear or flat (ribbon) curve (hair) scene in place for
+ * animation: re-derive the segments from a new strand set (points + radii) and
+ * recompute node bounds without rebuilding the tree. The strand topology must
+ * match the original build (same strand_first/strand_count layout, hence the
+ * same segment count) — only the point positions / radii change. The CSG
+ * neighbor data of round-linear segments is re-derived too, so joints stay
+ * correct. Refreshes the shade cache (lrt_tri_curve_frame / _tessellate). Tree
+ * topology is preserved (large motion degrades traversal but stays correct).
+ * Rejects mmapped scenes and non-(round/flat)-curve kinds. Returns
+ * LRT_RESULT_OK; INVALID_ARGUMENT (NULL/topology change/wrong kind/mmap);
+ * INVALID_BOUNDS (non-finite point or non-positive radii). */
+lrt_result lrt_curve_refit(lrt_tri_scene *s, const lrt_hair_strands *strands);
+
 /* --- Instancing / TLAS ----------------------------------------------------
  *
  * A top-level acceleration structure over instances of bottom-level scenes

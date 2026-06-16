@@ -840,6 +840,11 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
   extracted rational patches with no 1:1 map to the input net, so they are
   rejected. Refreshes the shade cache, so the normal/tessellate queries reflect
   the new geometry. Traces identically to a fresh build of the new CPs.
+- `lrt_curve_refit` — in-place refit for animated hair: re-derive the segments
+  (incl. round-linear CSG-neighbor data) from a new strand set and recompute node
+  bounds without a rebuild. Round-linear + flat curves; the strand topology must
+  match the original (same segment count). Refreshes the shade cache. Traces
+  identically to a fresh build (round joints included).
 
 ### Production
 - Serialization: `lrt_tri_scene_save[_to_memory]` / `load[_from_memory]`, plus
