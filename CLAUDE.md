@@ -922,9 +922,16 @@ incoherent). Takeaway: on RDNA4 the matrix cores do not accelerate these
 CPU-style RT primitives; the precise fp32 trace (Phase 1) is the path to use.
 Transform batching is memory-bound, so WMMA does not help it either.
 
-Remaining experimental ideas (not implemented, expected low/negative payoff):
-WMMA box/slab tests (the min/max reduction is not a matmul), and full
-coherent-packet traversal that would call the WMMA leaf kernel inline.
+Notes / not implemented: int4 (iu4) WMMA is not exposed by rocWMMA 2.2 (would
+need raw `__builtin_amdgcn_wmma_i32_16x16x16_iu4_w32`); since int8/fp16 already
+lose to scalar for leaf intersection, lower-precision int4 (same staging cost)
+would not change the verdict, so it is skipped. int16 is not a WMMA input type
+(the integer GEMM accumulates int32 from iu8/iu4 inputs). Other experimental
+ideas with expected low/negative payoff: WMMA box/slab tests (the min/max
+reduction is not a matmul) and full coherent-packet traversal calling the WMMA
+leaf kernel inline. Remaining stretch for the dynamic path: full-GPU LBVH (a
+hipCUB radix sort + Karras tree + GPU collapse) to speed topology-changing
+rebuilds beyond the current hybrid GPU-Morton/CPU-finish build.
 
 ## Code Conventions
 
