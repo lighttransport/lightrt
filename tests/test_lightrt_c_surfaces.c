@@ -516,6 +516,203 @@ static void test_nurbs_bad_knots(void) {
     printf("nurbs-knots: malformed rejected, valid accepted\n");
 }
 
+/* ----- post-hit shading query (lrt_tri_surface_normal) ----------------------
+ * For every hit on a parametric surface scene, validates:
+ *   - residual:    returned P lies on the ray (org + t*dir);
+ *   - tangents:    dPdu/dPdv match a central finite difference of P (direction);
+ *   - normal:      Ng agrees with cross(fd_u, fd_v);
+ *   - perpendic.:  Ng is orthogonal to both tangents (by construction).
+ * Aggregated as pass fractions (a handful of grazing/boundary hits may miss the
+ * FD direction tolerance), matching the residual-test style elsewhere. */
+static float vdot3(const float *a, const float *b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+static float vlen3(const float *a) { return sqrtf(vdot3(a, a)); }
+
+static void check_normals(lrt_tri_scene *sc, size_t nprims, const char *label) {
+    const size_t NR = 40000;
+    size_t hits = 0, resid_ok = 0, tan_ok = 0, norm_ok = 0, perp_ok = 0;
+    const float h = 5e-4f;
+    for (size_t i = 0; i < NR; i++) {
+        lrt_ray r;
+        make_ray(&r);
+        lrt_hit hit;
+        if (!lrt_tri_intersect1(sc, &r, &hit)) continue;
+        hits++;
+        float P[3], Ng[3], dU[3], dV[3];
+        lrt_result q =
+            lrt_tri_surface_normal(sc, hit.prim_id, hit.u, hit.v, P, Ng, dU, dV);
+        CHECK(q == LRT_RESULT_OK, "%s: surface_normal err=%d", label, (int)q);
+        if (q != LRT_RESULT_OK) continue;
+        /* residual: P on the ray */
+        float pr[3];
+        for (int k = 0; k < 3; k++) pr[k] = r.org[k] + hit.t * r.dir[k];
+        float dd[3] = {P[0] - pr[0], P[1] - pr[1], P[2] - pr[2]};
+        if (vlen3(dd) / (1.0f + fabsf(hit.t)) < 1e-3f) resid_ok++;
+        /* central finite-difference of P in u and v (via the query itself) */
+        float Pup[3], Pum[3], Pvp[3], Pvm[3];
+        lrt_result a = lrt_tri_surface_normal(sc, hit.prim_id, hit.u + h, hit.v,
+                                              Pup, NULL, NULL, NULL);
+        lrt_result b = lrt_tri_surface_normal(sc, hit.prim_id, hit.u - h, hit.v,
+                                              Pum, NULL, NULL, NULL);
+        lrt_result cc = lrt_tri_surface_normal(sc, hit.prim_id, hit.u, hit.v + h,
+                                               Pvp, NULL, NULL, NULL);
+        lrt_result e = lrt_tri_surface_normal(sc, hit.prim_id, hit.u, hit.v - h,
+                                              Pvm, NULL, NULL, NULL);
+        if (a != LRT_RESULT_OK || b != LRT_RESULT_OK || cc != LRT_RESULT_OK ||
+            e != LRT_RESULT_OK)
+            continue;
+        float fu[3], fv[3];
+        for (int k = 0; k < 3; k++) {
+            fu[k] = (Pup[k] - Pum[k]) / (2 * h);
+            fv[k] = (Pvp[k] - Pvm[k]) / (2 * h);
+        }
+        /* tangent direction agreement (skip near-degenerate steps) */
+        float lu = vlen3(fu), lv = vlen3(fv), ldU = vlen3(dU), ldV = vlen3(dV);
+        int tu = lu < 1e-5f || ldU < 1e-5f ||
+                 vdot3(fu, dU) / (lu * ldU) > 0.99f;
+        int tv = lv < 1e-5f || ldV < 1e-5f ||
+                 vdot3(fv, dV) / (lv * ldV) > 0.99f;
+        if (tu && tv) tan_ok++;
+        /* normal vs cross(fu,fv) */
+        float fn[3] = {fu[1] * fv[2] - fu[2] * fv[1],
+                       fu[2] * fv[0] - fu[0] * fv[2],
+                       fu[0] * fv[1] - fu[1] * fv[0]};
+        float lN = vlen3(Ng), lfn = vlen3(fn);
+        if (lN < 1e-6f || lfn < 1e-6f || vdot3(Ng, fn) / (lN * lfn) > 0.999f)
+            norm_ok++;
+        /* perpendicularity (exact by construction) */
+        if (lN < 1e-6f ||
+            (fabsf(vdot3(Ng, dU)) / (lN * (ldU + 1e-9f)) < 1e-4f &&
+             fabsf(vdot3(Ng, dV)) / (lN * (ldV + 1e-9f)) < 1e-4f))
+            perp_ok++;
+    }
+    (void)nprims;
+    double rf_ = hits ? (double)resid_ok / hits : 1.0;
+    double tf = hits ? (double)tan_ok / hits : 1.0;
+    double nf = hits ? (double)norm_ok / hits : 1.0;
+    double pf = hits ? (double)perp_ok / hits : 1.0;
+    printf("normals[%s]: %zu hits, resid %.2f%% tangent %.2f%% normal %.2f%% "
+           "perp %.2f%%\n",
+           label, hits, rf_ * 100, tf * 100, nf * 100, pf * 100);
+    CHECK(hits > NR / 200, "%s: too few hits (%zu)", label, hits);
+    CHECK(rf_ >= 0.999, "%s: P residual %.2f%% < 99.9%%", label, rf_ * 100);
+    CHECK(tf >= 0.99, "%s: tangent agreement %.2f%% < 99%%", label, tf * 100);
+    CHECK(nf >= 0.99, "%s: normal agreement %.2f%% < 99%%", label, nf * 100);
+    CHECK(pf >= 0.999, "%s: perpendicularity %.2f%% < 99.9%%", label, pf * 100);
+}
+
+static void test_surface_normals(void) {
+    lrt_tri_build_options o;
+    memset(&o, 0, sizeof(o));
+    o.num_threads = 1;
+
+    /* bilinear */
+    const size_t NB = 1500;
+    float *bil = (float *)malloc(NB * 12 * sizeof(float));
+    for (size_t i = 0; i < NB; i++) {
+        float c[3] = {rf(-2, 2), rf(-2, 2), rf(-2, 2)};
+        float *p = &bil[i * 12];
+        float ax[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+        float ay[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+        float s = 0.35f, w = 0.3f;
+        for (int k = 0; k < 3; k++) {
+            float warp = rf(-w, w);
+            p[0 + k] = c[k] - s * ax[k] - s * ay[k];
+            p[3 + k] = c[k] + s * ax[k] - s * ay[k] + (k == 2 ? warp : 0);
+            p[6 + k] = c[k] + s * ax[k] + s * ay[k];
+            p[9 + k] = c[k] - s * ax[k] + s * ay[k] - (k == 2 ? warp : 0);
+        }
+    }
+    lrt_tri_scene *sb = lrt_bilinear_scene_build(bil, NB, &o, NULL);
+    CHECK(sb != NULL, "normals: bilinear build");
+    if (sb) check_normals(sb, NB, "bilinear");
+
+    /* bicubic Bezier */
+    const size_t NP = 1500;
+    float *cps = (float *)malloc(NP * 48 * sizeof(float));
+    for (size_t i = 0; i < NP; i++) {
+        float c[3] = {rf(-2, 2), rf(-2, 2), rf(-2, 2)};
+        float ax[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+        float ay[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+        float *cp = &cps[i * 48];
+        for (int jj = 0; jj < 4; jj++)
+            for (int ii = 0; ii < 4; ii++) {
+                float fu = ii / 3.0f - 0.5f, fv = jj / 3.0f - 0.5f;
+                int idx = (jj * 4 + ii) * 3;
+                for (int k = 0; k < 3; k++)
+                    cp[idx + k] = c[k] + 0.8f * fu * ax[k] + 0.8f * fv * ay[k] +
+                                  rf(-0.12f, 0.12f);
+            }
+    }
+    lrt_tri_scene *sp = lrt_bezpatch_scene_build(cps, NP, &o, NULL);
+    CHECK(sp != NULL, "normals: bezpatch build");
+    if (sp) check_normals(sp, NP, "bezpatch");
+
+    /* NURBS (global-domain u,v + per-patch remap) */
+    const int nu = 4, nv = 4;
+    const float U[9] = {0, 0, 0, 0, 0.5f, 1, 1, 1, 1};
+    float net[25 * 3], w[25];
+    float cc[3] = {0, 0, 0};
+    float ax[3] = {1, 0.2f, 0}, ay[3] = {0.1f, 1, 0.3f};
+    for (int jj = 0; jj <= nv; jj++)
+        for (int ii = 0; ii <= nu; ii++) {
+            int idx = jj * (nu + 1) + ii;
+            float fu = (float)ii / nu - 0.5f, fv = (float)jj / nv - 0.5f;
+            for (int k = 0; k < 3; k++)
+                net[idx * 3 + k] =
+                    cc[k] + 1.2f * fu * ax[k] + 1.2f * fv * ay[k] + rf(-0.1f, 0.1f);
+            w[idx] = rf(0.5f, 2.0f);
+        }
+    lrt_tri_scene *sn = lrt_nurbs_scene_build(net, nu, nv, U, U, w, 3, 3, &o, NULL);
+    CHECK(sn != NULL, "normals: nurbs build");
+    if (sn) check_normals(sn, 0, "nurbs");
+
+    /* edge cases (reuse the bilinear scene) */
+    if (sb) {
+        lrt_result r;
+        r = lrt_tri_surface_normal(sb, 0, 0.5f, 0.5f, NULL, NULL, NULL, NULL);
+        CHECK(r == LRT_RESULT_OK, "normals: all-NULL outputs should be OK");
+        r = lrt_tri_surface_normal(NULL, 0, 0.5f, 0.5f, NULL, NULL, NULL, NULL);
+        CHECK(r == LRT_RESULT_INVALID_ARGUMENT, "normals: NULL scene -> INVALID");
+        float tmp[3];
+        r = lrt_tri_surface_normal(sb, (uint32_t)NB, 0.5f, 0.5f, tmp, NULL, NULL,
+                                   NULL);
+        CHECK(r == LRT_RESULT_INVALID_ARGUMENT,
+              "normals: prim_id==nprims -> INVALID");
+        /* a triangle scene must be rejected */
+        float tri[9] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+        lrt_tri_scene *st = lrt_tri_scene_build(tri, 1, &o, NULL);
+        if (st) {
+            r = lrt_tri_surface_normal(st, 0, 0.3f, 0.3f, tmp, NULL, NULL, NULL);
+            CHECK(r == LRT_RESULT_INVALID_ARGUMENT,
+                  "normals: triangle scene -> INVALID");
+            lrt_tri_scene_free(st);
+        }
+        /* a deserialized surface scene drops the shade data -> UNSUPPORTED */
+        void *blob = NULL;
+        size_t blob_sz = 0;
+        if (lrt_tri_scene_save_to_memory(sb, &blob, &blob_sz) == LRT_RESULT_OK &&
+            blob) {
+            lrt_tri_scene *sl = lrt_tri_scene_load_from_memory(blob, blob_sz, NULL);
+            if (sl) {
+                r = lrt_tri_surface_normal(sl, 0, 0.5f, 0.5f, tmp, NULL, NULL,
+                                           NULL);
+                CHECK(r == LRT_RESULT_UNSUPPORTED,
+                      "normals: loaded scene -> UNSUPPORTED (got %d)", (int)r);
+                lrt_tri_scene_free(sl);
+            }
+            free(blob);
+        }
+    }
+
+    free(bil);
+    free(cps);
+    if (sb) lrt_tri_scene_free(sb);
+    if (sp) lrt_tri_scene_free(sp);
+    if (sn) lrt_tri_scene_free(sn);
+}
+
 int main(void) {
     test_bilinear();
     test_bezpatch();
@@ -523,6 +720,7 @@ int main(void) {
     test_nurbs_bad_knots();
     test_trimnurbs();
     test_trim_serialize();
+    test_surface_normals();
     if (g_fail) {
         printf("\n%d FAILURES\n", g_fail);
         return 1;

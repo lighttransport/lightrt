@@ -401,6 +401,25 @@ lrt_tri_scene *lrt_trimnurbs_scene_build(
     const float *trim_pts, const uint32_t *loop_lengths, int nloops,
     const lrt_tri_build_options *opts, lrt_result *err);
 
+/* Post-hit shading data for the parametric SURFACE primitives (bilinear /
+ * bicubic Bezier / NURBS / trimmed NURBS). Given a hit's prim_id and (u,v) as
+ * reported by lrt_tri_intersect1, evaluates the surface point P, the geometric
+ * normal Ng = cross(dP/du, dP/dv) (NOT normalized), and the two parametric
+ * tangents dP/du, dP/dv. Any of the four output pointers may be NULL.
+ *
+ * (u,v) is the value reported in lrt_hit: local [0,1]^2 for bilinear/bezpatch,
+ * GLOBAL surface domain for NURBS/trimmed NURBS (remapped internally; the
+ * returned tangents are w.r.t. those global parameters).
+ *
+ * Returns LRT_RESULT_OK; LRT_RESULT_INVALID_ARGUMENT (NULL scene, prim_id out
+ * of range, or a non-surface scene); LRT_RESULT_UNSUPPORTED for a deserialized
+ * or mmapped scene (the control data is not part of the LRTS blob). Curves and
+ * the analytic primitives are not served by this query. Thread-safe. */
+lrt_result lrt_tri_surface_normal(const lrt_tri_scene *s, uint32_t prim_id,
+                                  float u, float v, float P_out[3],
+                                  float Ng_out[3], float dPdu_out[3],
+                                  float dPdv_out[3]);
+
 /* Direct access to a scene's resident node/block buffers + metadata, for GPU
  * backends that upload in-memory scenes without the LRTS serialization round
  * trip (needed for trimmed NURBS, whose trim loops are not in the v1 blob).

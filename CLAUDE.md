@@ -772,6 +772,20 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
     invariant (every hit inside the trim region). Serializes via the **LRTS v2
     aux region** (trim loops ride after the blocks; v1 files still load — their
     zero padding reads as aux_size 0).
+  - **Post-hit shading** (`lrt_tri_surface_normal`): given a hit's `prim_id` +
+    `(u,v)`, re-evaluates the surface for the point `P`, geometric normal `Ng =
+    cross(dP/du, dP/dv)`, and the two parametric tangents (any output NULL-able)
+    — the partials the intersectors already compute but discard. Works for all
+    four surface kinds; NURBS `(u,v)` is global and is remapped to the per-patch
+    local domain internally (tangents reported w.r.t. the global params). The
+    scene retains the per-prim control data (bilinear corners / Bézier CPs;
+    NURBS transfers ownership of the extracted rational patches + domains, so no
+    extra memory). Not part of the LRTS blob → returns `LRT_RESULT_UNSUPPORTED`
+    on a deserialized/mmapped scene; non-surface scenes return
+    `INVALID_ARGUMENT`. CPU-side by design (normals are consumed at shade time
+    on the host), so it is **not** mirrored on the HIP device — the `prim_kind`
+    trace-dispatch parity is unaffected. Curves are out of scope (a tube's
+    radial normal needs the ray-dependent hit point).
 
 ### Implicit surfaces / SDF (`lrt_sdf_*`)
 - `lrt_sdf_sphere_trace` — standalone enhanced sphere tracing (over-relaxation

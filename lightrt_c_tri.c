@@ -421,6 +421,13 @@ struct lrt_tri_scene {
     uint32_t trim_nloops;
     uint32_t *trim_loop_off; /* nloops+1 prefix offsets into trim_pts */
     float *trim_pts;         /* 2*npts (u,v) polyline points */
+    /* Post-hit shading: per-prim_id control data for the parametric SURFACE
+     * kinds (scene owns + frees). NULL unless a surface builder populated it
+     * (and not restored by deserialize/mmap, which omits this aux data). */
+    float *shade_cps;      /* per-prim CPs: 12 bilinear / 48 bezpatch / 64 rbez */
+    float *shade_dom;      /* 4/prim (umin,umax,vmin,vmax); NURBS only, else NULL */
+    uint32_t shade_nprims; /* number of surface prims (prim_id range) */
+    uint8_t shade_stride;  /* floats per prim in shade_cps */
     /* Serialization / mmap ownership (Workstream E). */
     int mem_mapped;   /* 1 => nodes/blocks alias map_base; do not free them */
     void *map_base;
@@ -8740,6 +8747,8 @@ void lrt_tri_scene_free(lrt_tri_scene *s) {
     free(s->owned_user);
     free(s->trim_loop_off);
     free(s->trim_pts);
+    free(s->shade_cps);
+    free(s->shade_dom);
     free(s);
 }
 
@@ -10370,6 +10379,17 @@ static lrt_tri_scene *tri_quadlike_scene_build(const float *quads, size_t nprims
     lrt_tri_scene *s =
         tri_finish_aabb_build(&bc, nprims, prim_kind, num_threads, err);
     tri_free_aabb_scratch(&bc);
+    /* Retain corners for the post-hit shading query (bilinear patches only; the
+     * planar quad/tetra kinds have a constant or face normal, not a parametric
+     * one, so they are not served by lrt_tri_surface_normal). */
+    if (s && prim_kind == TRI_PRIM_BILINEAR) {
+        s->shade_cps = (float *)malloc(nprims * 12 * sizeof(float));
+        if (s->shade_cps) {
+            memcpy(s->shade_cps, quads, nprims * 12 * sizeof(float));
+            s->shade_nprims = (uint32_t)nprims;
+            s->shade_stride = 12;
+        }
+    }
     return s;
 }
 
@@ -10657,8 +10677,17 @@ lrt_tri_scene *lrt_nurbs_scene_build(const float *net, int nu, int nv,
     lrt_tri_scene *s =
         tri_finish_aabb_build(&bc, npatch, TRI_PRIM_RBEZPATCH, num_threads, err);
     tri_free_aabb_scratch(&bc);
-    free(rbez);
-    free(dom);
+    if (s) {
+        /* Transfer the extracted rational patches + their (u,v) domains to the
+         * scene for the post-hit shading query (no extra copy). */
+        s->shade_cps = rbez;
+        s->shade_dom = dom;
+        s->shade_nprims = (uint32_t)npatch;
+        s->shade_stride = 64;
+    } else {
+        free(rbez);
+        free(dom);
+    }
     return s;
 }
 
@@ -10761,7 +10790,82 @@ lrt_tri_scene *lrt_bezpatch_scene_build(const float *cps, size_t npatch,
     lrt_tri_scene *s =
         tri_finish_aabb_build(&bc, npatch, TRI_PRIM_BEZPATCH, num_threads, err);
     tri_free_aabb_scratch(&bc);
+    /* Retain control points for the post-hit shading query. */
+    if (s) {
+        s->shade_cps = (float *)malloc(npatch * 48 * sizeof(float));
+        if (s->shade_cps) {
+            memcpy(s->shade_cps, cps, npatch * 48 * sizeof(float));
+            s->shade_nprims = (uint32_t)npatch;
+            s->shade_stride = 48;
+        }
+    }
     return s;
+}
+
+lrt_result lrt_tri_surface_normal(const lrt_tri_scene *s, uint32_t prim_id,
+                                  float u, float v, float P_out[3],
+                                  float Ng_out[3], float dPdu_out[3],
+                                  float dPdv_out[3]) {
+    if (!s) return LRT_RESULT_INVALID_ARGUMENT;
+    int k = s->prim_kind;
+    if (k != TRI_PRIM_BILINEAR && k != TRI_PRIM_BEZPATCH &&
+        k != TRI_PRIM_RBEZPATCH && k != TRI_PRIM_TRIMNURBS)
+        return LRT_RESULT_INVALID_ARGUMENT;
+    /* shade_cps is NULL for a deserialized/mmapped scene (the aux control data
+     * is not part of the LRTS blob); report that before the range check, since
+     * shade_nprims is also 0 there. */
+    if (!s->shade_cps) return LRT_RESULT_UNSUPPORTED;
+    if (prim_id >= s->shade_nprims) return LRT_RESULT_INVALID_ARGUMENT;
+
+    const float *cp = &s->shade_cps[(size_t)prim_id * s->shade_stride];
+    float P[3], dPdu[3], dPdv[3];
+
+    if (k == TRI_PRIM_BILINEAR) {
+        /* corners q00 q10 q11 q01; P is the bilinear map, partials analytic. */
+        const float *q00 = cp, *q10 = cp + 3, *q11 = cp + 6, *q01 = cp + 9;
+        float u1 = 1.0f - u, v1 = 1.0f - v;
+        for (int a = 0; a < 3; a++) {
+            P[a] = u1 * v1 * q00[a] + u * v1 * q10[a] + u * v * q11[a] +
+                   u1 * v * q01[a];
+            dPdu[a] = v1 * (q10[a] - q00[a]) + v * (q11[a] - q01[a]);
+            dPdv[a] = u1 * (q01[a] - q00[a]) + u * (q11[a] - q10[a]);
+        }
+    } else if (k == TRI_PRIM_BEZPATCH) {
+        tri_bezpatch_eval(cp, u, v, P, dPdu, dPdv); /* (u,v) already local */
+    } else {
+        /* RBEZPATCH / TRIMNURBS: (u,v) is GLOBAL; remap to the patch's local
+         * [0,1]^2, then rescale the local tangents back to the global params so
+         * dPdu/dPdv match the reported u,v (Ng direction is scale-invariant). */
+        const float *dom = &s->shade_dom[(size_t)prim_id * 4];
+        float du = dom[1] - dom[0], dv = dom[3] - dom[2];
+        float idu = du != 0.0f ? 1.0f / du : 0.0f;
+        float idv = dv != 0.0f ? 1.0f / dv : 0.0f;
+        float lu = (u - dom[0]) * idu, lv = (v - dom[2]) * idv;
+        lu = lu < 0.0f ? 0.0f : (lu > 1.0f ? 1.0f : lu);
+        lv = lv < 0.0f ? 0.0f : (lv > 1.0f ? 1.0f : lv);
+        float du_loc[3], dv_loc[3];
+        tri_rbezpatch_eval(cp, lu, lv, P, du_loc, dv_loc);
+        for (int a = 0; a < 3; a++) {
+            dPdu[a] = du_loc[a] * idu;
+            dPdv[a] = dv_loc[a] * idv;
+        }
+    }
+
+    if (P_out) {
+        P_out[0] = P[0]; P_out[1] = P[1]; P_out[2] = P[2];
+    }
+    if (dPdu_out) {
+        dPdu_out[0] = dPdu[0]; dPdu_out[1] = dPdu[1]; dPdu_out[2] = dPdu[2];
+    }
+    if (dPdv_out) {
+        dPdv_out[0] = dPdv[0]; dPdv_out[1] = dPdv[1]; dPdv_out[2] = dPdv[2];
+    }
+    if (Ng_out) {
+        Ng_out[0] = dPdu[1] * dPdv[2] - dPdu[2] * dPdv[1];
+        Ng_out[1] = dPdu[2] * dPdv[0] - dPdu[0] * dPdv[2];
+        Ng_out[2] = dPdu[0] * dPdv[1] - dPdu[1] * dPdv[0];
+    }
+    return LRT_RESULT_OK;
 }
 
 lrt_tri_scene *lrt_sdfprim_scene_build(const uint32_t *types,
