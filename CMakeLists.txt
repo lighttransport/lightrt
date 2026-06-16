@@ -207,6 +207,20 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME lightrt_c_tri_test COMMAND lightrt_c_tri_test)
 
+    # Planar-quad + solid-tetra primitive self-test
+    add_executable(lightrt_c_quadtetra_test
+        lightrt_c_tri.c tests/test_lightrt_c_quadtetra.c)
+    if(LIGHTRT_C_TRI_SIMD_FLAGS)
+        target_compile_options(lightrt_c_quadtetra_test PRIVATE ${LIGHTRT_C_TRI_SIMD_FLAGS})
+    endif()
+    if(Threads_FOUND)
+        target_link_libraries(lightrt_c_quadtetra_test Threads::Threads)
+    endif()
+    if(NOT MSVC)
+        target_link_libraries(lightrt_c_quadtetra_test m)
+    endif()
+    add_test(NAME lightrt_c_quadtetra_test COMMAND lightrt_c_quadtetra_test)
+
     # Vulkan GPU interop self-test. Skips (exit 0) when no Vulkan device is
     # present, so GPU-less CI stays green.
     if(LIGHTRT_BUILD_VK)

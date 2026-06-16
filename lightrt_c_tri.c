@@ -245,6 +245,19 @@ typedef struct lrt_bez4 {
 } lrt_bez4;
 _Static_assert(sizeof(lrt_bez4) == 272, "lrt_bez4");
 
+/* 4-point leaf block (208 bytes, own stride) shared by planar quads and solid
+ * tetrahedra: four vertices v0..v3 per lane. QUAD tests two triangles
+ * (v0,v1,v2)+(v0,v2,v3); TETRA tests the four faces of the tetra (v0,v1,v2,v3).
+ * Padding lanes: prim = LRT_TRI_NO_HIT (degenerate, never hit). */
+typedef struct lrt_quad4 {
+    float x0[4], y0[4], z0[4];
+    float x1[4], y1[4], z1[4];
+    float x2[4], y2[4], z2[4];
+    float x3[4], y3[4], z3[4];
+    uint32_t prim[4];
+} lrt_quad4;
+_Static_assert(sizeof(lrt_quad4) == 208, "lrt_quad4");
+
 /* Quantized triangle leaf blocks (4 tris each; store quantized absolute
  * v0,v1,v2 → decode → e1=v1-v0, e2=v2-v0 → Moller-Trumbore). These have their
  * own (smaller, format-specific) stride; the scene carries block_stride and the
@@ -298,7 +311,9 @@ enum {
     TRI_PRIM_RLCURVE = 5,/* round-linear curve leaves (lrt_rlc4)        */
     TRI_PRIM_POINT = 6, /* point leaves (lrt_point4): sphere/disc/odisc */
     TRI_PRIM_FLATCURVE = 7, /* flat (ribbon) linear curve leaves (lrt_flat4) */
-    TRI_PRIM_BEZCURVE = 8 /* round cubic Bezier curve leaves (lrt_bez4) */
+    TRI_PRIM_BEZCURVE = 8, /* round cubic Bezier curve leaves (lrt_bez4) */
+    TRI_PRIM_QUAD = 9,  /* planar quad (2-triangle) leaves (lrt_quad4)   */
+    TRI_PRIM_TETRA = 10 /* solid tetrahedron (4-face) leaves (lrt_quad4) */
 };
 
 /* Point-primitive kind (lrt_tri_scene.point_type), mirroring Embree's point
@@ -416,6 +431,8 @@ typedef struct tri_build_ctx {
     const float *points_n;   /* 3*nprims normals or NULL (TRI_PRIM_POINT) */
     const float *bez_cps;    /* 16*nseg ORIGINAL Bezier CPs (TRI_PRIM_BEZCURVE) */
     uint32_t bez_split;      /* build-time de Casteljau pieces per cubic (>=1) */
+    const float *quads;      /* 12*nprims v0v1v2v3 (TRI_PRIM_QUAD / _TETRA) */
+    uint32_t block_stride;   /* leaf block stride override (0 = default 160) */
     int emit_kind;           /* TRI_PRIM_* */
 } tri_build_ctx;
 
@@ -2481,6 +2498,38 @@ static uint32_t tri_emit_leaf(tri_collapse_ctx *cc, const tri_bnode *bn) {
             (double)count;
         return TRI_MAKE_LEAF_REF(first_block, nblocks);
     }
+    if (bc->emit_kind == TRI_PRIM_QUAD ||
+        bc->emit_kind == TRI_PRIM_TETRA) { /* 4-point leaves (BVH4) */
+        for (uint32_t b = 0; b < nblocks; b++) {
+            lrt_quad4 *blk = (lrt_quad4 *)tri_block_ptr(s->blocks,
+                                                        s->block_count,
+                                                        s->block_stride);
+            s->block_count++;
+            for (uint32_t lane = 0; lane < 4u; lane++) {
+                uint32_t k = b * 4u + lane;
+                if (k < count) {
+                    uint32_t prim = bc->indices[bn->a + k];
+                    const float *q = &bc->quads[(size_t)prim * 12];
+                    blk->x0[lane] = q[0]; blk->y0[lane] = q[1]; blk->z0[lane] = q[2];
+                    blk->x1[lane] = q[3]; blk->y1[lane] = q[4]; blk->z1[lane] = q[5];
+                    blk->x2[lane] = q[6]; blk->y2[lane] = q[7]; blk->z2[lane] = q[8];
+                    blk->x3[lane] = q[9]; blk->y3[lane] = q[10]; blk->z3[lane] = q[11];
+                    blk->prim[lane] = prim;
+                } else {
+                    blk->x0[lane] = blk->y0[lane] = blk->z0[lane] = 0.0f;
+                    blk->x1[lane] = blk->y1[lane] = blk->z1[lane] = 0.0f;
+                    blk->x2[lane] = blk->y2[lane] = blk->z2[lane] = 0.0f;
+                    blk->x3[lane] = blk->y3[lane] = blk->z3[lane] = 0.0f;
+                    blk->prim[lane] = LRT_TRI_NO_HIT;
+                }
+            }
+        }
+        cc->leaf_count++;
+        cc->sah_leaf +=
+            (double)(tri_surface_area(bn->lo, bn->hi) / cc->root_area) *
+            (double)count;
+        return TRI_MAKE_LEAF_REF(first_block, nblocks);
+    }
     if (bc->emit_kind == TRI_PRIM_QTRI) { /* quantized triangle leaves (BVH4) */
         for (uint32_t b = 0; b < nblocks; b++) {
             void *blk = tri_block_ptr(s->blocks, s->block_count, s->block_stride);
@@ -3753,6 +3802,82 @@ static inline int tri_slab_scalar(const float *lo_x, const float *lo_y,
     return tnear <= tfar;
 }
 
+/* Scalar Moller-Trumbore on an explicit triangle (v0,v1,v2). Returns 1 and
+ * writes t,u,v if the ray hits within [tmin, tbest). Shared by the quad/tetra
+ * leaf intersectors. */
+static inline int tri_mt_one(const float *o, const float *d, const float *v0,
+                             const float *v1, const float *v2, float tmin,
+                             float tbest, float *t, float *u, float *v) {
+    float e1[3] = {v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]};
+    float e2[3] = {v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]};
+    float px = d[1] * e2[2] - d[2] * e2[1];
+    float py = d[2] * e2[0] - d[0] * e2[2];
+    float pz = d[0] * e2[1] - d[1] * e2[0];
+    float det = e1[0] * px + e1[1] * py + e1[2] * pz;
+    if (det > -1e-12f && det < 1e-12f) return 0;
+    float inv = 1.0f / det;
+    float tvx = o[0] - v0[0], tvy = o[1] - v0[1], tvz = o[2] - v0[2];
+    float uu = (tvx * px + tvy * py + tvz * pz) * inv;
+    if (uu < 0.0f || uu > 1.0f) return 0;
+    float qx = tvy * e1[2] - tvz * e1[1];
+    float qy = tvz * e1[0] - tvx * e1[2];
+    float qz = tvx * e1[1] - tvy * e1[0];
+    float vv = (d[0] * qx + d[1] * qy + d[2] * qz) * inv;
+    if (vv < 0.0f || uu + vv > 1.0f) return 0;
+    float tt = (e2[0] * qx + e2[1] * qy + e2[2] * qz) * inv;
+    if (tt < tmin || tt >= tbest) return 0;
+    *t = tt;
+    *u = uu;
+    *v = vv;
+    return 1;
+}
+
+/* Planar quad leaf: two triangles (v0,v1,v2) and (v0,v2,v3) per lane. */
+static inline void tri_quad4_isect(const lrt_quad4 *blk, const tri_ray_ctx *rc,
+                                   float *best_t, float *best_u, float *best_v,
+                                   uint32_t *best_prim) {
+    for (int lane = 0; lane < 4; lane++) {
+        if (blk->prim[lane] == LRT_TRI_NO_HIT) continue;
+        float v0[3] = {blk->x0[lane], blk->y0[lane], blk->z0[lane]};
+        float v1[3] = {blk->x1[lane], blk->y1[lane], blk->z1[lane]};
+        float v2[3] = {blk->x2[lane], blk->y2[lane], blk->z2[lane]};
+        float v3[3] = {blk->x3[lane], blk->y3[lane], blk->z3[lane]};
+        float t, u, v;
+        if (tri_mt_one(rc->org, rc->dir, v0, v1, v2, rc->tmin, *best_t, &t, &u,
+                       &v)) {
+            *best_t = t; *best_u = u; *best_v = v; *best_prim = blk->prim[lane];
+        }
+        if (tri_mt_one(rc->org, rc->dir, v0, v2, v3, rc->tmin, *best_t, &t, &u,
+                       &v)) {
+            *best_t = t; *best_u = u; *best_v = v; *best_prim = blk->prim[lane];
+        }
+    }
+}
+
+/* Solid tetra leaf: nearest of the 4 triangular faces per lane. */
+static inline void tri_tetra4_isect(const lrt_quad4 *blk, const tri_ray_ctx *rc,
+                                    float *best_t, float *best_u, float *best_v,
+                                    uint32_t *best_prim) {
+    for (int lane = 0; lane < 4; lane++) {
+        if (blk->prim[lane] == LRT_TRI_NO_HIT) continue;
+        float p[4][3] = {
+            {blk->x0[lane], blk->y0[lane], blk->z0[lane]},
+            {blk->x1[lane], blk->y1[lane], blk->z1[lane]},
+            {blk->x2[lane], blk->y2[lane], blk->z2[lane]},
+            {blk->x3[lane], blk->y3[lane], blk->z3[lane]}};
+        /* four faces (winding irrelevant for closest-hit) */
+        static const int F[4][3] = {{0, 1, 2}, {0, 1, 3}, {0, 2, 3}, {1, 2, 3}};
+        for (int f = 0; f < 4; f++) {
+            float t, u, v;
+            if (tri_mt_one(rc->org, rc->dir, p[F[f][0]], p[F[f][1]], p[F[f][2]],
+                           rc->tmin, *best_t, &t, &u, &v)) {
+                *best_t = t; *best_u = u; *best_v = v;
+                *best_prim = blk->prim[lane];
+            }
+        }
+    }
+}
+
 /* Generic-width scalar traversal. */
 static int tri_intersect_scalar(const lrt_tri_scene *s, const lrt_ray *ray,
                                 lrt_hit *hit) {
@@ -3812,6 +3937,20 @@ static int tri_intersect_scalar(const lrt_tri_scene *s, const lrt_ray *ray,
                 for (uint32_t b = 0; b < nblk; b++) {
                     tri_bez4_isect(&blocks[blk0 + b], &rc, &best_t, &best_u,
                                    &best_prim);
+                }
+                continue;
+            }
+            if (s->prim_kind == TRI_PRIM_QUAD ||
+                s->prim_kind == TRI_PRIM_TETRA) {
+                for (uint32_t b = 0; b < nblk; b++) {
+                    const lrt_quad4 *blk = (const lrt_quad4 *)tri_block_ptr(
+                        s->blocks, blk0 + b, s->block_stride);
+                    if (s->prim_kind == TRI_PRIM_QUAD)
+                        tri_quad4_isect(blk, &rc, &best_t, &best_u, &best_v,
+                                        &best_prim);
+                    else
+                        tri_tetra4_isect(blk, &rc, &best_t, &best_u, &best_v,
+                                         &best_prim);
                 }
                 continue;
             }
@@ -4003,6 +4142,21 @@ static int tri_occluded_scalar(const lrt_tri_scene *s, const lrt_ray *ray) {
                     float t = t_max, u = 0.0f;
                     uint32_t prim = LRT_TRI_NO_HIT;
                     tri_bez4_isect(&blocks[blk0 + b], &rc, &t, &u, &prim);
+                    if (prim != LRT_TRI_NO_HIT) return 1;
+                }
+                continue;
+            }
+            if (s->prim_kind == TRI_PRIM_QUAD ||
+                s->prim_kind == TRI_PRIM_TETRA) {
+                for (uint32_t b = 0; b < nblk; b++) {
+                    const lrt_quad4 *blk = (const lrt_quad4 *)tri_block_ptr(
+                        s->blocks, blk0 + b, s->block_stride);
+                    float t = t_max, u = 0.0f, v = 0.0f;
+                    uint32_t prim = LRT_TRI_NO_HIT;
+                    if (s->prim_kind == TRI_PRIM_QUAD)
+                        tri_quad4_isect(blk, &rc, &t, &u, &v, &prim);
+                    else
+                        tri_tetra4_isect(blk, &rc, &t, &u, &v, &prim);
                     if (prim != LRT_TRI_NO_HIT) return 1;
                 }
                 continue;
@@ -7752,6 +7906,8 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
         return tri_qtri_intersect_scalar(s, ray, hit);
 #endif
     }
+    if (s->prim_kind == TRI_PRIM_QUAD || s->prim_kind == TRI_PRIM_TETRA)
+        return tri_intersect_scalar(s, ray, hit);
 #if LRT_TRI_HAS_SSE4
     if (s->curve) return tri_curve_intersect_bvh4(s, ray, hit);
     if (s->prim_kind == TRI_PRIM_RLCURVE)
@@ -7790,6 +7946,8 @@ int lrt_tri_occluded1(const lrt_tri_scene *s, const lrt_ray *ray) {
         return tri_qtri_occluded_scalar(s, ray);
 #endif
     }
+    if (s->prim_kind == TRI_PRIM_QUAD || s->prim_kind == TRI_PRIM_TETRA)
+        return tri_occluded_scalar(s, ray);
 #if LRT_TRI_HAS_SSE4
     if (s->curve) return tri_curve_occluded_bvh4(s, ray);
     if (s->prim_kind == TRI_PRIM_RLCURVE)
@@ -9116,7 +9274,9 @@ static lrt_tri_scene *tri_finish_aabb_build(tri_build_ctx *bc, size_t nprims,
     if (!bc->failed) {
         s->layout = 4;
         s->prim_kind = prim_kind;
-        if (!s->block_stride) s->block_stride = (uint32_t)tri_block_size(4);
+        if (!s->block_stride)
+            s->block_stride = bc->block_stride ? bc->block_stride
+                                               : (uint32_t)tri_block_size(4);
         uint32_t node_cap, block_cap;
         tri_collapse_caps(bc, 4, b_root, &node_cap, &block_cap);
         (void)nprims;
@@ -9297,6 +9457,83 @@ lrt_tri_scene *lrt_sphere_scene_build(const float *spheres, size_t nprims,
         tri_finish_aabb_build(&bc, nprims, TRI_PRIM_SPHERE, num_threads, err);
     tri_free_aabb_scratch(&bc);
     return s;
+}
+
+/* Shared builder for the 4-point primitives (planar quad / solid tetra). quads =
+ * 12*nprims floats (v0 v1 v2 v3 per primitive). prim_kind selects the leaf
+ * intersector at query time. */
+static lrt_tri_scene *tri_quadlike_scene_build(const float *quads, size_t nprims,
+                                               int prim_kind,
+                                               const lrt_tri_build_options *opts,
+                                               lrt_result *err) {
+    tri_set_err(err, LRT_RESULT_OK);
+    if (!quads || nprims == 0 || nprims > 0x07FFFFFFu) {
+        tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
+        return NULL;
+    }
+    lrt_tri_build_options o;
+    if (opts)
+        o = *opts;
+    else
+        memset(&o, 0, sizeof(o));
+    unsigned num_threads = o.num_threads ? o.num_threads : 1u;
+    uint32_t max_leaf = o.max_leaf_size ? o.max_leaf_size : TRI_DEFAULT_LEAF;
+    if (max_leaf > TRI_MAX_LEAF) max_leaf = TRI_MAX_LEAF;
+
+    tri_build_ctx bc;
+    memset(&bc, 0, sizeof(bc));
+    bc.ntris = nprims;
+    bc.max_leaf = max_leaf;
+    bc.block_shift = 2u;
+    bc.quality = LRT_TRI_BUILD_DEFAULT;
+    bc.quads = quads;
+    bc.emit_kind = prim_kind;
+    bc.block_stride = (uint32_t)sizeof(lrt_quad4);
+    if (tri_alloc_aabb_scratch(&bc, nprims)) {
+        tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+        return NULL;
+    }
+
+    int bad = 0;
+    for (size_t i = 0; i < nprims; i++) {
+        const float *q = &quads[i * 12];
+        for (int k = 0; k < 12; k++)
+            if (!isfinite(q[k])) bad = 1;
+        for (int a = 0; a < 3; a++) {
+            float lo = q[a], hi = q[a];
+            for (int vtx = 1; vtx < 4; vtx++) {
+                float c = q[vtx * 3 + a];
+                lo = tri_minf(lo, c);
+                hi = tri_maxf(hi, c);
+            }
+            bc.plo[i * 3 + a] = lo;
+            bc.phi[i * 3 + a] = hi;
+            bc.cen[i * 3 + a] = 0.5f * (lo + hi);
+        }
+        bc.indices[i] = (uint32_t)i;
+    }
+    if (bad) {
+        tri_free_aabb_scratch(&bc);
+        tri_set_err(err, LRT_RESULT_INVALID_BOUNDS);
+        return NULL;
+    }
+
+    lrt_tri_scene *s =
+        tri_finish_aabb_build(&bc, nprims, prim_kind, num_threads, err);
+    tri_free_aabb_scratch(&bc);
+    return s;
+}
+
+lrt_tri_scene *lrt_quad_scene_build(const float *quads, size_t nquads,
+                                    const lrt_tri_build_options *opts,
+                                    lrt_result *err) {
+    return tri_quadlike_scene_build(quads, nquads, TRI_PRIM_QUAD, opts, err);
+}
+
+lrt_tri_scene *lrt_tetra_scene_build(const float *tetras, size_t ntetras,
+                                     const lrt_tri_build_options *opts,
+                                     lrt_result *err) {
+    return tri_quadlike_scene_build(tetras, ntetras, TRI_PRIM_TETRA, opts, err);
 }
 
 lrt_tri_scene *lrt_points_scene_build(const float *centers, const float *radii,

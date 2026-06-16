@@ -323,6 +323,26 @@ lrt_tri_scene *lrt_sphere_scene_build(const float *spheres, size_t nprims,
                                       const lrt_tri_build_options *opts,
                                       lrt_result *err);
 
+/* --- Planar quad + solid tetrahedron primitives ---------------------------
+ *
+ * Quad: planar 4-vertex face, tested as two triangles (v0,v1,v2)+(v0,v2,v3).
+ * quads = 12*nquads floats (v0.xyz v1.xyz v2.xyz v3.xyz per quad, in order
+ * around the face). Hit reports prim_id = quad index, (u,v) = the barycentrics
+ * of whichever sub-triangle was hit.
+ *
+ * Tetra: solid tetrahedron, closest of its four triangular faces. tetras =
+ * 12*ntetras floats (v0 v1 v2 v3 per tetra). Hit reports prim_id = tetra index,
+ * (u,v) = the barycentrics of the nearest face. A ray that starts inside still
+ * reports the nearest exit face.
+ *
+ * Both force BVH4 layout and are queried through the same lrt_tri_* functions. */
+lrt_tri_scene *lrt_quad_scene_build(const float *quads, size_t nquads,
+                                    const lrt_tri_build_options *opts,
+                                    lrt_result *err);
+lrt_tri_scene *lrt_tetra_scene_build(const float *tetras, size_t ntetras,
+                                     const lrt_tri_build_options *opts,
+                                     lrt_result *err);
+
 /* --- Quantized triangle scenes (approximate / LOD / preview) ---------------
  *
  * Triangle vertices are stored in a low-precision format to cut memory and
