@@ -827,6 +827,11 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
   via `lrt_tri_surface_normal`; trimmed-NURBS cells whose centroid is outside
   the trim region are dropped (actual count ≤ the bound). Size buffers with
   `_bound`, then fill; `*ntris_out` reports the full count.
+- `lrt_tri_curve_tessellate[_bound]` — tessellate a ROUND-LINEAR (hair) scene
+  into a tube mesh: each segment a tapered cone frustum with `nsides` radial
+  faces (2·nsides tris, no caps), vertices on the cone surface at r(t), outward
+  cone-surface normals. Round-linear only (flat is a view-dependent ribbon;
+  Bézier u is sub-arc-local) → others return `INVALID_ARGUMENT`.
 - `lrt_tri_surface_refit` — in-place refit for animation (deforming patches):
   replace control points and recompute node bounds without rebuilding the tree
   (mirrors `lrt_tri_scene_refit` for triangles; shared `tri_refit_propagate`

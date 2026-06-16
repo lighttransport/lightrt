@@ -11063,6 +11063,97 @@ lrt_result lrt_tri_surface_tessellate(const lrt_tri_scene *s, uint32_t segu,
     return LRT_RESULT_OK;
 }
 
+size_t lrt_tri_curve_tessellate_bound(const lrt_tri_scene *s, uint32_t nsides) {
+    if (!s || nsides < 3 || !s->shade_cps || s->prim_kind != TRI_PRIM_RLCURVE)
+        return 0;
+    return (size_t)s->shade_nprims * nsides * 2u;
+}
+
+lrt_result lrt_tri_curve_tessellate(const lrt_tri_scene *s, uint32_t nsides,
+                                    float *pos, float *nrm, size_t cap,
+                                    size_t *ntris_out) {
+    if (ntris_out) *ntris_out = 0;
+    if (!s || nsides < 3) return LRT_RESULT_INVALID_ARGUMENT;
+    /* Round-linear only: each segment is a well-defined tapered tube. Flat
+     * curves are view-dependent ribbons (no static mesh) and the Bezier hit u is
+     * sub-arc-local — both rejected. */
+    if (s->prim_kind != TRI_PRIM_RLCURVE) return LRT_RESULT_INVALID_ARGUMENT;
+    if (!s->shade_cps) return LRT_RESULT_UNSUPPORTED;
+    const float k2pi = 6.28318530717958648f;
+    size_t written = 0, total = 0;
+    for (uint32_t p = 0; p < s->shade_nprims; p++) {
+        const float *cp = &s->shade_cps[(size_t)p * 8];
+        float p0[3] = {cp[0], cp[1], cp[2]}, r0 = cp[3];
+        float p1[3] = {cp[4], cp[5], cp[6]}, r1 = cp[7];
+        float ax[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]};
+        float L = sqrtf(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]);
+        if (L < 1e-12f) continue; /* degenerate segment */
+        float ah[3] = {ax[0] / L, ax[1] / L, ax[2] / L};
+        /* an orthonormal frame (e1,e2) perpendicular to the axis */
+        float up[3] = {0, 0, 0};
+        int mn = (fabsf(ah[0]) < fabsf(ah[1]))
+                     ? (fabsf(ah[0]) < fabsf(ah[2]) ? 0 : 2)
+                     : (fabsf(ah[1]) < fabsf(ah[2]) ? 1 : 2);
+        up[mn] = 1.0f;
+        float e1[3] = {ah[1] * up[2] - ah[2] * up[1],
+                       ah[2] * up[0] - ah[0] * up[2],
+                       ah[0] * up[1] - ah[1] * up[0]};
+        float e1l = sqrtf(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
+        for (int a = 0; a < 3; a++) e1[a] /= e1l;
+        float e2[3] = {ah[1] * e1[2] - ah[2] * e1[1],
+                       ah[2] * e1[0] - ah[0] * e1[2],
+                       ah[0] * e1[1] - ah[1] * e1[0]};
+        /* cone surface normal tilts by the taper slope along the axis */
+        float dr = (r1 - r0) / L;
+        for (uint32_t k = 0; k < nsides; k++) {
+            float a0 = k2pi * (float)k / (float)nsides;
+            float a1 = k2pi * (float)(k + 1) / (float)nsides;
+            float ca[2] = {cosf(a0), cosf(a1)}, sa[2] = {sinf(a0), sinf(a1)};
+            /* ring verts at both ends + radial/normal per corner */
+            float V[4][3], N[4][3];
+            for (int corner = 0; corner < 4; corner++) {
+                int side = (corner >= 2);                     /* 0:end0  1:end1 */
+                int e = (corner == 0 || corner == 3) ? 0 : 1; /* angle index */
+                const float *bp = side ? p1 : p0;
+                float rr = side ? r1 : r0;
+                float rad[3] = {ca[e] * e1[0] + sa[e] * e2[0],
+                                ca[e] * e1[1] + sa[e] * e2[1],
+                                ca[e] * e1[2] + sa[e] * e2[2]};
+                for (int a = 0; a < 3; a++) V[corner][a] = bp[a] + rr * rad[a];
+                float nn[3] = {rad[0] - dr * ah[0], rad[1] - dr * ah[1],
+                               rad[2] - dr * ah[2]};
+                float nl = sqrtf(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
+                if (nl < 1e-20f) nl = 1.0f;
+                for (int a = 0; a < 3; a++) N[corner][a] = nn[a] / nl;
+            }
+            /* quad (end0_k, end0_k+1, end1_k+1, end1_k) -> 2 tris, CCW outward */
+            static const int idx[2][3] = {{0, 1, 2}, {0, 2, 3}};
+            for (int t = 0; t < 2; t++) {
+                if (written < cap) {
+                    for (int c = 0; c < 3; c++) {
+                        int w = idx[t][c];
+                        size_t vert = written * 3 + (size_t)c;
+                        if (pos) {
+                            pos[vert * 3 + 0] = V[w][0];
+                            pos[vert * 3 + 1] = V[w][1];
+                            pos[vert * 3 + 2] = V[w][2];
+                        }
+                        if (nrm) {
+                            nrm[vert * 3 + 0] = N[w][0];
+                            nrm[vert * 3 + 1] = N[w][1];
+                            nrm[vert * 3 + 2] = N[w][2];
+                        }
+                    }
+                    written++;
+                }
+                total++;
+            }
+        }
+    }
+    if (ntris_out) *ntris_out = total;
+    return LRT_RESULT_OK;
+}
+
 lrt_tri_scene *lrt_sdfprim_scene_build(const uint32_t *types,
                                        const float *centers, const float *params,
                                        size_t nprims,

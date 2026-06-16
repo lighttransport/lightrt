@@ -469,6 +469,26 @@ lrt_result lrt_tri_surface_tessellate(const lrt_tri_scene *s, uint32_t segu,
                                       uint32_t segv, float *pos, float *nrm,
                                       float *uv, size_t cap, size_t *ntris_out);
 
+/* Tessellate a ROUND-LINEAR curve (hair) scene into a tube mesh — for preview /
+ * export / collision proxy. Each segment becomes a tapered cone frustum with
+ * `nsides` (>= 3) radial faces, 2*nsides triangles, no end caps; vertices ride
+ * the cone surface at radius r(t), normals are the (outward) cone-surface
+ * normals. Only round-linear scenes are served: flat curves are view-dependent
+ * ribbons with no static mesh, and the Bezier hit u is sub-arc-local — both
+ * return INVALID_ARGUMENT.
+ *
+ * lrt_tri_curve_tessellate_bound returns the triangle count (2*nsides per
+ * segment) for sizing; 0 for a non-round-linear/shadeless scene.
+ * lrt_tri_curve_tessellate writes up to `cap` triangles (3 verts each) into the
+ * caller's pos[9*cap] / nrm[9*cap] (each NULL-able); *ntris_out gets the full
+ * count. Degenerate (zero-length) segments are skipped. Returns LRT_RESULT_OK;
+ * INVALID_ARGUMENT (NULL/nsides<3/non-round-linear); UNSUPPORTED if shade data
+ * is unavailable. Thread-safe. */
+size_t lrt_tri_curve_tessellate_bound(const lrt_tri_scene *s, uint32_t nsides);
+lrt_result lrt_tri_curve_tessellate(const lrt_tri_scene *s, uint32_t nsides,
+                                    float *pos, float *nrm, size_t cap,
+                                    size_t *ntris_out);
+
 /* Direct access to a scene's resident node/block buffers + metadata, for GPU
  * backends that upload in-memory scenes without the LRTS serialization round
  * trip (needed for trimmed NURBS, whose trim loops are not in the v1 blob).

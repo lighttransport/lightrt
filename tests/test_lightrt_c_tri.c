@@ -2433,6 +2433,104 @@ static void test_curve_frame(void) {
     free(scount);
 }
 
+/* ----- round-linear curve tessellation (lrt_tri_curve_tessellate) -----------
+ * Verifies each tube vertex sits at radius r(t) from its segment axis, normals
+ * are unit + outward, the count matches the bound, and flat/bezier are rejected. */
+static void test_curve_tessellate(void) {
+    g_rng = 0x7ACE5511ull;
+    enum { NSTRAND = 60, PTS = 5 };
+    size_t npoints = (size_t)NSTRAND * PTS;
+    float *pts = (float *)malloc(npoints * 3 * sizeof(float));
+    float *rad = (float *)malloc(npoints * sizeof(float));
+    uint32_t *sf = (uint32_t *)malloc(NSTRAND * sizeof(uint32_t));
+    uint32_t *sc = (uint32_t *)malloc(NSTRAND * sizeof(uint32_t));
+    for (int st = 0; st < NSTRAND; st++) {
+        sf[st] = (uint32_t)(st * PTS);
+        sc[st] = PTS;
+        float px = rnd_f(-2, 2), py = rnd_f(-2, 2), pz = rnd_f(-2, 2);
+        for (int p = 0; p < PTS; p++) {
+            size_t idx = (size_t)st * PTS + p;
+            px += rnd_f(-0.8f, 0.8f);
+            py += rnd_f(-0.8f, 0.8f);
+            pz += rnd_f(-0.8f, 0.8f);
+            pts[idx * 3 + 0] = px;
+            pts[idx * 3 + 1] = py;
+            pts[idx * 3 + 2] = pz;
+            rad[idx] = rnd_f(0.02f, 0.06f);
+        }
+    }
+    lrt_hair_strands hs = {0};
+    hs.points = pts;
+    hs.radius = rad;
+    hs.strand_first = sf;
+    hs.strand_count = sc;
+    hs.nstrands = NSTRAND;
+    hs.npoints = npoints;
+    lrt_tri_scene *s = lrt_roundcurve_scene_build(&hs, NULL, NULL);
+    CHECK(s != NULL, "curve-tess: build");
+    if (s) {
+        const uint32_t NS = 8;
+        size_t bound = lrt_tri_curve_tessellate_bound(s, NS);
+        float *pos = (float *)malloc(bound * 9 * sizeof(float));
+        float *nrm = (float *)malloc(bound * 9 * sizeof(float));
+        size_t nt = 0;
+        lrt_result r = lrt_tri_curve_tessellate(s, NS, pos, nrm, bound, &nt);
+        CHECK(r == LRT_RESULT_OK && nt == bound, "curve-tess: count %zu/%zu", nt,
+              bound);
+        /* for each vertex: find its segment via the curve frame (the bound is
+         * exact here -> tri = seg*2*NS + ...), check radius + normal */
+        size_t rad_ok = 0, nrm_ok = 0, nv = nt * 3;
+        for (size_t vtx = 0; vtx < nv; vtx++) {
+            uint32_t seg = (uint32_t)((vtx / 3) / (2 * NS));
+            float C[3], T[3], rr;
+            lrt_tri_curve_frame(s, seg, 0.5f, C, T, &rr);
+            const float *P = &pos[vtx * 3];
+            float d[3] = {P[0] - C[0], P[1] - C[1], P[2] - C[2]};
+            float tt = T[0] * T[0] + T[1] * T[1] + T[2] * T[2];
+            float dtp = (d[0] * T[0] + d[1] * T[1] + d[2] * T[2]) / (tt + 1e-20f);
+            float pr[3] = {d[0] - dtp * T[0], d[1] - dtp * T[1],
+                           d[2] - dtp * T[2]};
+            float dp = sqrtf(pr[0] * pr[0] + pr[1] * pr[1] + pr[2] * pr[2]);
+            /* radius at this vertex's end (t=0 or 1); allow either end's r */
+            float r0 = 0, r1 = 0; /* recover from frame at 0 and 1 */
+            float Cx[3], Tx[3];
+            lrt_tri_curve_frame(s, seg, 0.0f, Cx, Tx, &r0);
+            lrt_tri_curve_frame(s, seg, 1.0f, Cx, Tx, &r1);
+            float rlo = r0 < r1 ? r0 : r1, rhi = r0 > r1 ? r0 : r1;
+            if (dp >= rlo - 1e-3f && dp <= rhi + 1e-3f) rad_ok++;
+            const float *N = &nrm[vtx * 3];
+            float nl = sqrtf(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]);
+            float dotr = (dp > 1e-9f)
+                             ? (N[0] * pr[0] + N[1] * pr[1] + N[2] * pr[2]) / dp
+                             : 1.0f;
+            if (fabsf(nl - 1.0f) < 1e-3f && dotr > 0.5f) nrm_ok++;
+        }
+        printf("  curve-tess: %zu tris, radius %.2f%% normal %.2f%%\n", nt,
+               100.0 * rad_ok / nv, 100.0 * nrm_ok / nv);
+        CHECK(rad_ok == nv, "curve-tess: radius %.2f%%", 100.0 * rad_ok / nv);
+        CHECK(nrm_ok == nv, "curve-tess: normal %.2f%%", 100.0 * nrm_ok / nv);
+        free(pos);
+        free(nrm);
+
+        /* flat curve must be rejected */
+        lrt_tri_scene *sf2 = lrt_flatcurve_scene_build(&hs, NULL, NULL);
+        if (sf2) {
+            size_t z = lrt_tri_curve_tessellate_bound(sf2, NS);
+            CHECK(z == 0, "curve-tess: flat bound 0");
+            size_t n2 = 0;
+            CHECK(lrt_tri_curve_tessellate(sf2, NS, NULL, NULL, 0, &n2) ==
+                      LRT_RESULT_INVALID_ARGUMENT,
+                  "curve-tess: flat rejected");
+            lrt_tri_scene_free(sf2);
+        }
+        lrt_tri_scene_free(s);
+    }
+    free(pts);
+    free(rad);
+    free(sf);
+    free(sc);
+}
+
 static void test_curve_point_edge_cases(void) {
     lrt_hit h;
 
@@ -2540,6 +2638,7 @@ int main(void) {
     test_flatcurve_scene();
     test_bezcurve_scene();
     test_curve_frame();
+    test_curve_tessellate();
     test_points_scene();
     test_curve_point_edge_cases();
     test_sphere_scene();
