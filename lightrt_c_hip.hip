@@ -137,7 +137,7 @@ __launch_bounds__(64) __global__
     constexpr uint32_t block_stride = 10u * W;
     constexpr uint32_t prim_off = 9u * W;
 
-    const uint32_t rb = gid * 8u;
+    const size_t rb = (size_t)gid * 8u;
     float orgx = fu(rays[rb + 0u]), orgy = fu(rays[rb + 1u]),
           orgz = fu(rays[rb + 2u]);
     float tmin = fu(rays[rb + 3u]);
@@ -180,7 +180,7 @@ __launch_bounds__(64) __global__
             uint32_t blk0 = (ref & 0x7FFFFFFFu) >> 4u;
             uint32_t nblk = ref & 0xFu;
             for (uint32_t b = 0u; b < nblk; b++) {
-                uint32_t bb = (blk0 + b) * block_stride;
+                size_t bb = (size_t)(blk0 + b) * block_stride;
                 for (uint32_t lane = 0u; lane < W; lane++) {
                     uint32_t prim = blocks[bb + prim_off + lane];
                     if (prim == LRT_HIP_NO_HIT) continue;
@@ -221,7 +221,7 @@ __launch_bounds__(64) __global__
         }
 
         /* Interior node. */
-        uint32_t nb = (ref & 0x7FFFFFFFu) * node_stride;
+        size_t nb = (size_t)(ref & 0x7FFFFFFFu) * node_stride;
         uint32_t nchildren = nodes[nb + 7u * W];
 
         uint32_t hit_ref[8];
@@ -267,7 +267,7 @@ __launch_bounds__(64) __global__
         }
     }
 
-    uint32_t hb = gid * 4u;
+    size_t hb = (size_t)gid * 4u;
     hits[hb + 0u] =
         __float_as_uint(best_prim != LRT_HIP_NO_HIT ? best_t : 0.0f);
     hits[hb + 1u] = __float_as_uint(best_u);
@@ -292,7 +292,7 @@ __launch_bounds__(64) __global__
     constexpr uint32_t block_stride = 10u * W;
     constexpr uint32_t prim_off = 9u * W;
 
-    const uint32_t rb = gid * 8u;
+    const size_t rb = (size_t)gid * 8u;
     float orgx = fu(rays[rb + 0u]), orgy = fu(rays[rb + 1u]),
           orgz = fu(rays[rb + 2u]);
     float tmin = fu(rays[rb + 3u]);
@@ -331,7 +331,7 @@ __launch_bounds__(64) __global__
             uint32_t blk0 = (ref & 0x7FFFFFFFu) >> 4u;
             uint32_t nblk = ref & 0xFu;
             for (uint32_t b = 0u; b < nblk && !hit; b++) {
-                uint32_t bb = (blk0 + b) * block_stride;
+                size_t bb = (size_t)(blk0 + b) * block_stride;
                 for (uint32_t lane = 0u; lane < W; lane++) {
                     uint32_t prim = blocks[bb + prim_off + lane];
                     if (prim == LRT_HIP_NO_HIT) continue;
@@ -369,7 +369,7 @@ __launch_bounds__(64) __global__
             continue;
         }
 
-        uint32_t nb = (ref & 0x7FFFFFFFu) * node_stride;
+        size_t nb = (size_t)(ref & 0x7FFFFFFFu) * node_stride;
         uint32_t nchildren = nodes[nb + 7u * W];
         for (uint32_t i = 0u; i < nchildren; i++) {
             float lo_x = fu(nodes[nb + 0u * W + i]);
@@ -420,14 +420,14 @@ __global__ void k_centroids(const float *__restrict__ verts,
                             float *__restrict__ centroids, uint32_t ntris) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= ntris) return;
-    uint32_t vb = i * 9u;
+    size_t vb = (size_t)i * 9u;
     for (uint32_t a = 0u; a < 3u; a++) {
         float v0 = verts[vb + 0u + a];
         float v1 = verts[vb + 3u + a];
         float v2 = verts[vb + 6u + a];
         float lo = fminf(v0, fminf(v1, v2));
         float hi = fmaxf(v0, fmaxf(v1, v2));
-        centroids[i * 3u + a] = 0.5f * (lo + hi);
+        centroids[(size_t)i * 3u + a] = 0.5f * (lo + hi);
     }
 }
 
@@ -441,7 +441,7 @@ __global__ void k_morton(const float *__restrict__ centroids,
     float scale[3] = {scale0, scale1, scale2};
     uint32_t q[3];
     for (uint32_t a = 0u; a < 3u; a++) {
-        float c = centroids[i * 3u + a];
+        float c = centroids[(size_t)i * 3u + a];
         float fv = (c - base[a]) * scale[a];
         int qi = (int)fv; /* truncation toward zero, matches (int32_t)v */
         if (qi < 0) qi = 0;
@@ -468,7 +468,7 @@ __global__ void k_raygen_camera(uint32_t *__restrict__ rays, uint32_t width,
     float dx = llx + sx * hx + sy * vx - ox;
     float dy = lly + sx * hy + sy * vy - oy;
     float dz = llz + sx * hz + sy * vz - oz;
-    uint32_t rb = gid * 8u;
+    size_t rb = (size_t)gid * 8u;
     rays[rb + 0] = __float_as_uint(ox);
     rays[rb + 1] = __float_as_uint(oy);
     rays[rb + 2] = __float_as_uint(oz);
@@ -494,7 +494,7 @@ __global__ void k_refit_leaves(uint32_t *__restrict__ blocks,
     uint32_t total = block_count * W;
     if (idx >= total) return;
     uint32_t b = idx / W, lane = idx % W;
-    uint32_t bb = b * block_stride;
+    size_t bb = (size_t)b * block_stride;
     uint32_t prim = blocks[bb + prim_off + lane];
     if (prim == LRT_HIP_NO_HIT || prim >= ntris) return;
     const float *v = verts + (size_t)prim * 9u;
@@ -523,7 +523,7 @@ __global__ void k_refit_nodes(uint32_t *__restrict__ nodes,
     constexpr uint32_t prim_off = 9u * W;
     uint32_t n = blockIdx.x * blockDim.x + threadIdx.x;
     if (n >= node_count) return;
-    uint32_t nb = n * node_stride;
+    size_t nb = (size_t)n * node_stride;
     uint32_t nchildren = nodes[nb + 7u * W];
     for (uint32_t i = 0; i < nchildren; i++) {
         uint32_t ref = nodes[nb + 6u * W + i];
@@ -533,7 +533,7 @@ __global__ void k_refit_nodes(uint32_t *__restrict__ nodes,
             uint32_t blk0 = (ref & 0x7FFFFFFFu) >> 4u;
             uint32_t nblk = ref & 0xFu;
             for (uint32_t b = 0; b < nblk; b++) {
-                uint32_t bb = (blk0 + b) * block_stride;
+                size_t bb = (size_t)(blk0 + b) * block_stride;
                 for (uint32_t lane = 0; lane < W; lane++) {
                     uint32_t prim = blocks[bb + prim_off + lane];
                     if (prim == LRT_HIP_NO_HIT) continue;
@@ -558,7 +558,7 @@ __global__ void k_refit_nodes(uint32_t *__restrict__ nodes,
             }
         } else {
             uint32_t c = ref & 0x7FFFFFFFu;
-            uint32_t cb = c * node_stride;
+            size_t cb = (size_t)c * node_stride;
             uint32_t cn = nodes[cb + 7u * W];
             for (uint32_t j = 0; j < cn; j++) {
                 lo0 = fminf(lo0, fu(nodes[cb + 0u * W + j]));
@@ -581,7 +581,6 @@ __global__ void k_refit_nodes(uint32_t *__restrict__ nodes,
 /* ========================================================================= */
 /* Trace launchers (compile-time W/STACK dispatch).                           */
 /* ========================================================================= */
-#define HIP_GRID(n) (((n) + 63u) / 64u), 64u, 0, e->stream
 
 static hipError_t launch_trace(lrt_hip_engine *e, const lrt_hip_scene *s,
                                const uint32_t *d_rays, uint32_t *d_hits,

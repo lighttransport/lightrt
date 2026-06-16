@@ -312,6 +312,11 @@ __global__ void kl_emit_nodes(uint32_t *__restrict__ nodes, uint32_t ninternal,
         nodes[nb + 6u * W + s] = child_ref(c);
     }
     nodes[nb + 7u * W] = 2u; /* nchildren */
+    /* perm[] (words 7*W+1 .. ) left zero: the GPU traversal sorts children by
+     * tnear and never reads perm, so this device-resident image is correct for
+     * the HIP kernels. It is NOT valid for the CPU SSE4/scalar-perm BVH4
+     * traversal (which indexes node->perm[octant]); do not feed a downloaded
+     * GPU-LBVH image into the CPU traverser without rebuilding perm. */
 }
 
 __global__ void kl_emit_leaves(uint32_t *__restrict__ blocks, uint32_t nleaves,
@@ -414,6 +419,8 @@ static lrt_hip_scene *build_gpu_core(lrt_hip_engine *e, const float *d_verts,
             d_nodes = NULL;
             d_blocks = NULL; /* owned by scene now */
             if (err) *err = LRT_RESULT_OK;
+        } else if (err) {
+            *err = LRT_RESULT_OUT_OF_MEMORY;
         }
         goto done;
     }

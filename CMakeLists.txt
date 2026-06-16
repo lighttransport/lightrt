@@ -277,14 +277,13 @@ if(LIGHTRT_BUILD_HIP)
         set(LIGHTRT_HIP_HIPCUB_OK ON)
     endif()
 
-    # Static library exposing the HIP backend to other targets.
-    set(LIGHTRT_HIP_SOURCES lightrt_c_hip.hip)
-    if(LIGHTRT_HIP_WMMA_OK)
-        list(APPEND LIGHTRT_HIP_SOURCES lightrt_hip_wmma.hip)
-    endif()
-    if(LIGHTRT_HIP_HIPCUB_OK)
-        list(APPEND LIGHTRT_HIP_SOURCES lightrt_hip_lbvh.hip)
-    endif()
+    # Static library exposing the HIP backend to other targets. All three TUs
+    # are always compiled — the WMMA and LBVH files self-stub via #ifdef (their
+    # #else branches define NOT_BUILT versions of the public symbols), so the
+    # test/benchmark always link even when rocWMMA / hipCUB are absent. Only the
+    # feature -D defines below are conditional.
+    set(LIGHTRT_HIP_SOURCES lightrt_c_hip.hip lightrt_hip_wmma.hip
+        lightrt_hip_lbvh.hip)
     add_library(lightrt_hip STATIC ${LIGHTRT_HIP_SOURCES})
     set_source_files_properties(${LIGHTRT_HIP_SOURCES} PROPERTIES LANGUAGE HIP)
     target_include_directories(lightrt_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
