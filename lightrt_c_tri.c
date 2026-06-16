@@ -258,6 +258,17 @@ typedef struct lrt_quad4 {
 } lrt_quad4;
 _Static_assert(sizeof(lrt_quad4) == 208, "lrt_quad4");
 
+/* Bicubic Bézier surface patch leaf (784 bytes, own stride): 4 patches/block,
+ * SoA. cp[c][lane] holds component c (= point k*3 + axis, k = j*4 + i, i = u
+ * index 0..3, j = v index 0..3) of 16 control points. Padding lanes: prim =
+ * LRT_TRI_NO_HIT. Used for both plain (TRI_PRIM_BEZPATCH) and rational
+ * (TRI_PRIM_RBEZPATCH stores 4-component homogeneous CPs in a wider sibling). */
+typedef struct lrt_bezpatch4 {
+    float cp[48][4];
+    uint32_t prim[4];
+} lrt_bezpatch4;
+_Static_assert(sizeof(lrt_bezpatch4) == 784, "lrt_bezpatch4");
+
 /* Built-in SDF / implicit leaf block (144 bytes, own stride): per lane a shape
  * type, object-space center, bounding radius (for ray-interval clipping), and up
  * to three shape params. Sphere-traced on CPU and GPU (no host callbacks). */
@@ -327,7 +338,8 @@ enum {
     TRI_PRIM_QUAD = 9,  /* planar quad (2-triangle) leaves (lrt_quad4)   */
     TRI_PRIM_TETRA = 10,/* solid tetrahedron (4-face) leaves (lrt_quad4) */
     TRI_PRIM_SDF = 11,  /* built-in implicit/SDF leaves (lrt_sdf4)       */
-    TRI_PRIM_BILINEAR = 12 /* bilinear patch leaves (lrt_quad4, exact)   */
+    TRI_PRIM_BILINEAR = 12, /* bilinear patch leaves (lrt_quad4, exact)  */
+    TRI_PRIM_BEZPATCH = 13 /* bicubic Bezier surface leaves (lrt_bezpatch4) */
 };
 
 /* Built-in SDF shapes (lrt_sdf_shape in the header). Evaluated on-device too;
@@ -453,7 +465,8 @@ typedef struct tri_build_ctx {
     const float *points_n;   /* 3*nprims normals or NULL (TRI_PRIM_POINT) */
     const float *bez_cps;    /* 16*nseg ORIGINAL Bezier CPs (TRI_PRIM_BEZCURVE) */
     uint32_t bez_split;      /* build-time de Casteljau pieces per cubic (>=1) */
-    const float *quads;      /* 12*nprims v0v1v2v3 (TRI_PRIM_QUAD / _TETRA) */
+    const float *quads;      /* 12*nprims v0v1v2v3 (TRI_PRIM_QUAD/_TETRA/_BILINEAR) */
+    const float *bezpatch_cps; /* 48*nprims (16 xyz CPs) (TRI_PRIM_BEZPATCH) */
     const uint32_t *sdf_types;   /* nprims shape type (TRI_PRIM_SDF) */
     const float *sdf_centers;    /* 3*nprims center (TRI_PRIM_SDF) */
     const float *sdf_params;     /* 3*nprims params (TRI_PRIM_SDF) */
@@ -2556,6 +2569,30 @@ static uint32_t tri_emit_leaf(tri_collapse_ctx *cc, const tri_bnode *bn) {
             (double)count;
         return TRI_MAKE_LEAF_REF(first_block, nblocks);
     }
+    if (bc->emit_kind == TRI_PRIM_BEZPATCH) { /* bicubic Bezier patch leaves */
+        for (uint32_t b = 0; b < nblocks; b++) {
+            lrt_bezpatch4 *blk = (lrt_bezpatch4 *)tri_block_ptr(
+                s->blocks, s->block_count, s->block_stride);
+            s->block_count++;
+            for (uint32_t lane = 0; lane < 4u; lane++) {
+                uint32_t k = b * 4u + lane;
+                if (k < count) {
+                    uint32_t prim = bc->indices[bn->a + k];
+                    const float *src = &bc->bezpatch_cps[(size_t)prim * 48];
+                    for (int c = 0; c < 48; c++) blk->cp[c][lane] = src[c];
+                    blk->prim[lane] = prim;
+                } else {
+                    for (int c = 0; c < 48; c++) blk->cp[c][lane] = 0.0f;
+                    blk->prim[lane] = LRT_TRI_NO_HIT;
+                }
+            }
+        }
+        cc->leaf_count++;
+        cc->sah_leaf +=
+            (double)(tri_surface_area(bn->lo, bn->hi) / cc->root_area) *
+            (double)count;
+        return TRI_MAKE_LEAF_REF(first_block, nblocks);
+    }
     if (bc->emit_kind == TRI_PRIM_SDF) { /* built-in implicit/SDF leaves (BVH4) */
         for (uint32_t b = 0; b < nblocks; b++) {
             lrt_sdf4 *blk = (lrt_sdf4 *)tri_block_ptr(s->blocks, s->block_count,
@@ -4027,6 +4064,220 @@ static inline void tri_bilin4_isect(const lrt_quad4 *blk, const tri_ray_ctx *rc,
     }
 }
 
+/* ---- Bicubic Bézier surface patch (direct: adaptive subdiv + Newton) ------
+ * cp[48] = 16 control points xyz, point k = j*4 + i (i=u idx, j=v idx),
+ * component cp[k*3 + axis]. */
+static inline void tri_bez_cubic1(float p0, float p1, float p2, float p3,
+                                  float u, float *val, float *der) {
+    float u1 = 1.0f - u;
+    *val = u1 * u1 * u1 * p0 + 3.0f * u1 * u1 * u * p1 +
+           3.0f * u1 * u * u * p2 + u * u * u * p3;
+    *der = 3.0f * (u1 * u1 * (p1 - p0) + 2.0f * u1 * u * (p2 - p1) +
+                   u * u * (p3 - p2));
+}
+
+/* S(u,v) + first partials. */
+static inline void tri_bezpatch_eval(const float cp[48], float u, float v,
+                                     float S[3], float dSdu[3], float dSdv[3]) {
+    for (int axis = 0; axis < 3; axis++) {
+        float R[4], dR[4];
+        for (int j = 0; j < 4; j++) {
+            tri_bez_cubic1(cp[(j * 4 + 0) * 3 + axis], cp[(j * 4 + 1) * 3 + axis],
+                           cp[(j * 4 + 2) * 3 + axis], cp[(j * 4 + 3) * 3 + axis],
+                           u, &R[j], &dR[j]);
+        }
+        float sv, dsv, su, tmp;
+        tri_bez_cubic1(R[0], R[1], R[2], R[3], v, &sv, &dsv);
+        tri_bez_cubic1(dR[0], dR[1], dR[2], dR[3], v, &su, &tmp);
+        S[axis] = sv;
+        dSdv[axis] = dsv;
+        dSdu[axis] = su;
+    }
+}
+
+/* de Casteljau split/restrict of a cubic over 4 points × 3 floats. */
+static void tri_bez_split3(const float c[12], float t, float L[12],
+                           float R[12]) {
+    for (int k = 0; k < 3; k++) {
+        float P0 = c[k], P1 = c[3 + k], P2 = c[6 + k], P3 = c[9 + k];
+        float ab = P0 + (P1 - P0) * t, bc = P1 + (P2 - P1) * t,
+              cd = P2 + (P3 - P2) * t;
+        float abc = ab + (bc - ab) * t, bcd = bc + (cd - bc) * t;
+        float abcd = abc + (bcd - abc) * t;
+        L[k] = P0; L[3 + k] = ab; L[6 + k] = abc; L[9 + k] = abcd;
+        R[k] = abcd; R[3 + k] = bcd; R[6 + k] = cd; R[9 + k] = P3;
+    }
+}
+static void tri_bez_subcurve3(const float c[12], float a, float b,
+                              float out[12]) {
+    float L[12], R[12];
+    tri_bez_split3(c, b, L, R);
+    if (a > 0.0f) {
+        float L2[12];
+        tri_bez_split3(L, a / b, L2, out);
+    } else {
+        memcpy(out, L, 12 * sizeof(float));
+    }
+}
+
+/* Control points of the sub-patch over [umin,umax]×[vmin,vmax]. */
+static void tri_bezpatch_subpatch(const float cp[48], float umin, float umax,
+                                  float vmin, float vmax, float out[48]) {
+    float tmp[48];
+    for (int j = 0; j < 4; j++) {
+        float row[12], sub[12];
+        for (int i = 0; i < 4; i++)
+            for (int k = 0; k < 3; k++) row[i * 3 + k] = cp[(j * 4 + i) * 3 + k];
+        tri_bez_subcurve3(row, umin, umax, sub);
+        for (int i = 0; i < 4; i++)
+            for (int k = 0; k < 3; k++) tmp[(j * 4 + i) * 3 + k] = sub[i * 3 + k];
+    }
+    for (int i = 0; i < 4; i++) {
+        float col[12], sub[12];
+        for (int j = 0; j < 4; j++)
+            for (int k = 0; k < 3; k++) col[j * 3 + k] = tmp[(j * 4 + i) * 3 + k];
+        tri_bez_subcurve3(col, vmin, vmax, sub);
+        for (int j = 0; j < 4; j++)
+            for (int k = 0; k < 3; k++) out[(j * 4 + i) * 3 + k] = sub[j * 3 + k];
+    }
+}
+
+static inline float tri_det3(const float a[3], const float b[3],
+                             const float c[3]) {
+    return a[0] * (b[1] * c[2] - b[2] * c[1]) -
+           a[1] * (b[0] * c[2] - b[2] * c[0]) +
+           a[2] * (b[0] * c[1] - b[1] * c[0]);
+}
+
+/* Newton on (u,v,t): S(u,v) - (org + t*dir) = 0. */
+static int tri_bezpatch_newton(const float cp[48], const float *org,
+                               const float *dir, float u, float v, float t,
+                               float tmin, float best, float *t_out,
+                               float *u_out, float *v_out) {
+    for (int it = 0; it < 8; it++) {
+        float S[3], du[3], dv[3];
+        tri_bezpatch_eval(cp, u, v, S, du, dv);
+        float R[3] = {S[0] - org[0] - t * dir[0], S[1] - org[1] - t * dir[1],
+                      S[2] - org[2] - t * dir[2]};
+        float ndir[3] = {-dir[0], -dir[1], -dir[2]};
+        float det = tri_det3(du, dv, ndir);
+        if (det > -1e-20f && det < 1e-20f) return 0;
+        float inv = 1.0f / det;
+        float d0 = tri_det3(R, dv, ndir) * inv;
+        float d1 = tri_det3(du, R, ndir) * inv;
+        float d2 = tri_det3(du, dv, R) * inv;
+        u -= d0;
+        v -= d1;
+        t -= d2;
+        float rr = sqrtf(R[0] * R[0] + R[1] * R[1] + R[2] * R[2]);
+        float sl = sqrtf(S[0] * S[0] + S[1] * S[1] + S[2] * S[2]);
+        if (rr < 1e-5f * (1.0f + sl)) {
+            if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f && t >= tmin &&
+                t < best) {
+                *t_out = t;
+                *u_out = u;
+                *v_out = v;
+                return 1;
+            }
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static int tri_bezpatch_isect_one(const float cp[48], const tri_ray_ctx *rc,
+                                  float best_t, float *t_out, float *u_out,
+                                  float *v_out) {
+    enum { BEZPATCH_MAXDEPTH = 4 };
+    struct {
+        float u0, u1, v0, v1;
+        int depth;
+    } stk[4 * BEZPATCH_MAXDEPTH + 4];
+    int sp = 0;
+    stk[sp].u0 = 0.0f; stk[sp].u1 = 1.0f; stk[sp].v0 = 0.0f; stk[sp].v1 = 1.0f;
+    stk[sp].depth = 0;
+    sp++;
+    float best = best_t;
+    int hit = 0;
+    while (sp > 0) {
+        sp--;
+        float u0 = stk[sp].u0, u1 = stk[sp].u1, v0 = stk[sp].v0, v1 = stk[sp].v1;
+        int depth = stk[sp].depth;
+        float sub[48];
+        tri_bezpatch_subpatch(cp, u0, u1, v0, v1, sub);
+        /* conservative AABB = control hull of the sub-patch */
+        float lo[3] = {sub[0], sub[1], sub[2]}, hi[3] = {sub[0], sub[1], sub[2]};
+        for (int k = 1; k < 16; k++)
+            for (int a = 0; a < 3; a++) {
+                float c = sub[k * 3 + a];
+                if (c < lo[a]) lo[a] = c;
+                if (c > hi[a]) hi[a] = c;
+            }
+        /* ray/AABB slab test (clamped to [tmin, best]) */
+        float tn = rc->tmin, tf = best;
+        int miss = 0;
+        for (int a = 0; a < 3; a++) {
+            float t0 = (lo[a] - rc->org[a]) * rc->invd[a];
+            float t1 = (hi[a] - rc->org[a]) * rc->invd[a];
+            float lo_t = t0 < t1 ? t0 : t1, hi_t = t0 < t1 ? t1 : t0;
+            if (lo_t > tn) tn = lo_t;
+            if (hi_t < tf) tf = hi_t;
+            if (tn > tf) { miss = 1; break; }
+        }
+        if (miss) continue;
+        if (depth >= BEZPATCH_MAXDEPTH) {
+            float uc = 0.5f * (u0 + u1), vc = 0.5f * (v0 + v1);
+            float S[3], du[3], dv[3];
+            tri_bezpatch_eval(cp, uc, vc, S, du, dv);
+            float ddot = rc->dir[0] * rc->dir[0] + rc->dir[1] * rc->dir[1] +
+                         rc->dir[2] * rc->dir[2];
+            float t0 = ((S[0] - rc->org[0]) * rc->dir[0] +
+                        (S[1] - rc->org[1]) * rc->dir[1] +
+                        (S[2] - rc->org[2]) * rc->dir[2]) /
+                       (ddot > 1e-20f ? ddot : 1e-20f);
+            float th, uh, vh;
+            if (tri_bezpatch_newton(cp, rc->org, rc->dir, uc, vc, t0, rc->tmin,
+                                    best, &th, &uh, &vh)) {
+                best = th;
+                *t_out = th;
+                *u_out = uh;
+                *v_out = vh;
+                hit = 1;
+            }
+            continue;
+        }
+        float um = 0.5f * (u0 + u1), vm = 0.5f * (v0 + v1);
+        const float uu[2][2] = {{u0, um}, {um, u1}};
+        const float vv[2][2] = {{v0, vm}, {vm, v1}};
+        for (int a = 0; a < 2; a++)
+            for (int b = 0; b < 2; b++) {
+                stk[sp].u0 = uu[a][0]; stk[sp].u1 = uu[a][1];
+                stk[sp].v0 = vv[b][0]; stk[sp].v1 = vv[b][1];
+                stk[sp].depth = depth + 1;
+                sp++;
+            }
+    }
+    return hit;
+}
+
+static inline void tri_bezpatch4_isect(const lrt_bezpatch4 *blk,
+                                       const tri_ray_ctx *rc, float *best_t,
+                                       float *best_u, float *best_v,
+                                       uint32_t *best_prim) {
+    for (int lane = 0; lane < 4; lane++) {
+        if (blk->prim[lane] == LRT_TRI_NO_HIT) continue;
+        float cp[48];
+        for (int c = 0; c < 48; c++) cp[c] = blk->cp[c][lane];
+        float t, u, v;
+        if (tri_bezpatch_isect_one(cp, rc, *best_t, &t, &u, &v)) {
+            *best_t = t;
+            *best_u = u;
+            *best_v = v;
+            *best_prim = blk->prim[lane];
+        }
+    }
+}
+
 /* Built-in implicit distance field in object space (p = world - center). */
 static inline float tri_sdf_eval(uint32_t type, float px, float py, float pz,
                                  float p0, float p1, float p2) {
@@ -4177,6 +4428,15 @@ static int tri_intersect_scalar(const lrt_tri_scene *s, const lrt_ray *ray,
                         s->blocks, blk0 + b, s->block_stride);
                     tri_bilin4_isect(blk, &rc, &best_t, &best_u, &best_v,
                                      &best_prim);
+                }
+                continue;
+            }
+            if (s->prim_kind == TRI_PRIM_BEZPATCH) {
+                for (uint32_t b = 0; b < nblk; b++) {
+                    const lrt_bezpatch4 *blk = (const lrt_bezpatch4 *)
+                        tri_block_ptr(s->blocks, blk0 + b, s->block_stride);
+                    tri_bezpatch4_isect(blk, &rc, &best_t, &best_u, &best_v,
+                                        &best_prim);
                 }
                 continue;
             }
@@ -4403,6 +4663,17 @@ static int tri_occluded_scalar(const lrt_tri_scene *s, const lrt_ray *ray) {
                     float t = t_max, u = 0.0f, v = 0.0f;
                     uint32_t prim = LRT_TRI_NO_HIT;
                     tri_bilin4_isect(blk, &rc, &t, &u, &v, &prim);
+                    if (prim != LRT_TRI_NO_HIT) return 1;
+                }
+                continue;
+            }
+            if (s->prim_kind == TRI_PRIM_BEZPATCH) {
+                for (uint32_t b = 0; b < nblk; b++) {
+                    const lrt_bezpatch4 *blk = (const lrt_bezpatch4 *)
+                        tri_block_ptr(s->blocks, blk0 + b, s->block_stride);
+                    float t = t_max, u = 0.0f, v = 0.0f;
+                    uint32_t prim = LRT_TRI_NO_HIT;
+                    tri_bezpatch4_isect(blk, &rc, &t, &u, &v, &prim);
                     if (prim != LRT_TRI_NO_HIT) return 1;
                 }
                 continue;
@@ -8164,7 +8435,8 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
 #endif
     }
     if (s->prim_kind == TRI_PRIM_QUAD || s->prim_kind == TRI_PRIM_TETRA ||
-        s->prim_kind == TRI_PRIM_SDF || s->prim_kind == TRI_PRIM_BILINEAR)
+        s->prim_kind == TRI_PRIM_SDF || s->prim_kind == TRI_PRIM_BILINEAR ||
+        s->prim_kind == TRI_PRIM_BEZPATCH)
         return tri_intersect_scalar(s, ray, hit);
 #if LRT_TRI_HAS_SSE4
     if (s->curve) return tri_curve_intersect_bvh4(s, ray, hit);
@@ -8205,7 +8477,8 @@ int lrt_tri_occluded1(const lrt_tri_scene *s, const lrt_ray *ray) {
 #endif
     }
     if (s->prim_kind == TRI_PRIM_QUAD || s->prim_kind == TRI_PRIM_TETRA ||
-        s->prim_kind == TRI_PRIM_SDF || s->prim_kind == TRI_PRIM_BILINEAR)
+        s->prim_kind == TRI_PRIM_SDF || s->prim_kind == TRI_PRIM_BILINEAR ||
+        s->prim_kind == TRI_PRIM_BEZPATCH)
         return tri_occluded_scalar(s, ray);
 #if LRT_TRI_HAS_SSE4
     if (s->curve) return tri_curve_occluded_bvh4(s, ray);
@@ -9798,6 +10071,69 @@ lrt_tri_scene *lrt_bilinear_scene_build(const float *corners, size_t npatch,
                                     err);
 }
 
+lrt_tri_scene *lrt_bezpatch_scene_build(const float *cps, size_t npatch,
+                                        const lrt_tri_build_options *opts,
+                                        lrt_result *err) {
+    tri_set_err(err, LRT_RESULT_OK);
+    if (!cps || npatch == 0 || npatch > 0x07FFFFFFu) {
+        tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
+        return NULL;
+    }
+    lrt_tri_build_options o;
+    if (opts)
+        o = *opts;
+    else
+        memset(&o, 0, sizeof(o));
+    unsigned num_threads = o.num_threads ? o.num_threads : 1u;
+    uint32_t max_leaf = o.max_leaf_size ? o.max_leaf_size : 8u;
+    if (max_leaf > 15u) max_leaf = 15u; /* big leaf blocks: keep leaves small */
+
+    tri_build_ctx bc;
+    memset(&bc, 0, sizeof(bc));
+    bc.ntris = npatch;
+    bc.max_leaf = max_leaf;
+    bc.block_shift = 2u;
+    bc.quality = LRT_TRI_BUILD_DEFAULT;
+    bc.bezpatch_cps = cps;
+    bc.emit_kind = TRI_PRIM_BEZPATCH;
+    bc.block_stride = (uint32_t)sizeof(lrt_bezpatch4);
+    if (tri_alloc_aabb_scratch(&bc, npatch)) {
+        tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+        return NULL;
+    }
+    int bad = 0;
+    for (size_t i = 0; i < npatch; i++) {
+        const float *cp = &cps[i * 48];
+        float lo[3], hi[3];
+        for (int a = 0; a < 3; a++) {
+            lo[a] = cp[a];
+            hi[a] = cp[a];
+        }
+        for (int k = 0; k < 16; k++)
+            for (int a = 0; a < 3; a++) {
+                float c = cp[k * 3 + a];
+                if (!isfinite(c)) bad = 1;
+                if (c < lo[a]) lo[a] = c;
+                if (c > hi[a]) hi[a] = c;
+            }
+        for (int a = 0; a < 3; a++) {
+            bc.plo[i * 3 + a] = lo[a];
+            bc.phi[i * 3 + a] = hi[a];
+            bc.cen[i * 3 + a] = 0.5f * (lo[a] + hi[a]);
+        }
+        bc.indices[i] = (uint32_t)i;
+    }
+    if (bad) {
+        tri_free_aabb_scratch(&bc);
+        tri_set_err(err, LRT_RESULT_INVALID_BOUNDS);
+        return NULL;
+    }
+    lrt_tri_scene *s =
+        tri_finish_aabb_build(&bc, npatch, TRI_PRIM_BEZPATCH, num_threads, err);
+    tri_free_aabb_scratch(&bc);
+    return s;
+}
+
 lrt_tri_scene *lrt_sdfprim_scene_build(const uint32_t *types,
                                        const float *centers, const float *params,
                                        size_t nprims,
@@ -10460,6 +10796,7 @@ static uint32_t tri_kind_block_stride(int prim_kind, int layout) {
     case TRI_PRIM_QUAD:
     case TRI_PRIM_TETRA:
     case TRI_PRIM_BILINEAR: return (uint32_t)sizeof(lrt_quad4);
+    case TRI_PRIM_BEZPATCH: return (uint32_t)sizeof(lrt_bezpatch4);
     case TRI_PRIM_SDF: return (uint32_t)sizeof(lrt_sdf4);
     case TRI_PRIM_RLCURVE: return (uint32_t)sizeof(lrt_rlc4);
     case TRI_PRIM_FLATCURVE: return (uint32_t)sizeof(lrt_flat4);

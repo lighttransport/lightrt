@@ -355,6 +355,17 @@ lrt_tri_scene *lrt_bilinear_scene_build(const float *corners, size_t npatch,
                                         const lrt_tri_build_options *opts,
                                         lrt_result *err);
 
+/* --- Bicubic Bézier surface patch (direct intersection) -------------------
+ *
+ * A bicubic (4x4 control point) Bézier surface patch, intersected directly via
+ * adaptive (u,v) subdivision + Newton on (u,v,t) — no tessellation (exceeds
+ * Embree). cps = 48*npatch floats: 16 control points xyz, point k = j*4 + i
+ * (i = u index 0..3, j = v index 0..3), stored cps[(k)*3 + axis]. Hit reports
+ * prim_id = patch index and (u,v) in [0,1]^2. BVH4 only. */
+lrt_tri_scene *lrt_bezpatch_scene_build(const float *cps, size_t npatch,
+                                        const lrt_tri_build_options *opts,
+                                        lrt_result *err);
+
 /* --- Built-in implicit / SDF primitives (GPU-resident, no callbacks) -------
  *
  * A device-friendly alternative to lrt_user_scene_build's host callbacks: each
