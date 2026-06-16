@@ -887,6 +887,19 @@ and the test skips (exit 0) when no device is present.
   parent index < child index by construction). Matches a CPU refit 100%. On the
   220k-tri mandelbulb it is ~1 ms vs ~136 ms for a full build (~140× faster) —
   the realtime animation path.
+- **Fully GPU-resident dynamic pipeline (no per-frame PCIe)**: for animation /
+  motion blur the whole loop stays on-device. `lrt_hip_dbuffer` holds resident
+  vertex/ray/hit buffers; `lrt_hip_raygen_camera` generates pinhole primary rays
+  on the GPU; `lrt_hip_scene_trace_device` / `_occluded_device` trace
+  device→device; `lrt_hip_scene_refit_device` / `lrt_hip_scene_build_gpu_device`
+  refit/rebuild from a device vertex buffer. The full-GPU build derives Morton
+  base/scale on-device (`kl_init6`+`kl_basescale`) — no D2H readback at all.
+  Only one-time vertex upload and a final present/debug download cross PCIe.
+  `bench_hip --dynamic` runs an orbiting-camera frame loop (1280×720, 220k tris,
+  zero per-frame PCIe): ~1500 fps raygen+trace, ~975 fps refit+raygen+trace
+  (deforming mesh), ~430 fps full-GPU-rebuild+raygen+trace (topology change).
+  Note refit suits the shallow collapsed BVH8 (depth ~20); the GPU binary tree
+  is depth ~64, for which a full rebuild is the better dynamic path.
 - **One-shot**: `lrt_hip_trace_scene` (upload+trace+free).
 - Engine: `lrt_hip_engine_create`/`_destroy`/`_caps`/`_device_name`/`_last_error`.
   Caps report `WMMA`/`FP8`/`INT8`/`INT4` (inferred from gfx11xx/gfx12xx arch).

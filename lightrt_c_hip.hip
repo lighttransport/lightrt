@@ -452,6 +452,34 @@ __global__ void k_morton(const float *__restrict__ centroids,
 }
 
 /* ========================================================================= */
+/* GPU primary-ray generation (pinhole camera) -> device ray buffer.           */
+/* ========================================================================= */
+__global__ void k_raygen_camera(uint32_t *__restrict__ rays, uint32_t width,
+                                uint32_t height, float ox, float oy, float oz,
+                                float llx, float lly, float llz, float hx,
+                                float hy, float hz, float vx, float vy, float vz,
+                                float tmin, float tmax) {
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t n = width * height;
+    if (gid >= n) return;
+    uint32_t px = gid % width, py = gid / width;
+    float sx = ((float)px + 0.5f) / (float)width;
+    float sy = ((float)py + 0.5f) / (float)height;
+    float dx = llx + sx * hx + sy * vx - ox;
+    float dy = lly + sx * hy + sy * vy - oy;
+    float dz = llz + sx * hz + sy * vz - oz;
+    uint32_t rb = gid * 8u;
+    rays[rb + 0] = __float_as_uint(ox);
+    rays[rb + 1] = __float_as_uint(oy);
+    rays[rb + 2] = __float_as_uint(oz);
+    rays[rb + 3] = __float_as_uint(tmin);
+    rays[rb + 4] = __float_as_uint(dx);
+    rays[rb + 5] = __float_as_uint(dy);
+    rays[rb + 6] = __float_as_uint(dz);
+    rays[rb + 7] = __float_as_uint(tmax);
+}
+
+/* ========================================================================= */
 /* Refit kernels — update leaf vertices + node bounds in place (animation).    */
 /* ========================================================================= */
 /* Rewrite every leaf block's v0/e1/e2 from new vertex positions (prim_id ->
@@ -912,6 +940,35 @@ extern "C" int lrt_hip_scene_occluded(lrt_hip_engine *e, lrt_hip_scene *s,
     return nocc;
 }
 
+/* Enqueue the refit kernels (leaf rewrite + bottom-up bounds) against a DEVICE
+ * vertex buffer. No allocation, copy, or sync — the caller owns those. */
+static void refit_core(lrt_hip_engine *e, lrt_hip_scene *s,
+                       const float *d_verts, uint32_t ntris) {
+    const uint32_t W = s->layout;
+    uint32_t leaf_threads = s->block_count * W;
+    uint32_t lg = (leaf_threads + 255u) / 256u;
+    if (W == 4u)
+        hipLaunchKernelGGL((k_refit_leaves<4>), dim3(lg), dim3(256), 0,
+                           e->stream, s->d_blocks, d_verts, s->block_count,
+                           ntris);
+    else
+        hipLaunchKernelGGL((k_refit_leaves<8>), dim3(lg), dim3(256), 0,
+                           e->stream, s->d_blocks, d_verts, s->block_count,
+                           ntris);
+    uint32_t ng = (s->node_count + 255u) / 256u;
+    uint32_t passes = s->max_depth + 1u;
+    for (uint32_t p = 0; p < passes; p++) {
+        if (W == 4u)
+            hipLaunchKernelGGL((k_refit_nodes<4>), dim3(ng), dim3(256), 0,
+                               e->stream, s->d_nodes, s->d_blocks,
+                               s->node_count);
+        else
+            hipLaunchKernelGGL((k_refit_nodes<8>), dim3(ng), dim3(256), 0,
+                               e->stream, s->d_nodes, s->d_blocks,
+                               s->node_count);
+    }
+}
+
 extern "C" int lrt_hip_scene_refit(lrt_hip_engine *e, lrt_hip_scene *s,
                                    const float *vertices, uint32_t ntris,
                                    lrt_result *err) {
@@ -934,31 +991,7 @@ extern "C" int lrt_hip_scene_refit(lrt_hip_engine *e, lrt_hip_scene *s,
         if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
         return -1;
     }
-    const uint32_t W = s->layout;
-    /* 1. Rewrite leaf vertices. */
-    uint32_t leaf_threads = s->block_count * W;
-    uint32_t lg = (leaf_threads + 255u) / 256u;
-    if (W == 4u)
-        hipLaunchKernelGGL((k_refit_leaves<4>), dim3(lg), dim3(256), 0,
-                           e->stream, s->d_blocks, d_verts, s->block_count,
-                           ntris);
-    else
-        hipLaunchKernelGGL((k_refit_leaves<8>), dim3(lg), dim3(256), 0,
-                           e->stream, s->d_blocks, d_verts, s->block_count,
-                           ntris);
-    /* 2. Bottom-up node bounds: max_depth+1 passes (parent index < child). */
-    uint32_t ng = (s->node_count + 255u) / 256u;
-    uint32_t passes = s->max_depth + 1u;
-    for (uint32_t p = 0; p < passes; p++) {
-        if (W == 4u)
-            hipLaunchKernelGGL((k_refit_nodes<4>), dim3(ng), dim3(256), 0,
-                               e->stream, s->d_nodes, s->d_blocks,
-                               s->node_count);
-        else
-            hipLaunchKernelGGL((k_refit_nodes<8>), dim3(ng), dim3(256), 0,
-                               e->stream, s->d_nodes, s->d_blocks,
-                               s->node_count);
-    }
+    refit_core(e, s, d_verts, ntris);
     if ((hr = hipStreamSynchronize(e->stream)) != hipSuccess) {
         hip_free(d_verts);
         hip_set_err_hip(e, "hipStreamSynchronize(refit)", hr);
@@ -966,6 +999,186 @@ extern "C" int lrt_hip_scene_refit(lrt_hip_engine *e, lrt_hip_scene *s,
         return -1;
     }
     hip_free(d_verts);
+    if (err) *err = LRT_RESULT_OK;
+    return 0;
+}
+
+/* ========================================================================= */
+/* Fully GPU-resident dynamic pipeline (no per-frame PCIe readback).          */
+/* ========================================================================= */
+struct lrt_hip_dbuffer {
+    void *ptr;
+    size_t size;
+};
+
+extern "C" lrt_hip_dbuffer *lrt_hip_dbuffer_alloc(lrt_hip_engine *e,
+                                                  size_t bytes,
+                                                  lrt_result *err) {
+    if (!e || bytes == 0) {
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return NULL;
+    }
+    lrt_hip_dbuffer *b = (lrt_hip_dbuffer *)calloc(1, sizeof(lrt_hip_dbuffer));
+    if (!b) {
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return NULL;
+    }
+    if (hipMalloc(&b->ptr, bytes) != hipSuccess) {
+        free(b);
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return NULL;
+    }
+    b->size = bytes;
+    if (err) *err = LRT_RESULT_OK;
+    return b;
+}
+
+extern "C" void lrt_hip_dbuffer_free(lrt_hip_engine *e, lrt_hip_dbuffer *b) {
+    (void)e;
+    if (!b) return;
+    hip_free(b->ptr);
+    free(b);
+}
+
+extern "C" void *lrt_hip_dbuffer_ptr(lrt_hip_dbuffer *b) {
+    return b ? b->ptr : NULL;
+}
+
+extern "C" size_t lrt_hip_dbuffer_size(const lrt_hip_dbuffer *b) {
+    return b ? b->size : 0;
+}
+
+extern "C" int lrt_hip_dbuffer_upload(lrt_hip_engine *e, lrt_hip_dbuffer *b,
+                                      const void *src, size_t bytes,
+                                      lrt_result *err) {
+    if (!e || !b || !src || bytes > b->size) {
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return -1;
+    }
+    hipError_t hr = hipMemcpy(b->ptr, src, bytes, hipMemcpyHostToDevice);
+    if (hr != hipSuccess) {
+        hip_set_err_hip(e, "dbuffer upload", hr);
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return -1;
+    }
+    if (err) *err = LRT_RESULT_OK;
+    return 0;
+}
+
+extern "C" int lrt_hip_dbuffer_download(lrt_hip_engine *e,
+                                        const lrt_hip_dbuffer *b, void *dst,
+                                        size_t bytes, lrt_result *err) {
+    if (!e || !b || !dst || bytes > b->size) {
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return -1;
+    }
+    hipError_t hr = hipMemcpy(dst, b->ptr, bytes, hipMemcpyDeviceToHost);
+    if (hr != hipSuccess) {
+        hip_set_err_hip(e, "dbuffer download", hr);
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return -1;
+    }
+    if (err) *err = LRT_RESULT_OK;
+    return 0;
+}
+
+extern "C" int lrt_hip_raygen_camera(lrt_hip_engine *e, lrt_hip_dbuffer *rays,
+                                     uint32_t width, uint32_t height,
+                                     const float origin[3],
+                                     const float lower_left[3],
+                                     const float horizontal[3],
+                                     const float vertical[3], float tmin,
+                                     float tmax, lrt_result *err) {
+    uint32_t n = width * height;
+    if (!e || !rays || n == 0 || rays->size < (size_t)n * sizeof(lrt_ray)) {
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return -1;
+    }
+    hipLaunchKernelGGL(k_raygen_camera, dim3((n + 63u) / 64u), dim3(64), 0,
+                       e->stream, (uint32_t *)rays->ptr, width, height,
+                       origin[0], origin[1], origin[2], lower_left[0],
+                       lower_left[1], lower_left[2], horizontal[0],
+                       horizontal[1], horizontal[2], vertical[0], vertical[1],
+                       vertical[2], tmin, tmax);
+    hipError_t hr = hipGetLastError();
+    if (hr != hipSuccess) {
+        hip_set_err_hip(e, "k_raygen_camera", hr);
+        if (err) *err = LRT_RESULT_NOT_BUILT;
+        return -1;
+    }
+    if (err) *err = LRT_RESULT_OK;
+    return 0;
+}
+
+extern "C" int lrt_hip_scene_trace_device(lrt_hip_engine *e, lrt_hip_scene *s,
+                                          const lrt_hip_dbuffer *rays,
+                                          uint32_t n, lrt_hip_dbuffer *hits,
+                                          lrt_result *err) {
+    if (!e || !s || !rays || !hits || n == 0 ||
+        rays->size < (size_t)n * sizeof(lrt_ray) ||
+        hits->size < (size_t)n * sizeof(lrt_hit)) {
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return -1;
+    }
+    hipError_t hr = launch_trace(e, s, (const uint32_t *)rays->ptr,
+                                 (uint32_t *)hits->ptr, n);
+    if (hr != hipSuccess) {
+        hip_set_err_hip(e, "k_trace launch (device)", hr);
+        if (err) *err = LRT_RESULT_NOT_BUILT;
+        return -1;
+    }
+    if ((hr = hipStreamSynchronize(e->stream)) != hipSuccess) {
+        hip_set_err_hip(e, "hipStreamSynchronize", hr);
+        if (err) *err = LRT_RESULT_NOT_BUILT;
+        return -1;
+    }
+    if (err) *err = LRT_RESULT_OK;
+    return 0;
+}
+
+extern "C" int lrt_hip_scene_occluded_device(lrt_hip_engine *e,
+                                             lrt_hip_scene *s,
+                                             const lrt_hip_dbuffer *rays,
+                                             uint32_t n,
+                                             lrt_hip_dbuffer *occluded,
+                                             lrt_result *err) {
+    if (!e || !s || !rays || !occluded || n == 0 ||
+        rays->size < (size_t)n * sizeof(lrt_ray) ||
+        occluded->size < (size_t)n) {
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return -1;
+    }
+    hipError_t hr = launch_occluded(e, s, (const uint32_t *)rays->ptr,
+                                    (uint8_t *)occluded->ptr, n);
+    if (hr != hipSuccess) {
+        hip_set_err_hip(e, "k_occluded launch (device)", hr);
+        if (err) *err = LRT_RESULT_NOT_BUILT;
+        return -1;
+    }
+    if ((hr = hipStreamSynchronize(e->stream)) != hipSuccess) {
+        hip_set_err_hip(e, "hipStreamSynchronize", hr);
+        if (err) *err = LRT_RESULT_NOT_BUILT;
+        return -1;
+    }
+    if (err) *err = LRT_RESULT_OK;
+    return 0;
+}
+
+extern "C" int lrt_hip_scene_refit_device(lrt_hip_engine *e, lrt_hip_scene *s,
+                                          const lrt_hip_dbuffer *vertices,
+                                          uint32_t ntris, lrt_result *err) {
+    if (!e || !s || !vertices || ntris == 0 ||
+        vertices->size < (size_t)ntris * 9u * sizeof(float)) {
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return -1;
+    }
+    refit_core(e, s, (const float *)vertices->ptr, ntris);
+    hipError_t hr = hipStreamSynchronize(e->stream);
+    if (hr != hipSuccess) {
+        hip_set_err_hip(e, "hipStreamSynchronize(refit_device)", hr);
+        if (err) *err = LRT_RESULT_NOT_BUILT;
+        return -1;
+    }
     if (err) *err = LRT_RESULT_OK;
     return 0;
 }

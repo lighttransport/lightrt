@@ -205,6 +205,55 @@ lrt_hip_scene *lrt_hip_scene_build_gpu(lrt_hip_engine *e, const float *vertices,
 /* 1 if the full-GPU LBVH builder was compiled in (hipCUB present). */
 int lrt_hip_have_gpu_build(void);
 
+/* --- Fully GPU-resident dynamic pipeline (no per-frame PCIe readback) ------
+ *
+ * For dynamic scenes / motion blur, keep vertices, rays and hits in device
+ * memory across frames: build (or refit) the BVH, generate rays, and intersect
+ * entirely on the GPU, with nothing copied back to the host per frame. The
+ * builds above (lrt_hip_scene_build_gpu) and refit compute base/scale on-device
+ * with no D2H. Use lrt_hip_dbuffer for resident vertex/ray/hit buffers; the
+ * *_device queries below take and produce those device buffers directly.
+ * Explicit upload/download are provided only for setup / final present / debug. */
+typedef struct lrt_hip_dbuffer lrt_hip_dbuffer;
+
+lrt_hip_dbuffer *lrt_hip_dbuffer_alloc(lrt_hip_engine *e, size_t bytes,
+                                       lrt_result *err);
+void lrt_hip_dbuffer_free(lrt_hip_engine *e, lrt_hip_dbuffer *b);
+void *lrt_hip_dbuffer_ptr(lrt_hip_dbuffer *b);   /* raw device pointer */
+size_t lrt_hip_dbuffer_size(const lrt_hip_dbuffer *b);
+int lrt_hip_dbuffer_upload(lrt_hip_engine *e, lrt_hip_dbuffer *b,
+                           const void *src, size_t bytes, lrt_result *err);
+int lrt_hip_dbuffer_download(lrt_hip_engine *e, const lrt_hip_dbuffer *b,
+                             void *dst, size_t bytes, lrt_result *err);
+
+/* Generate pinhole-camera primary rays directly into a device ray buffer (n =
+ * width*height lrt_rays). The ray (x,y) is origin -> lower_left + sx*horizontal
+ * + sy*vertical with sx=(x+0.5)/width, sy=(y+0.5)/height (dir not normalized).
+ * No host data crosses PCIe. */
+int lrt_hip_raygen_camera(lrt_hip_engine *e, lrt_hip_dbuffer *rays,
+                          uint32_t width, uint32_t height,
+                          const float origin[3], const float lower_left[3],
+                          const float horizontal[3], const float vertical[3],
+                          float tmin, float tmax, lrt_result *err);
+
+/* Trace / occlude device rays -> device hits. No PCIe readback; results stay on
+ * the GPU (for shading / further passes). Returns 0 on success, -1 on error. */
+int lrt_hip_scene_trace_device(lrt_hip_engine *e, lrt_hip_scene *s,
+                               const lrt_hip_dbuffer *rays, uint32_t n,
+                               lrt_hip_dbuffer *hits, lrt_result *err);
+int lrt_hip_scene_occluded_device(lrt_hip_engine *e, lrt_hip_scene *s,
+                                  const lrt_hip_dbuffer *rays, uint32_t n,
+                                  lrt_hip_dbuffer *occluded, lrt_result *err);
+
+/* Refit / full-GPU build from a DEVICE vertex buffer (9*ntris floats already on
+ * the GPU) — no per-frame H2D for animated geometry. */
+int lrt_hip_scene_refit_device(lrt_hip_engine *e, lrt_hip_scene *s,
+                               const lrt_hip_dbuffer *vertices, uint32_t ntris,
+                               lrt_result *err);
+lrt_hip_scene *lrt_hip_scene_build_gpu_device(lrt_hip_engine *e,
+                                              const lrt_hip_dbuffer *vertices,
+                                              uint32_t ntris, lrt_result *err);
+
 #ifdef __cplusplus
 }
 #endif

@@ -277,6 +277,84 @@ static void test_gpu_build(lrt_hip_engine *e, const char *label,
     lrt_tri_scene_free(cpu);
 }
 
+/* Fully GPU-resident dynamic pipeline: device vertex buffer -> GPU build ->
+ * GPU raygen -> device trace, with a single download at the end to verify. */
+static void test_device_pipeline(lrt_hip_engine *e, const float *verts,
+                                 size_t ntris) {
+    if (!lrt_hip_have_gpu_build()) {
+        printf("== GPU-resident pipeline: hipCUB absent, skipping\n");
+        return;
+    }
+    uint32_t W = 256, H = 256;
+    uint32_t n = W * H;
+
+    /* Resident buffers. */
+    lrt_hip_dbuffer *dverts =
+        lrt_hip_dbuffer_alloc(e, ntris * 9 * sizeof(float), NULL);
+    lrt_hip_dbuffer *drays = lrt_hip_dbuffer_alloc(e, n * sizeof(lrt_ray), NULL);
+    lrt_hip_dbuffer *dhits = lrt_hip_dbuffer_alloc(e, n * sizeof(lrt_hit), NULL);
+    CHECK(dverts && drays && dhits, "dbuffer alloc failed");
+    if (!dverts || !drays || !dhits) return;
+    lrt_hip_dbuffer_upload(e, dverts, verts, ntris * 9 * sizeof(float), NULL);
+
+    /* GPU build from the device vertex buffer (no H2D/D2H). */
+    lrt_hip_scene *gs =
+        lrt_hip_scene_build_gpu_device(e, dverts, (uint32_t)ntris, NULL);
+    CHECK(gs != NULL, "build_gpu_device failed: %s",
+          lrt_hip_engine_last_error(e));
+    if (!gs) return;
+
+    /* Camera that frames the [-2,2]^3 scene. */
+    float origin[3] = {5, 5, 5};
+    float ll[3] = {-3.5f, -3.5f, -3.5f};
+    float horiz[3] = {7, 0, 0};
+    float vert[3] = {0, 7, 0};
+    lrt_hip_raygen_camera(e, drays, W, H, origin, ll, horiz, vert, 1e-4f, 1e9f,
+                          NULL);
+    int tr = lrt_hip_scene_trace_device(e, gs, drays, n, dhits, NULL);
+    CHECK(tr == 0, "trace_device failed: %s", lrt_hip_engine_last_error(e));
+
+    /* Single download to verify against a CPU re-trace of the same rays. */
+    lrt_ray *hrays = (lrt_ray *)malloc(n * sizeof(lrt_ray));
+    lrt_hit *hhits = (lrt_hit *)malloc(n * sizeof(lrt_hit));
+    lrt_hip_dbuffer_download(e, drays, hrays, n * sizeof(lrt_ray), NULL);
+    lrt_hip_dbuffer_download(e, dhits, hhits, n * sizeof(lrt_hit), NULL);
+
+    lrt_tri_build_options opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.quality = LRT_TRI_BUILD_DEFAULT;
+    opts.layout = LRT_TRI_LAYOUT_BVH8;
+    opts.num_threads = 1;
+    lrt_tri_scene *cpu = lrt_tri_scene_build(verts, ntris, &opts, NULL);
+    size_t agree = 0, hits = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        lrt_hit c;
+        int ch = lrt_tri_intersect1(cpu, &hrays[i], &c);
+        int g = hhits[i].prim_id != LRT_TRI_NO_HIT;
+        if (g) hits++;
+        if (ch == g && (!ch || c.prim_id == hhits[i].prim_id))
+            agree++;
+        else if (ch && g) {
+            double rel = fabs((double)hhits[i].t - c.t) / (1.0 + fabs(c.t));
+            if (rel < 1e-4) agree++;
+        }
+    }
+    double frac = (double)agree / (double)n;
+    printf("== GPU-resident pipeline (raygen+build+trace on device) ==\n");
+    printf("  %ux%u rays hit_frac=%.3f  device-vs-CPU agree %.4f%%\n", W, H,
+           (double)hits / n, frac * 100.0);
+    CHECK(frac >= 0.999, "device pipeline agreement %.4f%% < 99.9%%",
+          frac * 100.0);
+
+    free(hrays);
+    free(hhits);
+    lrt_tri_scene_free(cpu);
+    lrt_hip_scene_free(e, gs);
+    lrt_hip_dbuffer_free(e, dverts);
+    lrt_hip_dbuffer_free(e, drays);
+    lrt_hip_dbuffer_free(e, dhits);
+}
+
 /* Phase 2: WMMA leaf intersection. Verify scalar GPU leaf kernel matches a CPU
  * brute force exactly, and that the low-precision WMMA methods agree with the
  * scalar method above their expected thresholds (fp16 > bf16/int8). */
@@ -546,6 +624,8 @@ int main(void) {
     printf("== GPU refit (animation) vs CPU refit ==\n");
     test_refit(e, "refit/BVH4", soup, ntris, LRT_TRI_LAYOUT_BVH4, 20000);
     test_refit(e, "refit/BVH8", grid, grid_n, LRT_TRI_LAYOUT_BVH8, 20000);
+
+    test_device_pipeline(e, soup, ntris);
 
     test_wmma(e);
 

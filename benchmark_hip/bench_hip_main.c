@@ -215,6 +215,126 @@ static int run_leaf_bench(uint32_t nblocks, uint32_t T, int iters) {
     return 0;
 }
 
+/* ---- Dynamic frame loop: fully GPU-resident, zero per-frame PCIe ---------- */
+/* Per frame: GPU camera raygen + GPU trace (and optionally a full GPU rebuild
+ * or refit), all on device buffers. The ONLY host<->device traffic is the
+ * one-time vertex upload and a single final hit download for a sanity check. */
+static int run_dynamic_bench(const char *scene, size_t want_tris, int frames) {
+    lrt_result er = LRT_RESULT_OK;
+    lrt_hip_engine *e = lrt_hip_engine_create(NULL, &er);
+    if (!e) {
+        printf("(no HIP device; skipping dynamic bench)\n");
+        return 0;
+    }
+    if (!lrt_hip_have_gpu_build()) {
+        printf("(hipCUB absent; dynamic full-GPU build unavailable)\n");
+        return 0;
+    }
+    size_t ntris = 0;
+    float *verts = gen_scene(scene, want_tris, &ntris);
+    if (!verts) return 1;
+    uint32_t W = 1280, H = 720, n = W * H;
+    printf("dynamic loop: scene=%s ntris=%zu res=%ux%u frames=%d "
+           "(zero per-frame PCIe)\n", scene, ntris, W, H, frames);
+
+    lrt_hip_dbuffer *dv = lrt_hip_dbuffer_alloc(e, ntris * 9 * sizeof(float), NULL);
+    lrt_hip_dbuffer *dr = lrt_hip_dbuffer_alloc(e, (size_t)n * sizeof(lrt_ray), NULL);
+    lrt_hip_dbuffer *dh = lrt_hip_dbuffer_alloc(e, (size_t)n * sizeof(lrt_hit), NULL);
+    lrt_hip_dbuffer_upload(e, dv, verts, ntris * 9 * sizeof(float), NULL); /* once */
+
+    /* Per-frame orbiting look-at camera (12 floats computed host-side; no PCIE). */
+#define SET_CAM(f)                                                            \
+    float org[3], ll[3], hz[3], vt[3];                                        \
+    do {                                                                      \
+        float a = 6.2831853f * (f) / frames;                                  \
+        float r = 3.2f;                                                       \
+        org[0] = r * cosf(a); org[1] = 1.2f; org[2] = r * sinf(a);            \
+        float fwd[3] = {-org[0], -org[1], -org[2]};                           \
+        float fl = sqrtf(fwd[0]*fwd[0]+fwd[1]*fwd[1]+fwd[2]*fwd[2]);          \
+        for (int k = 0; k < 3; k++) fwd[k] /= fl;                             \
+        float up[3] = {0, 1, 0};                                              \
+        float rt[3] = {fwd[1]*up[2]-fwd[2]*up[1], fwd[2]*up[0]-fwd[0]*up[2],  \
+                       fwd[0]*up[1]-fwd[1]*up[0]};                            \
+        float rl = sqrtf(rt[0]*rt[0]+rt[1]*rt[1]+rt[2]*rt[2]);               \
+        for (int k = 0; k < 3; k++) rt[k] /= rl;                             \
+        float uv[3] = {rt[1]*fwd[2]-rt[2]*fwd[1], rt[2]*fwd[0]-rt[0]*fwd[2],  \
+                       rt[0]*fwd[1]-rt[1]*fwd[0]};                            \
+        float hh2 = 0.5f, hw2 = hh2 * (float)W / (float)H;                    \
+        for (int k = 0; k < 3; k++) {                                         \
+            ll[k] = org[k] + fwd[k] - hw2 * rt[k] - hh2 * uv[k];              \
+            hz[k] = 2 * hw2 * rt[k];                                          \
+            vt[k] = 2 * hh2 * uv[k];                                          \
+        }                                                                     \
+    } while (0)
+
+    /* (a) static topology: raygen + trace each frame (full GPU binary tree). */
+    lrt_hip_scene *gs = lrt_hip_scene_build_gpu_device(e, dv, (uint32_t)ntris, NULL);
+    uint64_t t0 = bench_time_ns();
+    for (int f = 0; f < frames; f++) {
+        SET_CAM(f);
+        lrt_hip_raygen_camera(e, dr, W, H, org, ll, hz, vt, 1e-4f, 1e9f, NULL);
+        lrt_hip_scene_trace_device(e, gs, dr, n, dh, NULL);
+    }
+    uint64_t t1 = bench_time_ns();
+    double fps_rt = frames / bench_ns_to_s(t1 - t0);
+    lrt_hip_scene_free(e, gs);
+
+    /* (b) deforming geometry: refit a resident (shallow) BVH8 + raygen + trace.
+     * Refit suits the collapsed SAH tree (depth ~20); the GPU binary tree is
+     * depth ~64, for which a full rebuild (c) is the better dynamic path. */
+    lrt_tri_build_options o8;
+    memset(&o8, 0, sizeof(o8));
+    o8.quality = LRT_TRI_BUILD_DEFAULT;
+    o8.layout = LRT_TRI_LAYOUT_BVH8;
+    o8.num_threads = 1;
+    lrt_tri_scene *cpu8 = lrt_tri_scene_build(verts, ntris, &o8, NULL);
+    lrt_hip_scene *res8 = lrt_hip_scene_upload(e, cpu8, NULL); /* one-time */
+    t0 = bench_time_ns();
+    for (int f = 0; f < frames; f++) {
+        SET_CAM(f);
+        lrt_hip_scene_refit_device(e, res8, dv, (uint32_t)ntris, NULL);
+        lrt_hip_raygen_camera(e, dr, W, H, org, ll, hz, vt, 1e-4f, 1e9f, NULL);
+        lrt_hip_scene_trace_device(e, res8, dr, n, dh, NULL);
+    }
+    t1 = bench_time_ns();
+    double fps_refit = frames / bench_ns_to_s(t1 - t0);
+    lrt_hip_scene_free(e, res8);
+    lrt_tri_scene_free(cpu8);
+
+    /* (c) topology-changing: full GPU rebuild + raygen + trace each frame. */
+    t0 = bench_time_ns();
+    for (int f = 0; f < frames; f++) {
+        SET_CAM(f);
+        lrt_hip_scene *g = lrt_hip_scene_build_gpu_device(e, dv, (uint32_t)ntris, NULL);
+        lrt_hip_raygen_camera(e, dr, W, H, org, ll, hz, vt, 1e-4f, 1e9f, NULL);
+        lrt_hip_scene_trace_device(e, g, dr, n, dh, NULL);
+        lrt_hip_scene_free(e, g);
+    }
+    t1 = bench_time_ns();
+    double fps_rebuild = frames / bench_ns_to_s(t1 - t0);
+#undef SET_CAM
+
+    /* single final download (sanity). */
+    lrt_hit *hh = (lrt_hit *)malloc((size_t)n * sizeof(lrt_hit));
+    lrt_hip_dbuffer_download(e, dh, hh, (size_t)n * sizeof(lrt_hit), NULL);
+    size_t hits = 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (hh[i].prim_id != LRT_TRI_NO_HIT) hits++;
+
+    printf("  raygen+trace            : %7.1f fps\n", fps_rt);
+    printf("  refit+raygen+trace      : %7.1f fps  (deforming mesh)\n", fps_refit);
+    printf("  rebuild+raygen+trace    : %7.1f fps  (topology change)\n", fps_rebuild);
+    printf("  last-frame hit_frac=%.3f (single download)\n", (double)hits / n);
+
+    free(hh);
+    free(verts);
+    lrt_hip_dbuffer_free(e, dv);
+    lrt_hip_dbuffer_free(e, dr);
+    lrt_hip_dbuffer_free(e, dh);
+    lrt_hip_engine_destroy(e);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *scene = "mandelbulb";
     size_t want_tris = 200000;
@@ -222,12 +342,16 @@ int main(int argc, char **argv) {
     int iters = 5;
     int do_cpu = 1, do_fp32 = 1, do_build = 1, do_gpubuild = 1;
     int have_backend_filter = 0;
-    int leaf_mode = 0;
+    int leaf_mode = 0, dynamic_mode = 0, frames = 120;
     uint32_t leaf_blocks = 262144, leaf_tris = 8;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--leaf")) {
             leaf_mode = 1;
+        } else if (!strcmp(argv[i], "--dynamic")) {
+            dynamic_mode = 1;
+        } else if (!strcmp(argv[i], "--frames") && i + 1 < argc) {
+            frames = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--leaf-blocks") && i + 1 < argc) {
             leaf_blocks = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--leaf-tris") && i + 1 < argc) {
@@ -260,6 +384,7 @@ int main(int argc, char **argv) {
     (void)have_backend_filter;
 
     if (leaf_mode) return run_leaf_bench(leaf_blocks, leaf_tris, iters);
+    if (dynamic_mode) return run_dynamic_bench(scene, want_tris, frames);
 
     size_t ntris = 0;
     float *verts = gen_scene(scene, want_tris, &ntris);

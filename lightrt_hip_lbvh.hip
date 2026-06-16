@@ -113,15 +113,34 @@ __global__ void kl_cen_aabb(const float *__restrict__ cen, uint32_t ntris,
     }
 }
 
+/* Initialize the 6-float AABB accumulator to +/-inf (avoids a host upload). */
+__global__ void kl_init6(float *__restrict__ aabb) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        aabb[0] = aabb[1] = aabb[2] = 1e30f;
+        aabb[3] = aabb[4] = aabb[5] = -1e30f;
+    }
+}
+
+/* Derive Morton base/scale (1024^3 grid) from the centroid AABB, on-device. */
+__global__ void kl_basescale(const float *__restrict__ aabb,
+                             float *__restrict__ bs /* base[3], scale[3] */) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        for (int a = 0; a < 3; a++) {
+            float ext = aabb[3 + a] - aabb[a];
+            bs[a] = aabb[a];
+            bs[3 + a] = ext > 0.0f ? 1024.0f / ext : 0.0f;
+        }
+    }
+}
+
 /* 64-bit keys = (morton30 << 32) | tri_index, guaranteeing uniqueness. */
 __global__ void kl_keys(const float *__restrict__ cen, uint32_t ntris,
-                        float base0, float base1, float base2, float scale0,
-                        float scale1, float scale2,
+                        const float *__restrict__ bs,
                         uint64_t *__restrict__ keys) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= ntris) return;
-    float base[3] = {base0, base1, base2};
-    float scale[3] = {scale0, scale1, scale2};
+    float base[3] = {bs[0], bs[1], bs[2]};
+    float scale[3] = {bs[3], bs[4], bs[5]};
     uint32_t q[3];
     for (int a = 0; a < 3; a++) {
         float fv = (cen[i * 3u + a] - base[a]) * scale[a];
@@ -327,48 +346,41 @@ extern "C" int lrt_hip_have_gpu_build(void) { return 1; }
 
 #define GRID(n) dim3(((n) + 255u) / 256u), dim3(256), 0, stream
 
-extern "C" lrt_hip_scene *lrt_hip_scene_build_gpu(lrt_hip_engine *e,
-                                                  const float *vertices,
-                                                  uint32_t ntris,
-                                                  lrt_result *err) {
-    if (!e || !vertices || ntris == 0) {
-        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
-        return NULL;
-    }
+/* Core builder over a DEVICE vertex buffer (caller owns d_verts). No host
+ * readback: base/scale are derived on-device (kl_init6 + kl_cen_aabb +
+ * kl_basescale), so the whole build stays GPU-resident. */
+static lrt_hip_scene *build_gpu_core(lrt_hip_engine *e, const float *d_verts,
+                                     uint32_t ntris, lrt_result *err) {
     hipStream_t stream = (hipStream_t)lrt_hip_engine_stream_(e);
-    const uint32_t W = 4u;
     const uint32_t node_stride_b = 128u; /* BVH4 node bytes */
     const uint32_t block_stride_b = 160u;
-    const uint32_t node_stride_w = 8u * W;
-    const uint32_t block_stride_w = 10u * W;
 
     /* Device scratch + outputs. */
-    float *d_verts = NULL, *d_cen = NULL;
+    float *d_cen = NULL;
     uint64_t *d_keys = NULL, *d_keys2 = NULL;
     uint32_t *d_childA = NULL, *d_childB = NULL, *d_parInt = NULL,
              *d_parLeaf = NULL, *d_flags = NULL;
     float *d_leafLo = NULL, *d_leafHi = NULL, *d_intLo = NULL, *d_intHi = NULL,
-          *d_aabb = NULL;
+          *d_aabb = NULL, *d_bs = NULL;
     uint32_t *d_nodes = NULL, *d_blocks = NULL;
     void *d_tmp = NULL;
     lrt_hip_scene *scene = NULL;
     hipError_t hr;
     uint32_t ninternal = (ntris >= 1u) ? (ntris - 1u) : 0u;
 
-    size_t vbytes = (size_t)ntris * 9u * sizeof(float);
     size_t nodes_bytes = (size_t)(ninternal ? ninternal : 1u) * node_stride_b;
     size_t blocks_bytes = (size_t)ntris * block_stride_b;
 
-#define ALLOC(p, bytes)                                       \
+#define ALLOC(p, bytes)                                          \
     if ((hr = hipMalloc((void **)&(p), (bytes))) != hipSuccess) { \
-        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;             \
-        goto done;                                            \
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;                \
+        goto done;                                               \
     }
-    ALLOC(d_verts, vbytes);
     ALLOC(d_cen, (size_t)ntris * 3u * sizeof(float));
     ALLOC(d_keys, (size_t)ntris * sizeof(uint64_t));
     ALLOC(d_keys2, (size_t)ntris * sizeof(uint64_t));
     ALLOC(d_aabb, 6u * sizeof(float));
+    ALLOC(d_bs, 6u * sizeof(float));
     ALLOC(d_nodes, nodes_bytes);
     ALLOC(d_blocks, blocks_bytes);
     if (ninternal) {
@@ -383,12 +395,6 @@ extern "C" lrt_hip_scene *lrt_hip_scene_build_gpu(lrt_hip_engine *e,
     ALLOC(d_leafLo, (size_t)ntris * 3u * sizeof(float));
     ALLOC(d_leafHi, (size_t)ntris * 3u * sizeof(float));
 #undef ALLOC
-
-    if ((hr = hipMemcpyAsync(d_verts, vertices, vbytes, hipMemcpyHostToDevice,
-                             stream)) != hipSuccess) {
-        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
-        goto done;
-    }
 
     /* Single-triangle scene: one leaf block (prim 0), root is a leaf ref. */
     if (ntris == 1u) {
@@ -412,31 +418,14 @@ extern "C" lrt_hip_scene *lrt_hip_scene_build_gpu(lrt_hip_engine *e,
         goto done;
     }
 
-    /* 1. centroids + centroid AABB. */
+    /* 1. centroids + centroid AABB + base/scale, all on-device (no readback). */
     hipLaunchKernelGGL(kl_centroids, GRID(ntris), d_verts, d_cen, ntris);
-    {
-        float init[6] = {1e30f, 1e30f, 1e30f, -1e30f, -1e30f, -1e30f};
-        HIPV(hipMemcpyAsync(d_aabb, init, sizeof(init), hipMemcpyHostToDevice,
-                       stream));
-    }
+    hipLaunchKernelGGL(kl_init6, dim3(1), dim3(1), 0, stream, d_aabb);
     hipLaunchKernelGGL(kl_cen_aabb, GRID(ntris), d_cen, ntris, d_aabb);
-    float aabb[6];
-    if (hipMemcpyAsync(aabb, d_aabb, sizeof(aabb), hipMemcpyDeviceToHost,
-                       stream) != hipSuccess ||
-        hipStreamSynchronize(stream) != hipSuccess) {
-        if (err) *err = LRT_RESULT_NOT_BUILT;
-        goto done;
-    }
-    float base[3], scale[3];
-    for (int a = 0; a < 3; a++) {
-        float ext = aabb[3 + a] - aabb[a];
-        base[a] = aabb[a];
-        scale[a] = ext > 0.0f ? 1024.0f / ext : 0.0f;
-    }
+    hipLaunchKernelGGL(kl_basescale, dim3(1), dim3(1), 0, stream, d_aabb, d_bs);
 
     /* 2. keys + radix sort. */
-    hipLaunchKernelGGL(kl_keys, GRID(ntris), d_cen, ntris, base[0], base[1],
-                       base[2], scale[0], scale[1], scale[2], d_keys);
+    hipLaunchKernelGGL(kl_keys, GRID(ntris), d_cen, ntris, d_bs, d_keys);
     {
         size_t tmp_bytes = 0;
         HIPV(hipcub::DeviceRadixSort::SortKeys(NULL, tmp_bytes, d_keys, d_keys2,
@@ -488,11 +477,11 @@ extern "C" lrt_hip_scene *lrt_hip_scene_build_gpu(lrt_hip_engine *e,
     }
 
 done:
-    hip_free_l(d_verts);
     hip_free_l(d_cen);
     hip_free_l(d_keys);
     hip_free_l(d_keys2);
     hip_free_l(d_aabb);
+    hip_free_l(d_bs);
     hip_free_l(d_childA);
     hip_free_l(d_childB);
     hip_free_l(d_parInt);
@@ -508,6 +497,49 @@ done:
     return scene;
 }
 
+/* Host-vertex entry: upload the soup once (input H2D, not a per-frame readback)
+ * then build entirely on the GPU. */
+extern "C" lrt_hip_scene *lrt_hip_scene_build_gpu(lrt_hip_engine *e,
+                                                  const float *vertices,
+                                                  uint32_t ntris,
+                                                  lrt_result *err) {
+    if (!e || !vertices || ntris == 0) {
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return NULL;
+    }
+    hipStream_t stream = (hipStream_t)lrt_hip_engine_stream_(e);
+    size_t vbytes = (size_t)ntris * 9u * sizeof(float);
+    float *d_verts = NULL;
+    if (hipMalloc((void **)&d_verts, vbytes) != hipSuccess) {
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return NULL;
+    }
+    if (hipMemcpyAsync(d_verts, vertices, vbytes, hipMemcpyHostToDevice,
+                       stream) != hipSuccess) {
+        hip_free_l(d_verts);
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return NULL;
+    }
+    lrt_hip_scene *scene = build_gpu_core(e, d_verts, ntris, err);
+    hip_free_l(d_verts);
+    return scene;
+}
+
+/* Device-vertex entry: vertices already resident (animated on the GPU). No H2D
+ * and no D2H — the whole build is GPU-resident. */
+extern "C" lrt_hip_scene *lrt_hip_scene_build_gpu_device(
+    lrt_hip_engine *e, const lrt_hip_dbuffer *vertices, uint32_t ntris,
+    lrt_result *err) {
+    if (!e || !vertices || ntris == 0 ||
+        lrt_hip_dbuffer_size(vertices) < (size_t)ntris * 9u * sizeof(float)) {
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return NULL;
+    }
+    const float *d_verts =
+        (const float *)lrt_hip_dbuffer_ptr((lrt_hip_dbuffer *)vertices);
+    return build_gpu_core(e, d_verts, ntris, err);
+}
+
 #else /* !LIGHTRT_HIP_HAVE_HIPCUB */
 
 extern "C" int lrt_hip_have_gpu_build(void) { return 0; }
@@ -516,6 +548,16 @@ extern "C" lrt_hip_scene *lrt_hip_scene_build_gpu(lrt_hip_engine *e,
                                                   const float *vertices,
                                                   uint32_t ntris,
                                                   lrt_result *err) {
+    (void)e;
+    (void)vertices;
+    (void)ntris;
+    if (err) *err = LRT_RESULT_NOT_BUILT;
+    return NULL;
+}
+
+extern "C" lrt_hip_scene *lrt_hip_scene_build_gpu_device(
+    lrt_hip_engine *e, const lrt_hip_dbuffer *vertices, uint32_t ntris,
+    lrt_result *err) {
     (void)e;
     (void)vertices;
     (void)ntris;
