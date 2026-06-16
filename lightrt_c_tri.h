@@ -420,6 +420,26 @@ lrt_result lrt_tri_surface_normal(const lrt_tri_scene *s, uint32_t prim_id,
                                   float Ng_out[3], float dPdu_out[3],
                                   float dPdv_out[3]);
 
+/* Post-hit centerline frame for the LINEAR curve primitives (round-linear and
+ * flat/ribbon). Given a hit's prim_id (segment index) and u in [0,1] along that
+ * segment, returns the centerline point C(u), the (unnormalized) tangent
+ * T = dC/du, and the interpolated radius r(u). Any output pointer may be NULL.
+ *
+ * A curve carries no single normal; the caller forms the surface shading normal
+ * from its own hit point P (= ray.org + t*ray.dir) by removing the tangential
+ * component of the radial vector:
+ *     d  = P - C;  Ng = normalize(d - (dot(d,T)/dot(T,T)) * T);
+ *
+ * The cubic-Bezier curve type is NOT served: it pre-subdivides at build time
+ * and reports u local to the (unrecorded) sub-arc, so a global segment
+ * parameter cannot be reconstructed (returns LRT_RESULT_INVALID_ARGUMENT).
+ *
+ * Returns LRT_RESULT_OK; LRT_RESULT_INVALID_ARGUMENT (NULL scene, prim_id out
+ * of range, or an unsupported scene kind); LRT_RESULT_UNSUPPORTED for a
+ * deserialized or mmapped scene (curve scenes do not serialize). Thread-safe. */
+lrt_result lrt_tri_curve_frame(const lrt_tri_scene *s, uint32_t prim_id, float u,
+                               float C_out[3], float T_out[3], float *r_out);
+
 /* Direct access to a scene's resident node/block buffers + metadata, for GPU
  * backends that upload in-memory scenes without the LRTS serialization round
  * trip (needed for trimmed NURBS, whose trim loops are not in the v1 blob).

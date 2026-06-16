@@ -9605,6 +9605,24 @@ lrt_tri_scene *lrt_curve_scene_build(const float *segments, const float *radii,
     return s;
 }
 
+/* Retain per-segment centerline endpoints + radii (p0 r0 p1 r1, stride 8) for
+ * the post-hit curve-frame query. segs is indexed by prim_id (== write order).
+ * Shared by the round-linear and flat (ribbon) builders. */
+static void tri_retain_linear_curve(lrt_tri_scene *s, const tri_rlcseg *segs,
+                                    size_t nseg) {
+    float *d = (float *)malloc(nseg * 8 * sizeof(float));
+    if (!d) return; /* leave shade data absent -> query reports UNSUPPORTED */
+    for (size_t i = 0; i < nseg; i++) {
+        const tri_rlcseg *rs = &segs[i];
+        float *o = &d[i * 8];
+        o[0] = rs->p0[0]; o[1] = rs->p0[1]; o[2] = rs->p0[2]; o[3] = rs->r0;
+        o[4] = rs->p1[0]; o[5] = rs->p1[1]; o[6] = rs->p1[2]; o[7] = rs->r1;
+    }
+    s->shade_cps = d;
+    s->shade_nprims = (uint32_t)nseg;
+    s->shade_stride = 8;
+}
+
 /* Round-linear (Embree-style) hair scene: one tapered-cone segment per pair of
  * consecutive strand points, capped by end spheres, with CSG joint clipping
  * against the strand neighbors. No sub-segment subdivision (segments are short);
@@ -9809,6 +9827,7 @@ lrt_tri_scene *lrt_roundcurve_scene_build(const lrt_hair_strands *strands,
         }
     }
 
+    if (!bc.failed && s) tri_retain_linear_curve(s, segs, nseg);
     free(segs);
     free(bc.plo);
     free(bc.phi);
@@ -9969,6 +9988,7 @@ lrt_tri_scene *lrt_flatcurve_scene_build(const lrt_hair_strands *strands,
         }
     }
     tri_free_aabb_scratch(&bc);
+    if (!bc.failed && s) tri_retain_linear_curve(s, segs, nseg);
     free(segs);
     if (bc.failed) {
         lrt_tri_scene_free(s);
@@ -10093,6 +10113,10 @@ lrt_tri_scene *lrt_bezcurve_scene_build(const float *cps, size_t nseg,
         tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
         return NULL;
     }
+    /* No curve-frame data: the build pre-subdivides each cubic into sub-arcs and
+     * the reported hit u is local to the (unrecorded) sub-arc, so a global
+     * segment parameter cannot be reconstructed -> lrt_tri_curve_frame rejects
+     * BEZCURVE scenes. */
 #if LRT_TRI_HAS_SSE4
     s->kernel_name = "bezcurve-bvh4/sse4";
 #else
@@ -10865,6 +10889,39 @@ lrt_result lrt_tri_surface_normal(const lrt_tri_scene *s, uint32_t prim_id,
         Ng_out[1] = dPdu[2] * dPdv[0] - dPdu[0] * dPdv[2];
         Ng_out[2] = dPdu[0] * dPdv[1] - dPdu[1] * dPdv[0];
     }
+    return LRT_RESULT_OK;
+}
+
+lrt_result lrt_tri_curve_frame(const lrt_tri_scene *s, uint32_t prim_id, float u,
+                               float C_out[3], float T_out[3], float *r_out) {
+    if (!s) return LRT_RESULT_INVALID_ARGUMENT;
+    int k = s->prim_kind;
+    /* Only the linear curves report a clean global segment parameter u. The
+     * cubic-Bezier path pre-subdivides at build time and reports u local to the
+     * unrecorded sub-arc, so it cannot be reconstructed here. */
+    if (k != TRI_PRIM_RLCURVE && k != TRI_PRIM_FLATCURVE)
+        return LRT_RESULT_INVALID_ARGUMENT;
+    if (!s->shade_cps) return LRT_RESULT_UNSUPPORTED;
+    if (prim_id >= s->shade_nprims) return LRT_RESULT_INVALID_ARGUMENT;
+
+    /* linear segment (stride 8: p0[3] r0 p1[3] r1): C/r interpolate p0->p1, the
+     * tangent is the chord. */
+    const float *cp = &s->shade_cps[(size_t)prim_id * s->shade_stride];
+    const float *p0 = cp, *p1 = cp + 4;
+    float r0 = cp[3], r1 = cp[7];
+    float C[3], T[3], r;
+    for (int a = 0; a < 3; a++) {
+        C[a] = p0[a] + u * (p1[a] - p0[a]);
+        T[a] = p1[a] - p0[a];
+    }
+    r = r0 + u * (r1 - r0);
+    if (C_out) {
+        C_out[0] = C[0]; C_out[1] = C[1]; C_out[2] = C[2];
+    }
+    if (T_out) {
+        T_out[0] = T[0]; T_out[1] = T[1]; T_out[2] = T[2];
+    }
+    if (r_out) *r_out = r;
     return LRT_RESULT_OK;
 }
 

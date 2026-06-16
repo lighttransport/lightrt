@@ -805,6 +805,19 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
 - Coherent ray packets `lrt_tri_intersect4/8`, `lrt_tri_occluded4/8`.
 - Filtered any-hit `lrt_tri_occluded1_filtered` (alpha-tested shadows).
 
+### Post-hit shading data (CPU; geometry-aware)
+- `lrt_tri_surface_normal` — parametric SURFACE point / geometric normal (`Ng =
+  cross(dP/du, dP/dv)`) / tangents from a hit's `(prim_id, u, v)`. See the
+  parametric-surfaces section.
+- `lrt_tri_curve_frame` — LINEAR curve (round-linear / flat) centerline point
+  `C(u)`, tangent `T = dC/du`, and radius `r(u)` from a hit's `(prim_id, u)`; the
+  caller forms the shading normal by removing the tangential part of `P - C`. The
+  scene retains per-segment `p0 r0 p1 r1` (cheap). Cubic-Bezier curves are *not*
+  served — the build pre-subdivides each cubic and the reported `u` is local to
+  the unrecorded sub-arc, so a global segment parameter can't be reconstructed
+  (`INVALID_ARGUMENT`). Both queries are CPU-side and not part of the LRTS blob
+  (deserialized/mmap scene → `LRT_RESULT_UNSUPPORTED`).
+
 ### Production
 - Serialization: `lrt_tri_scene_save[_to_memory]` / `load[_from_memory]`, plus
   zero-copy `lrt_tri_scene_open_mmap` (validates every child ref on load).

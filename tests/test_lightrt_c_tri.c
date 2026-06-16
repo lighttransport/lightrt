@@ -2289,6 +2289,128 @@ static void test_bezcurve_scene(void) {
  * origin is inside the sphere -> far root), an oriented-disc edge-on miss, and
  * tmin/tmax/occluded clipping. The random hair-like scenes never reliably reach
  * these (every interior segment there has two neighbors and varying radii). */
+/* ----- post-hit curve frame (lrt_tri_curve_frame) ---------------------------
+ * For each hit, queries the centerline frame C/T/r at (prim_id, u) and checks
+ * the hit point's perpendicular distance to the axis is within the swept radius
+ * r(u) (the cone/ribbon surface sits at ~r, joint end-caps slightly inside).
+ * Also verifies the reconstructed shading normal is orthogonal to the tangent. */
+static void curve_frame_check(lrt_tri_scene *s, const char *label) {
+    enum { NR = 30000 };
+    size_t hits = 0, dist_ok = 0, perp_ok = 0;
+    for (int i = 0; i < NR; i++) {
+        lrt_ray r;
+        make_random_ray(&r);
+        lrt_hit h;
+        if (!lrt_tri_intersect1(s, &r, &h)) continue;
+        hits++;
+        float C[3], T[3], rad;
+        lrt_result q = lrt_tri_curve_frame(s, h.prim_id, h.u, C, T, &rad);
+        CHECK(q == LRT_RESULT_OK, "%s: curve_frame err=%d", label, (int)q);
+        if (q != LRT_RESULT_OK) continue;
+        float P[3];
+        for (int k = 0; k < 3; k++) P[k] = r.org[k] + h.t * r.dir[k];
+        float d[3] = {P[0] - C[0], P[1] - C[1], P[2] - C[2]};
+        float tt = T[0] * T[0] + T[1] * T[1] + T[2] * T[2];
+        float dt = (d[0] * T[0] + d[1] * T[1] + d[2] * T[2]) / (tt + 1e-20f);
+        float perp[3] = {d[0] - dt * T[0], d[1] - dt * T[1], d[2] - dt * T[2]};
+        float dp = sqrtf(perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]);
+        /* hit lies within the swept radius of the centerline */
+        if (dp <= rad + 0.06f * rad + 1e-3f) dist_ok++;
+        /* shading normal = perp direction, must be orthogonal to the tangent */
+        float pn = dp + 1e-9f, tn = sqrtf(tt) + 1e-9f;
+        float align = (perp[0] * T[0] + perp[1] * T[1] + perp[2] * T[2]) /
+                      (pn * tn);
+        if (fabsf(align) < 1e-3f) perp_ok++;
+    }
+    double df = hits ? (double)dist_ok / hits : 1.0;
+    double pf = hits ? (double)perp_ok / hits : 1.0;
+    printf("  curve-frame[%s]: %zu hits, dist %.2f%% perp %.2f%%\n", label, hits,
+           df * 100, pf * 100);
+    CHECK(hits > NR / 200, "%s: too few hits (%zu)", label, hits);
+    CHECK(df >= 0.99, "%s: frame dist agreement %.2f%% < 99%%", label, df * 100);
+    CHECK(pf >= 0.999, "%s: frame perp %.2f%% < 99.9%%", label, pf * 100);
+}
+
+static void test_curve_frame(void) {
+    g_rng = 0xC0FFEE11ull;
+    /* round-linear + flat strands (shared generation) */
+    enum { NSTRAND = 80, PTS = 6 };
+    size_t npoints = (size_t)NSTRAND * PTS;
+    float *pts = (float *)malloc(npoints * 3 * sizeof(float));
+    float *rad = (float *)malloc(npoints * sizeof(float));
+    uint32_t *sfirst = (uint32_t *)malloc(NSTRAND * sizeof(uint32_t));
+    uint32_t *scount = (uint32_t *)malloc(NSTRAND * sizeof(uint32_t));
+    for (int st = 0; st < NSTRAND; st++) {
+        sfirst[st] = (uint32_t)(st * PTS);
+        scount[st] = PTS;
+        float px = rnd_f(-2, 2), py = rnd_f(-2, 2), pz = rnd_f(-2, 2);
+        for (int p = 0; p < PTS; p++) {
+            size_t idx = (size_t)st * PTS + p;
+            px += rnd_f(-0.9f, 0.9f);
+            py += rnd_f(-0.9f, 0.9f);
+            pz += rnd_f(-0.9f, 0.9f);
+            pts[idx * 3 + 0] = px;
+            pts[idx * 3 + 1] = py;
+            pts[idx * 3 + 2] = pz;
+            rad[idx] = rnd_f(0.02f, 0.06f);
+        }
+    }
+    lrt_hair_strands hs = {0};
+    hs.points = pts;
+    hs.radius = rad;
+    hs.strand_first = sfirst;
+    hs.strand_count = scount;
+    hs.nstrands = NSTRAND;
+    hs.npoints = npoints;
+
+    lrt_tri_scene *sr = lrt_roundcurve_scene_build(&hs, NULL, NULL);
+    CHECK(sr != NULL, "curve-frame: roundcurve build");
+    if (sr) curve_frame_check(sr, "round");
+    lrt_tri_scene *sf = lrt_flatcurve_scene_build(&hs, NULL, NULL);
+    CHECK(sf != NULL, "curve-frame: flatcurve build");
+    if (sf) curve_frame_check(sf, "flat");
+
+    /* edge cases (round-linear scene) */
+    if (sr) {
+        float C[3];
+        lrt_result q;
+        q = lrt_tri_curve_frame(sr, 0, 0.5f, NULL, NULL, NULL);
+        CHECK(q == LRT_RESULT_OK, "curve-frame: all-NULL outputs OK");
+        q = lrt_tri_curve_frame(NULL, 0, 0.5f, C, NULL, NULL);
+        CHECK(q == LRT_RESULT_INVALID_ARGUMENT, "curve-frame: NULL scene");
+        q = lrt_tri_curve_frame(sr, 0xFFFFFFu, 0.5f, C, NULL, NULL);
+        CHECK(q == LRT_RESULT_INVALID_ARGUMENT, "curve-frame: prim_id OOB");
+        /* a triangle scene must be rejected */
+        float tri[9] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+        lrt_tri_scene *st = lrt_tri_scene_build(tri, 1, NULL, NULL);
+        if (st) {
+            q = lrt_tri_curve_frame(st, 0, 0.5f, C, NULL, NULL);
+            CHECK(q == LRT_RESULT_INVALID_ARGUMENT, "curve-frame: tri scene");
+            lrt_tri_scene_free(st);
+        }
+        /* cubic-Bezier is explicitly unsupported (sub-arc-local u) */
+        float cps[16];
+        for (int kk = 0; kk < 4; kk++) {
+            cps[kk * 4 + 0] = (float)kk;
+            cps[kk * 4 + 1] = cps[kk * 4 + 2] = 0.0f;
+            cps[kk * 4 + 3] = 0.1f;
+        }
+        lrt_tri_scene *sbz = lrt_bezcurve_scene_build(cps, 1, NULL, NULL);
+        if (sbz) {
+            q = lrt_tri_curve_frame(sbz, 0, 0.5f, C, NULL, NULL);
+            CHECK(q == LRT_RESULT_INVALID_ARGUMENT, "curve-frame: bezier scene");
+            lrt_tri_scene_free(sbz);
+        }
+    }
+
+    if (sr) lrt_tri_scene_free(sr);
+    if (sf) lrt_tri_scene_free(sf);
+    free(pts);
+    free(rad);
+    free(sfirst);
+    free(scount);
+}
+
 static void test_curve_point_edge_cases(void) {
     lrt_hit h;
 
@@ -2395,6 +2517,7 @@ int main(void) {
     test_roundcurve_scene();
     test_flatcurve_scene();
     test_bezcurve_scene();
+    test_curve_frame();
     test_points_scene();
     test_curve_point_edge_cases();
     test_sphere_scene();
