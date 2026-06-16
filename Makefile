@@ -2,10 +2,12 @@
 # Copyright (c) 2026 Light Transport Entertainment, Inc.
 # SPDX-License-Identifier: MIT
 
+CC ?= gcc
 CXX ?= g++
 AR ?= ar
 
 # Compiler flags
+CFLAGS = -std=c11 -Wall -Wextra -O3
 CXXFLAGS = -std=c++17 -Wall -Wextra -O3 -fno-rtti -fno-exceptions
 INCLUDES = -I.
 LDFLAGS =
@@ -40,6 +42,8 @@ endif
 
 # Debug build
 ifeq ($(DEBUG),1)
+    CFLAGS := $(filter-out -O3,$(CFLAGS))
+    CFLAGS += -O0 -g -DDEBUG
     CXXFLAGS := $(filter-out -O3,$(CXXFLAGS))
     CXXFLAGS += -O0 -g -DDEBUG
 endif
@@ -52,6 +56,8 @@ TARGET_BENCHMARK = lightrt_benchmark
 # Source files
 SOURCES = lightrt.cc
 OBJECTS = $(SOURCES:.cc=.o)
+C_SOURCES = lightrt_c.c
+C_OBJECTS = $(C_SOURCES:.c=.o)
 
 # Example source
 EXAMPLE_SOURCES = example.cc
@@ -70,7 +76,7 @@ OBJ_BENCH_OBJECTS = benchmark/obj_bvh_bench.o
 all: $(TARGET_LIB) $(TARGET_EXAMPLE) $(TARGET_BENCHMARK)
 
 # Build static library
-$(TARGET_LIB): $(OBJECTS)
+$(TARGET_LIB): $(OBJECTS) $(C_OBJECTS)
 	$(AR) rcs $@ $^
 	@echo "Built $(TARGET_LIB)"
 
@@ -93,12 +99,15 @@ $(OBJ_BENCH_TARGET): $(OBJ_BENCH_OBJECTS) $(TARGET_LIB)
 %.o: %.cc lightrt.hh
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
+%.o: %.c lightrt_c.h
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
 benchmark/%.o: benchmark/%.cc lightrt.hh
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 # Clean build artifacts
 clean:
-	rm -f $(OBJECTS) $(EXAMPLE_OBJECTS) $(BENCHMARK_OBJECTS) $(OBJ_BENCH_OBJECTS) $(TARGET_LIB) $(TARGET_EXAMPLE) $(TARGET_BENCHMARK) $(OBJ_BENCH_TARGET)
+	rm -f $(OBJECTS) $(C_OBJECTS) $(EXAMPLE_OBJECTS) $(BENCHMARK_OBJECTS) $(OBJ_BENCH_OBJECTS) $(TARGET_LIB) $(TARGET_EXAMPLE) $(TARGET_BENCHMARK) $(OBJ_BENCH_TARGET)
 	@echo "Cleaned build artifacts"
 
 # Run example
