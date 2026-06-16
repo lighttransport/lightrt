@@ -587,6 +587,125 @@ static void test_refit(lrt_hip_engine *e, const char *label, const float *verts,
     lrt_tri_scene_free(s);
 }
 
+/* GPU analytic primitives (sphere / point / quad / tetra): CPU build -> GPU
+ * trace, compared against the CPU oracle (same scene). */
+static void test_analytic(lrt_hip_engine *e, const char *label,
+                          lrt_tri_scene *cpu, size_t nrays) {
+    if (!cpu) {
+        CHECK(0, "%s: CPU build failed", label);
+        return;
+    }
+    lrt_hip_scene *gs = lrt_hip_scene_upload(e, cpu, NULL);
+    CHECK(gs != NULL, "%s: GPU upload failed: %s", label,
+          lrt_hip_engine_last_error(e));
+    if (!gs) {
+        lrt_tri_scene_free(cpu);
+        return;
+    }
+    lrt_ray *rays = (lrt_ray *)malloc(nrays * sizeof(lrt_ray));
+    lrt_hit *gh = (lrt_hit *)malloc(nrays * sizeof(lrt_hit));
+    uint8_t *go = (uint8_t *)malloc(nrays * sizeof(uint8_t));
+    for (size_t i = 0; i < nrays; i++) make_random_ray(&rays[i]);
+    lrt_hip_scene_trace(e, gs, rays, (uint32_t)nrays, gh, NULL);
+    lrt_hip_scene_occluded(e, gs, rays, (uint32_t)nrays, go, NULL);
+    size_t agree = 0, oagree = 0;
+    double max_rel = 0.0;
+    for (size_t i = 0; i < nrays; i++) {
+        lrt_hit c;
+        int ch = lrt_tri_intersect1(cpu, &rays[i], &c);
+        int g = gh[i].prim_id != LRT_TRI_NO_HIT;
+        if (ch == g && (!g || c.prim_id == gh[i].prim_id)) {
+            agree++;
+            if (g) {
+                double rel = fabs((double)gh[i].t - c.t) / (1.0 + fabs(c.t));
+                if (rel > max_rel) max_rel = rel;
+            }
+        } else if (ch && g) {
+            double rel = fabs((double)gh[i].t - c.t) / (1.0 + fabs(c.t));
+            if (rel < 1e-4) agree++;
+        }
+        int co = lrt_tri_occluded1(cpu, &rays[i]);
+        if ((co != 0) == (go[i] != 0)) oagree++;
+    }
+    double f = (double)agree / nrays, of = (double)oagree / nrays;
+    printf("  %-14s closest %.3f%% (max_rel_t %.2e)  occ %.3f%%\n", label,
+           f * 100.0, max_rel, of * 100.0);
+    CHECK(f >= 0.999, "%s: closest agreement %.3f%% < 99.9%%", label, f * 100.0);
+    CHECK(of >= 0.999, "%s: occ agreement %.3f%% < 99.9%%", label, of * 100.0);
+    free(rays);
+    free(gh);
+    free(go);
+    lrt_hip_scene_free(e, gs);
+    lrt_tri_scene_free(cpu);
+}
+
+static void test_gpu_analytics(lrt_hip_engine *e) {
+    lrt_tri_build_options o;
+    memset(&o, 0, sizeof(o));
+    o.num_threads = 1;
+    size_t N = 3000;
+    printf("== GPU analytic primitives vs CPU oracle ==\n");
+
+    float *sph = (float *)malloc(N * 4 * sizeof(float));
+    for (size_t i = 0; i < N; i++) {
+        sph[i * 4 + 0] = rnd_f(-2, 2);
+        sph[i * 4 + 1] = rnd_f(-2, 2);
+        sph[i * 4 + 2] = rnd_f(-2, 2);
+        sph[i * 4 + 3] = rnd_f(0.05f, 0.25f);
+    }
+    test_analytic(e, "sphere", lrt_sphere_scene_build(sph, N, &o, NULL), 20000);
+    free(sph);
+
+    float *ctr = (float *)malloc(N * 3 * sizeof(float));
+    float *rad = (float *)malloc(N * sizeof(float));
+    float *nrm = (float *)malloc(N * 3 * sizeof(float));
+    for (size_t i = 0; i < N; i++) {
+        for (int k = 0; k < 3; k++) {
+            ctr[i * 3 + k] = rnd_f(-2, 2);
+            nrm[i * 3 + k] = rnd_f(-1, 1);
+        }
+        rad[i] = rnd_f(0.05f, 0.2f);
+    }
+    test_analytic(e, "point/sphere",
+                  lrt_points_scene_build(ctr, rad, NULL, LRT_POINT_SPHERE, N,
+                                         &o, NULL),
+                  20000);
+    test_analytic(e, "point/disc",
+                  lrt_points_scene_build(ctr, rad, NULL, LRT_POINT_DISC, N, &o,
+                                         NULL),
+                  20000);
+    test_analytic(e, "point/odisc",
+                  lrt_points_scene_build(ctr, rad, nrm, LRT_POINT_ORIENTED_DISC,
+                                         N, &o, NULL),
+                  20000);
+    free(ctr);
+    free(rad);
+    free(nrm);
+
+    float *quads = (float *)malloc(N * 12 * sizeof(float));
+    float *tets = (float *)malloc(N * 12 * sizeof(float));
+    for (size_t i = 0; i < N; i++) {
+        float c[3] = {rnd_f(-2, 2), rnd_f(-2, 2), rnd_f(-2, 2)};
+        float a[3] = {rnd_f(-1, 1), rnd_f(-1, 1), rnd_f(-1, 1)};
+        float b[3] = {rnd_f(-1, 1), rnd_f(-1, 1), rnd_f(-1, 1)};
+        float *q = &quads[i * 12];
+        for (int k = 0; k < 3; k++) {
+            q[0 + k] = c[k] - 0.3f * a[k] - 0.3f * b[k];
+            q[3 + k] = c[k] + 0.3f * a[k] - 0.3f * b[k];
+            q[6 + k] = c[k] + 0.3f * a[k] + 0.3f * b[k];
+            q[9 + k] = c[k] - 0.3f * a[k] + 0.3f * b[k];
+        }
+        float *t = &tets[i * 12];
+        for (int vtx = 0; vtx < 4; vtx++)
+            for (int k = 0; k < 3; k++)
+                t[vtx * 3 + k] = c[k] + rnd_f(-0.3f, 0.3f);
+    }
+    test_analytic(e, "quad", lrt_quad_scene_build(quads, N, &o, NULL), 20000);
+    test_analytic(e, "tetra", lrt_tetra_scene_build(tets, N, &o, NULL), 20000);
+    free(quads);
+    free(tets);
+}
+
 int main(void) {
     lrt_result err = LRT_RESULT_OK;
     lrt_hip_engine *e = lrt_hip_engine_create(NULL, &err);
@@ -626,6 +745,8 @@ int main(void) {
     test_refit(e, "refit/BVH8", grid, grid_n, LRT_TRI_LAYOUT_BVH8, 20000);
 
     test_device_pipeline(e, soup, ntris);
+
+    test_gpu_analytics(e);
 
     test_wmma(e);
 

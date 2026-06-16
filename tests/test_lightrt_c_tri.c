@@ -117,6 +117,14 @@ static void make_random_ray(lrt_ray *r) {
     r->tmax = ((z >> 25) & 1) ? 1e10f : rnd_f(1.0f, 12.0f);
 }
 
+/* Dummy user-geometry callback (never hits); only used to build a user scene
+ * for the "must refuse serialization" check. */
+static int dummy_user_isect(const lrt_ray *r, uint32_t pid, void *u, float *t,
+                            float *uu, float *vv) {
+    (void)r; (void)pid; (void)u; (void)t; (void)uu; (void)vv;
+    return 0;
+}
+
 static int g_failures = 0;
 
 #define CHECK(cond, ...)                          \
@@ -1484,16 +1492,47 @@ static void test_serialization(void) {
             }
             lrt_tri_scene_free(cs);
         }
+        /* Analytic primitives (sphere) now serialize (GPU-traceable); a
+         * round-trip must preserve hits. */
         float sph[4] = {0, 0, 0, 1};
         lrt_tri_scene *sp = lrt_sphere_scene_build(sph, 1, NULL, &err);
         if (sp) {
             void *buf = NULL;
             size_t n = 0;
-            CHECK(lrt_tri_scene_save_to_memory(sp, &buf, &n) ==
-                      LRT_RESULT_INVALID_ARGUMENT,
-                  "sphere scene should refuse serialization");
+            CHECK(lrt_tri_scene_save_to_memory(sp, &buf, &n) == LRT_RESULT_OK &&
+                      buf,
+                  "sphere scene should serialize");
+            if (buf) {
+                lrt_tri_scene *lp =
+                    lrt_tri_scene_load_from_memory(buf, n, &err);
+                CHECK(lp != NULL, "sphere scene reload");
+                if (lp) {
+                    lrt_ray r = {{0, 0, -5}, 0.0f, {0, 0, 1}, 1e9f};
+                    lrt_hit a, b;
+                    int ha = lrt_tri_intersect1(sp, &r, &a);
+                    int hb = lrt_tri_intersect1(lp, &r, &b);
+                    CHECK(ha && hb && a.prim_id == b.prim_id,
+                          "sphere round-trip hit mismatch");
+                    lrt_tri_scene_free(lp);
+                }
+            }
             free(buf);
             lrt_tri_scene_free(sp);
+        }
+        /* User (callback) geometry must still refuse serialization. */
+        {
+            float box[6] = {-1, -1, -1, 1, 1, 1};
+            lrt_tri_scene *us = lrt_user_scene_build(
+                box, 1, dummy_user_isect, NULL, NULL, NULL, &err);
+            if (us) {
+                void *buf = NULL;
+                size_t n = 0;
+                CHECK(lrt_tri_scene_save_to_memory(us, &buf, &n) ==
+                          LRT_RESULT_INVALID_ARGUMENT,
+                      "user scene should refuse serialization");
+                free(buf);
+                lrt_tri_scene_free(us);
+            }
         }
     }
     free(verts);

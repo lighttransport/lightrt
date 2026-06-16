@@ -10099,13 +10099,30 @@ static void tri_recompute_stats(lrt_tri_scene *s) {
     s->stats.sah_cost = 0.0f;
 }
 
+/* Expected leaf-block stride for a serializable prim_kind (0 = not
+ * serializable: USER/SDF use host callbacks, QTRI needs out-of-header grid). */
+static uint32_t tri_kind_block_stride(int prim_kind, int layout) {
+    switch (prim_kind) {
+    case TRI_PRIM_TRI: return (uint32_t)tri_block_size(layout);
+    case TRI_PRIM_CURVE: return (uint32_t)sizeof(lrt_crv4);
+    case TRI_PRIM_SPHERE:
+    case TRI_PRIM_POINT: return (uint32_t)tri_block_size(4);
+    case TRI_PRIM_QUAD:
+    case TRI_PRIM_TETRA: return (uint32_t)sizeof(lrt_quad4);
+    case TRI_PRIM_RLCURVE: return (uint32_t)sizeof(lrt_rlc4);
+    case TRI_PRIM_FLATCURVE: return (uint32_t)sizeof(lrt_flat4);
+    case TRI_PRIM_BEZCURVE: return (uint32_t)sizeof(lrt_bez4);
+    default: return 0u;
+    }
+}
+
 lrt_result lrt_tri_scene_save_to_memory(const lrt_tri_scene *s, void **buf,
                                         size_t *n) {
     if (!s || !buf || !n) return LRT_RESULT_INVALID_ARGUMENT;
     *buf = NULL;
     *n = 0;
-    if (s->prim_kind != TRI_PRIM_TRI && s->prim_kind != TRI_PRIM_CURVE)
-        return LRT_RESULT_INVALID_ARGUMENT; /* callbacks can't serialize */
+    if (tri_kind_block_stride(s->prim_kind, s->layout) == 0)
+        return LRT_RESULT_INVALID_ARGUMENT; /* callbacks/qtri can't serialize */
     if (s->qnode != 0)
         return LRT_RESULT_INVALID_ARGUMENT; /* qnode format not in the v1 header */
     size_t nstride = tri_node_stride(s->layout, s->quantized);
@@ -10139,6 +10156,7 @@ lrt_result lrt_tri_scene_save_to_memory(const lrt_tri_scene *s, void **buf,
         h.root_lo[a] = s->root_lo[a];
         h.root_hi[a] = s->root_hi[a];
     }
+    h.reserved0 = (uint32_t)s->point_type; /* point_type (0 for non-point) */
     h.node_offset = node_off;
     h.block_offset = block_off;
     h.file_size = total;
@@ -10175,10 +10193,11 @@ static int tri_header_check(const lrt_tri_file_header *h, size_t n) {
     if (h->version != LRT_TRI_FILE_VERSION) return 1;
     if (h->endian != 0x01020304u) return 1;
     if (h->layout != 4 && h->layout != 8) return 1;
-    if (h->prim_kind != TRI_PRIM_TRI && h->prim_kind != TRI_PRIM_CURVE) return 1;
+    uint32_t exp_bstride = tri_kind_block_stride((int)h->prim_kind, (int)h->layout);
+    if (exp_bstride == 0) return 1; /* not a serializable prim_kind */
     int quantized = (h->flags & 2u) != 0;
     if (h->node_stride != tri_node_stride((int)h->layout, quantized)) return 1;
-    if (h->block_stride != tri_block_size((int)h->layout)) return 1;
+    if (h->block_stride != exp_bstride) return 1;
     if (h->file_size != (uint64_t)n) return 1;
     uint64_t nodes_bytes = (uint64_t)h->node_count * h->node_stride;
     uint64_t blocks_bytes = (uint64_t)h->block_count * h->block_stride;
@@ -10207,6 +10226,7 @@ static lrt_tri_scene *tri_scene_from_buffer(const void *buf, size_t n, int copy,
     s->quantized = (h->flags & 2u) != 0;
     s->curve = (h->flags & 1u) != 0;
     s->prim_kind = (int)h->prim_kind;
+    s->point_type = (int)h->reserved0;
     s->root = h->root;
     s->node_count = h->node_count;
     s->block_count = h->block_count;

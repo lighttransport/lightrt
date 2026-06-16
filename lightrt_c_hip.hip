@@ -80,11 +80,23 @@ struct lrt_hip_scene {
     uint32_t node_stride;  /* bytes */
     uint32_t block_stride; /* bytes */
     uint32_t root;
-    uint32_t layout;    /* 4 or 8 */
-    uint32_t stack;     /* traversal stack depth bucket (32/64/128/256) */
-    uint32_t max_depth; /* wide-tree depth (refit bottom-up pass count) */
+    uint32_t layout;     /* 4 or 8 */
+    uint32_t stack;      /* traversal stack depth bucket (32/64/128/256) */
+    uint32_t max_depth;  /* wide-tree depth (refit bottom-up pass count) */
+    uint32_t prim_kind;  /* TRI_PRIM_* (0 = triangle) */
+    uint32_t point_type; /* lrt_tri_point_type (point scenes only) */
     size_t mem_bytes;
 };
+
+/* prim_kind values mirrored from lightrt_c_tri.c (kept in sync). */
+#define HIP_PRIM_TRI 0u
+#define HIP_PRIM_SPHERE 3u
+#define HIP_PRIM_POINT 6u
+#define HIP_PRIM_QUAD 9u
+#define HIP_PRIM_TETRA 10u
+#define HIP_POINT_SPHERE 0u
+#define HIP_POINT_DISC 1u
+#define HIP_POINT_ORIENTED_DISC 2u
 
 /* hipFree is [[nodiscard]]; this swallows the result at teardown/cleanup sites
  * where there is nothing useful to do with a free error. */
@@ -409,6 +421,322 @@ __launch_bounds__(64) __global__
 }
 
 /* ========================================================================= */
+/* Analytic primitives (sphere / point / quad / tetra) — BVH4, runtime kind.  */
+/* Ported byte-for-byte from the CPU scalar intersectors for hit parity.       */
+/* ========================================================================= */
+#define HIP_INV_2PI 0.15915494309189535f
+#define HIP_INV_PI 0.3183098861837907f
+
+/* Moller-Trumbore on an explicit triangle (matches tri_mt_one). */
+__device__ __forceinline__ bool hp_mt(float ox, float oy, float oz, float dx,
+                                      float dy, float dz, float v0x, float v0y,
+                                      float v0z, float v1x, float v1y, float v1z,
+                                      float v2x, float v2y, float v2z,
+                                      float tmin, float tbest, float *t,
+                                      float *u, float *v) {
+    float e1x = v1x - v0x, e1y = v1y - v0y, e1z = v1z - v0z;
+    float e2x = v2x - v0x, e2y = v2y - v0y, e2z = v2z - v0z;
+    float px = dy * e2z - dz * e2y, py = dz * e2x - dx * e2z,
+          pz = dx * e2y - dy * e2x;
+    float det = e1x * px + e1y * py + e1z * pz;
+    if (det > -1e-12f && det < 1e-12f) return false;
+    float inv = 1.0f / det;
+    float tvx = ox - v0x, tvy = oy - v0y, tvz = oz - v0z;
+    float uu = (tvx * px + tvy * py + tvz * pz) * inv;
+    if (uu < 0.0f || uu > 1.0f) return false;
+    float qx = tvy * e1z - tvz * e1y, qy = tvz * e1x - tvx * e1z,
+          qz = tvx * e1y - tvy * e1x;
+    float vv = (dx * qx + dy * qy + dz * qz) * inv;
+    if (vv < 0.0f || uu + vv > 1.0f) return false;
+    float tt = (e2x * qx + e2y * qy + e2z * qz) * inv;
+    if (tt < tmin || tt >= tbest) return false;
+    *t = tt; *u = uu; *v = vv;
+    return true;
+}
+
+/* One leaf block (4 lanes) against the ray, for the given prim_kind. blk = base
+ * word index of the block; bsw = block stride in words. Updates best_*. */
+__device__ __forceinline__ void hp_leaf(const uint32_t *__restrict__ blocks,
+                                        uint32_t blk, uint32_t prim_kind,
+                                        uint32_t point_type, float ox, float oy,
+                                        float oz, float dx, float dy, float dz,
+                                        float tmin, float *best_t, float *best_u,
+                                        float *best_v, uint32_t *best_prim) {
+    if (prim_kind == HIP_PRIM_SPHERE) {
+        for (uint32_t l = 0; l < 4u; l++) {
+            uint32_t prim = blocks[blk + 16u + l];
+            if (prim == LRT_HIP_NO_HIT) continue;
+            float cx = fu(blocks[blk + 0u + l]), cy = fu(blocks[blk + 4u + l]),
+                  cz = fu(blocks[blk + 8u + l]), r = fu(blocks[blk + 12u + l]);
+            if (r <= 0.0f) continue;
+            float ocx = ox - cx, ocy = oy - cy, ocz = oz - cz;
+            float a = dx * dx + dy * dy + dz * dz;
+            if (a <= 1e-20f) continue;
+            float b = ocx * dx + ocy * dy + ocz * dz;
+            float c = ocx * ocx + ocy * ocy + ocz * ocz - r * r;
+            float disc = b * b - a * c;
+            if (disc < 0.0f) continue;
+            float sq = sqrtf(disc), inv_a = 1.0f / a;
+            float tt = (-b - sq) * inv_a;
+            if (tt < tmin || tt >= *best_t) {
+                tt = (-b + sq) * inv_a;
+                if (tt < tmin || tt >= *best_t) continue;
+            }
+            float nx = (ocx + tt * dx) / r, ny = (ocy + tt * dy) / r,
+                  nz = (ocz + tt * dz) / r;
+            float cl = ny < -1.0f ? -1.0f : (ny > 1.0f ? 1.0f : ny);
+            *best_t = tt;
+            *best_u = atan2f(nz, nx) * HIP_INV_2PI + 0.5f;
+            *best_v = acosf(cl) * HIP_INV_PI;
+            *best_prim = prim;
+        }
+    } else if (prim_kind == HIP_PRIM_POINT) {
+        for (uint32_t l = 0; l < 4u; l++) {
+            uint32_t prim = blocks[blk + 28u + l];
+            if (prim == LRT_HIP_NO_HIT) continue;
+            float cx = fu(blocks[blk + 0u + l]), cy = fu(blocks[blk + 4u + l]),
+                  cz = fu(blocks[blk + 8u + l]), r = fu(blocks[blk + 12u + l]);
+            float dOdO = dx * dx + dy * dy + dz * dz;
+            if (dOdO <= 0.0f) continue;
+            float c0x = cx - ox, c0y = cy - oy, c0z = cz - oz;
+            if (point_type == HIP_POINT_ORIENTED_DISC) {
+                float nx = fu(blocks[blk + 16u + l]),
+                      ny = fu(blocks[blk + 20u + l]),
+                      nz = fu(blocks[blk + 24u + l]);
+                float div = dx * nx + dy * ny + dz * nz;
+                if (div == 0.0f) continue;
+                float t = (c0x * nx + c0y * ny + c0z * nz) / div;
+                if (t < tmin || t >= *best_t) continue;
+                float hx = ox + t * dx - cx, hy = oy + t * dy - cy,
+                      hz = oz + t * dz - cz;
+                if (hx * hx + hy * hy + hz * hz >= r * r) continue;
+                *best_t = t; *best_u = 0.0f; *best_v = 0.0f; *best_prim = prim;
+                continue;
+            }
+            float rd2 = 1.0f / dOdO;
+            float projC0 = (c0x * dx + c0y * dy + c0z * dz) * rd2;
+            float perpx = c0x - projC0 * dx, perpy = c0y - projC0 * dy,
+                  perpz = c0z - projC0 * dz;
+            float l2 = perpx * perpx + perpy * perpy + perpz * perpz;
+            float r2 = r * r;
+            if (l2 > r2) continue;
+            if (point_type == HIP_POINT_DISC) {
+                if (projC0 < tmin || projC0 >= *best_t) continue;
+                *best_t = projC0; *best_u = 0.0f; *best_v = 0.0f;
+                *best_prim = prim;
+                continue;
+            }
+            float td = sqrtf((r2 - l2) * rd2);
+            float tf = projC0 - td;
+            if (tf >= tmin && tf < *best_t) {
+                *best_t = tf; *best_u = 0.0f; *best_v = 0.0f; *best_prim = prim;
+                continue;
+            }
+            float tb = projC0 + td;
+            if (tb >= tmin && tb < *best_t) {
+                *best_t = tb; *best_u = 0.0f; *best_v = 0.0f; *best_prim = prim;
+            }
+        }
+    } else { /* QUAD or TETRA: 4-point leaf (52 words) */
+        for (uint32_t l = 0; l < 4u; l++) {
+            uint32_t prim = blocks[blk + 48u + l];
+            if (prim == LRT_HIP_NO_HIT) continue;
+            float x0 = fu(blocks[blk + 0u + l]), y0 = fu(blocks[blk + 4u + l]),
+                  z0 = fu(blocks[blk + 8u + l]);
+            float x1 = fu(blocks[blk + 12u + l]), y1 = fu(blocks[blk + 16u + l]),
+                  z1 = fu(blocks[blk + 20u + l]);
+            float x2 = fu(blocks[blk + 24u + l]), y2 = fu(blocks[blk + 28u + l]),
+                  z2 = fu(blocks[blk + 32u + l]);
+            float x3 = fu(blocks[blk + 36u + l]), y3 = fu(blocks[blk + 40u + l]),
+                  z3 = fu(blocks[blk + 44u + l]);
+            float t, u, v;
+            if (prim_kind == HIP_PRIM_QUAD) {
+                if (hp_mt(ox, oy, oz, dx, dy, dz, x0, y0, z0, x1, y1, z1, x2, y2,
+                          z2, tmin, *best_t, &t, &u, &v)) {
+                    *best_t = t; *best_u = u; *best_v = v; *best_prim = prim;
+                }
+                if (hp_mt(ox, oy, oz, dx, dy, dz, x0, y0, z0, x2, y2, z2, x3, y3,
+                          z3, tmin, *best_t, &t, &u, &v)) {
+                    *best_t = t; *best_u = u; *best_v = v; *best_prim = prim;
+                }
+            } else { /* TETRA: 4 faces (0,1,2)(0,1,3)(0,2,3)(1,2,3) */
+                float P[4][3] = {{x0, y0, z0}, {x1, y1, z1},
+                                 {x2, y2, z2}, {x3, y3, z3}};
+                const int F[4][3] = {{0, 1, 2}, {0, 1, 3}, {0, 2, 3}, {1, 2, 3}};
+                for (int f = 0; f < 4; f++) {
+                    if (hp_mt(ox, oy, oz, dx, dy, dz, P[F[f][0]][0],
+                              P[F[f][0]][1], P[F[f][0]][2], P[F[f][1]][0],
+                              P[F[f][1]][1], P[F[f][1]][2], P[F[f][2]][0],
+                              P[F[f][2]][1], P[F[f][2]][2], tmin, *best_t, &t,
+                              &u, &v)) {
+                        *best_t = t; *best_u = u; *best_v = v; *best_prim = prim;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* BVH4 analytic-primitive closest-hit (node_stride = 32 words; runtime kind). */
+template <unsigned STACK>
+__launch_bounds__(64) __global__
+    void k_trace_prim(const uint32_t *__restrict__ nodes,
+                      const uint32_t *__restrict__ blocks,
+                      const uint32_t *__restrict__ rays,
+                      uint32_t *__restrict__ hits, uint32_t root,
+                      uint32_t ray_count, uint32_t prim_kind,
+                      uint32_t point_type, uint32_t bsw) {
+    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= ray_count) return;
+    constexpr uint32_t W = 4u, node_stride = 8u * W;
+    const size_t rb = (size_t)gid * 8u;
+    float ox = fu(rays[rb + 0]), oy = fu(rays[rb + 1]), oz = fu(rays[rb + 2]);
+    float tmin = fu(rays[rb + 3]);
+    float dx = fu(rays[rb + 4]), dy = fu(rays[rb + 5]), dz = fu(rays[rb + 6]);
+    float tmax = fu(rays[rb + 7]);
+    float invd[3];
+    float dd[3] = {dx, dy, dz};
+    for (int k = 0; k < 3; k++) {
+        float d = dd[k], inv = 1.0f / d;
+        if (!(inv >= -LRT_HIP_INVD_MAX && inv <= LRT_HIP_INVD_MAX)) {
+            float s = (d == 0.0f) ? 1.0f : d;
+            inv = (s < 0.0f) ? -LRT_HIP_INVD_MAX : LRT_HIP_INVD_MAX;
+        }
+        invd[k] = inv;
+    }
+    float invdx = invd[0], invdy = invd[1], invdz = invd[2];
+    float best_t = tmax, best_u = 0.0f, best_v = 0.0f;
+    uint32_t best_prim = LRT_HIP_NO_HIT;
+    uint32_t stk_ref[STACK];
+    float stk_tn[STACK];
+    int sp = 0;
+    stk_ref[0] = root;
+    stk_tn[0] = tmin;
+    sp = 1;
+    while (sp > 0) {
+        sp--;
+        uint32_t ref = stk_ref[sp];
+        if (stk_tn[sp] >= best_t) continue;
+        if ((ref & LRT_HIP_LEAF_BIT) != 0u) {
+            uint32_t blk0 = (ref & 0x7FFFFFFFu) >> 4u, nblk = ref & 0xFu;
+            for (uint32_t b = 0; b < nblk; b++)
+                hp_leaf(blocks, (blk0 + b) * bsw, prim_kind, point_type, ox, oy,
+                        oz, dx, dy, dz, tmin, &best_t, &best_u, &best_v,
+                        &best_prim);
+            continue;
+        }
+        size_t nb = (size_t)(ref & 0x7FFFFFFFu) * node_stride;
+        uint32_t nchildren = nodes[nb + 7u * W];
+        uint32_t hit_ref[4];
+        float hit_tn[4];
+        int nhit = 0;
+        for (uint32_t i = 0; i < nchildren; i++) {
+            float lo_x = fu(nodes[nb + 0u * W + i]), lo_y = fu(nodes[nb + 1u * W + i]),
+                  lo_z = fu(nodes[nb + 2u * W + i]);
+            float hi_x = fu(nodes[nb + 3u * W + i]), hi_y = fu(nodes[nb + 4u * W + i]),
+                  hi_z = fu(nodes[nb + 5u * W + i]);
+            float tlx = (lo_x - ox) * invdx, thx = (hi_x - ox) * invdx;
+            float tly = (lo_y - oy) * invdy, thy = (hi_y - oy) * invdy;
+            float tlz = (lo_z - oz) * invdz, thz = (hi_z - oz) * invdz;
+            float tnear = fmaxf(fmaxf(fminf(tlx, thx), fminf(tly, thy)),
+                                fmaxf(fminf(tlz, thz), tmin));
+            float tfar = fminf(fminf(fmaxf(tlx, thx), fmaxf(tly, thy)),
+                               fminf(fmaxf(tlz, thz), best_t));
+            if (tnear <= tfar) {
+                int j = nhit++;
+                while (j > 0 && hit_tn[j - 1] > tnear) {
+                    hit_tn[j] = hit_tn[j - 1];
+                    hit_ref[j] = hit_ref[j - 1];
+                    j--;
+                }
+                hit_tn[j] = tnear;
+                hit_ref[j] = nodes[nb + 6u * W + i];
+            }
+        }
+        if ((uint32_t)sp + (uint32_t)nhit > STACK) break;
+        for (int i = nhit - 1; i >= 0; i--) {
+            stk_ref[sp] = hit_ref[i];
+            stk_tn[sp] = hit_tn[i];
+            sp++;
+        }
+    }
+    uint32_t hb = gid * 4u;
+    hits[hb + 0] = __float_as_uint(best_prim != LRT_HIP_NO_HIT ? best_t : 0.0f);
+    hits[hb + 1] = __float_as_uint(best_u);
+    hits[hb + 2] = __float_as_uint(best_v);
+    hits[hb + 3] = best_prim;
+}
+
+/* BVH4 analytic-primitive any-hit (occlusion). */
+template <unsigned STACK>
+__launch_bounds__(64) __global__
+    void k_occluded_prim(const uint32_t *__restrict__ nodes,
+                         const uint32_t *__restrict__ blocks,
+                         const uint32_t *__restrict__ rays,
+                         uint8_t *__restrict__ occ, uint32_t root,
+                         uint32_t ray_count, uint32_t prim_kind,
+                         uint32_t point_type, uint32_t bsw) {
+    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= ray_count) return;
+    constexpr uint32_t W = 4u, node_stride = 8u * W;
+    const size_t rb = (size_t)gid * 8u;
+    float ox = fu(rays[rb + 0]), oy = fu(rays[rb + 1]), oz = fu(rays[rb + 2]);
+    float tmin = fu(rays[rb + 3]);
+    float dx = fu(rays[rb + 4]), dy = fu(rays[rb + 5]), dz = fu(rays[rb + 6]);
+    float tmax = fu(rays[rb + 7]);
+    float invd[3];
+    float dd[3] = {dx, dy, dz};
+    for (int k = 0; k < 3; k++) {
+        float d = dd[k], inv = 1.0f / d;
+        if (!(inv >= -LRT_HIP_INVD_MAX && inv <= LRT_HIP_INVD_MAX)) {
+            float s = (d == 0.0f) ? 1.0f : d;
+            inv = (s < 0.0f) ? -LRT_HIP_INVD_MAX : LRT_HIP_INVD_MAX;
+        }
+        invd[k] = inv;
+    }
+    float invdx = invd[0], invdy = invd[1], invdz = invd[2];
+    uint8_t hit = 0u;
+    uint32_t stk_ref[STACK];
+    int sp = 0;
+    stk_ref[0] = root;
+    sp = 1;
+    while (sp > 0 && !hit) {
+        uint32_t ref = stk_ref[--sp];
+        if ((ref & LRT_HIP_LEAF_BIT) != 0u) {
+            uint32_t blk0 = (ref & 0x7FFFFFFFu) >> 4u, nblk = ref & 0xFu;
+            for (uint32_t b = 0; b < nblk && !hit; b++) {
+                float bt = tmax, bu = 0.0f, bv = 0.0f;
+                uint32_t bp = LRT_HIP_NO_HIT;
+                hp_leaf(blocks, (blk0 + b) * bsw, prim_kind, point_type, ox, oy,
+                        oz, dx, dy, dz, tmin, &bt, &bu, &bv, &bp);
+                if (bp != LRT_HIP_NO_HIT) hit = 1u;
+            }
+            continue;
+        }
+        size_t nb = (size_t)(ref & 0x7FFFFFFFu) * node_stride;
+        uint32_t nchildren = nodes[nb + 7u * W];
+        for (uint32_t i = 0; i < nchildren; i++) {
+            float lo_x = fu(nodes[nb + 0u * W + i]), lo_y = fu(nodes[nb + 1u * W + i]),
+                  lo_z = fu(nodes[nb + 2u * W + i]);
+            float hi_x = fu(nodes[nb + 3u * W + i]), hi_y = fu(nodes[nb + 4u * W + i]),
+                  hi_z = fu(nodes[nb + 5u * W + i]);
+            float tlx = (lo_x - ox) * invdx, thx = (hi_x - ox) * invdx;
+            float tly = (lo_y - oy) * invdy, thy = (hi_y - oy) * invdy;
+            float tlz = (lo_z - oz) * invdz, thz = (hi_z - oz) * invdz;
+            float tnear = fmaxf(fmaxf(fminf(tlx, thx), fminf(tly, thy)),
+                                fmaxf(fminf(tlz, thz), tmin));
+            float tfar = fminf(fminf(fmaxf(tlx, thx), fmaxf(tly, thy)),
+                               fminf(fmaxf(tlz, thz), tmax));
+            if (tnear <= tfar) {
+                if ((uint32_t)sp >= STACK) { hit = 1u; break; }
+                stk_ref[sp++] = nodes[nb + 6u * W + i];
+            }
+        }
+    }
+    occ[gid] = hit;
+}
+
+/* ========================================================================= */
 /* Build kernels — port of vk/shaders/build_morton.comp.                      */
 /* ========================================================================= */
 __device__ __forceinline__ uint32_t expand10(uint32_t v) {
@@ -590,6 +918,19 @@ static hipError_t launch_trace(lrt_hip_engine *e, const lrt_hip_scene *s,
                                const uint32_t *d_rays, uint32_t *d_hits,
                                uint32_t n) {
     const uint32_t W = s->layout, S = s->stack, root = s->root;
+    if (s->prim_kind != HIP_PRIM_TRI) {
+        uint32_t bsw = s->block_stride / 4u; /* block stride in words */
+#define LAUNCHP(st)                                                            \
+    hipLaunchKernelGGL((k_trace_prim<st>), dim3(((n) + 63u) / 64u), dim3(64),  \
+                       0, e->stream, s->d_nodes, s->d_blocks, d_rays, d_hits,  \
+                       root, n, s->prim_kind, s->point_type, bsw)
+        if (S == 32u) LAUNCHP(32);
+        else if (S == 64u) LAUNCHP(64);
+        else if (S == 128u) LAUNCHP(128);
+        else LAUNCHP(256);
+#undef LAUNCHP
+        return hipGetLastError();
+    }
 #define LAUNCH(w, st)                                                          \
     hipLaunchKernelGGL((k_trace<w, st>), dim3(((n) + 63u) / 64u), dim3(64), 0, \
                        e->stream, s->d_nodes, s->d_blocks, d_rays, d_hits,     \
@@ -613,6 +954,19 @@ static hipError_t launch_occluded(lrt_hip_engine *e, const lrt_hip_scene *s,
                                   const uint32_t *d_rays, uint8_t *d_occ,
                                   uint32_t n) {
     const uint32_t W = s->layout, S = s->stack, root = s->root;
+    if (s->prim_kind != HIP_PRIM_TRI) {
+        uint32_t bsw = s->block_stride / 4u;
+#define LAUNCHP(st)                                                            \
+    hipLaunchKernelGGL((k_occluded_prim<st>), dim3(((n) + 63u) / 64u),         \
+                       dim3(64), 0, e->stream, s->d_nodes, s->d_blocks, d_rays, \
+                       d_occ, root, n, s->prim_kind, s->point_type, bsw)
+        if (S == 32u) LAUNCHP(32);
+        else if (S == 64u) LAUNCHP(64);
+        else if (S == 128u) LAUNCHP(128);
+        else LAUNCHP(256);
+#undef LAUNCHP
+        return hipGetLastError();
+    }
 #define LAUNCH(w, st)                                                          \
     hipLaunchKernelGGL((k_occluded<w, st>), dim3(((n) + 63u) / 64u), dim3(64), \
                        0, e->stream, s->d_nodes, s->d_blocks, d_rays, d_occ,   \
@@ -779,6 +1133,23 @@ extern "C" lrt_hip_scene *lrt_hip_scene_upload(lrt_hip_engine *e,
         if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
         return NULL;
     }
+    /* Supported on GPU: triangles (BVH4/BVH8) + analytic BVH4 prims
+     * (sphere/point/quad/tetra). Curves are Phase C/D (rejected here). */
+    uint32_t pk = h->prim_kind;
+    int analytic = (pk == HIP_PRIM_SPHERE || pk == HIP_PRIM_POINT ||
+                    pk == HIP_PRIM_QUAD || pk == HIP_PRIM_TETRA);
+    if (pk != HIP_PRIM_TRI && !analytic) {
+        free(blob);
+        hip_set_err(e, "prim_kind not GPU-traceable yet (curve/bezier?)");
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return NULL;
+    }
+    if (analytic && w != 4u) {
+        free(blob);
+        hip_set_err(e, "analytic primitives are BVH4 only");
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return NULL;
+    }
 
     lrt_tri_stats st;
     lrt_tri_scene_stats(s, &st);
@@ -804,6 +1175,8 @@ extern "C" lrt_hip_scene *lrt_hip_scene_upload(lrt_hip_engine *e,
     sc->layout = w;
     sc->stack = stack;
     sc->max_depth = st.max_depth;
+    sc->prim_kind = pk;
+    sc->point_type = h->reserved0;
 
     size_t nodes_bytes = (size_t)h->node_count * h->node_stride;
     size_t blocks_bytes = (size_t)h->block_count * h->block_stride;
@@ -976,7 +1349,7 @@ static void refit_core(lrt_hip_engine *e, lrt_hip_scene *s,
 extern "C" int lrt_hip_scene_refit(lrt_hip_engine *e, lrt_hip_scene *s,
                                    const float *vertices, uint32_t ntris,
                                    lrt_result *err) {
-    if (!e || !s || !vertices || ntris == 0) {
+    if (!e || !s || !vertices || ntris == 0 || s->prim_kind != HIP_PRIM_TRI) {
         if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
         return -1;
     }
@@ -1171,7 +1544,7 @@ extern "C" int lrt_hip_scene_occluded_device(lrt_hip_engine *e,
 extern "C" int lrt_hip_scene_refit_device(lrt_hip_engine *e, lrt_hip_scene *s,
                                           const lrt_hip_dbuffer *vertices,
                                           uint32_t ntris, lrt_result *err) {
-    if (!e || !s || !vertices || ntris == 0 ||
+    if (!e || !s || !vertices || ntris == 0 || s->prim_kind != HIP_PRIM_TRI ||
         vertices->size < (size_t)ntris * 9u * sizeof(float)) {
         if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
         return -1;
