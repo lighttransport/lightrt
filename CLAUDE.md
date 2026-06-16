@@ -820,6 +820,13 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
   serialized/mmapped scenes alike, with no extra on-disk data (a deserialized
   scene rebuilds the arrays on load). `LRT_RESULT_UNSUPPORTED` only on an
   allocation failure.
+- `lrt_tri_surface_tessellate[_bound]` — dice a parametric SURFACE scene into a
+  triangle mesh (positions + geometric normals + (u,v), 2·segu·segv tris/patch)
+  for rasterization preview / OBJ export / collision proxy. Samples each patch
+  over its parameter domain (per-patch (u,v) span for NURBS, [0,1]² otherwise)
+  via `lrt_tri_surface_normal`; trimmed-NURBS cells whose centroid is outside
+  the trim region are dropped (actual count ≤ the bound). Size buffers with
+  `_bound`, then fill; `*ntris_out` reports the full count.
 
 ### Production
 - Serialization: `lrt_tri_scene_save[_to_memory]` / `load[_from_memory]`, plus

@@ -444,6 +444,31 @@ lrt_result lrt_tri_surface_normal(const lrt_tri_scene *s, uint32_t prim_id,
 lrt_result lrt_tri_curve_frame(const lrt_tri_scene *s, uint32_t prim_id, float u,
                                float C_out[3], float T_out[3], float *r_out);
 
+/* Tessellate a parametric SURFACE scene (bilinear / bicubic Bezier / NURBS /
+ * trimmed NURBS) into a triangle mesh — for rasterization preview, OBJ export,
+ * or a collision proxy. Each patch is sampled on a (segu x segv) grid in its
+ * parameter domain (its per-patch (u,v) span for NURBS, [0,1]^2 otherwise),
+ * emitting 2*segu*segv triangles per patch. For trimmed NURBS a cell is dropped
+ * when its centroid is outside the trim region (so the actual count is data-
+ * dependent and <= the bound). Reuses lrt_tri_surface_normal per grid vertex.
+ *
+ * lrt_tri_surface_tessellate_bound returns the upper-bound triangle count
+ * (ignores trimming); size the buffers with it. Returns 0 for a non-surface or
+ * shadeless scene.
+ *
+ * lrt_tri_surface_tessellate writes up to `cap` triangles, 3 vertices each, into
+ * the caller's buffers (each may be NULL): pos[9*cap] / nrm[9*cap] (geometric,
+ * normalized by the caller if needed) / uv[6*cap] (the sample's (u,v); global
+ * domain for NURBS). *ntris_out gets the full triangle count produced — if it
+ * exceeds cap, only the first cap were written (size with the bound to avoid
+ * truncation). Returns LRT_RESULT_OK; INVALID_ARGUMENT (NULL/zero seg/non-
+ * surface scene); UNSUPPORTED if shade data is unavailable. Thread-safe. */
+size_t lrt_tri_surface_tessellate_bound(const lrt_tri_scene *s, uint32_t segu,
+                                        uint32_t segv);
+lrt_result lrt_tri_surface_tessellate(const lrt_tri_scene *s, uint32_t segu,
+                                      uint32_t segv, float *pos, float *nrm,
+                                      float *uv, size_t cap, size_t *ntris_out);
+
 /* Direct access to a scene's resident node/block buffers + metadata, for GPU
  * backends that upload in-memory scenes without the LRTS serialization round
  * trip (needed for trimmed NURBS, whose trim loops are not in the v1 blob).

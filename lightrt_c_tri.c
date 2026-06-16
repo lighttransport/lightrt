@@ -10985,6 +10985,84 @@ lrt_result lrt_tri_curve_frame(const lrt_tri_scene *s, uint32_t prim_id, float u
     return LRT_RESULT_OK;
 }
 
+static int tri_is_surface_kind(int k) {
+    return k == TRI_PRIM_BILINEAR || k == TRI_PRIM_BEZPATCH ||
+           k == TRI_PRIM_RBEZPATCH || k == TRI_PRIM_TRIMNURBS;
+}
+
+size_t lrt_tri_surface_tessellate_bound(const lrt_tri_scene *s, uint32_t segu,
+                                        uint32_t segv) {
+    if (!s || segu == 0 || segv == 0 || !s->shade_cps ||
+        !tri_is_surface_kind(s->prim_kind))
+        return 0;
+    return (size_t)s->shade_nprims * segu * segv * 2u;
+}
+
+lrt_result lrt_tri_surface_tessellate(const lrt_tri_scene *s, uint32_t segu,
+                                      uint32_t segv, float *pos, float *nrm,
+                                      float *uv, size_t cap, size_t *ntris_out) {
+    if (ntris_out) *ntris_out = 0;
+    if (!s || segu == 0 || segv == 0) return LRT_RESULT_INVALID_ARGUMENT;
+    if (!tri_is_surface_kind(s->prim_kind)) return LRT_RESULT_INVALID_ARGUMENT;
+    if (!s->shade_cps) return LRT_RESULT_UNSUPPORTED;
+    const int trimmed = (s->prim_kind == TRI_PRIM_TRIMNURBS);
+    const int has_dom = (s->shade_stride == 64); /* NURBS: per-patch (u,v) domain */
+    size_t written = 0, total = 0;
+    for (uint32_t p = 0; p < s->shade_nprims; p++) {
+        float umin = 0.0f, umax = 1.0f, vmin = 0.0f, vmax = 1.0f;
+        if (has_dom) {
+            const float *d = &s->shade_dom[(size_t)p * 4];
+            umin = d[0]; umax = d[1]; vmin = d[2]; vmax = d[3];
+        }
+        for (uint32_t j = 0; j < segv; j++) {
+            for (uint32_t i = 0; i < segu; i++) {
+                float u0 = umin + (umax - umin) * (float)i / (float)segu;
+                float u1 = umin + (umax - umin) * (float)(i + 1) / (float)segu;
+                float v0 = vmin + (vmax - vmin) * (float)j / (float)segv;
+                float v1 = vmin + (vmax - vmin) * (float)(j + 1) / (float)segv;
+                if (trimmed &&
+                    !tri_trim_inside(s->trim_loop_off, s->trim_pts,
+                                     s->trim_nloops, 0.5f * (u0 + u1),
+                                     0.5f * (v0 + v1)))
+                    continue;
+                float gu[4] = {u0, u1, u1, u0}, gv[4] = {v0, v0, v1, v1};
+                float P[4][3], N[4][3];
+                for (int c = 0; c < 4; c++)
+                    lrt_tri_surface_normal(s, p, gu[c], gv[c], P[c], N[c], NULL,
+                                           NULL);
+                /* cell -> 2 triangles (0,1,2) and (0,2,3), CCW in (u,v) */
+                static const int idx[2][3] = {{0, 1, 2}, {0, 2, 3}};
+                for (int t = 0; t < 2; t++) {
+                    if (written < cap) {
+                        for (int c = 0; c < 3; c++) {
+                            int w = idx[t][c];
+                            size_t vert = written * 3 + (size_t)c;
+                            if (pos) {
+                                pos[vert * 3 + 0] = P[w][0];
+                                pos[vert * 3 + 1] = P[w][1];
+                                pos[vert * 3 + 2] = P[w][2];
+                            }
+                            if (nrm) {
+                                nrm[vert * 3 + 0] = N[w][0];
+                                nrm[vert * 3 + 1] = N[w][1];
+                                nrm[vert * 3 + 2] = N[w][2];
+                            }
+                            if (uv) {
+                                uv[vert * 2 + 0] = gu[w];
+                                uv[vert * 2 + 1] = gv[w];
+                            }
+                        }
+                        written++;
+                    }
+                    total++;
+                }
+            }
+        }
+    }
+    if (ntris_out) *ntris_out = total;
+    return LRT_RESULT_OK;
+}
+
 lrt_tri_scene *lrt_sdfprim_scene_build(const uint32_t *types,
                                        const float *centers, const float *params,
                                        size_t nprims,

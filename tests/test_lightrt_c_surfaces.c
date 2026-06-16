@@ -726,6 +726,160 @@ static void test_surface_normals(void) {
     if (sn) lrt_tri_scene_free(sn);
 }
 
+/* ----- tessellation (lrt_tri_surface_tessellate) ----------------------------
+ * Verifies emitted vertices lie on the surface (independent eval), the
+ * geometric normal aligns with a finite-difference normal, the count matches
+ * the bound (untrimmed), and trimmed cells are dropped (all centroids inside). */
+static void test_tessellate(void) {
+    lrt_tri_build_options o;
+    memset(&o, 0, sizeof(o));
+    o.num_threads = 1;
+    const uint32_t SU = 6, SV = 5;
+
+    /* --- bezpatch: positions + normals vs independent eval --- */
+    const size_t NP = 80;
+    float *cps = (float *)malloc(NP * 48 * sizeof(float));
+    for (size_t i = 0; i < NP; i++) {
+        float c[3] = {rf(-2, 2), rf(-2, 2), rf(-2, 2)};
+        float ax[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+        float ay[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+        float *cp = &cps[i * 48];
+        for (int jj = 0; jj < 4; jj++)
+            for (int ii = 0; ii < 4; ii++) {
+                float fu = ii / 3.0f - 0.5f, fv = jj / 3.0f - 0.5f;
+                int idx = (jj * 4 + ii) * 3;
+                for (int k = 0; k < 3; k++)
+                    cp[idx + k] = c[k] + 0.8f * fu * ax[k] + 0.8f * fv * ay[k] +
+                                  rf(-0.1f, 0.1f);
+            }
+    }
+    lrt_tri_scene *sp = lrt_bezpatch_scene_build(cps, NP, &o, NULL);
+    CHECK(sp != NULL, "tess: bezpatch build");
+    if (sp) {
+        size_t bound = lrt_tri_surface_tessellate_bound(sp, SU, SV);
+        CHECK(bound == NP * SU * SV * 2, "tess: bound %zu", bound);
+        float *pos = (float *)malloc(bound * 9 * sizeof(float));
+        float *nrm = (float *)malloc(bound * 9 * sizeof(float));
+        float *uv = (float *)malloc(bound * 6 * sizeof(float));
+        size_t nt = 0;
+        lrt_result r =
+            lrt_tri_surface_tessellate(sp, SU, SV, pos, nrm, uv, bound, &nt);
+        CHECK(r == LRT_RESULT_OK && nt == bound, "tess: bezpatch count %zu", nt);
+        size_t resid_ok = 0, norm_ok = 0, nverts = nt * 3;
+        for (size_t vtx = 0; vtx < nverts; vtx++) {
+            float u = uv[vtx * 2 + 0], v = uv[vtx * 2 + 1];
+            int prim = (int)((vtx / 3) / (SU * SV * 2)); /* patch from tri order */
+            float S[3];
+            bezpatch_eval(&cps[(size_t)prim * 48], u, v, S);
+            float dp = fabsf(S[0] - pos[vtx * 3]) + fabsf(S[1] - pos[vtx * 3 + 1]) +
+                       fabsf(S[2] - pos[vtx * 3 + 2]);
+            if (dp < 1e-4f) resid_ok++;
+            /* FD normal from the independent eval */
+            float h = 1e-3f, Su0[3], Su1[3], Sv0[3], Sv1[3];
+            bezpatch_eval(&cps[(size_t)prim * 48], u + h, v, Su1);
+            bezpatch_eval(&cps[(size_t)prim * 48], u - h, v, Su0);
+            bezpatch_eval(&cps[(size_t)prim * 48], u, v + h, Sv1);
+            bezpatch_eval(&cps[(size_t)prim * 48], u, v - h, Sv0);
+            float du[3], dv[3];
+            for (int k = 0; k < 3; k++) {
+                du[k] = Su1[k] - Su0[k];
+                dv[k] = Sv1[k] - Sv0[k];
+            }
+            float fn[3] = {du[1] * dv[2] - du[2] * dv[1],
+                           du[2] * dv[0] - du[0] * dv[2],
+                           du[0] * dv[1] - du[1] * dv[0]};
+            const float *gn = &nrm[vtx * 3];
+            float lf = sqrtf(fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2]);
+            float lg = sqrtf(gn[0] * gn[0] + gn[1] * gn[1] + gn[2] * gn[2]);
+            if (lf < 1e-9f || lg < 1e-9f ||
+                (fn[0] * gn[0] + fn[1] * gn[1] + fn[2] * gn[2]) / (lf * lg) >
+                    0.999f)
+                norm_ok++;
+        }
+        printf("tess[bezpatch]: %zu tris, resid %.2f%% normal %.2f%%\n", nt,
+               100.0 * resid_ok / nverts, 100.0 * norm_ok / nverts);
+        CHECK(resid_ok == nverts, "tess: bezpatch residual %.3f%%",
+              100.0 * resid_ok / nverts);
+        CHECK(norm_ok >= (size_t)(0.99 * nverts), "tess: bezpatch normal %.3f%%",
+              100.0 * norm_ok / nverts);
+        free(pos);
+        free(nrm);
+        free(uv);
+        lrt_tri_scene_free(sp);
+    }
+    free(cps);
+
+    /* --- trimmed NURBS: every emitted cell centroid is inside the trim disk,
+     * and the trimmed count is strictly below the untrimmed bound --- */
+    {
+        const int nu = 4, nv = 4;
+        const float U[9] = {0, 0, 0, 0, 0.5f, 1, 1, 1, 1};
+        const int NG = 40;
+        float tp[40 * 2];
+        uint32_t ll[1] = {(uint32_t)NG};
+        for (int i = 0; i < NG; i++) {
+            float a = 6.2831853f * i / NG;
+            tp[i * 2 + 0] = 0.5f + 0.3f * cosf(a);
+            tp[i * 2 + 1] = 0.5f + 0.3f * sinf(a);
+        }
+        float net[25 * 3], w[25];
+        for (int jj = 0; jj <= nv; jj++)
+            for (int ii = 0; ii <= nu; ii++) {
+                int idx = jj * (nu + 1) + ii;
+                float fu = (float)ii / nu - 0.5f, fv = (float)jj / nv - 0.5f;
+                net[idx * 3 + 0] = fu;
+                net[idx * 3 + 1] = fv;
+                net[idx * 3 + 2] = 0.2f * fu * fv;
+                w[idx] = 1.0f;
+            }
+        lrt_tri_scene *st = lrt_trimnurbs_scene_build(net, nu, nv, U, U, w, 3, 3,
+                                                      tp, ll, 1, &o, NULL);
+        CHECK(st != NULL, "tess: trimnurbs build");
+        if (st) {
+            const uint32_t S = 24;
+            size_t bound = lrt_tri_surface_tessellate_bound(st, S, S);
+            float *pos = (float *)malloc(bound * 9 * sizeof(float));
+            float *uv = (float *)malloc(bound * 6 * sizeof(float));
+            size_t nt = 0;
+            lrt_result r =
+                lrt_tri_surface_tessellate(st, S, S, pos, NULL, uv, bound, &nt);
+            CHECK(r == LRT_RESULT_OK, "tess: trimnurbs result");
+            CHECK(nt > 0 && nt < bound, "tess: trim should drop cells (%zu/%zu)",
+                  nt, bound);
+            /* every emitted vertex's (u,v) lies within ~the trim disk (allow a
+             * cell-diagonal slack, since the *centroid* is the gate) */
+            size_t inside = 0, nverts = nt * 3;
+            float cellr = 1.0f / (float)S; /* domain span ~1; cell ~1/S */
+            for (size_t vtx = 0; vtx < nverts; vtx++) {
+                float du = uv[vtx * 2] - 0.5f, dv = uv[vtx * 2 + 1] - 0.5f;
+                if (sqrtf(du * du + dv * dv) <= 0.3f + 1.5f * cellr) inside++;
+            }
+            printf("tess[trimnurbs]: %zu/%zu tris kept, verts-in-disk %.2f%%\n",
+                   nt, bound, 100.0 * inside / nverts);
+            CHECK(inside == nverts, "tess: trim vertices outside disk (%.2f%%)",
+                  100.0 * inside / nverts);
+            free(pos);
+            free(uv);
+            lrt_tri_scene_free(st);
+        }
+    }
+
+    /* edge cases */
+    {
+        float tri[9] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+        lrt_tri_scene *st = lrt_tri_scene_build(tri, 1, &o, NULL);
+        if (st) {
+            size_t nt = 0;
+            lrt_result r =
+                lrt_tri_surface_tessellate(st, 2, 2, NULL, NULL, NULL, 0, &nt);
+            CHECK(r == LRT_RESULT_INVALID_ARGUMENT, "tess: tri scene rejected");
+            CHECK(lrt_tri_surface_tessellate_bound(st, 2, 2) == 0,
+                  "tess: tri bound 0");
+            lrt_tri_scene_free(st);
+        }
+    }
+}
+
 int main(void) {
     test_bilinear();
     test_bezpatch();
@@ -734,6 +888,7 @@ int main(void) {
     test_trimnurbs();
     test_trim_serialize();
     test_surface_normals();
+    test_tessellate();
     if (g_fail) {
         printf("\n%d FAILURES\n", g_fail);
         return 1;
