@@ -739,6 +739,7 @@ extern "C" lrt_hip_scene *lrt_hip_scene_make_(uint32_t *d_nodes,
 
 /* Grow a device scratch buffer to at least `need` bytes. */
 static int hip_grow(lrt_hip_engine *e, void **buf, size_t *cap, size_t need) {
+    (void)e;
     if (*cap >= need && *buf) return 1;
     hip_free(*buf);
     *buf = NULL;

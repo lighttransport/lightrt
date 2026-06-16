@@ -59,11 +59,11 @@ __global__ void kl_centroids(const float *__restrict__ verts,
                              float *__restrict__ cen, uint32_t ntris) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= ntris) return;
-    uint32_t vb = i * 9u;
+    size_t vb = (size_t)i * 9u;
     for (uint32_t a = 0; a < 3u; a++) {
         float v0 = verts[vb + 0u + a], v1 = verts[vb + 3u + a],
               v2 = verts[vb + 6u + a];
-        cen[i * 3u + a] = 0.5f * (fminf(v0, fminf(v1, v2)) +
+        cen[(size_t)i * 3u + a] = 0.5f * (fminf(v0, fminf(v1, v2)) +
                                   fmaxf(v0, fmaxf(v1, v2)));
     }
 }
@@ -101,7 +101,7 @@ __global__ void kl_cen_aabb(const float *__restrict__ cen, uint32_t ntris,
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < ntris) {
         for (int a = 0; a < 3; a++) {
-            float v = cen[i * 3u + a];
+            float v = cen[(size_t)i * 3u + a];
             atomicMinF(&slo[a], v);
             atomicMaxF(&shi[a], v);
         }
@@ -143,7 +143,7 @@ __global__ void kl_keys(const float *__restrict__ cen, uint32_t ntris,
     float scale[3] = {bs[3], bs[4], bs[5]};
     uint32_t q[3];
     for (int a = 0; a < 3; a++) {
-        float fv = (cen[i * 3u + a] - base[a]) * scale[a];
+        float fv = (cen[(size_t)i * 3u + a] - base[a]) * scale[a];
         int qi = (int)fv;
         qi = qi < 0 ? 0 : (qi > 1023 ? 1023 : qi);
         q[a] = (uint32_t)qi;
@@ -185,9 +185,10 @@ __global__ void kl_karras(const uint64_t *__restrict__ keys, uint32_t n,
     int l = 0;
     for (int t = lmax >> 1; t >= 1; t >>= 1)
         if (delta(keys, ni, i, i + (l + t) * d) > dmin) l += t;
-    int j = i + l * d;
-    int first = i < j ? i : j;
-    int last = i < j ? j : i;
+    int ii = (int)i; /* i in [0, n-2], fits int; avoids unsigned/signed mix */
+    int j = ii + l * d;
+    int first = ii < j ? ii : j;
+    int last = ii < j ? j : ii;
 
     /* findSplit */
     int commonPrefix = delta(keys, ni, first, last);
@@ -243,8 +244,8 @@ __global__ void kl_bounds(const float *__restrict__ verts,
     float lo[3], hi[3];
     leaf_aabb(verts, prim, lo, hi);
     for (int a = 0; a < 3; a++) {
-        leafLo[L * 3 + a] = lo[a];
-        leafHi[L * 3 + a] = hi[a];
+        leafLo[(size_t)L * 3 + a] = lo[a];
+        leafHi[(size_t)L * 3 + a] = hi[a];
     }
     __threadfence();
     uint32_t cur = parentLeaf[L];
@@ -253,20 +254,20 @@ __global__ void kl_bounds(const float *__restrict__ verts,
         /* second child arrived: both subtrees done -> union into intLo/intHi */
         uint32_t a = childA[cur], b = childB[cur];
         const float *aLo = (a & LBVH_LEAF_FLAG)
-                               ? &leafLo[(a & ~LBVH_LEAF_FLAG) * 3]
-                               : &intLo[a * 3];
+                               ? &leafLo[(size_t)(a & ~LBVH_LEAF_FLAG) * 3]
+                               : &intLo[(size_t)a * 3];
         const float *aHi = (a & LBVH_LEAF_FLAG)
-                               ? &leafHi[(a & ~LBVH_LEAF_FLAG) * 3]
-                               : &intHi[a * 3];
+                               ? &leafHi[(size_t)(a & ~LBVH_LEAF_FLAG) * 3]
+                               : &intHi[(size_t)a * 3];
         const float *bLo = (b & LBVH_LEAF_FLAG)
-                               ? &leafLo[(b & ~LBVH_LEAF_FLAG) * 3]
-                               : &intLo[b * 3];
+                               ? &leafLo[(size_t)(b & ~LBVH_LEAF_FLAG) * 3]
+                               : &intLo[(size_t)b * 3];
         const float *bHi = (b & LBVH_LEAF_FLAG)
-                               ? &leafHi[(b & ~LBVH_LEAF_FLAG) * 3]
-                               : &intHi[b * 3];
+                               ? &leafHi[(size_t)(b & ~LBVH_LEAF_FLAG) * 3]
+                               : &intHi[(size_t)b * 3];
         for (int k = 0; k < 3; k++) {
-            intLo[cur * 3 + k] = fminf(aLo[k], bLo[k]);
-            intHi[cur * 3 + k] = fmaxf(aHi[k], bHi[k]);
+            intLo[(size_t)cur * 3 + k] = fminf(aLo[k], bLo[k]);
+            intHi[(size_t)cur * 3 + k] = fmaxf(aHi[k], bHi[k]);
         }
         __threadfence();
         cur = parentInt[cur];
@@ -293,7 +294,7 @@ __global__ void kl_emit_nodes(uint32_t *__restrict__ nodes, uint32_t ninternal,
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= ninternal) return;
     const uint32_t W = 4u;          /* BVH4 format */
-    uint32_t nb = i * (8u * W);     /* node stride = 32 words */
+    size_t nb = (size_t)i * (8u * W);     /* node stride = 32 words */
     uint32_t kids[2] = {childA[i], childB[i]};
     for (int s = 0; s < 2; s++) {
         uint32_t c = kids[s];
@@ -325,7 +326,7 @@ __global__ void kl_emit_leaves(uint32_t *__restrict__ blocks, uint32_t nleaves,
     uint32_t L = blockIdx.x * blockDim.x + threadIdx.x;
     if (L >= nleaves) return;
     const uint32_t W = 4u;       /* BVH4 leaf block (lrt_tri4), 40 words */
-    uint32_t bb = L * (10u * W);
+    size_t bb = (size_t)L * (10u * W);
     uint32_t prim = (uint32_t)(keys[L] & 0xFFFFFFFFu);
     const float *v = verts + (size_t)prim * 9u;
     float v0x = v[0], v0y = v[1], v0z = v[2];
