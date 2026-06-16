@@ -150,4 +150,45 @@ info_vk:
 	@echo "CC: $(CC)"
 	@echo "CFLAGS: $(CFLAGS) $(C_SIMD)"
 
-.PHONY: all clean run benchmark obj_bench info vk_test shaders info_vk
+# ---- HIP (ROCm/AMD) GPU backend (opt-in; needs hipcc) ----
+# Build + run the HIP self-test:        make hip_test && ./lightrt_c_hip_test
+# Build the HIP benchmark:              make benchmark_hip && ./bench_hip
+HIPCC ?= hipcc
+HIP_ARCH ?= gfx1201
+ROCM_PATH ?= /opt/rocm
+HIP_FLAGS = --offload-arch=$(HIP_ARCH) -ffp-contract=off -O2 $(INCLUDES)
+# rocWMMA is header-only; enable the matrix-core kernels when it is present.
+HIP_WMMA := $(wildcard $(ROCM_PATH)/include/rocwmma/rocwmma.hpp)
+ifneq ($(HIP_WMMA),)
+HIP_WMMA_FLAGS = -DLIGHTRT_HIP_HAVE_WMMA -I$(ROCM_PATH)/include
+endif
+HIP_C_OBJS = /tmp/lrt_hip_c.o /tmp/lrt_hip_c_tri.o
+HIP_DEV_OBJS = /tmp/lrt_hip_dev.o /tmp/lrt_hip_wmma.o
+
+hip_dev_objs:
+	$(HIPCC) $(HIP_FLAGS) -c lightrt_c_hip.hip -o /tmp/lrt_hip_dev.o
+	$(HIPCC) $(HIP_FLAGS) $(HIP_WMMA_FLAGS) -c lightrt_hip_wmma.hip -o /tmp/lrt_hip_wmma.o
+
+hip_test: hip_dev_objs
+	$(CC) $(CFLAGS) $(INCLUDES) -c lightrt_c.c -o /tmp/lrt_hip_c.o
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -c lightrt_c_tri.c -o /tmp/lrt_hip_c_tri.o
+	$(CC) $(CFLAGS) $(INCLUDES) -c tests/test_lightrt_c_hip.c -o /tmp/lrt_hip_test.o
+	$(HIPCC) --offload-arch=$(HIP_ARCH) -O2 /tmp/lrt_hip_test.o $(HIP_DEV_OBJS) $(HIP_C_OBJS) -o lightrt_c_hip_test -lm
+	@echo "Built lightrt_c_hip_test (run: ./lightrt_c_hip_test)"
+
+benchmark_hip: hip_dev_objs
+	$(CC) $(CFLAGS) $(INCLUDES) -c lightrt_c.c -o /tmp/lrt_hip_c.o
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -c lightrt_c_tri.c -o /tmp/lrt_hip_c_tri.o
+	$(CC) $(CFLAGS) $(INCLUDES) -c benchmark_c/rays.c -o /tmp/lrt_hip_rays.o
+	$(CC) $(CFLAGS) $(INCLUDES) -c benchmark_c/scene_mandelbulb.c -o /tmp/lrt_hip_mb.o
+	$(CC) $(CFLAGS) $(INCLUDES) -c benchmark_c/scene_thinspan.c -o /tmp/lrt_hip_ts.o
+	$(CC) -std=gnu11 $(filter-out -std=c11,$(CFLAGS)) $(INCLUDES) -c benchmark_hip/bench_hip_main.c -o /tmp/lrt_hip_bench.o
+	$(HIPCC) --offload-arch=$(HIP_ARCH) -O2 /tmp/lrt_hip_bench.o $(HIP_DEV_OBJS) $(HIP_C_OBJS) /tmp/lrt_hip_rays.o /tmp/lrt_hip_mb.o /tmp/lrt_hip_ts.o -o bench_hip -lm
+	@echo "Built bench_hip (run: ./bench_hip --scene mandelbulb  |  ./bench_hip --leaf)"
+
+info_hip:
+	@echo "HIPCC: $(HIPCC)"
+	@echo "HIP_ARCH: $(HIP_ARCH)"
+	@echo "HIP_FLAGS: $(HIP_FLAGS)"
+
+.PHONY: all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip

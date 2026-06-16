@@ -847,6 +847,80 @@ cmake -S benchmark_c -B build_bench_c -DLRTBENCH_VK=ON
 - Path B v1 is hybrid (GPU front end, CPU hierarchy); full-GPU LBVH (radix sort /
   Karras tree / collapse on GPU) is a planned v2/v3.
 
+## HIP GPU Backend (`lightrt_c_hip.h`)
+
+Optional HIP (ROCm/AMD) GPU backend for the C11 triangle kernel, parallel to the
+Vulkan path but with a **device-resident scene** (upload the BVH once, trace many
+batches) and Phase-2 hooks for WMMA / int-quantized low-precision tracing.
+Targets RDNA4 (gfx1201, wave32) but runs on any HIP device. Implementation is
+`lightrt_c_hip.hip` (compiled by `hipcc` as C++, all symbols `extern "C"`); the
+header is pure C11 so the C library/benchmark include it cleanly. Build is opt-in
+and the test skips (exit 0) when no device is present.
+
+### Phase 1 (implemented): fp32 build + trace
+- **Resident trace**: `lrt_hip_scene_upload` (CPU-built BVH4/BVH8 → device via the
+  LRTS serialization blob, byte-identical to the Vulkan path) then
+  `lrt_hip_scene_trace` / `lrt_hip_scene_occluded` (reused/grown device ray/hit
+  scratch). The `k_trace<W,STACK>` / `k_occluded<W,STACK>` kernels are a
+  byte-for-byte port of `vk/shaders/trace_bvh.comp` over raw `uint32_t*` node/leaf
+  buffers (node stride `8*W` words, block stride `10*W`, prim at `9*W`; parity
+  constants `INVD_MAX=1e18`, MT det `±1e-12`, deferred tnear cull, far-to-near
+  push). Compiled `-ffp-contract=off` to stay bit-faithful to the scalar C kernel
+  → matches `lrt_tri_intersect1` to ~99.999% (`max_rel_t < 1e-6`).
+- **Hybrid GPU build (Path B)**: `lrt_hip_build_scene` runs `k_centroids` +
+  `k_morton` on the GPU (port of `build_morton.comp`), finishes the LBVH on the
+  CPU via `lrt_tri_scene_build_lbvh_morton`; matches a FAST CPU build.
+- **One-shot**: `lrt_hip_trace_scene` (upload+trace+free).
+- Engine: `lrt_hip_engine_create`/`_destroy`/`_caps`/`_device_name`/`_last_error`.
+  Caps report `WMMA`/`FP8`/`INT8`/`INT4` (inferred from gfx11xx/gfx12xx arch).
+- `lrt_hip_scene_trace_ex(mode, ...)` selects precision; Phase-2 modes
+  (`WMMA_BF16`/`WMMA_FP8`/`WMMA_F32SEED`/`INT8`/`INT4`) currently fall back to fp32.
+
+### Build / test / benchmark
+```bash
+cmake -S . -B build_hip -DLIGHTRT_BUILD_HIP=ON -DLIGHTRT_BUILD_BENCHMARK_HIP=ON -DBUILD_TESTING=ON
+cmake --build build_hip && ctest --test-dir build_hip -R lightrt_c_hip_test
+./build_hip/benchmark_hip/bench_hip --scene mandelbulb --tris 200000 --rays 2000000
+make hip_test && ./lightrt_c_hip_test           # Makefile path (opt-in, needs hipcc)
+make benchmark_hip && ./bench_hip               # benchmark
+```
+The benchmark (`benchmark_hip/`) reports build_ms + primary/incoherent/shadow
+Mray/s + agreement vs the CPU oracle, for `cpu-bvh8` / `hip-fp32` / `hip-build`.
+On an RX 9070 XT (gfx1201) hip-fp32 traces a 220k-tri mandelbulb at ~210 Mray/s
+primary / ~135 Mray/s incoherent (vs ~19 / ~2 for 1-thread CPU); the GPU build is
+~2.7× faster than the CPU SAH build. Override the arch with `-DCMAKE_HIP_ARCHITECTURES=...`
+or `make HIP_ARCH=...`.
+
+### Phase 2 (implemented): WMMA + int-quantized leaf kernels
+`lightrt_hip_wmma.hip` (compiled into `lightrt_hip` when rocWMMA is present;
+`lrt_hip_have_wmma()` reports it). RDNA4 WMMA does `D=A·B+C` — fits batched dense
+math, NOT divergent traversal — so the leaf intersection of a coherent 16-ray
+tile vs <=16 triangles is cast as the **Plücker edge-side GEMM**: ray Plücker
+`A=[dir, cross(org,dir)]` (M=16, K=6) times per-edge Plücker `B_k=[moment;dir]`
+(3 edges -> 3 16x16x16 mma ops), fp32/int32 accumulate; the sign of the three
+edge functions classifies in/out and `t` is recovered in fp32. Methods
+(`lrt_hip_leaf_bench`, `lrt_hip_isect_method`): `SCALAR` (fp32 Moller-Trumbore
+baseline), `WMMA_BF16`, `WMMA_FP16`, `WMMA_FP8` (e4m3, leaf-local normalized),
+`WMMA_INT8` (leaf-local quantized iu8). `lrt_hip_transform_bench` is the batched
+ray transform / motion-blur keyframe-lerp kernel (instancing path).
+
+**Honest verdict (RX 9070 XT, `bench_hip --leaf`, 16 rays/leaf, full-wave
+scalar baseline):** scalar fp32 FMA **beats** WMMA for leaf intersection — WMMA
+tops out at ~0.5x scalar (fp16) in both coherent and incoherent regimes. The
+K=6 tiles waste 10/16 of the WMMA K dimension and the shared-memory staging +
+3 GEMMs/leaf cost more than the lean scalar Moller-Trumbore. This is the
+expected result for tiny one-tile-per-leaf ops and matches the design's
+prediction; the benchmark reports it rather than hiding it. Classification
+accuracy vs scalar: fp16 ~98–99.6%, int8 ~94–98%, fp8 ~94–97%, bf16 ~88–97%
+(fp16 best; coherent rays graze shared edges so agree slightly lower than
+incoherent). Takeaway: on RDNA4 the matrix cores do not accelerate these
+CPU-style RT primitives; the precise fp32 trace (Phase 1) is the path to use.
+Transform batching is memory-bound, so WMMA does not help it either.
+
+Remaining experimental ideas (not implemented, expected low/negative payoff):
+WMMA box/slab tests (the min/max reduction is not a matmul), and full
+coherent-packet traversal that would call the WMMA leaf kernel inline.
+
 ## Code Conventions
 
 - C++17, no RTTI (`-fno-rtti`), no exceptions (`-fno-exceptions`)

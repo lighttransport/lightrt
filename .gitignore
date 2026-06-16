@@ -27,7 +27,13 @@ webgpu/softrt.wasm
 
 # Build directories
 build/
+build-*/
 cmake-build-*/
+
+# HIP / GPU self-test + benchmark binaries
+lightrt_c_hip_test
+lightrt_c_vk_test
+bench_hip
 
 # Locally built toolchain (scripts/setup-and-build-glslang.sh)
 tools/

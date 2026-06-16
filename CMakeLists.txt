@@ -240,6 +240,74 @@ if(LIGHTRT_BUILD_VK)
     endif()
 endif()
 
+# --- HIP (ROCm/AMD) GPU backend (opt-in) ----------------------------------
+# Enables the HIP triangle-BVH trace/build backend (lightrt_c_hip.{h,hip}) and
+# its self-test. Requires hipcc + CMake >= 3.21 for the HIP language. The test
+# skips (exit 0) when no HIP device is present, so GPU-less CI stays green.
+option(LIGHTRT_BUILD_HIP "Build the HIP (ROCm/AMD) GPU backend" OFF)
+if(LIGHTRT_BUILD_HIP)
+    if(CMAKE_VERSION VERSION_LESS 3.21)
+        message(FATAL_ERROR "LIGHTRT_BUILD_HIP requires CMake >= 3.21 for the HIP language")
+    endif()
+    if(NOT DEFINED ROCM_PATH)
+        if(DEFINED ENV{ROCM_PATH})
+            set(ROCM_PATH $ENV{ROCM_PATH} CACHE PATH "ROCm install root")
+        else()
+            set(ROCM_PATH "/opt/rocm" CACHE PATH "ROCm install root")
+        endif()
+    endif()
+    list(APPEND CMAKE_PREFIX_PATH "${ROCM_PATH}" "${ROCM_PATH}/lib/cmake")
+    if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
+        set(CMAKE_HIP_ARCHITECTURES gfx1201 CACHE STRING "HIP offload archs")
+    endif()
+    enable_language(HIP)
+
+    # rocWMMA (matrix cores) for the Phase-2 WMMA leaf/transform kernels. Header-
+    # only; detected via find_package or a direct header probe under ROCM_PATH.
+    set(LIGHTRT_HIP_WMMA_OK OFF)
+    find_package(rocwmma QUIET)
+    if(rocwmma_FOUND OR EXISTS "${ROCM_PATH}/include/rocwmma/rocwmma.hpp")
+        set(LIGHTRT_HIP_WMMA_OK ON)
+    endif()
+
+    # Static library exposing the HIP backend to other targets.
+    set(LIGHTRT_HIP_SOURCES lightrt_c_hip.hip)
+    if(LIGHTRT_HIP_WMMA_OK)
+        list(APPEND LIGHTRT_HIP_SOURCES lightrt_hip_wmma.hip)
+    endif()
+    add_library(lightrt_hip STATIC ${LIGHTRT_HIP_SOURCES})
+    set_source_files_properties(${LIGHTRT_HIP_SOURCES} PROPERTIES LANGUAGE HIP)
+    target_include_directories(lightrt_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_include_directories(lightrt_hip PRIVATE ${ROCM_PATH}/include)
+    # -ffp-contract=off keeps the GPU kernel bit-faithful to the scalar C kernel.
+    target_compile_options(lightrt_hip PRIVATE -ffp-contract=off)
+    if(LIGHTRT_HIP_WMMA_OK)
+        target_compile_definitions(lightrt_hip PRIVATE LIGHTRT_HIP_HAVE_WMMA)
+        message(STATUS "  HIP: rocWMMA found (matrix-core kernels enabled)")
+    else()
+        message(STATUS "  HIP: rocWMMA NOT found (WMMA kernels stubbed out)")
+    endif()
+
+    if(BUILD_TESTING)
+        add_executable(lightrt_c_hip_test
+            lightrt_c.c lightrt_c_tri.c tests/test_lightrt_c_hip.c)
+        set_source_files_properties(lightrt_c.c lightrt_c_tri.c
+            tests/test_lightrt_c_hip.c PROPERTIES LANGUAGE C)
+        target_include_directories(lightrt_c_hip_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        if(LIGHTRT_C_TRI_SIMD_FLAGS)
+            target_compile_options(lightrt_c_hip_test PRIVATE
+                $<$<COMPILE_LANGUAGE:C>:${LIGHTRT_C_TRI_SIMD_FLAGS}>)
+        endif()
+        target_link_libraries(lightrt_c_hip_test lightrt_hip)
+        if(NOT MSVC)
+            target_link_libraries(lightrt_c_hip_test m)
+        endif()
+        add_test(NAME lightrt_c_hip_test COMMAND lightrt_c_hip_test)
+    endif()
+
+    install(FILES lightrt_c_hip.h DESTINATION include)
+endif()
+
 # Optional: regenerate the checked-in SPIR-V headers (developers with glslang
 # only; never part of the default build / ALL target).
 find_program(LIGHTRT_GLSLANG glslangValidator)
@@ -300,6 +368,15 @@ endif()
 option(LIGHTRT_BUILD_BENCHMARK_C "Build the C11 lightrt-vs-Embree benchmark" OFF)
 if(LIGHTRT_BUILD_BENCHMARK_C)
     add_subdirectory(benchmark_c)
+endif()
+
+# HIP (ROCm/AMD) GPU benchmark (benchmark_hip/). Implies LIGHTRT_BUILD_HIP.
+option(LIGHTRT_BUILD_BENCHMARK_HIP "Build the HIP GPU ray-tracing benchmark" OFF)
+if(LIGHTRT_BUILD_BENCHMARK_HIP)
+    if(NOT LIGHTRT_BUILD_HIP)
+        message(FATAL_ERROR "LIGHTRT_BUILD_BENCHMARK_HIP requires LIGHTRT_BUILD_HIP=ON")
+    endif()
+    add_subdirectory(benchmark_hip)
 endif()
 
 # Print configuration summary
