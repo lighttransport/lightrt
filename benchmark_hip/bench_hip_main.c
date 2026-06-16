@@ -348,6 +348,18 @@ int main(int argc, char **argv) {
                    "hip-fp32", bench_ns_to_ms(t1 - t0), pm, im, sm, ag * 100.0,
                    st.memory_bytes / (1024.0 * 1024.0));
             (void)hits;
+            /* Refit timing (dynamic/animation path): vs the full build_ms. */
+            double refit_ms = 1e30;
+            for (int it = 0; it < iters; it++) {
+                uint64_t r0 = bench_time_ns();
+                lrt_hip_scene_refit(e, gs, verts, (uint32_t)ntris, NULL);
+                uint64_t r1 = bench_time_ns();
+                double m = bench_ns_to_ms(r1 - r0);
+                if (m < refit_ms) refit_ms = m;
+            }
+            printf("%-12s refit %.2f ms (%.1fx faster than the %.2f ms build)\n",
+                   "hip-refit", refit_ms, bench_ns_to_ms(t1 - t0) / refit_ms,
+                   bench_ns_to_ms(t1 - t0));
             lrt_hip_scene_free(e, gs);
         } else {
             printf("hip-fp32: upload failed: %s\n",

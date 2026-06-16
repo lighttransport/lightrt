@@ -398,6 +398,62 @@ static void test_wmma(lrt_hip_engine *e) {
     free(times);
 }
 
+/* Refit: deform vertices, GPU-refit the resident scene, and check its trace
+ * matches a CPU scene refitted (same topology) on the same deformed vertices. */
+static void test_refit(lrt_hip_engine *e, const char *label, const float *verts,
+                       size_t ntris, lrt_tri_layout layout, size_t nrays) {
+    lrt_tri_build_options opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.quality = LRT_TRI_BUILD_DEFAULT;
+    opts.layout = layout;
+    opts.num_threads = 1;
+    lrt_tri_scene *s = lrt_tri_scene_build(verts, ntris, &opts, NULL);
+    lrt_hip_scene *gs = lrt_hip_scene_upload(e, s, NULL);
+    CHECK(s && gs, "%s: build/upload failed", label);
+    if (!s || !gs) {
+        if (gs) lrt_hip_scene_free(e, gs);
+        if (s) lrt_tri_scene_free(s);
+        return;
+    }
+
+    /* Deform: vertical wave displacement. */
+    float *def = (float *)malloc(ntris * 9 * sizeof(float));
+    for (size_t i = 0; i < ntris * 9; i += 3) {
+        def[i + 0] = verts[i + 0];
+        def[i + 1] = verts[i + 1] + 0.3f * sinf(verts[i + 0] * 1.7f);
+        def[i + 2] = verts[i + 2];
+    }
+
+    lrt_result rr = lrt_tri_scene_refit(s, def, ntris);
+    CHECK(rr == LRT_RESULT_OK, "%s: CPU refit failed", label);
+    int gr = lrt_hip_scene_refit(e, gs, def, (uint32_t)ntris, NULL);
+    CHECK(gr == 0, "%s: GPU refit failed: %s", label,
+          lrt_hip_engine_last_error(e));
+
+    lrt_ray *rays = (lrt_ray *)malloc(nrays * sizeof(lrt_ray));
+    lrt_hit *gh = (lrt_hit *)malloc(nrays * sizeof(lrt_hit));
+    for (size_t i = 0; i < nrays; i++) make_random_ray(&rays[i]);
+    lrt_hip_scene_trace(e, gs, rays, (uint32_t)nrays, gh, NULL);
+
+    size_t agree = 0;
+    for (size_t i = 0; i < nrays; i++) {
+        lrt_hit cpu;
+        int ch = lrt_tri_intersect1(s, &rays[i], &cpu);
+        int g = gh[i].prim_id != LRT_TRI_NO_HIT;
+        if (ch == g && (!ch || cpu.prim_id == gh[i].prim_id)) agree++;
+    }
+    double frac = (double)agree / (double)nrays;
+    printf("  %-22s GPU-refit vs CPU-refit agree %.4f%%\n", label, frac * 100.0);
+    CHECK(frac >= 0.999, "%s: refit agreement %.4f%% < 99.9%%", label,
+          frac * 100.0);
+
+    free(def);
+    free(rays);
+    free(gh);
+    lrt_hip_scene_free(e, gs);
+    lrt_tri_scene_free(s);
+}
+
 int main(void) {
     lrt_result err = LRT_RESULT_OK;
     lrt_hip_engine *e = lrt_hip_engine_create(NULL, &err);
@@ -423,6 +479,10 @@ int main(void) {
     printf("== Path B (GPU-Morton build) vs CPU FAST ==\n");
     test_build(e, "build/BVH4", soup, ntris, LRT_TRI_LAYOUT_BVH4, 20000);
     test_build(e, "build/BVH8", grid, grid_n, LRT_TRI_LAYOUT_BVH8, 20000);
+
+    printf("== GPU refit (animation) vs CPU refit ==\n");
+    test_refit(e, "refit/BVH4", soup, ntris, LRT_TRI_LAYOUT_BVH4, 20000);
+    test_refit(e, "refit/BVH8", grid, grid_n, LRT_TRI_LAYOUT_BVH8, 20000);
 
     test_wmma(e);
 

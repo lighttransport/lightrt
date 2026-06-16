@@ -105,6 +105,15 @@ int lrt_hip_scene_occluded(lrt_hip_engine *e, lrt_hip_scene *s,
                            const lrt_ray *rays, uint32_t n, uint8_t *occluded,
                            lrt_result *err);
 
+/* Refit a resident scene in place for animation / motion blur (dynamic path):
+ * update the leaf vertices and recompute node bounds WITHOUT rebuilding the tree.
+ * vertices is 9*ntris floats in the ORIGINAL build order (indexed by prim_id);
+ * ntris must equal the original triangle count. Tree topology is preserved (large
+ * deformations degrade traversal quality but stay correct). Far cheaper than a
+ * rebuild — the realtime dynamic-scene path. Returns 0 on success, -1 on error. */
+int lrt_hip_scene_refit(lrt_hip_engine *e, lrt_hip_scene *s,
+                        const float *vertices, uint32_t ntris, lrt_result *err);
+
 /* As lrt_hip_scene_trace but selects a precision / acceleration mode. With
  * LRT_HIP_TRACE_FP32 it is identical to lrt_hip_scene_trace. Phase 2 modes fall
  * back to fp32 with LRT_RESULT_NOT_BUILT until implemented. */

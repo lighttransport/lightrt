@@ -80,8 +80,9 @@ struct lrt_hip_scene {
     uint32_t node_stride;  /* bytes */
     uint32_t block_stride; /* bytes */
     uint32_t root;
-    uint32_t layout; /* 4 or 8 */
-    uint32_t stack;  /* traversal stack depth bucket (32/64/128/256) */
+    uint32_t layout;    /* 4 or 8 */
+    uint32_t stack;     /* traversal stack depth bucket (32/64/128/256) */
+    uint32_t max_depth; /* wide-tree depth (refit bottom-up pass count) */
     size_t mem_bytes;
 };
 
@@ -451,6 +452,105 @@ __global__ void k_morton(const float *__restrict__ centroids,
 }
 
 /* ========================================================================= */
+/* Refit kernels — update leaf vertices + node bounds in place (animation).    */
+/* ========================================================================= */
+/* Rewrite every leaf block's v0/e1/e2 from new vertex positions (prim_id ->
+ * vertices[prim*9]). One thread per (block, lane). */
+template <unsigned W>
+__global__ void k_refit_leaves(uint32_t *__restrict__ blocks,
+                               const float *__restrict__ verts,
+                               uint32_t block_count, uint32_t ntris) {
+    constexpr uint32_t block_stride = 10u * W;
+    constexpr uint32_t prim_off = 9u * W;
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t total = block_count * W;
+    if (idx >= total) return;
+    uint32_t b = idx / W, lane = idx % W;
+    uint32_t bb = b * block_stride;
+    uint32_t prim = blocks[bb + prim_off + lane];
+    if (prim == LRT_HIP_NO_HIT || prim >= ntris) return;
+    const float *v = verts + (size_t)prim * 9u;
+    float v0x = v[0], v0y = v[1], v0z = v[2];
+    blocks[bb + 0u * W + lane] = __float_as_uint(v0x);
+    blocks[bb + 1u * W + lane] = __float_as_uint(v0y);
+    blocks[bb + 2u * W + lane] = __float_as_uint(v0z);
+    blocks[bb + 3u * W + lane] = __float_as_uint(v[3] - v0x);
+    blocks[bb + 4u * W + lane] = __float_as_uint(v[4] - v0y);
+    blocks[bb + 5u * W + lane] = __float_as_uint(v[5] - v0z);
+    blocks[bb + 6u * W + lane] = __float_as_uint(v[6] - v0x);
+    blocks[bb + 7u * W + lane] = __float_as_uint(v[7] - v0y);
+    blocks[bb + 8u * W + lane] = __float_as_uint(v[8] - v0z);
+}
+
+/* Recompute each node's per-child AABB slots. Leaf children union their block
+ * triangles; interior children union the child node's own slots. Run repeatedly
+ * (>= max_depth+1 passes): leaf bounds are exact after pass 1, interior bounds
+ * propagate one level per pass (parent index < child index by construction). */
+template <unsigned W>
+__global__ void k_refit_nodes(uint32_t *__restrict__ nodes,
+                              const uint32_t *__restrict__ blocks,
+                              uint32_t node_count) {
+    constexpr uint32_t node_stride = 8u * W;
+    constexpr uint32_t block_stride = 10u * W;
+    constexpr uint32_t prim_off = 9u * W;
+    uint32_t n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= node_count) return;
+    uint32_t nb = n * node_stride;
+    uint32_t nchildren = nodes[nb + 7u * W];
+    for (uint32_t i = 0; i < nchildren; i++) {
+        uint32_t ref = nodes[nb + 6u * W + i];
+        float lo0 = 1e30f, lo1 = 1e30f, lo2 = 1e30f;
+        float hi0 = -1e30f, hi1 = -1e30f, hi2 = -1e30f;
+        if ((ref & LRT_HIP_LEAF_BIT) != 0u) {
+            uint32_t blk0 = (ref & 0x7FFFFFFFu) >> 4u;
+            uint32_t nblk = ref & 0xFu;
+            for (uint32_t b = 0; b < nblk; b++) {
+                uint32_t bb = (blk0 + b) * block_stride;
+                for (uint32_t lane = 0; lane < W; lane++) {
+                    uint32_t prim = blocks[bb + prim_off + lane];
+                    if (prim == LRT_HIP_NO_HIT) continue;
+                    float v0x = fu(blocks[bb + 0u * W + lane]);
+                    float v0y = fu(blocks[bb + 1u * W + lane]);
+                    float v0z = fu(blocks[bb + 2u * W + lane]);
+                    float e1x = fu(blocks[bb + 3u * W + lane]);
+                    float e1y = fu(blocks[bb + 4u * W + lane]);
+                    float e1z = fu(blocks[bb + 5u * W + lane]);
+                    float e2x = fu(blocks[bb + 6u * W + lane]);
+                    float e2y = fu(blocks[bb + 7u * W + lane]);
+                    float e2z = fu(blocks[bb + 8u * W + lane]);
+                    float v1x = v0x + e1x, v1y = v0y + e1y, v1z = v0z + e1z;
+                    float v2x = v0x + e2x, v2y = v0y + e2y, v2z = v0z + e2z;
+                    lo0 = fminf(lo0, fminf(v0x, fminf(v1x, v2x)));
+                    lo1 = fminf(lo1, fminf(v0y, fminf(v1y, v2y)));
+                    lo2 = fminf(lo2, fminf(v0z, fminf(v1z, v2z)));
+                    hi0 = fmaxf(hi0, fmaxf(v0x, fmaxf(v1x, v2x)));
+                    hi1 = fmaxf(hi1, fmaxf(v0y, fmaxf(v1y, v2y)));
+                    hi2 = fmaxf(hi2, fmaxf(v0z, fmaxf(v1z, v2z)));
+                }
+            }
+        } else {
+            uint32_t c = ref & 0x7FFFFFFFu;
+            uint32_t cb = c * node_stride;
+            uint32_t cn = nodes[cb + 7u * W];
+            for (uint32_t j = 0; j < cn; j++) {
+                lo0 = fminf(lo0, fu(nodes[cb + 0u * W + j]));
+                lo1 = fminf(lo1, fu(nodes[cb + 1u * W + j]));
+                lo2 = fminf(lo2, fu(nodes[cb + 2u * W + j]));
+                hi0 = fmaxf(hi0, fu(nodes[cb + 3u * W + j]));
+                hi1 = fmaxf(hi1, fu(nodes[cb + 4u * W + j]));
+                hi2 = fmaxf(hi2, fu(nodes[cb + 5u * W + j]));
+            }
+        }
+        nodes[nb + 0u * W + i] = __float_as_uint(lo0);
+        nodes[nb + 1u * W + i] = __float_as_uint(lo1);
+        nodes[nb + 2u * W + i] = __float_as_uint(lo2);
+        nodes[nb + 3u * W + i] = __float_as_uint(hi0);
+        nodes[nb + 4u * W + i] = __float_as_uint(hi1);
+        nodes[nb + 5u * W + i] = __float_as_uint(hi2);
+    }
+}
+
+/* ========================================================================= */
 /* Trace launchers (compile-time W/STACK dispatch).                           */
 /* ========================================================================= */
 #define HIP_GRID(n) (((n) + 63u) / 64u), 64u, 0, e->stream
@@ -643,6 +743,7 @@ extern "C" lrt_hip_scene *lrt_hip_scene_upload(lrt_hip_engine *e,
     sc->root = h->root;
     sc->layout = w;
     sc->stack = stack;
+    sc->max_depth = st.max_depth;
 
     size_t nodes_bytes = (size_t)h->node_count * h->node_stride;
     size_t blocks_bytes = (size_t)h->block_count * h->block_stride;
@@ -781,6 +882,64 @@ extern "C" int lrt_hip_scene_occluded(lrt_hip_engine *e, lrt_hip_scene *s,
         if (occluded[i]) nocc++;
     if (err) *err = LRT_RESULT_OK;
     return nocc;
+}
+
+extern "C" int lrt_hip_scene_refit(lrt_hip_engine *e, lrt_hip_scene *s,
+                                   const float *vertices, uint32_t ntris,
+                                   lrt_result *err) {
+    if (!e || !s || !vertices || ntris == 0) {
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return -1;
+    }
+    size_t vbytes = (size_t)ntris * 9u * sizeof(float);
+    float *d_verts = NULL;
+    hipError_t hr;
+    if ((hr = hipMalloc((void **)&d_verts, vbytes)) != hipSuccess) {
+        hip_set_err_hip(e, "hipMalloc(refit verts)", hr);
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return -1;
+    }
+    if ((hr = hipMemcpyAsync(d_verts, vertices, vbytes, hipMemcpyHostToDevice,
+                             e->stream)) != hipSuccess) {
+        hip_free(d_verts);
+        hip_set_err_hip(e, "hipMemcpyAsync(refit verts)", hr);
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return -1;
+    }
+    const uint32_t W = s->layout;
+    /* 1. Rewrite leaf vertices. */
+    uint32_t leaf_threads = s->block_count * W;
+    uint32_t lg = (leaf_threads + 255u) / 256u;
+    if (W == 4u)
+        hipLaunchKernelGGL((k_refit_leaves<4>), dim3(lg), dim3(256), 0,
+                           e->stream, s->d_blocks, d_verts, s->block_count,
+                           ntris);
+    else
+        hipLaunchKernelGGL((k_refit_leaves<8>), dim3(lg), dim3(256), 0,
+                           e->stream, s->d_blocks, d_verts, s->block_count,
+                           ntris);
+    /* 2. Bottom-up node bounds: max_depth+1 passes (parent index < child). */
+    uint32_t ng = (s->node_count + 255u) / 256u;
+    uint32_t passes = s->max_depth + 1u;
+    for (uint32_t p = 0; p < passes; p++) {
+        if (W == 4u)
+            hipLaunchKernelGGL((k_refit_nodes<4>), dim3(ng), dim3(256), 0,
+                               e->stream, s->d_nodes, s->d_blocks,
+                               s->node_count);
+        else
+            hipLaunchKernelGGL((k_refit_nodes<8>), dim3(ng), dim3(256), 0,
+                               e->stream, s->d_nodes, s->d_blocks,
+                               s->node_count);
+    }
+    if ((hr = hipStreamSynchronize(e->stream)) != hipSuccess) {
+        hip_free(d_verts);
+        hip_set_err_hip(e, "hipStreamSynchronize(refit)", hr);
+        if (err) *err = LRT_RESULT_NOT_BUILT;
+        return -1;
+    }
+    hip_free(d_verts);
+    if (err) *err = LRT_RESULT_OK;
+    return 0;
 }
 
 extern "C" int lrt_hip_scene_trace_ex(lrt_hip_engine *e, lrt_hip_scene *s,

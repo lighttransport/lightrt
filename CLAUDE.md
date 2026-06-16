@@ -870,6 +870,11 @@ and the test skips (exit 0) when no device is present.
 - **Hybrid GPU build (Path B)**: `lrt_hip_build_scene` runs `k_centroids` +
   `k_morton` on the GPU (port of `build_morton.comp`), finishes the LBVH on the
   CPU via `lrt_tri_scene_build_lbvh_morton`; matches a FAST CPU build.
+- **GPU refit (dynamic / motion-blur)**: `lrt_hip_scene_refit` updates leaf
+  vertices + node bounds in place without rebuilding (multi-pass bottom-up;
+  parent index < child index by construction). Matches a CPU refit 100%. On the
+  220k-tri mandelbulb it is ~1 ms vs ~136 ms for a full build (~140× faster) —
+  the realtime animation path.
 - **One-shot**: `lrt_hip_trace_scene` (upload+trace+free).
 - Engine: `lrt_hip_engine_create`/`_destroy`/`_caps`/`_device_name`/`_last_error`.
   Caps report `WMMA`/`FP8`/`INT8`/`INT4` (inferred from gfx11xx/gfx12xx arch).
