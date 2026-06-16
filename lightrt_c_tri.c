@@ -12122,12 +12122,54 @@ lrt_tri_scene *lrt_tri_scene_open_mmap(const char *path, lrt_result *err) {
  * ------------------------------------------------------------------------ */
 
 /* AABB of a leaf reference, from its (already-updated) block vertices. */
+static lrt_result tri_refit_propagate(lrt_tri_scene *s);
+
+/* Expand [lo,hi] by the convex-hull box of npts control points stored SoA in a
+ * BVH4 leaf block at `cp` (cp[component][lane]); used by surface refit. */
+static inline void tri_cp_leaf_box(const float (*cp)[4], int npts, int lane,
+                                   float lo[3], float hi[3]) {
+    for (int p = 0; p < npts; p++)
+        for (int a = 0; a < 3; a++) {
+            float c = cp[p * 3 + a][lane];
+            if (c < lo[a]) lo[a] = c;
+            if (c > hi[a]) hi[a] = c;
+        }
+}
+
 static void tri_leaf_box(const lrt_tri_scene *s, uint32_t ref, float lo[3],
                          float hi[3]) {
     lo[0] = lo[1] = lo[2] = TRI_INF_F;
     hi[0] = hi[1] = hi[2] = -TRI_INF_F;
-    int width = s->layout;
     uint32_t blk0 = TRI_REF_BLOCK(ref), nblk = TRI_REF_NBLOCKS(ref);
+    /* Surface leaves (BVH4): the prim box is the control-point hull. */
+    if (s->prim_kind == TRI_PRIM_BILINEAR || s->prim_kind == TRI_PRIM_BEZPATCH) {
+        for (uint32_t b = 0; b < nblk; b++) {
+            const void *blk =
+                (const char *)s->blocks + (size_t)(blk0 + b) * s->block_stride;
+            if (s->prim_kind == TRI_PRIM_BILINEAR) {
+                const lrt_quad4 *q = (const lrt_quad4 *)blk;
+                for (int lane = 0; lane < 4; lane++) {
+                    if (q->prim[lane] == LRT_TRI_NO_HIT) continue;
+                    float c[4][3] = {{q->x0[lane], q->y0[lane], q->z0[lane]},
+                                     {q->x1[lane], q->y1[lane], q->z1[lane]},
+                                     {q->x2[lane], q->y2[lane], q->z2[lane]},
+                                     {q->x3[lane], q->y3[lane], q->z3[lane]}};
+                    for (int p = 0; p < 4; p++)
+                        for (int a = 0; a < 3; a++) {
+                            if (c[p][a] < lo[a]) lo[a] = c[p][a];
+                            if (c[p][a] > hi[a]) hi[a] = c[p][a];
+                        }
+                }
+            } else {
+                const lrt_bezpatch4 *bp = (const lrt_bezpatch4 *)blk;
+                for (int lane = 0; lane < 4; lane++)
+                    if (bp->prim[lane] != LRT_TRI_NO_HIT)
+                        tri_cp_leaf_box(bp->cp, 16, lane, lo, hi);
+            }
+        }
+        return;
+    }
+    int width = s->layout;
     for (uint32_t b = 0; b < nblk; b++) {
         const float *f = tri_block_floats(s->blocks, blk0 + b, width);
         const uint32_t *ids = (const uint32_t *)(f + 9 * width);
@@ -12172,6 +12214,13 @@ lrt_result lrt_tri_scene_refit(lrt_tri_scene *s, const float *vertices,
     }
 
     /* 2. Recompute node bounds bottom-up (children have higher indices). */
+    return tri_refit_propagate(s);
+}
+
+/* Recompute all node bounds (and the root box) bottom-up from the current leaf
+ * geometry — the shared tail of triangle and surface refit. The leaf boxes come
+ * from tri_leaf_box, which dispatches on prim_kind. */
+static lrt_result tri_refit_propagate(lrt_tri_scene *s) {
     float root_lo[3] = {TRI_INF_F, TRI_INF_F, TRI_INF_F};
     float root_hi[3] = {-TRI_INF_F, -TRI_INF_F, -TRI_INF_F};
     if (s->node_count == 0) {
@@ -12271,6 +12320,56 @@ lrt_result lrt_tri_scene_refit(lrt_tri_scene *s, const float *vertices,
         s->root_hi[a] = root_hi[a];
     }
     return LRT_RESULT_OK;
+}
+
+lrt_result lrt_tri_surface_refit(lrt_tri_scene *s, const float *cps,
+                                 size_t nprims) {
+    if (!s || !cps || nprims == 0) return LRT_RESULT_INVALID_ARGUMENT;
+    if (s->mem_mapped) return LRT_RESULT_INVALID_ARGUMENT; /* read-only */
+    /* Only the direct-control-point patches refit: bilinear (12 floats/patch:
+     * q00 q10 q11 q01) and bicubic Bezier (48 floats/patch). NURBS leaves are
+     * extracted rational patches with no 1:1 map back to the input net. */
+    if (s->prim_kind != TRI_PRIM_BILINEAR && s->prim_kind != TRI_PRIM_BEZPATCH)
+        return LRT_RESULT_INVALID_ARGUMENT;
+
+    /* 1. Scatter new control points into the leaf blocks by prim id. */
+    for (uint32_t bi = 0; bi < s->block_count; bi++) {
+        void *blk = (char *)s->blocks + (size_t)bi * s->block_stride;
+        if (s->prim_kind == TRI_PRIM_BILINEAR) {
+            lrt_quad4 *q = (lrt_quad4 *)blk;
+            for (int lane = 0; lane < 4; lane++) {
+                uint32_t pid = q->prim[lane];
+                if (pid == LRT_TRI_NO_HIT) continue;
+                if ((size_t)pid >= nprims) return LRT_RESULT_INVALID_ARGUMENT;
+                const float *c = &cps[(size_t)pid * 12];
+                q->x0[lane] = c[0];  q->y0[lane] = c[1];  q->z0[lane] = c[2];
+                q->x1[lane] = c[3];  q->y1[lane] = c[4];  q->z1[lane] = c[5];
+                q->x2[lane] = c[6];  q->y2[lane] = c[7];  q->z2[lane] = c[8];
+                q->x3[lane] = c[9];  q->y3[lane] = c[10]; q->z3[lane] = c[11];
+            }
+        } else {
+            lrt_bezpatch4 *bp = (lrt_bezpatch4 *)blk;
+            for (int lane = 0; lane < 4; lane++) {
+                uint32_t pid = bp->prim[lane];
+                if (pid == LRT_TRI_NO_HIT) continue;
+                if ((size_t)pid >= nprims) return LRT_RESULT_INVALID_ARGUMENT;
+                const float *c = &cps[(size_t)pid * 48];
+                for (int k = 0; k < 48; k++) bp->cp[k][lane] = c[k];
+            }
+        }
+    }
+
+    /* 2. Refresh the per-prim shade cache (control points changed). */
+    free(s->shade_cps);
+    free(s->shade_dom);
+    s->shade_cps = NULL;
+    s->shade_dom = NULL;
+    s->shade_nprims = 0;
+    s->shade_stride = 0;
+    tri_build_shade_data(s);
+
+    /* 3. Recompute node bounds bottom-up from the new control-point hulls. */
+    return tri_refit_propagate(s);
 }
 
 /* --------------------------------------------------------------------------

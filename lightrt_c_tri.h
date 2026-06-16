@@ -683,6 +683,20 @@ lrt_tri_scene *lrt_tri_scene_open_mmap(const char *path, lrt_result *err);
 lrt_result lrt_tri_scene_refit(lrt_tri_scene *s, const float *vertices,
                                size_t ntris);
 
+/* Refit a parametric SURFACE scene in place for animation (deforming patches):
+ * replace the control points and recompute node bounds without rebuilding the
+ * tree. Supported for bilinear (cps = 12*nprims: q00 q10 q11 q01 per patch) and
+ * bicubic Bezier (cps = 48*nprims) scenes — the direct-control-point kinds;
+ * nprims must equal the original patch count, in build order. NURBS/trimmed
+ * NURBS are rejected (their leaves are extracted rational patches with no 1:1
+ * map back to the input net). The post-hit shade cache is refreshed, so
+ * lrt_tri_surface_normal / _tessellate reflect the new geometry. Tree topology
+ * is preserved (large deformations degrade traversal quality but stay correct).
+ * Rejects mmapped (read-only) scenes. Returns LRT_RESULT_OK or INVALID_ARGUMENT
+ * (NULL/zero args, wrong kind, mmap, or a prim id >= nprims). */
+lrt_result lrt_tri_surface_refit(lrt_tri_scene *s, const float *cps,
+                                 size_t nprims);
+
 /* --- Instancing / TLAS ----------------------------------------------------
  *
  * A top-level acceleration structure over instances of bottom-level scenes

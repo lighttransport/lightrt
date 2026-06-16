@@ -880,6 +880,95 @@ static void test_tessellate(void) {
     }
 }
 
+/* ----- surface refit (lrt_tri_surface_refit) --------------------------------
+ * Refit a scene built from CPs A to CPs B, then verify it traces identically to
+ * a fresh scene built from B (same geometry, different tree topology -> hits
+ * must still agree), and that the refreshed shade cache matches. */
+static void gen_bezpatch_cps(float *cps, size_t n, uint64_t seed) {
+    g_rng = seed;
+    for (size_t i = 0; i < n; i++) {
+        float c[3] = {rf(-2, 2), rf(-2, 2), rf(-2, 2)};
+        float ax[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+        float ay[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+        float *cp = &cps[i * 48];
+        for (int jj = 0; jj < 4; jj++)
+            for (int ii = 0; ii < 4; ii++) {
+                float fu = ii / 3.0f - 0.5f, fv = jj / 3.0f - 0.5f;
+                int idx = (jj * 4 + ii) * 3;
+                for (int k = 0; k < 3; k++)
+                    cp[idx + k] = c[k] + 0.8f * fu * ax[k] + 0.8f * fv * ay[k] +
+                                  rf(-0.1f, 0.1f);
+            }
+    }
+}
+
+static void test_surface_refit(void) {
+    lrt_tri_build_options o;
+    memset(&o, 0, sizeof(o));
+    o.num_threads = 1;
+    const size_t NP = 400, NR = 40000;
+    float *A = (float *)malloc(NP * 48 * sizeof(float));
+    float *B = (float *)malloc(NP * 48 * sizeof(float));
+    gen_bezpatch_cps(A, NP, 0x1234abcdull);
+    gen_bezpatch_cps(B, NP, 0x9988efefull);
+
+    lrt_tri_scene *sa = lrt_bezpatch_scene_build(A, NP, &o, NULL);
+    lrt_tri_scene *sb = lrt_bezpatch_scene_build(B, NP, &o, NULL);
+    CHECK(sa && sb, "refit: builds");
+    if (sa && sb) {
+        lrt_result r = lrt_tri_surface_refit(sa, B, NP);
+        CHECK(r == LRT_RESULT_OK, "refit: result %d", (int)r);
+
+        size_t hits = 0, agree = 0;
+        double max_dt = 0.0;
+        for (size_t i = 0; i < NR; i++) {
+            lrt_ray ray;
+            make_ray(&ray);
+            lrt_hit ha, hb;
+            int a = lrt_tri_intersect1(sa, &ray, &ha);
+            int b = lrt_tri_intersect1(sb, &ray, &hb);
+            if (a || b) hits++;
+            if (a == b &&
+                (!a || (ha.prim_id == hb.prim_id &&
+                        fabs((double)ha.t - hb.t) <=
+                            1e-3 * (1.0 + fabs((double)hb.t)))))
+                agree++;
+            if (a && b) {
+                double dt = fabs((double)ha.t - hb.t);
+                if (dt > max_dt) max_dt = dt;
+            }
+        }
+        double af = (double)agree / NR;
+        /* shade cache refreshed: refit scene's normal == fresh scene's normal */
+        float Na[3], Nb[3], Pa[3], Pb[3];
+        lrt_tri_surface_normal(sa, 5, 0.3f, 0.7f, Pa, Na, NULL, NULL);
+        lrt_tri_surface_normal(sb, 5, 0.3f, 0.7f, Pb, Nb, NULL, NULL);
+        float dN = fabsf(Na[0] - Nb[0]) + fabsf(Na[1] - Nb[1]) +
+                   fabsf(Na[2] - Nb[2]) + fabsf(Pa[0] - Pb[0]);
+        printf("refit: %zu rays hit, agree %.3f%% (max dt %.2e), shade dN %.2e\n",
+               hits, af * 100, max_dt, dN);
+        CHECK(af >= 0.999, "refit: trace agreement %.3f%% < 99.9%%", af * 100);
+        CHECK(dN < 1e-5f, "refit: shade cache not refreshed (dN=%.2e)", dN);
+
+        /* edge case: NURBS refit is rejected */
+        const float U[9] = {0, 0, 0, 0, 0.5f, 1, 1, 1, 1};
+        float net[25 * 3], w[25];
+        for (int k = 0; k < 75; k++) net[k] = (float)(k % 5) * 0.2f;
+        for (int k = 0; k < 25; k++) w[k] = 1.0f;
+        lrt_tri_scene *sn =
+            lrt_nurbs_scene_build(net, 4, 4, U, U, w, 3, 3, &o, NULL);
+        if (sn) {
+            r = lrt_tri_surface_refit(sn, net, 25);
+            CHECK(r == LRT_RESULT_INVALID_ARGUMENT, "refit: NURBS rejected");
+            lrt_tri_scene_free(sn);
+        }
+    }
+    if (sa) lrt_tri_scene_free(sa);
+    if (sb) lrt_tri_scene_free(sb);
+    free(A);
+    free(B);
+}
+
 int main(void) {
     test_bilinear();
     test_bezpatch();
@@ -889,6 +978,7 @@ int main(void) {
     test_trim_serialize();
     test_surface_normals();
     test_tessellate();
+    test_surface_refit();
     if (g_fail) {
         printf("\n%d FAILURES\n", g_fail);
         return 1;

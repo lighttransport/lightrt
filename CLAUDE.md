@@ -827,6 +827,14 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
   via `lrt_tri_surface_normal`; trimmed-NURBS cells whose centroid is outside
   the trim region are dropped (actual count ≤ the bound). Size buffers with
   `_bound`, then fill; `*ntris_out` reports the full count.
+- `lrt_tri_surface_refit` — in-place refit for animation (deforming patches):
+  replace control points and recompute node bounds without rebuilding the tree
+  (mirrors `lrt_tri_scene_refit` for triangles; shared `tri_refit_propagate`
+  tail + a `prim_kind`-dispatched `tri_leaf_box`). Bilinear (12 floats/patch) and
+  bicubic Bézier (48) only — the direct-control-point kinds; NURBS leaves are
+  extracted rational patches with no 1:1 map to the input net, so they are
+  rejected. Refreshes the shade cache, so the normal/tessellate queries reflect
+  the new geometry. Traces identically to a fresh build of the new CPs.
 
 ### Production
 - Serialization: `lrt_tri_scene_save[_to_memory]` / `load[_from_memory]`, plus
