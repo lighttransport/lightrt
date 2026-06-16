@@ -385,6 +385,22 @@ lrt_tri_scene *lrt_nurbs_scene_build(const float *net, int nu, int nv,
                                      const lrt_tri_build_options *opts,
                                      lrt_result *err);
 
+/* --- Trimmed NURBS surface ------------------------------------------------
+ *
+ * As lrt_nurbs_scene_build, plus trim loops in (u,v) parameter space: a hit on
+ * the surface is kept only if its (u,v) is visible under the EVEN-ODD rule over
+ * all loops (so a single outer loop bounds the surface and inner loops cut
+ * holes — orientation-agnostic). trim_pts = concatenated (u,v) points of all
+ * loops (2 floats each); loop_lengths[nloops] = points per loop (each loop is a
+ * closed polyline; Bézier trim curves should be flattened to polylines by the
+ * caller). nloops = 0 is identical to lrt_nurbs_scene_build. Not currently
+ * serializable (trim loops are not in the v1 LRTS blob). */
+lrt_tri_scene *lrt_trimnurbs_scene_build(
+    const float *net, int nu, int nv, const float *knots_u,
+    const float *knots_v, const float *weights, int degu, int degv,
+    const float *trim_pts, const uint32_t *loop_lengths, int nloops,
+    const lrt_tri_build_options *opts, lrt_result *err);
+
 /* --- Built-in implicit / SDF primitives (GPU-resident, no callbacks) -------
  *
  * A device-friendly alternative to lrt_user_scene_build's host callbacks: each

@@ -314,10 +314,124 @@ static void test_nurbs(void) {
           rfrac * 100.0);
 }
 
+/* even-odd point-in-loops, same rule as the library (mirror tri_trim_inside). */
+static int pt_in_loops(const float *pts, const uint32_t *off, int nloops,
+                       float u, float v) {
+    int cross = 0;
+    for (int L = 0; L < nloops; L++) {
+        uint32_t a = off[L], b = off[L + 1], np = b - a;
+        for (uint32_t i = 0; i < np; i++) {
+            uint32_t j = (i + 1 == np) ? 0 : i + 1;
+            float ui = pts[(a + i) * 2], vi = pts[(a + i) * 2 + 1];
+            float uj = pts[(a + j) * 2], vj = pts[(a + j) * 2 + 1];
+            if ((vi > v) != (vj > v)) {
+                float ut = ui + (v - vi) / (vj - vi) * (uj - ui);
+                if (u < ut) cross ^= 1;
+            }
+        }
+    }
+    return cross;
+}
+
+static void test_trimnurbs(void) {
+    const int degu = 3, degv = 3, nu = 4, nv = 4;
+    const float U[9] = {0, 0, 0, 0, 0.5f, 1, 1, 1, 1};
+    /* trim loop = a 40-gon disk in (u,v) centered (0.5,0.5), r=0.3: visible
+     * region is its interior. */
+    const int NG = 40;
+    float trim_pts[40 * 2];
+    uint32_t loop_len[1] = {(uint32_t)NG};
+    uint32_t loop_off[2] = {0, (uint32_t)NG};
+    for (int i = 0; i < NG; i++) {
+        float a = 6.2831853f * i / NG;
+        trim_pts[i * 2 + 0] = 0.5f + 0.3f * cosf(a);
+        trim_pts[i * 2 + 1] = 0.5f + 0.3f * sinf(a);
+    }
+    const int NS = 60, RPS = 3000;
+    size_t thits = 0, inside_ok = 0, preserved = 0, preserved_tot = 0,
+           removed = 0, outside_tot = 0;
+    for (int s = 0; s < NS; s++) {
+        float net[25 * 3], w[25];
+        float c[3] = {rf(-2, 2), rf(-2, 2), rf(-2, 2)};
+        float ax[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+        float ay[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+        for (int j = 0; j <= nv; j++)
+            for (int i = 0; i <= nu; i++) {
+                int idx = j * (nu + 1) + i;
+                float fu = (float)i / nu - 0.5f, fv = (float)j / nv - 0.5f;
+                for (int k = 0; k < 3; k++)
+                    net[idx * 3 + k] =
+                        c[k] + 0.7f * fu * ax[k] + 0.7f * fv * ay[k];
+                w[idx] = rf(0.6f, 1.8f);
+            }
+        lrt_tri_build_options o;
+        memset(&o, 0, sizeof(o));
+        o.num_threads = 1;
+        lrt_tri_scene *un =
+            lrt_nurbs_scene_build(net, nu, nv, U, U, w, degu, degv, &o, NULL);
+        lrt_tri_scene *tr = lrt_trimnurbs_scene_build(
+            net, nu, nv, U, U, w, degu, degv, trim_pts, loop_len, 1, &o, NULL);
+        CHECK(un && tr, "trimnurbs build");
+        if (!un || !tr) {
+            if (un) lrt_tri_scene_free(un);
+            if (tr) lrt_tri_scene_free(tr);
+            continue;
+        }
+        for (int rr = 0; rr < RPS; rr++) {
+            lrt_ray r;
+            float o2[3] = {c[0] + rf(-3, 3), c[1] + rf(-3, 3), c[2] + rf(-3, 3)};
+            float d[3] = {c[0] - o2[0] + rf(-0.4f, 0.4f),
+                          c[1] - o2[1] + rf(-0.4f, 0.4f),
+                          c[2] - o2[2] + rf(-0.4f, 0.4f)};
+            float l = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) + 1e-9f;
+            for (int k = 0; k < 3; k++) {
+                r.org[k] = o2[k];
+                r.dir[k] = d[k] / l;
+            }
+            r.tmin = 1e-4f;
+            r.tmax = 1e9f;
+            lrt_hit hu, ht;
+            int uh = lrt_tri_intersect1(un, &r, &hu);
+            int th = lrt_tri_intersect1(tr, &r, &ht);
+            if (th) {
+                thits++;
+                /* core invariant: every trimmed hit is inside the trim region */
+                if (pt_in_loops(trim_pts, loop_off, 1, ht.u, ht.v)) inside_ok++;
+            }
+            if (uh) {
+                int in = pt_in_loops(trim_pts, loop_off, 1, hu.u, hu.v);
+                if (in) {
+                    preserved_tot++;
+                    if (th && fabsf(ht.t - hu.t) < 1e-2f) preserved++;
+                } else {
+                    outside_tot++;
+                    if (!th) removed++; /* outside-region hit correctly trimmed */
+                }
+            }
+        }
+        lrt_tri_scene_free(un);
+        lrt_tri_scene_free(tr);
+    }
+    double inside = thits ? (double)inside_ok / thits : 1.0;
+    double pres = preserved_tot ? (double)preserved / preserved_tot : 1.0;
+    double rem = outside_tot ? (double)removed / outside_tot : 1.0;
+    printf("trimnurbs: %zu trimmed hits, all-inside %.3f%%, preserved %.3f%%, "
+           "removed %.3f%%\n",
+           thits, inside * 100.0, pres * 100.0, rem * 100.0);
+    CHECK(thits > (size_t)(NS * 30), "trimnurbs: too few hits");
+    CHECK(inside >= 0.999, "trimnurbs: trimmed hit outside region %.3f%%",
+          inside * 100.0);
+    CHECK(pres >= 0.98, "trimnurbs: inside hits not preserved %.3f%%",
+          pres * 100.0);
+    CHECK(rem >= 0.98, "trimnurbs: outside hits not removed %.3f%%",
+          rem * 100.0);
+}
+
 int main(void) {
     test_bilinear();
     test_bezpatch();
     test_nurbs();
+    test_trimnurbs();
     if (g_fail) {
         printf("\n%d FAILURES\n", g_fail);
         return 1;

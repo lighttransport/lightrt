@@ -352,7 +352,8 @@ enum {
     TRI_PRIM_SDF = 11,  /* built-in implicit/SDF leaves (lrt_sdf4)       */
     TRI_PRIM_BILINEAR = 12, /* bilinear patch leaves (lrt_quad4, exact)  */
     TRI_PRIM_BEZPATCH = 13, /* bicubic Bezier surface leaves (lrt_bezpatch4) */
-    TRI_PRIM_RBEZPATCH = 14 /* rational bicubic Bezier (NURBS) leaves     */
+    TRI_PRIM_RBEZPATCH = 14, /* rational bicubic Bezier (NURBS) leaves    */
+    TRI_PRIM_TRIMNURBS = 15 /* trimmed NURBS (rbez leaf + scene trim loops) */
 };
 
 /* Built-in SDF shapes (lrt_sdf_shape in the header). Evaluated on-device too;
@@ -416,6 +417,10 @@ struct lrt_tri_scene {
     lrt_user_occluded_cb user_occ; /* NULL => reuse user_isect */
     void *user_ptr;
     void *owned_user; /* heap table freed by scene_free (e.g. SDF), else NULL */
+    /* Trimmed-NURBS trim loops in (u,v) param space (scene owns + frees). */
+    uint32_t trim_nloops;
+    uint32_t *trim_loop_off; /* nloops+1 prefix offsets into trim_pts */
+    float *trim_pts;         /* 2*npts (u,v) polyline points */
     /* Serialization / mmap ownership (Workstream E). */
     int mem_mapped;   /* 1 => nodes/blocks alias map_base; do not free them */
     void *map_base;
@@ -4423,9 +4428,36 @@ static int tri_rbezpatch_newton(const float cp[64], const float *org,
     return 0;
 }
 
+/* Even-odd point-in-trim-region test in (u,v) parameter space. loop_off has
+ * nloops+1 prefix offsets into pts (2 floats per point); each loop is a closed
+ * polyline. Visible (untrimmed) iff the crossing count is odd. nloops==0 =>
+ * fully visible. */
+static int tri_trim_inside(const uint32_t *loop_off, const float *pts,
+                           uint32_t nloops, float u, float v) {
+    if (nloops == 0 || !loop_off || !pts) return 1;
+    int cross = 0;
+    for (uint32_t L = 0; L < nloops; L++) {
+        uint32_t a = loop_off[L], b = loop_off[L + 1];
+        uint32_t np = b - a;
+        if (np < 3) continue;
+        for (uint32_t i = 0; i < np; i++) {
+            uint32_t j = (i + 1 == np) ? 0 : i + 1;
+            float ui = pts[(a + i) * 2 + 0], vi = pts[(a + i) * 2 + 1];
+            float uj = pts[(a + j) * 2 + 0], vj = pts[(a + j) * 2 + 1];
+            if ((vi > v) != (vj > v)) {
+                float ut = ui + (v - vi) / (vj - vi) * (uj - ui);
+                if (u < ut) cross ^= 1;
+            }
+        }
+    }
+    return cross; /* 1 = inside (visible), 0 = trimmed */
+}
+
 static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
                                    const tri_ray_ctx *rc, float best_t,
-                                   float *t_out, float *u_out, float *v_out) {
+                                   const uint32_t *trim_off, const float *trim_pts,
+                                   uint32_t trim_nloops, float *t_out,
+                                   float *u_out, float *v_out) {
     enum { RBEZ_MAXDEPTH = 4 };
     struct { float u0, u1, v0, v1; int depth; } stk[4 * RBEZ_MAXDEPTH + 4];
     int sp = 0;
@@ -4477,11 +4509,17 @@ static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
             float th, uh, vh;
             if (tri_rbezpatch_newton(cp, rc->org, rc->dir, uc, vc, t0, rc->tmin,
                                      best, &th, &uh, &vh)) {
-                best = th;
-                *t_out = th;
-                *u_out = dom[0] + uh * (dom[1] - dom[0]); /* local -> global */
-                *v_out = dom[2] + vh * (dom[3] - dom[2]);
-                hit = 1;
+                float gu = dom[0] + uh * (dom[1] - dom[0]); /* local -> global */
+                float gv = dom[2] + vh * (dom[3] - dom[2]);
+                /* trimmed hits are rejected; keep searching for the nearest
+                 * untrimmed one (best is not advanced for trimmed). */
+                if (tri_trim_inside(trim_off, trim_pts, trim_nloops, gu, gv)) {
+                    best = th;
+                    *t_out = th;
+                    *u_out = gu;
+                    *v_out = gv;
+                    hit = 1;
+                }
             }
             continue;
         }
@@ -4502,14 +4540,18 @@ static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
 static inline void tri_rbezpatch4_isect(const lrt_rbezpatch4 *blk,
                                         const tri_ray_ctx *rc, float *best_t,
                                         float *best_u, float *best_v,
-                                        uint32_t *best_prim) {
+                                        uint32_t *best_prim,
+                                        const uint32_t *trim_off,
+                                        const float *trim_pts,
+                                        uint32_t trim_nloops) {
     for (int lane = 0; lane < 4; lane++) {
         if (blk->prim[lane] == LRT_TRI_NO_HIT) continue;
         float cp[64], dom[4];
         for (int c = 0; c < 64; c++) cp[c] = blk->cp[c][lane];
         for (int d = 0; d < 4; d++) dom[d] = blk->dom[d][lane];
         float t, u, v;
-        if (tri_rbezpatch_isect_one(cp, dom, rc, *best_t, &t, &u, &v)) {
+        if (tri_rbezpatch_isect_one(cp, dom, rc, *best_t, trim_off, trim_pts,
+                                    trim_nloops, &t, &u, &v)) {
             *best_t = t;
             *best_u = u;
             *best_v = v;
@@ -4680,12 +4722,20 @@ static int tri_intersect_scalar(const lrt_tri_scene *s, const lrt_ray *ray,
                 }
                 continue;
             }
-            if (s->prim_kind == TRI_PRIM_RBEZPATCH) {
+            if (s->prim_kind == TRI_PRIM_RBEZPATCH ||
+                s->prim_kind == TRI_PRIM_TRIMNURBS) {
+                const uint32_t *toff = NULL;
+                const float *tpts = NULL;
+                uint32_t tnl = 0;
+                if (s->prim_kind == TRI_PRIM_TRIMNURBS) {
+                    toff = s->trim_loop_off; tpts = s->trim_pts;
+                    tnl = s->trim_nloops;
+                }
                 for (uint32_t b = 0; b < nblk; b++) {
                     const lrt_rbezpatch4 *blk = (const lrt_rbezpatch4 *)
                         tri_block_ptr(s->blocks, blk0 + b, s->block_stride);
                     tri_rbezpatch4_isect(blk, &rc, &best_t, &best_u, &best_v,
-                                         &best_prim);
+                                         &best_prim, toff, tpts, tnl);
                 }
                 continue;
             }
@@ -4927,13 +4977,22 @@ static int tri_occluded_scalar(const lrt_tri_scene *s, const lrt_ray *ray) {
                 }
                 continue;
             }
-            if (s->prim_kind == TRI_PRIM_RBEZPATCH) {
+            if (s->prim_kind == TRI_PRIM_RBEZPATCH ||
+                s->prim_kind == TRI_PRIM_TRIMNURBS) {
+                const uint32_t *toff = NULL;
+                const float *tpts = NULL;
+                uint32_t tnl = 0;
+                if (s->prim_kind == TRI_PRIM_TRIMNURBS) {
+                    toff = s->trim_loop_off; tpts = s->trim_pts;
+                    tnl = s->trim_nloops;
+                }
                 for (uint32_t b = 0; b < nblk; b++) {
                     const lrt_rbezpatch4 *blk = (const lrt_rbezpatch4 *)
                         tri_block_ptr(s->blocks, blk0 + b, s->block_stride);
                     float t = t_max, u = 0.0f, v = 0.0f;
                     uint32_t prim = LRT_TRI_NO_HIT;
-                    tri_rbezpatch4_isect(blk, &rc, &t, &u, &v, &prim);
+                    tri_rbezpatch4_isect(blk, &rc, &t, &u, &v, &prim, toff, tpts,
+                                         tnl);
                     if (prim != LRT_TRI_NO_HIT) return 1;
                 }
                 continue;
@@ -8679,6 +8738,8 @@ void lrt_tri_scene_free(lrt_tri_scene *s) {
         tri_aligned_free(s->blocks);
     }
     free(s->owned_user);
+    free(s->trim_loop_off);
+    free(s->trim_pts);
     free(s);
 }
 
@@ -8696,7 +8757,8 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
     }
     if (s->prim_kind == TRI_PRIM_QUAD || s->prim_kind == TRI_PRIM_TETRA ||
         s->prim_kind == TRI_PRIM_SDF || s->prim_kind == TRI_PRIM_BILINEAR ||
-        s->prim_kind == TRI_PRIM_BEZPATCH || s->prim_kind == TRI_PRIM_RBEZPATCH)
+        s->prim_kind == TRI_PRIM_BEZPATCH || s->prim_kind == TRI_PRIM_RBEZPATCH ||
+        s->prim_kind == TRI_PRIM_TRIMNURBS)
         return tri_intersect_scalar(s, ray, hit);
 #if LRT_TRI_HAS_SSE4
     if (s->curve) return tri_curve_intersect_bvh4(s, ray, hit);
@@ -8738,7 +8800,8 @@ int lrt_tri_occluded1(const lrt_tri_scene *s, const lrt_ray *ray) {
     }
     if (s->prim_kind == TRI_PRIM_QUAD || s->prim_kind == TRI_PRIM_TETRA ||
         s->prim_kind == TRI_PRIM_SDF || s->prim_kind == TRI_PRIM_BILINEAR ||
-        s->prim_kind == TRI_PRIM_BEZPATCH || s->prim_kind == TRI_PRIM_RBEZPATCH)
+        s->prim_kind == TRI_PRIM_BEZPATCH || s->prim_kind == TRI_PRIM_RBEZPATCH ||
+        s->prim_kind == TRI_PRIM_TRIMNURBS)
         return tri_occluded_scalar(s, ray);
 #if LRT_TRI_HAS_SSE4
     if (s->curve) return tri_curve_occluded_bvh4(s, ray);
@@ -10580,6 +10643,45 @@ lrt_tri_scene *lrt_nurbs_scene_build(const float *net, int nu, int nv,
     tri_free_aabb_scratch(&bc);
     free(rbez);
     free(dom);
+    return s;
+}
+
+lrt_tri_scene *lrt_trimnurbs_scene_build(
+    const float *net, int nu, int nv, const float *knots_u,
+    const float *knots_v, const float *weights, int degu, int degv,
+    const float *trim_pts, const uint32_t *loop_lengths, int nloops,
+    const lrt_tri_build_options *opts, lrt_result *err) {
+    if (nloops < 0 || (nloops > 0 && (!trim_pts || !loop_lengths))) {
+        tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
+        return NULL;
+    }
+    lrt_tri_scene *s = lrt_nurbs_scene_build(net, nu, nv, knots_u, knots_v,
+                                             weights, degu, degv, opts, err);
+    if (!s) return NULL;
+    if (nloops > 0) {
+        uint32_t npts = 0;
+        for (int L = 0; L < nloops; L++) npts += loop_lengths[L];
+        uint32_t *off = (uint32_t *)malloc((size_t)(nloops + 1) * sizeof(uint32_t));
+        float *pts = (float *)malloc((size_t)npts * 2 * sizeof(float));
+        if (!off || !pts) {
+            free(off);
+            free(pts);
+            lrt_tri_scene_free(s);
+            tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+            return NULL;
+        }
+        uint32_t acc = 0;
+        for (int L = 0; L < nloops; L++) {
+            off[L] = acc;
+            acc += loop_lengths[L];
+        }
+        off[nloops] = acc;
+        memcpy(pts, trim_pts, (size_t)npts * 2 * sizeof(float));
+        s->trim_loop_off = off;
+        s->trim_pts = pts;
+        s->trim_nloops = (uint32_t)nloops;
+    }
+    s->prim_kind = TRI_PRIM_TRIMNURBS; /* same rbez leaf; adds the trim gate */
     return s;
 }
 
