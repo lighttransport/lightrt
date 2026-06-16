@@ -662,6 +662,191 @@ Quantized primitives trade precision for memory savings:
 
 Quantized types require a global bounding box for coordinate reconstruction. Use `quantize()` to compress and `dequantize()` to restore full precision before intersection testing.
 
+## C11 Production Ray-Tracing Kernel (`lightrt_c_tri.h`)
+
+A standalone, dependency-free C11 fp32 wide-BVH kernel (separate from the C++
+`lightrt` library and from the fp64 generic callback API in `lightrt_c.h`).
+Build a scene once, then query it from any number of threads concurrently
+(stateless, lock-free). Compiled scalar + SSE4 (BVH4) + AVX2 (BVH8) with
+compile-time dispatch; `lrt_tri_kernel_name()` reports the selection. Tests:
+`tests/test_lightrt_c_tri.c` (brute-force oracles across BVH4/BVH8/BVH8Q ×
+FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
+
+### Scene types (all share the `lrt_tri_scene` handle and the `lrt_tri_*` queries)
+- `lrt_tri_scene_build` — triangles (BVH4/BVH8/BVH8Q; LBVH/SAH/SBVH).
+- `lrt_curve_scene_build` — hair/curve capsules (constant radius per
+  sub-segment; cylinder + 2 end spheres).
+- `lrt_roundcurve_scene_build` — **Embree-style round-linear curves**: one
+  tapered cone (varying radius r0→r1) per strand segment, tangent to its two end
+  spheres, CSG-clipped at the joints against the strand neighbors (a port of
+  Embree's `roundline_intersector.h`, scalar `tri_rlc_isect_one` + a 4-wide SSE
+  leaf `tri_rlc4_isect_sse` over the SoA `lrt_rlc4` block; matches Embree's
+  `RTC_GEOMETRY_TYPE_ROUND_LINEAR_CURVE` to fp precision — see the wCurly.hair
+  cross-check in `benchmark_c/hair_bench.c`). Strand-structured input
+  (`lrt_hair_strands`: points + per-point radius + strand offsets); `prim_kind ==
+  TRI_PRIM_RLCURVE`, `lrt_rlc4` leaf (own 272-byte `block_stride`, stores
+  v0/v1/vL/vR), BVH4 only, no serialization/refit/mmap. The CyHair (.hair) loader
+  is `benchmark_c/cyhair.{h,c}`; `hair_bench` loads `data/wCurly.hair`, builds it
+  with both lightrt and Embree, reports build/throughput, cross-checks hits, and
+  writes a shaded PPM. `hair_bench --prim {round,flat,sphere,disc,odisc}` exercises
+  all the curve/point types below against the matching Embree geometry, and
+  `hair_bench --gen furball [--strands N --segments M]` generates procedural fur
+  (`benchmark_c/furball.{h,c}`, à la Embree's hair tutorial) instead of a file.
+- `lrt_flatcurve_scene_build` — **flat (ribbon) linear curves**: each strand
+  segment is a ray-facing ribbon quad of width 2r (Embree
+  `RTC_GEOMETRY_TYPE_FLAT_LINEAR_CURVE`; world-space `b = normalize(cross(p1-p0,
+  dir))` quad, two-triangle MT). `TRI_PRIM_FLATCURVE`, `lrt_flat4` leaf, scalar +
+  4-wide SSE leaf `tri_flat4_isect_sse`. Matches Embree ~99.96% (the ribbon's
+  ray-space-vs-world orientation differs at grazing edges).
+- `lrt_bezcurve_scene_build` — **true higher-order round cubic-Bézier curves**
+  (not tessellation): a port of Embree's sweep intersector
+  (`curve_intersector_sweep.h`, `RTC_GEOMETRY_TYPE_ROUND_BEZIER_CURVE`). Each
+  sub-interval seeds a 2D Newton/Jacobian iteration (`tri_bez_newton`: `f =
+  dot(R,T)` foot, `g = dist−radius` surface) that converges to the exact tube;
+  the seed comes from a round-linear cone, with a cone fallback when Newton is
+  ill-conditioned (grazing). Build-time de Casteljau **pre-subdivision**
+  (`TRI_BEZ_BUILD_SPLIT=4`) gives tight AABBs so the BVH culls well; the sub-arcs
+  are computed on the fly (no materialized temp array — low build memory), and
+  the leaf keeps the original segment id (`seg = sub/K`). `TRI_PRIM_BEZCURVE`,
+  `lrt_bez4` leaf (4 CPs xyz+r). The SSE leaf (`tri_bez4_isect_sse`) is a 4-wide
+  **ray-to-segment closest-distance cull** over the block's 4 curves (a tight
+  capsule that is robust for *all* ray orientations, including exactly parallel —
+  a cylinder-based capsule cull silently under-fired there, and a sphere cull was
+  correct but too loose) that gates the exact scalar sweep on the survivors
+  (bit-identical to scalar). The scalar sweep seeds Newton from a lean tapered
+  cone (`tri_cone_seed`, no neighbor CSG). Net: **beats Embree** on the trace
+  (~1.3–1.5× on primary and incoherent) at ~99.5% agreement. Input is explicit
+  cubic CPs (`16*nseg`); B-spline/Catmull-Rom convert to Bézier first (hair_bench
+  does Catmull-Rom→Bézier). Memory/build trade off against `TRI_BEZ_BUILD_SPLIT`
+  (K). The sweep is **adaptive and SIMD** (`tri_bez_sweep_sse`): it recursively
+  4-ary-subdivides each fired curve, evaluating/bounding/rejecting 4 sub-intervals
+  at a time (4-wide), pruning those whose bounding capsule the ray misses and
+  refining only the surviving leaves with cone+Newton — far regions cost a cheap
+  4-wide reject, and accuracy rises to ~99.9%. This lifts the whole speed/memory
+  Pareto: default `TRI_BEZ_BUILD_SPLIT=2` ≈Embree speed (and beats it on
+  incoherent) at ~94 MB; `K=4` ~13 Mrays/s at 191 MB; `K=1` matches Embree's
+  memory (~46 MB) and build (store-once) at ~half Embree's trace speed (looser
+  K=1 BVH boxes fire more curves). The scalar `tri_bez_isect_one` (also adaptive)
+  is the non-SSE fallback.
+- `lrt_points_scene_build(centers, radii, normals, point_type, n)` — **point
+  primitives** mirroring Embree's point types (`lrt_tri_point_type`):
+  `LRT_POINT_SPHERE` (ray-sphere), `LRT_POINT_DISC` (ray-facing disc),
+  `LRT_POINT_ORIENTED_DISC` (fixed-normal disc; normals required). `TRI_PRIM_POINT`,
+  `lrt_point4` leaf (160 B, reuses the default block path), scalar + 4-wide SSE
+  leaf `tri_point4_isect_sse`. Direct port of Embree's
+  `sphere_intersector.h`/`disc_intersector.h`; matches Embree ≥99.99% and beats it
+  on point throughput. (Sphere points overlap the older `lrt_sphere_scene_build`
+  path but add disc/oriented-disc + a normal buffer.)
+- `lrt_sphere_scene_build` — built-in fully-SIMD analytic spheres (`cx cy cz r`).
+- `lrt_user_scene_build` — **efficient custom geometry**: an fp32 BVH broad
+  phase over caller AABBs, with a per-candidate intersect/occluded callback
+  invoked only after a 4-wide AABB pretest. Far faster than the fp64
+  `lightrt_c.h` path. Callbacks must be re-entrant for concurrent queries.
+
+### Implicit surfaces / SDF (`lrt_sdf_*`)
+- `lrt_sdf_sphere_trace` — standalone enhanced sphere tracing (over-relaxation
+  with safe fallback, relative epsilon, tetrahedron-difference normal). The SDF
+  must be a Lipschitz≤1 distance bound.
+- `lrt_sdf_scene_build` — BVH-accelerated field of SDF blobs (built on the
+  custom-geometry path; for overlaps, each blob's callback evaluates the global
+  union field).
+
+### Queries (triangle scenes)
+- Closest hit `lrt_tri_intersect1`, any-hit `lrt_tri_occluded1`, batched
+  `*1N` (with `lrt_tri_batch_hint` for coherent vs incoherent).
+- Nearest-N multi-hit `lrt_tri_intersect_n` (transparency / CSG / volumes).
+- Point query `lrt_tri_closest_point`, kNN `lrt_tri_knn`.
+- Region queries `lrt_tri_query_aabb` / `_sphere` / `_frustum`
+  (+ `lrt_frustum_from_matrix`).
+- Coherent ray packets `lrt_tri_intersect4/8`, `lrt_tri_occluded4/8`.
+- Filtered any-hit `lrt_tri_occluded1_filtered` (alpha-tested shadows).
+
+### Production
+- Serialization: `lrt_tri_scene_save[_to_memory]` / `load[_from_memory]`, plus
+  zero-copy `lrt_tri_scene_open_mmap` (validates every child ref on load).
+  Triangle/curve scenes only.
+- Refit: `lrt_tri_scene_refit` updates vertices + node bounds in place (no
+  rebuild), for animation.
+- Instancing/TLAS: `lrt_tlas_build` / `lrt_tlas_intersect1` / `lrt_tlas_occluded1`
+  / `lrt_tlas_refit` — two-level BVH with per-instance 3×4 affine transforms,
+  `instance_id`, and a visibility `mask`.
+
+## Vulkan GPU Interop (`lightrt_c_vk.h`)
+
+Optional Vulkan-compute GPU interop for the C11 triangle kernel, in **both
+directions**. The Vulkan loader (`lightrt_vkew.{h,c}`) is a C11 port of vkew that
+`dlopen`s libvulkan at runtime: **no Vulkan SDK headers, no link-time `-lvulkan`,
+no `find_package(Vulkan)`**. Build is opt-in and the test skips (exit 0) when no
+device is present.
+
+### Directions
+- **Path A — CPU build → GPU trace**: `lrt_vk_trace_scene(engine, scene, rays, n,
+  out, err)`. Uploads a scene built by `lrt_tri_scene_build` and traverses it with
+  a compute shader that mirrors the scalar CPU kernel (identical hits within fp
+  tolerance). Plain triangle scenes, BVH4/BVH8 only.
+- **Path B — GPU build → CPU trace**: `lrt_vk_build_scene(engine, verts, ntris,
+  layout, &scene, err)`. Computes centroids + 30-bit Morton codes on the GPU,
+  finishes the LBVH (radix sort + collapse + leaf packing) on the CPU, and returns
+  a heap `lrt_tri_scene` usable with the normal `lrt_tri_*` queries. Matches a FAST
+  CPU build.
+- **Path C — hardware ray tracing**: `lrt_vk_trace_scene_rtx(engine, verts, ntris,
+  rays, n, out, err)`. Builds a real `VkAccelerationStructure` (BLAS + identity
+  TLAS) on the GPU and traces it with a `GL_EXT_ray_query` compute shader. Takes
+  raw triangles (the AS is vendor-opaque, so trace-only — it cannot feed Path B).
+  Requires `lrt_vk_engine_caps() & LRT_VK_CAP_RAY_QUERY` (engine created with
+  `want_ray_tracing=1` on an RT-capable device); hits match a Moller-Trumbore CPU
+  trace within fp tolerance. For repeated tracing, build the AS once with the
+  resident API — `lrt_vk_rtx_scene_build` / `lrt_vk_rtx_scene_trace` /
+  `lrt_vk_rtx_scene_free` — which keeps the BLAS+TLAS device-resident and traces
+  via device-local ray/hit buffers (the one-shot call above is build+trace+free).
+
+### Engine
+`lrt_vk_engine_create` (NULL → caller falls back to CPU), `_destroy`, `_caps`
+(`LRT_VK_CAP_COMPUTE/BUFFER_ADDRESS/ACCEL_STRUCT/RAY_QUERY`), `_device_name`,
+`_last_error`. A single engine is reusable but not thread-safe (one queue).
+
+### How it works
+- Both directions bridge through the existing LRTS serialization blob
+  (`lrt_tri_scene_save_to_memory` / `load_from_memory`); the latter bounds-checks
+  every child ref, so GPU-built trees are validated for free. `block_stride` must
+  equal `tri_block_size(layout)`.
+- `vk/shaders/trace_bvh.comp` mirrors `tri_intersect_scalar` exactly over **raw
+  `uint[]` SSBOs with manual offset math** (not std430 structs), so the GPU sees
+  byte-identical `lrt_bvh{4,8}_node` / `lrt_tri{4,8}` data. Spec constant `W` (4/8)
+  + `STACK`; node stride = `8*W` words, block stride = `10*W` words, prim_id at
+  word `9*W`. Parity constants replicated: invd clamp `1e18`, MT det `±1e-12`,
+  slab `(bound-org)*invd`, deferred tnear culling.
+- Path B uses the internal hook `lrt_tri_scene_build_lbvh_morton` in
+  `lightrt_c_tri.c` (a refactor of the builder taking optional precomputed Morton
+  codes; not a public-ABI entry).
+- Path C builds the AS via the soft-loaded `VK_KHR_acceleration_structure` /
+  `ray_query` entry points (AS-input and scratch buffers use device addresses;
+  the `trace_ray_query.comp` descriptor set binds the TLAS + ray/hit SSBOs).
+- Shaders are **pre-compiled to checked-in SPIR-V** (`vk/shaders/*.spv.h`), so a
+  normal build needs no shader toolchain. Regenerate after editing a `.comp` with
+  `scripts/compile_shaders.sh` — note `trace_ray_query.comp` needs a glslang with
+  `GL_EXT_ray_query` (Vulkan SDK ≥1.2 / glslang ≥11; the checked-in set was built
+  with one).
+
+### Build / test / benchmark
+```bash
+cmake -S . -B build_vk -DLIGHTRT_BUILD_VK=ON -DBUILD_TESTING=ON
+cmake --build build_vk && ctest --test-dir build_vk -R lightrt_c_vk_test
+make vk_test && ./lightrt_c_vk_test          # Makefile path (opt-in)
+make shaders                                  # optional SPIR-V regen
+cmake -S benchmark_c -B build_bench_c -DLRTBENCH_VK=ON
+./build_bench_c/bench_c --backend vk-trace,vk-rtx --verify  # GPU trace + HW RT
+```
+
+### Notes / current limits
+- `vk-rtx` uses the resident AS (built once) + device-local trace buffers, so its
+  benchmark number reflects traversal + per-batch ray/hit PCIe transfer (it beats
+  embree on incoherent rays on an RTX 3070). `vk-trace` still re-uploads the BVH
+  per call (a resident compute-trace mode and a GPU any-hit/occlusion path are
+  follow-ups).
+- Path B v1 is hybrid (GPU front end, CPU hierarchy); full-GPU LBVH (radix sort /
+  Karras tree / collapse on GPU) is a planned v2/v3.
+
 ## Code Conventions
 
 - C++17, no RTTI (`-fno-rtti`), no exceptions (`-fno-exceptions`)

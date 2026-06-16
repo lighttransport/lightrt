@@ -6,12 +6,17 @@
 #include "x11/lightrt_x11_loader.h"
 
 #include "common/viewer_common.h"
+#include "common/renderer.hh"
+#include "common/hair_bsdf.hh"
+#include "lightrt_c.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <time.h>
 
 using namespace lightrt_viewer;
@@ -24,28 +29,8 @@ static Window      g_win = 0;
 
 // --- File loading ---
 
-static void LoadAndReplaceScene(const std::string& path) {
-    std::cout << "Loading " << path << "...\n";
-    scene::Scene newScene;
-    if (!LoadModel(path, newScene)) {
-        std::cerr << "Failed to load: " << path << "\n";
-        return;
-    }
-    if (sceneTriangleCount(newScene) == 0) {
-        std::cerr << "No triangles in: " << path << "\n";
-        return;
-    }
-    g_state.scene = std::move(newScene);
-    FitToScene(g_state);
-    std::cout << "Scene: " << g_state.scene.meshes.size() << " meshes, "
-              << sceneTriangleCount(g_state.scene) << " triangles.\n";
-
-    // Update window title
-    size_t sep = path.find_last_of("/\\");
-    std::string fname = (sep != std::string::npos) ? path.substr(sep + 1) : path;
-    std::string title = "LightRT Viewer (X11) - " + fname;
-    if (g_dpy && g_win) XStoreName(g_dpy, g_win, title.c_str());
-}
+static void ShowOpenFileDialog();
+static void LoadAndRebuildC11(const std::string& path);
 
 static void ShowOpenFileDialog() {
     // Try zenity (GNOME/GTK), then kdialog (KDE)
@@ -59,9 +44,163 @@ static void ShowOpenFileDialog() {
     if (fgets(buf, sizeof(buf), f)) {
         size_t len = strlen(buf);
         if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
-        if (buf[0] != '\0') LoadAndReplaceScene(buf);
+        if (buf[0] != '\0') LoadAndRebuildC11(buf);
     }
     pclose(f);
+}
+
+// --- C11 flat scene (replaces C++ TriangleBVH traversal) ---
+
+struct C11Scene {
+    std::vector<float> vertices;       // 9 * num_tris (v0x,v0y,v0z,v1x,v1y,v1z,v2x,v2y,v2z)
+    std::vector<float> colors;         // 3 * num_tris (base color per triangle)
+    std::vector<uint32_t> instance_ids; // instance index per triangle (for albedo lookup)
+    int num_tris = 0;
+    int num_threads = 1;
+    std::vector<lrt_scene*> scenes;    // one lrt_scene per thread (not thread-safe otherwise)
+
+    ~C11Scene() {
+        for (auto* s : scenes) lrt_scene_free(s);
+    }
+};
+
+static C11Scene g_c11scene;
+
+static lrt_aabb c11_bounds_cb(unsigned prim, void* user) {
+    C11Scene* cs = static_cast<C11Scene*>(user);
+    float* v = &cs->vertices[prim * 9];
+    lrt_aabb bb;
+    bb.lo[0] = bb.hi[0] = v[0];
+    bb.lo[1] = bb.hi[1] = v[1];
+    bb.lo[2] = bb.hi[2] = v[2];
+    for (int i = 1; i < 3; i++) {
+        float* p = &v[i * 3];
+        if (p[0] < bb.lo[0]) bb.lo[0] = p[0];
+        if (p[1] < bb.lo[1]) bb.lo[1] = p[1];
+        if (p[2] < bb.lo[2]) bb.lo[2] = p[2];
+        if (p[0] > bb.hi[0]) bb.hi[0] = p[0];
+        if (p[1] > bb.hi[1]) bb.hi[1] = p[1];
+        if (p[2] > bb.hi[2]) bb.hi[2] = p[2];
+    }
+    return bb;
+}
+
+static int c11_intersect_cb(const double org[3], const double dir[3],
+                            double tmin, double tmax, unsigned prim,
+                            void* user, double* t, double* u, double* v) {
+    C11Scene* cs = static_cast<C11Scene*>(user);
+    float* verts = &cs->vertices[prim * 9];
+
+    double v0[3] = {verts[0], verts[1], verts[2]};
+    double v1[3] = {verts[3], verts[4], verts[5]};
+    double v2[3] = {verts[6], verts[7], verts[8]};
+
+    double e1[3] = {v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]};
+    double e2[3] = {v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]};
+
+    double pvec[3];
+    pvec[0] = dir[1] * e2[2] - dir[2] * e2[1];
+    pvec[1] = dir[2] * e2[0] - dir[0] * e2[2];
+    pvec[2] = dir[0] * e2[1] - dir[1] * e2[0];
+
+    double det = e1[0] * pvec[0] + e1[1] * pvec[1] + e1[2] * pvec[2];
+    if (det > -1e-12 && det < 1e-12) return 0;
+
+    double inv_det = 1.0 / det;
+
+    double tvec[3] = {org[0] - v0[0], org[1] - v0[1], org[2] - v0[2]};
+
+    double uu = (tvec[0] * pvec[0] + tvec[1] * pvec[1] + tvec[2] * pvec[2]) * inv_det;
+    if (uu < 0.0 || uu > 1.0) return 0;
+
+    double qvec[3];
+    qvec[0] = tvec[1] * e1[2] - tvec[2] * e1[1];
+    qvec[1] = tvec[2] * e1[0] - tvec[0] * e1[2];
+    qvec[2] = tvec[0] * e1[1] - tvec[1] * e1[0];
+
+    double vv = (dir[0] * qvec[0] + dir[1] * qvec[1] + dir[2] * qvec[2]) * inv_det;
+    if (vv < 0.0 || uu + vv > 1.0) return 0;
+
+    double tt = (e2[0] * qvec[0] + e2[1] * qvec[1] + e2[2] * qvec[2]) * inv_det;
+    if (tt < tmin || tt > tmax) return 0;
+
+    *t = tt;
+    *u = uu;
+    *v = vv;
+    return 1;
+}
+
+static void buildC11Scene(C11Scene& cs, const scene::Scene& sc, int num_threads) {
+    for (auto* s : cs.scenes) lrt_scene_free(s);
+    cs.scenes.clear();
+    cs.vertices.clear();
+    cs.colors.clear();
+    cs.instance_ids.clear();
+    cs.num_tris = 0;
+    cs.num_threads = num_threads;
+
+    int total = 0;
+    for (const auto& inst : sc.instances)
+        total += (int)sc.meshes[inst.mesh_id].bvh.getTriangles().size();
+    cs.num_tris = total;
+    if (total == 0) return;
+
+    cs.vertices.reserve(total * 9);
+    cs.colors.reserve(total * 3);
+    cs.instance_ids.reserve(total);
+
+    for (uint32_t i = 0; i < (uint32_t)sc.instances.size(); i++) {
+        const auto& inst = sc.instances[i];
+        const auto& blas = sc.meshes[inst.mesh_id];
+        const auto& tris = blas.bvh.getTriangles();
+
+        lightrt::Vec3 color(0.8f, 0.8f, 0.8f);
+        int32_t mat_id = blas.default_material_id;
+        if (mat_id >= 0 && mat_id < (int32_t)sc.materials.size())
+            color = sc.materials[mat_id].base_color;
+
+        for (const auto& tri : tris) {
+            lightrt::Vec3 v0 = lightrt_common::transformPoint(inst.transform, tri.v0);
+            lightrt::Vec3 v1 = lightrt_common::transformPoint(inst.transform, tri.v1);
+            lightrt::Vec3 v2 = lightrt_common::transformPoint(inst.transform, tri.v2);
+
+            cs.vertices.push_back(v0.x); cs.vertices.push_back(v0.y); cs.vertices.push_back(v0.z);
+            cs.vertices.push_back(v1.x); cs.vertices.push_back(v1.y); cs.vertices.push_back(v1.z);
+            cs.vertices.push_back(v2.x); cs.vertices.push_back(v2.y); cs.vertices.push_back(v2.z);
+            cs.colors.push_back(color.x); cs.colors.push_back(color.y); cs.colors.push_back(color.z);
+            cs.instance_ids.push_back(i);
+        }
+    }
+
+    cs.scenes.resize(num_threads);
+    for (int t = 0; t < num_threads; t++) {
+        cs.scenes[t] = lrt_scene_create((unsigned)total, c11_bounds_cb, c11_intersect_cb, &cs);
+        if (cs.scenes[t]) lrt_scene_build(cs.scenes[t]);
+    }
+}
+
+// Helper: load scene and rebuild C11 BVH
+static void LoadAndRebuildC11(const std::string& path) {
+    std::cout << "Loading " << path << "...\n";
+    scene::Scene newScene;
+    if (!LoadModel(path, newScene)) {
+        std::cerr << "Failed to load: " << path << "\n";
+        return;
+    }
+    if (sceneTriangleCount(newScene) == 0) {
+        std::cerr << "No triangles in: " << path << "\n";
+        return;
+    }
+    g_state.scene = std::move(newScene);
+    int num_threads = std::max(1, (int)std::thread::hardware_concurrency());
+    buildC11Scene(g_c11scene, g_state.scene, num_threads);
+    FitToScene(g_state);
+    std::cout << "Scene: " << g_state.scene.meshes.size() << " meshes, "
+              << g_c11scene.num_tris << " triangles.\n";
+    size_t sep = path.find_last_of("/\\");
+    std::string fname = (sep != std::string::npos) ? path.substr(sep + 1) : path;
+    std::string title = "LightRT Viewer (X11) - " + fname;
+    if (g_dpy && g_win) XStoreName(g_dpy, g_win, title.c_str());
 }
 
 // --- Timing helpers ---
@@ -70,6 +209,1184 @@ static uint64_t GetTimeNs() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+// --- X11-specific path tracing using C11 API ---
+
+// Inline helpers (mirror the ones in viewer_common.cc)
+static uint32_t pcg_hash_impl(uint32_t input) {
+    uint32_t state = input * 747796405u + 2891336453u;
+    uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+static float rand_float_impl(uint32_t& seed) {
+    seed = pcg_hash_impl(seed);
+    return (float)(seed & 0xFFFFFFu) / (float)0x1000000u;
+}
+
+static Vec3 cosine_hemisphere_impl(float u1, float u2, const Vec3& normal) {
+    return lightrt_common::shading::cosineHemisphere(u1, u2, normal);
+}
+
+static Vec3 vmul_impl(const Vec3& a, const Vec3& b) {
+    return Vec3(a.x * b.x, a.y * b.y, a.z * b.z);
+}
+
+static Vec3 jitter_direction_impl(const Vec3& dir, float half_angle, uint32_t& seed) {
+    float u1 = rand_float_impl(seed);
+    float u2 = rand_float_impl(seed);
+    float cos_max = cosf(half_angle);
+    float cos_theta = 1.0f - u1 * (1.0f - cos_max);
+    float sin_theta = sqrtf(std::max(0.0f, 1.0f - cos_theta * cos_theta));
+    float phi = 2.0f * (float)lightrt_common::shading::kPi * u2;
+
+    Vec3 tangent;
+    if (fabsf(dir.x) > 0.9f)
+        tangent = Vec3(0, 1, 0).cross(dir).normalize();
+    else
+        tangent = Vec3(1, 0, 0).cross(dir).normalize();
+    Vec3 bitangent = dir.cross(tangent);
+
+    return (tangent * (sin_theta * cosf(phi)) +
+            bitangent * (sin_theta * sinf(phi)) +
+            dir * cos_theta).normalize();
+}
+
+// Sample one pixel: trace ray + bounce, accumulate into accumBuffer
+static void SamplePixel(ViewerState& state, C11Scene& cs, lrt_scene* local_scene, uint32_t pixelIdx) {
+    int width = (int)state.width;
+    uint32_t x = pixelIdx % width;
+    uint32_t y = pixelIdx / width;
+
+    uint32_t seed = pcg_hash_impl(pixelIdx + state.pixelSampleCount[pixelIdx] * 1000003u);
+
+    float invWidth = 1.0f / (float)state.width;
+    float invHeight = 1.0f / (float)state.height;
+    float aspectRatio = (float)state.width / (float)state.height;
+    float scale = tanf(state.camera.fov * 0.5f * (float)lightrt_common::shading::kPi / 180.0f);
+
+    float jx = rand_float_impl(seed);
+    float jy = rand_float_impl(seed);
+
+    float px = (2.0f * (x + jx) * invWidth - 1.0f) * aspectRatio * scale;
+    float py = (1.0f - 2.0f * (y + jy) * invHeight) * scale;
+
+    Vec3 dir = (state.camera.forward + state.camera.right * px + state.camera.up * py).normalize();
+    Vec3 origin = state.camera.position;
+
+    double org[3] = {origin.x, origin.y, origin.z};
+    double ddir[3] = {dir.x, dir.y, dir.z};
+
+    double hit_t, hit_u, hit_v;
+    unsigned prim = lrt_scene_intersect(local_scene, org, ddir, 1e-6, 1e30, &hit_t, &hit_u, &hit_v);
+
+    Vec3 color(0, 0, 0);
+    Vec3 sunDir = state.sunDirection;
+    ShadowMode shadowMode = state.shadowMode;
+
+    float shadowConeAngle = 0.0f;
+    if (shadowMode == SHADOW_SOFT) shadowConeAngle = 0.035f;
+    else if (shadowMode == SHADOW_STRONG_SOFT) shadowConeAngle = 0.087f;
+
+    if (prim == LRT_NO_HIT) {
+        color = SampleSky(dir, sunDir);
+    } else {
+        float* verts = &cs.vertices[prim * 9];
+        Vec3 v0(verts[0], verts[1], verts[2]);
+        Vec3 v1(verts[3], verts[4], verts[5]);
+        Vec3 v2(verts[6], verts[7], verts[8]);
+        Vec3 normal = (v1 - v0).cross(v2 - v0).normalize();
+
+        if (normal.dot(dir) > 0.0f) normal = normal * -1.0f;
+
+        Vec3 hitPos(origin + dir * (float)hit_t);
+        Vec3 albedo(cs.colors[prim * 3], cs.colors[prim * 3 + 1], cs.colors[prim * 3 + 2]);
+
+        Vec3 shadowDir = sunDir;
+        if (shadowConeAngle > 0.0f)
+            shadowDir = jitter_direction_impl(sunDir, shadowConeAngle, seed);
+
+        float NdotL = std::max(0.0f, normal.dot(shadowDir));
+        float directLight = 0.0f;
+        if (NdotL > 0.0f) {
+            bool occluded = false;
+            if (shadowMode != SHADOW_OFF) {
+                double s_org[3] = {hitPos.x + normal.x * 0.001f,
+                                   hitPos.y + normal.y * 0.001f,
+                                   hitPos.z + normal.z * 0.001f};
+                double s_dir[3] = {shadowDir.x, shadowDir.y, shadowDir.z};
+                double s_t;
+                unsigned s_hit = lrt_scene_intersect(local_scene, s_org, s_dir,
+                                                     0.0, 1e10, &s_t, nullptr, nullptr);
+                occluded = (s_hit != LRT_NO_HIT);
+            }
+            if (!occluded) directLight = NdotL;
+        }
+
+        Vec3 sunColor(1.5f, 1.4f, 1.2f);
+        Vec3 direct = sunColor * directLight;
+        Vec3 ambient = SampleSky(normal, sunDir) * 0.15f;
+
+        Vec3 indirect(0, 0, 0);
+        {
+            float u1 = rand_float_impl(seed);
+            float u2 = rand_float_impl(seed);
+            Vec3 bounceDir = cosine_hemisphere_impl(u1, u2, normal);
+            Vec3 bOrg = hitPos + normal * 0.001f;
+
+            double b_org[3] = {bOrg.x, bOrg.y, bOrg.z};
+            double b_dir[3] = {bounceDir.x, bounceDir.y, bounceDir.z};
+
+            double b_t, b_u, b_v;
+            unsigned b_prim = lrt_scene_intersect(local_scene, b_org, b_dir,
+                                                   1e-6, 1e30, &b_t, &b_u, &b_v);
+
+            if (b_prim == LRT_NO_HIT) {
+                indirect = SampleSky(bounceDir, sunDir);
+            } else {
+                float* b_verts = &cs.vertices[b_prim * 9];
+                Vec3 bv0(b_verts[0], b_verts[1], b_verts[2]);
+                Vec3 bv1(b_verts[3], b_verts[4], b_verts[5]);
+                Vec3 bv2(b_verts[6], b_verts[7], b_verts[8]);
+                Vec3 bnorm = (bv1 - bv0).cross(bv2 - bv0).normalize();
+                if (bnorm.dot(bounceDir) > 0.0f) bnorm = bnorm * -1.0f;
+
+                Vec3 bHitPos(bOrg + bounceDir * (float)b_t);
+
+                Vec3 bShadowDir = sunDir;
+                if (shadowConeAngle > 0.0f)
+                    bShadowDir = jitter_direction_impl(sunDir, shadowConeAngle, seed);
+
+                float bNdotL = std::max(0.0f, bnorm.dot(bShadowDir));
+                float bDirect = 0.0f;
+                if (bNdotL > 0.0f) {
+                    bool bOcc = false;
+                    if (shadowMode != SHADOW_OFF) {
+                        double bs_org[3] = {bHitPos.x + bnorm.x * 0.001f,
+                                            bHitPos.y + bnorm.y * 0.001f,
+                                            bHitPos.z + bnorm.z * 0.001f};
+                        double bs_dir[3] = {bShadowDir.x, bShadowDir.y, bShadowDir.z};
+                        double bs_t;
+                        unsigned bs_hit = lrt_scene_intersect(local_scene, bs_org, bs_dir,
+                                                               0.0, 1e10, &bs_t, nullptr, nullptr);
+                        bOcc = (bs_hit != LRT_NO_HIT);
+                    }
+                    if (!bOcc) bDirect = bNdotL;
+                }
+                Vec3 bAlbedo(cs.colors[b_prim * 3], cs.colors[b_prim * 3 + 1], cs.colors[b_prim * 3 + 2]);
+                Vec3 bAmbient = SampleSky(bnorm, sunDir) * 0.15f;
+                indirect = vmul_impl(sunColor * bDirect + bAmbient, bAlbedo);
+            }
+        }
+
+        color = vmul_impl(direct + ambient + indirect, albedo);
+    }
+
+    size_t idx = ((size_t)y * state.width + x) * 3;
+    state.accumBuffer[idx + 0] += color.x;
+    state.accumBuffer[idx + 1] += color.y;
+    state.accumBuffer[idx + 2] += color.z;
+    state.pixelSampleCount[pixelIdx]++;
+}
+
+// Render all pixels (full frame), used by RenderFrameX11 and non-frameless mode
+static void RenderFullFrame(ViewerState& state, C11Scene& cs) {
+    if (state.cameraDirty) {
+        std::fill(state.accumBuffer.begin(), state.accumBuffer.end(), 0.0f);
+        std::fill(state.pixelSampleCount.begin(), state.pixelSampleCount.end(), 0u);
+        state.sampleCount = 0;
+        state.cameraDirty = false;
+    }
+
+    uint32_t total = state.width * state.height;
+    int num_threads = cs.num_threads;
+    std::vector<std::thread> threads;
+
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&, t]() {
+            lrt_scene* local_scene = cs.scenes[t];
+            uint32_t start = (uint32_t)((uint64_t)t * total / num_threads);
+            uint32_t end = (uint32_t)((uint64_t)(t + 1) * total / num_threads);
+            for (uint32_t i = start; i < end; i++) {
+                SamplePixel(state, cs, local_scene, state.pixelOrder[i]);
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    state.sampleCount++;
+}
+
+// Frameless rendering: render pixel subset within time budget
+static void RenderFrameless(ViewerState& state, C11Scene& cs) {
+    if (state.cameraDirty) {
+        std::fill(state.accumBuffer.begin(), state.accumBuffer.end(), 0.0f);
+        std::fill(state.pixelSampleCount.begin(), state.pixelSampleCount.end(), 0u);
+        state.sampleCount = 0;
+        state.nextPixelIdx = 0;
+        state.cameraDirty = false;
+    }
+
+    uint32_t total = state.width * state.height;
+
+    // Estimate pixels for this frame's budget
+    uint32_t maxPixels = (uint32_t)(state.measuredPixelsPerMs * state.frameBudgetMs);
+    if (maxPixels < total / 8) maxPixels = total / 8;
+    if (maxPixels > total) maxPixels = total;
+
+    uint64_t renderStart = GetTimeNs();
+    uint32_t startIdx = state.nextPixelIdx;
+    int num_threads = cs.num_threads;
+    uint32_t chunk = maxPixels / num_threads;
+    std::vector<std::thread> threads;
+
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&, t]() {
+            lrt_scene* local_scene = cs.scenes[t];
+            uint32_t begin = startIdx + (uint32_t)t * chunk;
+            uint32_t end = (t == num_threads - 1) ? startIdx + maxPixels : begin + chunk;
+            if (end > startIdx + maxPixels) end = startIdx + maxPixels;
+            for (uint32_t j = begin; j < end; j++) {
+                uint32_t pi = state.pixelOrder[j % total];
+                SamplePixel(state, cs, local_scene, pi);
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    state.nextPixelIdx = (startIdx + maxPixels) % total;
+
+    // Update throughput estimate
+    uint64_t renderEnd = GetTimeNs();
+    float elapsedMs = (float)(renderEnd - renderStart) / 1e6f;
+    if (elapsedMs > 0.1f) {
+        float throughput = (float)maxPixels / elapsedMs;
+        state.measuredPixelsPerMs = state.measuredPixelsPerMs * 0.9f + throughput * 0.1f;
+    }
+
+    state.sampleCount++;
+}
+
+// Draw HUD overlay (stats, controls help)
+static void DrawHUD(ViewerState& state, const C11Scene& cs) {
+    int w = (int)state.width;
+    int h = (int)state.height;
+    int fs = state.fontScale;
+    int lineH = 10 * fs;
+
+    std::string stats = "FPS: " + std::to_string((int)state.fps);
+    DrawString(10, 10, stats.c_str(), 0xFFFFFFFF, state.pixels.data(), w, h, fs);
+
+    std::string tris = "Tris: " + std::to_string(cs.num_tris);
+    DrawString(10, 10 + lineH, tris.c_str(), 0xFFFFFFFF, state.pixels.data(), w, h, fs);
+
+    std::string meshCount = "Meshes: " + std::to_string(state.scene.meshes.size());
+    DrawString(10, 10 + lineH * 2, meshCount.c_str(), 0xFFFFFFFF, state.pixels.data(), w, h, fs);
+
+    std::string samples = "Samples: " + std::to_string(state.sampleCount);
+    DrawString(10, 10 + lineH * 3, samples.c_str(), 0xFFFFFFFF, state.pixels.data(), w, h, fs);
+
+    std::string help = "Alt+LMB/Shift+LMB Orbit, Alt+MMB/Ctrl+LMB Pan, Alt+RMB/Ctrl+Shift+LMB/Tab+LMB Dolly";
+    DrawString(10, h - lineH * 3, help.c_str(), 0xFFFFFF00, state.pixels.data(), w, h, fs);
+
+    static const char* shadowModeNames[] = {"OFF", "HARD", "SOFT", "STRONG_SOFT"};
+    std::string help2 = "F: Frame [" + std::string(state.framelessMode ? "ON" : "OFF") + "], R: Fit, S: Shadow [" + std::string(shadowModeNames[state.shadowMode]) + "], +: Font 2x [" + std::string(fs == 2 ? "ON" : "OFF") + "], O: Open File";
+    DrawString(10, h - lineH * 2, help2.c_str(), 0xFFFFFF00, state.pixels.data(), w, h, fs);
+}
+
+static void RenderFrameX11(ViewerState& state, C11Scene& cs) {
+    RenderFullFrame(state, cs);
+    Tonemap(state);
+    DrawHUD(state, cs);
+}
+
+// --- Benchmark mode: procedural mandelbulb + rays/sec measurement ---
+
+// Direct C11 scene build from raw triangles (no scene::Scene needed)
+static void buildC11SceneFromTriangles(C11Scene& cs,
+                                       const float* verts, int num_tris,
+                                       const float* colors,
+                                       int num_threads) {
+    for (auto* s : cs.scenes) lrt_scene_free(s);
+    cs.scenes.clear();
+    cs.vertices.clear();
+    cs.colors.clear();
+    cs.instance_ids.clear();
+    cs.num_tris = 0;
+    cs.num_threads = num_threads;
+    if (num_tris == 0) return;
+
+    cs.vertices.assign(verts, verts + num_tris * 9);
+    cs.colors.assign(colors, colors + num_tris * 3);
+    cs.instance_ids.resize(num_tris, 0);
+    cs.num_tris = num_tris;
+
+    cs.scenes.resize(num_threads);
+    for (int t = 0; t < num_threads; t++) {
+        cs.scenes[t] = lrt_scene_create((unsigned)num_tris,
+                                        c11_bounds_cb, c11_intersect_cb, &cs);
+        if (cs.scenes[t] && !lrt_scene_build(cs.scenes[t])) {
+            std::cerr << "benchmark BVH build failed: "
+                      << lrt_scene_last_error(cs.scenes[t]) << "\n";
+        }
+    }
+}
+
+// --- Marching Cubes (mandelbulb mesh generation) ---
+
+static const int kMcEdgeTable[256] = {
+    0x0, 0x109, 0x203, 0x30a, 0x406, 0x50f, 0x605, 0x70c, 0x80c, 0x905, 0xa0f, 0xb06, 0xc0a, 0xd03, 0xe09, 0xf00,
+    0x190, 0x99, 0x393, 0x29a, 0x596, 0x49f, 0x795, 0x69c, 0x99c, 0x895, 0xb9f, 0xa96, 0xd9a, 0xc93, 0xf99, 0xe90,
+    0x230, 0x339, 0x33, 0x13a, 0x636, 0x73f, 0x435, 0x53c, 0xa3c, 0xb35, 0x83f, 0x936, 0xe3a, 0xf33, 0xc39, 0xd30,
+    0x3a0, 0x2a9, 0x1a3, 0xaa, 0x7a6, 0x6af, 0x5a5, 0x4ac, 0xbac, 0xaa5, 0x9af, 0x8a6, 0xfaa, 0xea3, 0xda9, 0xca0,
+    0x460, 0x569, 0x663, 0x76a, 0x66, 0x16f, 0x265, 0x36c, 0xc6c, 0xd65, 0xe6f, 0xf66, 0x86a, 0x963, 0xa69, 0xb60,
+    0x5f0, 0x4f9, 0x7f3, 0x6fa, 0x1f6, 0xff, 0x3f5, 0x2fc, 0xdfc, 0xcf5, 0xfff, 0xef6, 0x9fa, 0x8f3, 0xbf9, 0xaf0,
+    0x650, 0x759, 0x453, 0x55a, 0x256, 0x35f, 0x55, 0x15c, 0xe5c, 0xf55, 0xc5f, 0xd56, 0xa5a, 0xb53, 0x859, 0x950,
+    0x7c0, 0x6c9, 0x5c3, 0x4ca, 0x3c6, 0x2cf, 0x1c5, 0xcc, 0xfcc, 0xec5, 0xdcf, 0xcc6, 0xbca, 0xac3, 0x9c9, 0x8c0,
+    0x8c0, 0x9c9, 0xac3, 0xbca, 0xcc6, 0xdcf, 0xec5, 0xfcc, 0xcc, 0x1c5, 0x2cf, 0x3c6, 0x4ca, 0x5c3, 0x6c9, 0x7c0,
+    0x950, 0x859, 0xb53, 0xa5a, 0xd56, 0xc5f, 0xf55, 0xe5c, 0x15c, 0x55, 0x35f, 0x256, 0x55a, 0x453, 0x759, 0x650,
+    0xaf0, 0xbf9, 0x8f3, 0x9fa, 0xef6, 0xfff, 0xcf5, 0xdfc, 0x2fc, 0x3f5, 0xff, 0x1f6, 0x6fa, 0x7f3, 0x4f9, 0x5f0,
+    0xb60, 0xa69, 0x963, 0x86a, 0xf66, 0xe6f, 0xd65, 0xc6c, 0x36c, 0x265, 0x16f, 0x66, 0x76a, 0x663, 0x569, 0x460,
+    0xca0, 0xda9, 0xea3, 0xfaa, 0x8a6, 0x9af, 0xaa5, 0xbac, 0x4ac, 0x5a5, 0x6af, 0x7a6, 0xaa, 0x1a3, 0x2a9, 0x3a0,
+    0xd30, 0xc39, 0xf33, 0xe3a, 0x936, 0x83f, 0xb35, 0xa3c, 0x53c, 0x435, 0x73f, 0x636, 0x13a, 0x33, 0x339, 0x230,
+    0xe90, 0xf99, 0xc93, 0xd9a, 0xa96, 0xb9f, 0x895, 0x99c, 0x69c, 0x795, 0x49f, 0x596, 0x29a, 0x393, 0x99, 0x190,
+    0xf00, 0xe09, 0xd03, 0xc0a, 0xb06, 0xa0f, 0x905, 0x80c, 0x70c, 0x605, 0x50f, 0x406, 0x30a, 0x203, 0x109, 0x0,
+};
+
+static const int kMcTriTable[256][16] = {
+    {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,3,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,1,9,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,8,3,9,8,1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,2,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,3,1,2,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {9,2,10,0,2,9,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {2,8,3,2,10,8,10,9,8,-1,-1,-1,-1,-1,-1,-1},
+    {3,11,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,11,2,8,11,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,9,0,2,3,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,11,2,1,9,11,9,8,11,-1,-1,-1,-1,-1,-1,-1},
+    {3,10,1,11,10,3,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,10,1,0,8,10,8,11,10,-1,-1,-1,-1,-1,-1,-1},
+    {3,9,0,3,11,9,11,10,9,-1,-1,-1,-1,-1,-1,-1},
+    {9,8,10,10,8,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {4,7,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {4,3,0,7,3,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,1,9,8,4,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {4,1,9,4,7,1,7,3,1,-1,-1,-1,-1,-1,-1,-1},
+    {1,2,10,8,4,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {3,4,7,3,0,4,1,2,10,-1,-1,-1,-1,-1,-1,-1},
+    {9,2,10,9,0,2,8,4,7,-1,-1,-1,-1,-1,-1,-1},
+    {2,10,9,2,9,7,2,7,3,7,9,4,-1,-1,-1,-1},
+    {8,4,7,3,11,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {11,4,7,11,2,4,2,0,4,-1,-1,-1,-1,-1,-1,-1},
+    {9,0,1,8,4,7,2,3,11,-1,-1,-1,-1,-1,-1,-1},
+    {4,7,11,9,4,11,9,11,2,9,2,1,-1,-1,-1,-1},
+    {3,10,1,3,11,10,7,8,4,-1,-1,-1,-1,-1,-1,-1},
+    {1,11,10,1,4,11,1,0,4,7,11,4,-1,-1,-1,-1},
+    {4,7,8,9,0,11,9,11,10,11,0,3,-1,-1,-1,-1},
+    {4,7,11,4,11,9,9,11,10,-1,-1,-1,-1,-1,-1,-1},
+    {9,5,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {9,5,4,0,8,3,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,5,4,1,5,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {8,5,4,8,3,5,3,1,5,-1,-1,-1,-1,-1,-1,-1},
+    {1,2,10,9,5,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {3,0,8,1,2,10,4,9,5,-1,-1,-1,-1,-1,-1,-1},
+    {5,2,10,5,4,2,4,0,2,-1,-1,-1,-1,-1,-1,-1},
+    {2,10,5,3,2,5,3,5,4,3,4,8,-1,-1,-1,-1},
+    {9,5,4,2,3,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,11,2,0,8,11,4,9,5,-1,-1,-1,-1,-1,-1,-1},
+    {0,5,4,0,1,5,2,3,11,-1,-1,-1,-1,-1,-1,-1},
+    {2,1,5,2,5,8,2,8,11,4,8,5,-1,-1,-1,-1},
+    {10,3,11,10,1,3,9,5,4,-1,-1,-1,-1,-1,-1,-1},
+    {4,9,5,0,8,1,8,10,1,8,11,10,-1,-1,-1,-1},
+    {5,4,0,5,0,11,5,11,10,11,0,3,-1,-1,-1,-1},
+    {5,4,8,5,8,10,10,8,11,-1,-1,-1,-1,-1,-1,-1},
+    {9,7,8,5,7,9,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {9,3,0,9,5,3,5,7,3,-1,-1,-1,-1,-1,-1,-1},
+    {0,7,8,0,1,7,1,5,7,-1,-1,-1,-1,-1,-1,-1},
+    {1,5,3,3,5,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {9,7,8,9,5,7,10,1,2,-1,-1,-1,-1,-1,-1,-1},
+    {10,1,2,9,5,0,5,3,0,5,7,3,-1,-1,-1,-1},
+    {8,0,2,8,2,5,8,5,7,10,5,2,-1,-1,-1,-1},
+    {2,10,5,2,5,3,3,5,7,-1,-1,-1,-1,-1,-1,-1},
+    {7,9,5,7,8,9,3,11,2,-1,-1,-1,-1,-1,-1,-1},
+    {9,5,7,9,7,2,9,2,0,2,7,11,-1,-1,-1,-1},
+    {2,3,11,0,1,8,1,7,8,1,5,7,-1,-1,-1,-1},
+    {11,2,1,11,1,7,7,1,5,-1,-1,-1,-1,-1,-1,-1},
+    {9,5,8,8,5,7,10,1,3,10,3,11,-1,-1,-1,-1},
+    {5,7,0,5,0,9,7,11,0,1,0,10,11,10,0,-1},
+    {11,10,0,11,0,3,10,5,0,8,0,7,5,7,0,-1},
+    {11,10,5,7,11,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {10,6,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,3,5,10,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {9,0,1,5,10,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,8,3,1,9,8,5,10,6,-1,-1,-1,-1,-1,-1,-1},
+    {1,6,5,2,6,1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,6,5,1,2,6,3,0,8,-1,-1,-1,-1,-1,-1,-1},
+    {9,6,5,9,0,6,0,2,6,-1,-1,-1,-1,-1,-1,-1},
+    {5,9,8,5,8,2,5,2,6,3,2,8,-1,-1,-1,-1},
+    {2,3,11,10,6,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {11,0,8,11,2,0,10,6,5,-1,-1,-1,-1,-1,-1,-1},
+    {0,1,9,2,3,11,5,10,6,-1,-1,-1,-1,-1,-1,-1},
+    {5,10,6,1,9,2,9,11,2,9,8,11,-1,-1,-1,-1},
+    {6,3,11,6,5,3,5,1,3,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,11,0,11,5,0,5,1,5,11,6,-1,-1,-1,-1},
+    {3,11,6,0,3,6,0,6,5,0,5,9,-1,-1,-1,-1},
+    {6,5,9,6,9,11,11,9,8,-1,-1,-1,-1,-1,-1,-1},
+    {5,10,6,4,7,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {4,3,0,4,7,3,6,5,10,-1,-1,-1,-1,-1,-1,-1},
+    {1,9,0,5,10,6,8,4,7,-1,-1,-1,-1,-1,-1,-1},
+    {10,6,5,1,9,7,1,7,3,7,9,4,-1,-1,-1,-1},
+    {6,1,2,6,5,1,4,7,8,-1,-1,-1,-1,-1,-1,-1},
+    {1,2,5,5,2,6,3,0,4,3,4,7,-1,-1,-1,-1},
+    {8,4,7,9,0,5,0,6,5,0,2,6,-1,-1,-1,-1},
+    {7,3,9,7,9,4,3,2,9,5,9,6,2,6,9,-1},
+    {3,11,2,7,8,4,10,6,5,-1,-1,-1,-1,-1,-1,-1},
+    {5,10,6,4,7,2,4,2,0,2,7,11,-1,-1,-1,-1},
+    {0,1,9,4,7,8,2,3,11,5,10,6,-1,-1,-1,-1},
+    {9,2,1,9,11,2,9,4,11,7,11,4,5,10,6,-1},
+    {8,4,7,3,11,5,3,5,1,5,11,6,-1,-1,-1,-1},
+    {5,1,11,5,11,6,1,0,11,7,11,4,0,4,11,-1},
+    {0,5,9,0,6,5,0,3,6,11,6,3,8,4,7,-1},
+    {6,5,9,6,9,11,4,7,9,7,11,9,-1,-1,-1,-1},
+    {10,4,9,6,4,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {4,10,6,4,9,10,0,8,3,-1,-1,-1,-1,-1,-1,-1},
+    {10,0,1,10,6,0,6,4,0,-1,-1,-1,-1,-1,-1,-1},
+    {8,3,1,8,1,6,8,6,4,6,1,10,-1,-1,-1,-1},
+    {1,4,9,1,2,4,2,6,4,-1,-1,-1,-1,-1,-1,-1},
+    {3,0,8,1,2,9,2,4,9,2,6,4,-1,-1,-1,-1},
+    {0,2,4,4,2,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {8,3,2,8,2,4,4,2,6,-1,-1,-1,-1,-1,-1,-1},
+    {10,4,9,10,6,4,11,2,3,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,2,2,8,11,4,9,10,4,10,6,-1,-1,-1,-1},
+    {3,11,2,0,1,6,0,6,4,6,1,10,-1,-1,-1,-1},
+    {6,4,1,6,1,10,4,8,1,2,1,11,8,11,1,-1},
+    {9,6,4,9,3,6,9,1,3,11,6,3,-1,-1,-1,-1},
+    {8,11,1,8,1,0,11,6,1,9,1,4,6,4,1,-1},
+    {3,11,6,3,6,0,0,6,4,-1,-1,-1,-1,-1,-1,-1},
+    {6,4,8,11,6,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {7,10,6,7,8,10,8,9,10,-1,-1,-1,-1,-1,-1,-1},
+    {0,7,3,0,10,7,0,9,10,6,7,10,-1,-1,-1,-1},
+    {10,6,7,1,10,7,1,7,8,1,8,0,-1,-1,-1,-1},
+    {10,6,7,10,7,1,1,7,3,-1,-1,-1,-1,-1,-1,-1},
+    {1,2,6,1,6,8,1,8,9,8,6,7,-1,-1,-1,-1},
+    {2,6,9,2,9,1,6,7,9,0,9,3,7,3,9,-1},
+    {7,8,0,7,0,6,6,0,2,-1,-1,-1,-1,-1,-1,-1},
+    {7,3,2,6,7,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {2,3,11,10,6,8,10,8,9,8,6,7,-1,-1,-1,-1},
+    {2,0,7,2,7,11,0,9,7,6,7,10,9,10,7,-1},
+    {1,8,0,1,7,8,1,10,7,6,7,10,2,3,11,-1},
+    {11,2,1,11,1,7,10,6,1,6,7,1,-1,-1,-1,-1},
+    {8,9,6,8,6,7,9,1,6,11,6,3,1,3,6,-1},
+    {0,9,1,11,6,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {7,8,0,7,0,6,3,11,0,11,6,0,-1,-1,-1,-1},
+    {7,11,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {7,6,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {3,0,8,11,7,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,1,9,11,7,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {8,1,9,8,3,1,11,7,6,-1,-1,-1,-1,-1,-1,-1},
+    {10,1,2,6,11,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,2,10,3,0,8,6,11,7,-1,-1,-1,-1,-1,-1,-1},
+    {2,9,0,2,10,9,6,11,7,-1,-1,-1,-1,-1,-1,-1},
+    {6,11,7,2,10,3,10,8,3,10,9,8,-1,-1,-1,-1},
+    {7,2,3,6,2,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {7,0,8,7,6,0,6,2,0,-1,-1,-1,-1,-1,-1,-1},
+    {2,7,6,2,3,7,0,1,9,-1,-1,-1,-1,-1,-1,-1},
+    {1,6,2,1,8,6,1,9,8,8,7,6,-1,-1,-1,-1},
+    {10,7,6,10,1,7,1,3,7,-1,-1,-1,-1,-1,-1,-1},
+    {10,7,6,1,7,10,1,8,7,1,0,8,-1,-1,-1,-1},
+    {0,3,7,0,7,10,0,10,9,6,10,7,-1,-1,-1,-1},
+    {7,6,10,7,10,8,8,10,9,-1,-1,-1,-1,-1,-1,-1},
+    {6,8,4,11,8,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {3,6,11,3,0,6,0,4,6,-1,-1,-1,-1,-1,-1,-1},
+    {8,6,11,8,4,6,9,0,1,-1,-1,-1,-1,-1,-1,-1},
+    {9,4,6,9,6,3,9,3,1,11,3,6,-1,-1,-1,-1},
+    {6,8,4,6,11,8,2,10,1,-1,-1,-1,-1,-1,-1,-1},
+    {1,2,10,3,0,11,0,6,11,0,4,6,-1,-1,-1,-1},
+    {4,11,8,4,6,11,0,2,9,2,10,9,-1,-1,-1,-1},
+    {10,9,3,10,3,2,9,4,3,11,3,6,4,6,3,-1},
+    {8,2,3,8,4,2,4,6,2,-1,-1,-1,-1,-1,-1,-1},
+    {0,4,2,4,6,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,9,0,2,3,4,2,4,6,4,3,8,-1,-1,-1,-1},
+    {1,9,4,1,4,2,2,4,6,-1,-1,-1,-1,-1,-1,-1},
+    {8,1,3,8,6,1,8,4,6,6,10,1,-1,-1,-1,-1},
+    {10,1,0,10,0,6,6,0,4,-1,-1,-1,-1,-1,-1,-1},
+    {4,6,3,4,3,8,6,10,3,0,3,9,10,9,3,-1},
+    {10,9,4,6,10,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {4,9,5,7,6,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,3,4,9,5,11,7,6,-1,-1,-1,-1,-1,-1,-1},
+    {5,0,1,5,4,0,7,6,11,-1,-1,-1,-1,-1,-1,-1},
+    {11,7,6,8,3,4,3,5,4,3,1,5,-1,-1,-1,-1},
+    {9,5,4,10,1,2,7,6,11,-1,-1,-1,-1,-1,-1,-1},
+    {6,11,7,1,2,10,0,8,3,4,9,5,-1,-1,-1,-1},
+    {7,6,11,5,4,10,4,2,10,4,0,2,-1,-1,-1,-1},
+    {3,4,8,3,5,4,3,2,5,10,5,2,11,7,6,-1},
+    {7,2,3,7,6,2,5,4,9,-1,-1,-1,-1,-1,-1,-1},
+    {9,5,4,0,8,6,0,6,2,6,8,7,-1,-1,-1,-1},
+    {3,6,2,3,7,6,1,5,0,5,4,0,-1,-1,-1,-1},
+    {6,2,8,6,8,7,2,1,8,4,8,5,1,5,8,-1},
+    {9,5,4,10,1,6,1,7,6,1,3,7,-1,-1,-1,-1},
+    {1,6,10,1,7,6,1,0,7,8,7,0,9,5,4,-1},
+    {4,0,10,4,10,5,0,3,10,6,10,7,3,7,10,-1},
+    {7,6,10,7,10,8,5,4,10,4,8,10,-1,-1,-1,-1},
+    {6,9,5,6,11,9,11,8,9,-1,-1,-1,-1,-1,-1,-1},
+    {3,6,11,0,6,3,0,5,6,0,9,5,-1,-1,-1,-1},
+    {0,11,8,0,5,11,0,1,5,5,6,11,-1,-1,-1,-1},
+    {6,11,3,6,3,5,5,3,1,-1,-1,-1,-1,-1,-1,-1},
+    {1,2,10,9,5,11,9,11,8,11,5,6,-1,-1,-1,-1},
+    {0,11,3,0,6,11,0,9,6,5,6,9,1,2,10,-1},
+    {11,8,5,11,5,6,8,0,5,10,5,2,0,2,5,-1},
+    {6,11,3,6,3,5,2,10,3,10,5,3,-1,-1,-1,-1},
+    {5,8,9,5,2,8,5,6,2,3,8,2,-1,-1,-1,-1},
+    {9,5,6,9,6,0,0,6,2,-1,-1,-1,-1,-1,-1,-1},
+    {1,5,8,1,8,0,5,6,8,3,8,2,6,2,8,-1},
+    {1,5,6,2,1,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,3,6,1,6,10,3,8,6,5,6,9,8,9,6,-1},
+    {10,1,0,10,0,6,9,5,0,5,6,0,-1,-1,-1,-1},
+    {0,3,8,5,6,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {10,5,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {11,5,10,7,5,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {11,5,10,11,7,5,8,3,0,-1,-1,-1,-1,-1,-1,-1},
+    {5,11,7,5,10,11,1,9,0,-1,-1,-1,-1,-1,-1,-1},
+    {10,7,5,10,11,7,9,8,1,8,3,1,-1,-1,-1,-1},
+    {11,1,2,11,7,1,7,5,1,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,3,1,2,7,1,7,5,7,2,11,-1,-1,-1,-1},
+    {9,7,5,9,2,7,9,0,2,2,11,7,-1,-1,-1,-1},
+    {7,5,2,7,2,11,5,9,2,3,2,8,9,8,2,-1},
+    {2,5,10,2,3,5,3,7,5,-1,-1,-1,-1,-1,-1,-1},
+    {8,2,0,8,5,2,8,7,5,10,2,5,-1,-1,-1,-1},
+    {9,0,1,5,10,3,5,3,7,3,10,2,-1,-1,-1,-1},
+    {9,8,2,9,2,1,8,7,2,10,2,5,7,5,2,-1},
+    {1,3,5,3,7,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,7,0,7,1,1,7,5,-1,-1,-1,-1,-1,-1,-1},
+    {9,0,3,9,3,5,5,3,7,-1,-1,-1,-1,-1,-1,-1},
+    {9,8,7,5,9,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {5,8,4,5,10,8,10,11,8,-1,-1,-1,-1,-1,-1,-1},
+    {5,0,4,5,11,0,5,10,11,11,3,0,-1,-1,-1,-1},
+    {0,1,9,8,4,10,8,10,11,10,4,5,-1,-1,-1,-1},
+    {10,11,4,10,4,5,11,3,4,9,4,1,3,1,4,-1},
+    {2,5,1,2,8,5,2,11,8,4,5,8,-1,-1,-1,-1},
+    {0,4,11,0,11,3,4,5,11,2,11,1,5,1,11,-1},
+    {0,2,5,0,5,9,2,11,5,4,5,8,11,8,5,-1},
+    {9,4,5,2,11,3,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {2,5,10,3,5,2,3,4,5,3,8,4,-1,-1,-1,-1},
+    {5,10,2,5,2,4,4,2,0,-1,-1,-1,-1,-1,-1,-1},
+    {3,10,2,3,5,10,3,8,5,4,5,8,0,1,9,-1},
+    {5,10,2,5,2,4,1,9,2,9,4,2,-1,-1,-1,-1},
+    {8,4,5,8,5,3,3,5,1,-1,-1,-1,-1,-1,-1,-1},
+    {0,4,5,1,0,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {8,4,5,8,5,3,9,0,5,0,3,5,-1,-1,-1,-1},
+    {9,4,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {4,11,7,4,9,11,9,10,11,-1,-1,-1,-1,-1,-1,-1},
+    {0,8,3,4,9,7,9,11,7,9,10,11,-1,-1,-1,-1},
+    {1,10,11,1,11,4,1,4,0,7,4,11,-1,-1,-1,-1},
+    {3,1,4,3,4,8,1,10,4,7,4,11,10,11,4,-1},
+    {4,11,7,9,11,4,9,2,11,9,1,2,-1,-1,-1,-1},
+    {9,7,4,9,11,7,9,1,11,2,11,1,0,8,3,-1},
+    {11,7,4,11,4,2,2,4,0,-1,-1,-1,-1,-1,-1,-1},
+    {11,7,4,11,4,2,8,3,4,3,2,4,-1,-1,-1,-1},
+    {2,9,10,2,7,9,2,3,7,7,4,9,-1,-1,-1,-1},
+    {9,10,7,9,7,4,10,2,7,8,7,0,2,0,7,-1},
+    {3,7,10,3,10,2,7,4,10,1,10,0,4,0,10,-1},
+    {1,10,2,8,7,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {4,9,1,4,1,7,7,1,3,-1,-1,-1,-1,-1,-1,-1},
+    {4,9,1,4,1,7,0,8,1,8,7,1,-1,-1,-1,-1},
+    {4,0,3,7,4,3,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {4,8,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {9,10,8,10,11,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {3,0,9,3,9,11,11,9,10,-1,-1,-1,-1,-1,-1,-1},
+    {0,1,10,0,10,8,8,10,11,-1,-1,-1,-1,-1,-1,-1},
+    {3,1,10,11,3,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,2,11,1,11,9,9,11,8,-1,-1,-1,-1,-1,-1,-1},
+    {3,0,9,3,9,11,1,2,9,2,11,9,-1,-1,-1,-1},
+    {0,2,11,8,0,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {3,2,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {2,3,8,2,8,10,10,8,9,-1,-1,-1,-1,-1,-1,-1},
+    {9,10,2,0,9,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {2,3,8,2,8,10,0,1,8,1,10,8,-1,-1,-1,-1},
+    {1,10,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {1,3,8,9,1,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,9,1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {0,3,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+    {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1},
+};
+
+static const int kMcCorner[8][3] = {
+    {0,0,0},{1,0,0},{1,0,1},{0,0,1},
+    {0,1,0},{1,1,0},{1,1,1},{0,1,1}
+};
+static const int kMcEdge[12][2] = {
+    {0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},{0,4},{1,5},{2,6},{3,7}
+};
+
+static float lerp(float a, float b, float t) { return a + (b - a) * t; }
+
+static int marchingCubes(float (*de)(float,float,float,void*), void* de_user,
+                         const AABB& bounds, int res,
+                         std::vector<float>& out_verts) {
+    out_verts.clear();
+    int n = res;
+    Vec3 sz = bounds.extents();
+    Vec3 org = bounds.min;
+    float step_x = sz.x / n, step_y = sz.y / n, step_z = sz.z / n;
+    int grid_n = n + 1;
+    int grid_slice = grid_n * grid_n;
+
+    // Allocate grid
+    std::vector<float> grid(grid_n * grid_n * grid_n);
+    for (int k = 0; k <= n; k++)
+        for (int j = 0; j <= n; j++)
+            for (int i = 0; i <= n; i++) {
+                float px = org.x + i * step_x, py = org.y + j * step_y, pz = org.z + k * step_z;
+                grid[k * grid_slice + j * grid_n + i] = de(px, py, pz, de_user);
+            }
+
+    int tri_count = 0;
+    for (int k = 0; k < n; k++)
+        for (int j = 0; j < n; j++)
+            for (int i = 0; i < n; i++) {
+                int idx[8];
+                for (int c = 0; c < 8; c++)
+                    idx[c] = (k + kMcCorner[c][2]) * grid_slice +
+                             (j + kMcCorner[c][1]) * grid_n +
+                             (i + kMcCorner[c][0]);
+
+                int cube_idx = 0;
+                for (int c = 0; c < 8; c++)
+                    if (grid[idx[c]] < 0) cube_idx |= (1 << c);
+
+                if (cube_idx == 0 || cube_idx == 255) continue;
+
+                int edge_mask = kMcEdgeTable[cube_idx];
+                float vert_list[12][3];
+                for (int e = 0; e < 12; e++) {
+                    if (edge_mask & (1 << e)) {
+                        int c0 = kMcEdge[e][0], c1 = kMcEdge[e][1];
+                        float v0 = grid[idx[c0]], v1 = grid[idx[c1]];
+                        float t = v0 / (v0 - v1);
+                        float x0 = org.x + (i + kMcCorner[c0][0]) * step_x;
+                        float y0 = org.y + (j + kMcCorner[c0][1]) * step_y;
+                        float z0 = org.z + (k + kMcCorner[c0][2]) * step_z;
+                        float x1 = org.x + (i + kMcCorner[c1][0]) * step_x;
+                        float y1 = org.y + (j + kMcCorner[c1][1]) * step_y;
+                        float z1 = org.z + (k + kMcCorner[c1][2]) * step_z;
+                        vert_list[e][0] = lerp(x0, x1, t);
+                        vert_list[e][1] = lerp(y0, y1, t);
+                        vert_list[e][2] = lerp(z0, z1, t);
+                    }
+                }
+
+                for (int t = 0; t + 2 < 16; t += 3) {
+                    int i0 = kMcTriTable[cube_idx][t];
+                    if (i0 == -1) break;
+                    int i1 = kMcTriTable[cube_idx][t+1];
+                    int i2 = kMcTriTable[cube_idx][t+2];
+                    if (i1 == -1 || i2 == -1) break;
+                    // The DE is NaN where r == 0 (acosf(0/0)); cells touching
+                    // that grid point emit non-finite vertices. Drop them —
+                    // the BVH build rejects NaN bounds.
+                    bool finite = true;
+                    const int ids[3] = {i0, i1, i2};
+                    for (int c = 0; c < 3 && finite; c++)
+                        for (int k = 0; k < 3; k++)
+                            if (!std::isfinite(vert_list[ids[c]][k])) { finite = false; break; }
+                    if (!finite) continue;
+                    out_verts.push_back(vert_list[i0][0]); out_verts.push_back(vert_list[i0][1]); out_verts.push_back(vert_list[i0][2]);
+                    out_verts.push_back(vert_list[i1][0]); out_verts.push_back(vert_list[i1][1]); out_verts.push_back(vert_list[i1][2]);
+                    out_verts.push_back(vert_list[i2][0]); out_verts.push_back(vert_list[i2][1]); out_verts.push_back(vert_list[i2][2]);
+                    tri_count++;
+                }
+            }
+
+    return tri_count;
+}
+
+// Mandelbulb distance estimator
+struct MandelbulbParams { int power; int iterations; float bailout; };
+
+static float mandelbulbDE(float x, float y, float z, void* user) {
+    MandelbulbParams* p = (MandelbulbParams*)user;
+    float wx = x, wy = y, wz = z;
+    float dr = 1.0f;
+    float r = 0.0f;
+    for (int i = 0; i < p->iterations; i++) {
+        r = sqrtf(wx*wx + wy*wy + wz*wz);
+        if (r > p->bailout) break;
+        float theta = acosf(wz / r);
+        float phi = atan2f(wy, wx);
+        float pow_r = powf(r, (float)p->power);
+        dr = powf(r, (float)(p->power - 1)) * (float)p->power * dr + 1.0f;
+        theta *= (float)p->power;
+        phi *= (float)p->power;
+        float st = sinf(theta);
+        wx = st * cosf(phi) * pow_r + x;
+        wy = st * sinf(phi) * pow_r + y;
+        wz = cosf(theta) * pow_r + z;
+    }
+    return 0.5f * logf(r) * r / dr;
+}
+
+static int generateMandelbulb(int fineness, std::vector<float>& out_verts,
+                              std::vector<float>& out_colors) {
+    MandelbulbParams params;
+    params.power = 8;
+    params.iterations = 10;
+    params.bailout = 2.0f;
+
+    AABB bounds(Vec3(-1.6f, -1.6f, -1.6f), Vec3(1.6f, 1.6f, 1.6f));
+    int ntri = marchingCubes(mandelbulbDE, &params, bounds, fineness, out_verts);
+
+    // Colors based on vertex position (gradient)
+    out_colors.clear();
+    out_colors.reserve(ntri * 3);
+    for (int i = 0; i < ntri; i++) {
+        float* v = &out_verts[i * 9];
+        float cx = (v[0] + v[3] + v[6]) / 3.0f;
+        float cy = (v[1] + v[4] + v[7]) / 3.0f;
+        float cz = (v[2] + v[5] + v[8]) / 3.0f;
+        float r = sqrtf(cx*cx + cy*cy + cz*cz);
+        float hue = atan2f(cz, cx) / 3.14159f * 0.5f + 0.5f;
+        float val = (1.0f - r * 0.4f);
+        // Simple HSV-like coloring
+        out_colors.push_back(fabsf(sinf(hue * 6.2832f)) * val);
+        out_colors.push_back(fabsf(sinf((hue + 0.333f) * 6.2832f)) * val);
+        out_colors.push_back(fabsf(sinf((hue + 0.667f) * 6.2832f)) * val);
+    }
+    return ntri;
+}
+
+// Benchmark mode state
+static struct {
+    bool active = false;
+    int fineness = 64;
+    double rays_per_sec = 0;
+    float build_time_ms = 0;
+    int num_tris = 0;
+    int num_rays = 0;
+    C11Scene c11scene;
+    bool c11scene_valid = false;
+} g_bench;
+
+static void regenerateBenchmark();
+static void runBenchmarkMeasurement();
+
+static void enterBenchmarkMode(C11Scene& main_cs) {
+    g_bench.active = true;
+    g_bench.num_rays = 0;
+    // Build a fresh C11 scene for the mandelbulb
+    regenerateBenchmark();
+    // Clear the accumulation buffer so the viewer starts fresh
+    std::fill(g_state.accumBuffer.begin(), g_state.accumBuffer.end(), 0.0f);
+    g_state.sampleCount = 0;
+    g_state.cameraDirty = true;
+    // Fit camera to the mandelbulb
+    g_state.camera.orbitCenter = Vec3(0, 0, 0);
+    g_state.camera.orbitDistance = 3.5f;
+    g_state.camera.yaw = 90.0f;
+    g_state.camera.pitch = 25.0f;
+    UpdateCameraFromOrbit(g_state.camera);
+}
+
+static void exitBenchmarkMode() {
+    g_bench.active = false;
+    // Free the benchmark C11 scene
+    for (auto* s : g_bench.c11scene.scenes) lrt_scene_free(s);
+    g_bench.c11scene.scenes.clear();
+    g_bench.c11scene.vertices.clear();
+    g_bench.c11scene.colors.clear();
+    g_bench.c11scene.num_tris = 0;
+    g_bench.c11scene_valid = false;
+}
+
+static void regenerateBenchmark() {
+    // Free old scene
+    for (auto* s : g_bench.c11scene.scenes) lrt_scene_free(s);
+    g_bench.c11scene.scenes.clear();
+
+    std::vector<float> verts, colors;
+    uint64_t t0 = GetTimeNs();
+    g_bench.num_tris = generateMandelbulb(g_bench.fineness, verts, colors);
+    uint64_t t1 = GetTimeNs();
+
+    int num_threads = std::max(1, (int)std::thread::hardware_concurrency());
+    buildC11SceneFromTriangles(g_bench.c11scene, verts.data(), g_bench.num_tris,
+                               colors.data(), num_threads);
+    uint64_t t2 = GetTimeNs();
+
+    g_bench.build_time_ms = (float)(t2 - t0) / 1e6f;
+    g_bench.c11scene_valid = true;
+    g_bench.num_rays = 0;
+
+    runBenchmarkMeasurement();
+}
+
+static void runBenchmarkMeasurement() {
+    if (!g_bench.c11scene_valid || g_bench.c11scene.num_tris == 0) return;
+    if (g_bench.c11scene.scenes.empty()) return;
+    lrt_scene* scene = g_bench.c11scene.scenes[0];
+    if (!scene) return;
+
+    // Cast random rays through the bounding box from random origins on a sphere
+    int total_rays = std::max(100000, g_bench.c11scene.num_tris * 50);
+    if (total_rays > 5000000) total_rays = 5000000;
+
+    uint64_t t0 = GetTimeNs();
+    uint32_t hits = 0;
+
+    for (int i = 0; i < total_rays; i++) {
+        uint32_t seed = (uint32_t)(i * 2654435761u);
+        // Random direction on unit sphere
+        float theta = 2.0f * 3.14159f * (float)(seed & 0xFFFFFF) / 16777216.0f; seed = pcg_hash_impl(seed);
+        float phi = acosf(2.0f * (float)(seed & 0xFFFFFF) / 16777216.0f - 1.0f); seed = pcg_hash_impl(seed);
+        float sx = sinf(phi) * cosf(theta);
+        float sy = sinf(phi) * sinf(theta);
+        float sz = cosf(phi);
+        double org[3] = {sx * 5.0, sy * 5.0, sz * 5.0};
+        // Direction toward center with some spread
+        seed = pcg_hash_impl(seed);
+        float spread = (float)(seed & 0xFFFF) / 65536.0f * 0.5f;
+        double tx = (double)((float)((seed >> 16) & 0xFF) / 256.0f * 2.0f - 1.0f) * spread;
+        double ty = (double)((float)((seed >> 8) & 0xFF) / 256.0f * 2.0f - 1.0f) * spread;
+        double tz = (double)((float)(seed & 0xFF) / 256.0f * 2.0f - 1.0f) * spread;
+        double dir[3] = {-org[0] + tx, -org[1] + ty, -org[2] + tz};
+        double dlen = sqrt(dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2]);
+        if (dlen > 1e-12) { dir[0] /= dlen; dir[1] /= dlen; dir[2] /= dlen; }
+        double ht;
+        unsigned hit = lrt_scene_intersect(scene, org, dir, 1e-6, 1e10, &ht, 0, 0);
+        if (hit != LRT_NO_HIT) hits++;
+    }
+
+    uint64_t t1 = GetTimeNs();
+    double elapsed = (double)(t1 - t0) / 1e9;
+    g_bench.rays_per_sec = (elapsed > 0) ? (double)total_rays / elapsed : 0;
+    g_bench.num_rays = total_rays;
+}
+
+// --- SSS Validation Mode ---
+
+struct SSSPreset {
+  const char* name;
+  float weight;
+  float color[3];
+  float radius;
+  float radius_scale[3];
+  float anisotropy;
+  float base_color[3];
+};
+
+static const SSSPreset kSSSPresets[] = {
+  {"Skin",       0.8f, {0.85f,0.25f,0.08f}, 0.5f, {1.0f,0.35f,0.15f}, 0.3f, {0.85f,0.50f,0.35f}},
+  {"Jade",       0.9f, {0.10f,0.50f,0.20f}, 0.3f, {0.30f,1.0f,0.20f}, 0.0f, {0.30f,0.60f,0.35f}},
+  {"Wax",        0.7f, {0.90f,0.80f,0.50f}, 0.4f, {0.80f,0.70f,0.50f}, 0.2f, {0.90f,0.85f,0.70f}},
+  {"Milk",       0.95f,{0.95f,0.93f,0.88f}, 0.6f, {0.90f,0.92f,0.95f}, 0.1f, {0.95f,0.93f,0.88f}},
+};
+
+static int g_sss_preset = 0;
+static bool g_sss_mode = false;
+
+static void buildSSSScene(int preset_idx) {
+  if (preset_idx < 0 || preset_idx >= 4) preset_idx = 0;
+  const SSSPreset& p = kSSSPresets[preset_idx];
+
+  scene::Scene sc;
+  scene::MaterialData mat;
+  mat.base_color = Vec3(p.base_color[0], p.base_color[1], p.base_color[2]);
+  mat.base_roughness = 0.0f; mat.base_metalness = 0.0f;
+  mat.specular_weight = 1.0f;
+  mat.specular_color = Vec3(1,1,1); mat.specular_roughness = 0.35f; mat.specular_ior = 1.4f;
+  mat.subsurface_weight = p.weight;
+  mat.subsurface_color = Vec3(p.color[0], p.color[1], p.color[2]);
+  mat.subsurface_radius = p.radius;
+  mat.subsurface_radius_scale = Vec3(p.radius_scale[0], p.radius_scale[1], p.radius_scale[2]);
+  mat.subsurface_scale = 1.0f;
+  mat.subsurface_anisotropy = p.anisotropy;
+
+  int mat_id = (int)sc.materials.size();
+  sc.materials.push_back(mat);
+
+  // Sphere mesh (procedural)
+  std::vector<Triangle> tris;
+  for (int r = 0; r < 16; r++) {
+    for (int s = 0; s < 32; s++) {
+      float phi0 = 3.14159265f * r / 16, phi1 = 3.14159265f * (r+1) / 16;
+      float th0 = 6.2831853f * s / 32, th1 = 6.2831853f * (s+1) / 32;
+      auto vertex = [](float phi, float th) -> Vec3 {
+        return Vec3(sinf(phi)*cosf(th), cosf(phi), sinf(phi)*sinf(th));
+      };
+      Vec3 a0 = vertex(phi0, th0), a1 = vertex(phi0, th1);
+      Vec3 b0 = vertex(phi1, th0), b1 = vertex(phi1, th1);
+      tris.emplace_back(a0, b0, a1);
+      tris.emplace_back(a0, a1, b1);
+    }
+  }
+
+  sc.meshes.emplace_back();
+  auto& blas = sc.meshes.back();
+  blas.default_material_id = mat_id;
+  for (const auto& tri : tris) {
+    blas.local_bounds.expand(tri.v0);
+    blas.local_bounds.expand(tri.v1);
+    blas.local_bounds.expand(tri.v2);
+  }
+  BVHBuildConfig cfg;
+  blas.bvh.build(tris, cfg);
+
+  sc.instances.emplace_back();
+  auto& inst = sc.instances.back();
+  inst.mesh_id = 0;
+  float id[12] = {1,0,0,0, 0,1,0,0, 0,0,1,0};
+  memcpy(inst.transform, id, sizeof(id));
+  memcpy(inst.inv_transform, id, sizeof(id));
+  memcpy(inst.transform_close, id, sizeof(id));
+  memcpy(inst.inv_transform_close, id, sizeof(id));
+  inst.world_bounds = blas.local_bounds;
+  sc.scene_bounds = blas.local_bounds;
+
+  // Lights
+  auto addLight = [&](const Vec3& pos, const Vec3& col, float intensity, float radius) {
+    scene::LightData l;
+    l.type = scene::LightData::Sphere;
+    l.position = pos; l.color = col * intensity; l.radius = radius;
+    sc.lights.push_back(l);
+  };
+  addLight(Vec3(-2.5f,2.0f,3.0f), Vec3(1,0.92f,0.8f), 40.0f, 0.5f);
+  addLight(Vec3(0,0.5f,-3.5f), Vec3(0.6f,0.85f,1.0f), 80.0f, 0.3f);
+
+  g_state.scene = std::move(sc);
+  int num_threads = std::max(1, (int)std::thread::hardware_concurrency());
+  buildC11Scene(g_c11scene, g_state.scene, num_threads);
+  g_state.camera.orbitCenter = Vec3(0,0,0);
+  g_state.camera.orbitDistance = 4.0f;
+  g_state.camera.yaw = 90.0f;
+  g_state.camera.pitch = 25.0f;
+  UpdateCameraFromOrbit(g_state.camera);
+  std::fill(g_state.accumBuffer.begin(), g_state.accumBuffer.end(), 0.0f);
+  g_state.sampleCount = 0;
+  g_state.cameraDirty = true;
+}
+
+static void drawSSSOverlay(ViewerState& state) {
+  int w = (int)state.width;
+  int h = (int)state.height;
+  int fs = state.fontScale;
+  int lineH = 12 * fs;
+  int x = 10;
+  int y = h - lineH * 9;
+  if (y < 10) y = 10;
+  uint32_t col = 0xFF00FF00;
+
+  const SSSPreset& p = kSSSPresets[g_sss_preset];
+  DrawString(x, y, "[SSS VALIDATION]", col, state.pixels.data(), w, h, fs); y += lineH;
+  DrawString(x, y, ("Preset: " + std::string(p.name)).c_str(), col, state.pixels.data(), w, h, fs); y += lineH;
+  char buf[128];
+  snprintf(buf, sizeof(buf), "Weight: %.2f  Radius: %.2f  Aniso: %.2f", p.weight, p.radius, p.anisotropy);
+  DrawString(x, y, buf, col, state.pixels.data(), w, h, fs); y += lineH;
+  snprintf(buf, sizeof(buf), "Color: (%.2f,%.2f,%.2f)", p.color[0], p.color[1], p.color[2]);
+  DrawString(x, y, buf, col, state.pixels.data(), w, h, fs); y += lineH;
+  snprintf(buf, sizeof(buf), "Radius Scale: (%.2f,%.2f,%.2f)", p.radius_scale[0], p.radius_scale[1], p.radius_scale[2]);
+  DrawString(x, y, buf, col, state.pixels.data(), w, h, fs); y += lineH;
+  DrawString(x, y, "V: Exit  [ ]: Cycle preset", col, state.pixels.data(), w, h, fs);
+}
+
+// --- Hair Validation Mode ---
+
+struct HairPreset {
+  const char* name;
+  float roughness;
+  float azim_rough;
+  float ior;
+  float cuticle;
+  float color[3];
+  float absorption[3];
+};
+
+static const HairPreset kHairPresets[] = {
+  {"Dark",  0.4f, 0.3f, 1.55f, 3.0f, {0.10f,0.05f,0.02f}, {0.3f,0.7f,1.0f}},
+  {"Blonde",0.3f, 0.25f,1.55f, 3.0f, {0.75f,0.55f,0.20f},{0.1f,0.3f,0.6f}},
+  {"Red",   0.35f,0.3f, 1.55f, 3.0f, {0.65f,0.25f,0.08f},{0.15f,0.5f,0.9f}},
+  {"Gray",  0.2f, 0.2f, 1.55f, 2.5f, {0.85f,0.82f,0.78f},{0.05f,0.1f,0.15f}},
+  {"Rainbow",0.3f,0.3f, 1.55f, 3.5f, {0.30f,0.20f,0.10f},{0.0f,0.0f,0.0f}},
+};
+
+static int g_hair_preset = 0;
+static bool g_hair_mode = false;
+
+static void buildHairScene(int preset_idx) {
+  if (preset_idx < 0 || preset_idx >= 5) preset_idx = 0;
+  const HairPreset& p = kHairPresets[preset_idx];
+
+  // Build scene directly (not via ViewerState) — use renderFrame()
+  // to render and copy result to pixel buffer.
+  (void)p;
+  // Scene is built lazily — see below
+}
+
+// Renders hair scene and copies result to g_state.pixels
+static void renderHairFrame(ViewerState& state) {
+  const HairPreset& p = kHairPresets[g_hair_preset];
+
+  scene::Scene sc;
+
+  scene::MaterialData mat;
+  mat.hair_roughness_longitudinal = p.roughness;
+  mat.hair_roughness_azimuthal = p.azim_rough;
+  mat.hair_ior = p.ior;
+  mat.hair_cuticle_angle = p.cuticle;
+  mat.hair_color = Vec3(p.color[0], p.color[1], p.color[2]);
+  mat.hair_absorption = Vec3(p.absorption[0], p.absorption[1], p.absorption[2]);
+  mat.hair_weight = 1.0f;
+  mat.base_color = Vec3(p.color[0], p.color[1], p.color[2]);
+
+  int mat_id = (int)sc.materials.size();
+  sc.materials.push_back(mat);
+
+  // Generate hair strands
+  std::vector<Curve> curves;
+  int num_strands = 30;
+  int cols = 6;
+  float spacing = 0.35f;
+  float offset = (float)(cols - 1) * spacing * 0.5f;
+  for (int i = 0; i < num_strands; i++) {
+    int c = i % cols, r = i / cols;
+    float x = c * spacing - offset;
+    float z = r * spacing - offset + 0.5f;
+    float len = 0.8f + (float)i / (float)num_strands * 0.8f;
+    float rad = 0.008f + (float)i / (float)num_strands * 0.003f;
+    std::vector<Vec3> pts;
+    std::vector<float> rads;
+    int segs = 6;
+    for (int j = 0; j <= segs; j++) {
+      float t = (float)j / (float)segs;
+      float y = t * len;
+      float bx = sinf(t * 1.5708f) * 0.15f * x * 0.3f;
+      float bz = cosf(t * 1.5708f) * 0.15f * z * 0.3f;
+      pts.push_back(Vec3(x + bx, y - 0.5f, z + bz));
+      rads.push_back(rad * (1.0f - t * 0.5f));
+    }
+    curves.emplace_back(pts, rads, CurveType::Bezier);
+  }
+
+  sc.curve_meshes.emplace_back();
+  auto& cb = sc.curve_meshes.back();
+  cb.default_material_id = mat_id;
+  cb.build(curves);
+
+  sc.instances.emplace_back();
+  auto& inst = sc.instances.back();
+  inst.mesh_id = kInvalidIndex;
+  inst.curve_mesh_id = 0;
+  float id[12] = {1,0,0,0, 0,1,0,0, 0,0,1,0};
+  memcpy(inst.transform, id, sizeof(id));
+  memcpy(inst.inv_transform, id, sizeof(id));
+  memcpy(inst.transform_close, id, sizeof(id));
+  memcpy(inst.inv_transform_close, id, sizeof(id));
+  inst.world_bounds = cb.local_bounds;
+  sc.scene_bounds = cb.local_bounds;
+
+  // Lights
+  {
+    scene::LightData l;
+    l.type = scene::LightData::Sphere;
+    l.position = Vec3(-2.0f, 3.0f, 2.5f);
+    l.color = Vec3(1,0.95f,0.85f) * 60.0f;
+    l.radius = 0.5f;
+    sc.lights.push_back(l);
+  }
+  {
+    scene::LightData l;
+    l.type = scene::LightData::Sphere;
+    l.position = Vec3(1.5f, 1.0f, -2.5f);
+    l.color = Vec3(0.7f,0.8f,1.0f) * 40.0f;
+    l.radius = 0.3f;
+    sc.lights.push_back(l);
+  }
+
+  // Camera
+  lightrt_common::CameraView cam;
+  cam.position = Vec3(0, 1.2f, 3.0f);
+  cam.direction = (Vec3(0, 0.3f, 0) - cam.position).normalize();
+  cam.up = Vec3(0, 1, 0);
+  cam.right = cam.direction.cross(cam.up).normalize();
+  cam.up = cam.right.cross(cam.direction).normalize();
+  float fov_y = 40.0f * 3.14159265f / 180.0f;
+  float half_h = tanf(fov_y * 0.5f);
+  cam.half_width = half_h * (float)state.width / (float)state.height;
+  cam.half_height = half_h;
+  cam.half_width = 1.0f; // override for hair view
+
+  // Render using renderFrame (CPU renderer with hair BSDF support)
+  lightrt_common::RenderSettings rs;
+  rs.width = state.width;
+  rs.height = state.height;
+  rs.spp = std::max(1u, 4u);
+
+  std::vector<lightrt::RGB8> image(rs.width * rs.height);
+  lightrt_common::renderFrame(sc, rs, cam, image);
+
+  // Copy to pixel buffer for display
+  for (size_t i = 0; i < image.size(); i++) {
+    state.pixels[i] = 0xFF000000u | ((uint32_t)image[i].r << 16) | ((uint32_t)image[i].g << 8) | (uint32_t)image[i].b;
+  }
+}
+
+static void drawHairOverlay(ViewerState& state) {
+  int w = (int)state.width;
+  int h = (int)state.height;
+  int fs = state.fontScale;
+  int lineH = 12 * fs;
+  int x = 10;
+  int y = h - lineH * 8;
+  if (y < 10) y = 10;
+  uint32_t col = 0xFF00FF00;
+
+  const HairPreset& p = kHairPresets[g_hair_preset];
+  DrawString(x, y, "[HAIR BSDF VALIDATION]", col, state.pixels.data(), w, h, fs); y += lineH;
+  DrawString(x, y, ("Preset: " + std::string(p.name)).c_str(), col, state.pixels.data(), w, h, fs); y += lineH;
+  char buf[128];
+  snprintf(buf, sizeof(buf), "Roughness: %.2f  Azim: %.2f", p.roughness, p.azim_rough);
+  DrawString(x, y, buf, col, state.pixels.data(), w, h, fs); y += lineH;
+  snprintf(buf, sizeof(buf), "IOR: %.2f  Cuticle: %.1f", p.ior, p.cuticle);
+  DrawString(x, y, buf, col, state.pixels.data(), w, h, fs); y += lineH;
+  snprintf(buf, sizeof(buf), "Color: (%.2f,%.2f,%.2f)", p.color[0], p.color[1], p.color[2]);
+  DrawString(x, y, buf, col, state.pixels.data(), w, h, fs); y += lineH;
+  DrawString(x, y, "H: Exit  [ ]: Cycle preset", col, state.pixels.data(), w, h, fs);
+}
+
+// Overlay for benchmark mode (called from main loop after rendering)
+static void drawBenchmarkOverlay(ViewerState& state) {
+    int w = (int)state.width;
+    int h = (int)state.height;
+    int fs = state.fontScale;
+    int lineH = 12 * fs;
+    int x = 10;
+    int y = h - lineH * 8;
+    if (y < 10) y = 10;
+
+    uint32_t color = 0xFF00FF00; // green text
+
+    DrawString(x, y, "[BENCHMARK MODE]", color, state.pixels.data(), w, h, fs);
+    y += lineH;
+    std::string fstr = "Fineness: " + std::to_string(g_bench.fineness) + "x" + std::to_string(g_bench.fineness) + "x" + std::to_string(g_bench.fineness);
+    DrawString(x, y, fstr.c_str(), color, state.pixels.data(), w, h, fs);
+    y += lineH;
+    std::string tstr = "Triangles: " + std::to_string(g_bench.num_tris);
+    DrawString(x, y, tstr.c_str(), color, state.pixels.data(), w, h, fs);
+    y += lineH;
+    char btbuf[64];
+    snprintf(btbuf, sizeof(btbuf), "Build time: %.2f ms", g_bench.build_time_ms);
+    DrawString(x, y, btbuf, color, state.pixels.data(), w, h, fs);
+    y += lineH;
+    char rpsbuf[64];
+    snprintf(rpsbuf, sizeof(rpsbuf), "Throughput: %.1f M rays/sec", g_bench.rays_per_sec / 1e6);
+    DrawString(x, y, rpsbuf, color, state.pixels.data(), w, h, fs);
+    y += lineH;
+    char nrbuf[64];
+    snprintf(nrbuf, sizeof(nrbuf), "Rays traced: %d", g_bench.num_rays);
+    DrawString(x, y, nrbuf, color, state.pixels.data(), w, h, fs);
+    y += lineH;
+    DrawString(x, y, "B: Exit benchmark   [ ]: Fineness", color, state.pixels.data(), w, h, fs);
 }
 
 // --- Entry Point ---
@@ -97,10 +1414,16 @@ int main(int argc, char* argv[]) {
     std::cout << "Scene: " << g_state.scene.meshes.size() << " meshes, "
               << sceneTriangleCount(g_state.scene) << " triangles.\n";
 
-    // Initialize sun direction and accumulation buffer
+    // Build C11 scene (flat BVH over world-space triangles, one lrt_scene per thread)
+    int num_threads = std::max(1, (int)std::thread::hardware_concurrency());
+    buildC11Scene(g_c11scene, g_state.scene, num_threads);
+
+    // Initialize sun direction, accumulation, and frameless pixel order
     g_state.sunDirection = Vec3(1, 1, -0.5f).normalize();
     g_state.pixels.resize(g_state.width * g_state.height);
     g_state.accumBuffer.resize((size_t)g_state.width * g_state.height * 3, 0.0f);
+    g_state.pixelSampleCount.resize(g_state.width * g_state.height, 0u);
+    BuildPixelOrder(g_state);
     FitToScene(g_state);
 
     // Load X11 at runtime
@@ -127,6 +1450,12 @@ int main(int argc, char* argv[]) {
         std::cerr << "Need 24-bit or 32-bit display depth, got " << depth << ".\n";
         XCloseDisplay(dpy);
         return 1;
+    }
+
+    // 4K display: 1.5x window (1920x1080), 2x font
+    {
+        ResizeFramebuffer(g_state, 1920, 1080);
+        g_state.fontScale = 2;
     }
 
     // Create window
@@ -170,7 +1499,7 @@ int main(int argc, char* argv[]) {
     int fpsFrameCount = 0;
 
     std::cout << "Controls: Alt+LMB/Shift+LMB Orbit, Alt+MMB/Ctrl+LMB Pan, Alt+RMB/Ctrl+Shift+LMB/Tab+LMB Dolly\n";
-    std::cout << "          F: Fit, S: Shadow, +: Font 2x, O: Open File (zenity/kdialog)\n";
+    std::cout << "          F: Frameless toggle, R: Fit, S: Shadow, +: Font 2x, O: Open File (zenity/kdialog)\n";
 
     // Main loop
     while (g_running) {
@@ -212,12 +1541,65 @@ int main(int argc, char* argv[]) {
                 switch (ks) {
                 case XK_f: case XK_F:
                     g_state.keys[KEY_F] = true; break;
+                case XK_r: case XK_R:
+                    g_state.keys[KEY_R] = true; break;
                 case XK_s: case XK_S:
                     g_state.keys[KEY_S] = true; break;
                 case XK_plus: case XK_equal:
                     g_state.keys[KEY_PLUS] = true; break;
                 case XK_o: case XK_O:
                     ShowOpenFileDialog(); break;
+                case XK_v: case XK_V:
+                    if (g_sss_mode) {
+                        g_sss_mode = false;
+                    } else {
+                        if (g_bench.active) exitBenchmarkMode();
+                        if (g_hair_mode) g_hair_mode = false;
+                        g_sss_preset = 0;
+                        g_sss_mode = true;
+                        buildSSSScene(g_sss_preset);
+                    }
+                    break;
+                case XK_h: case XK_H:
+                    g_hair_mode = !g_hair_mode;
+                    if (g_hair_mode) {
+                        if (g_bench.active) exitBenchmarkMode();
+                        if (g_sss_mode) g_sss_mode = false;
+                        g_hair_preset = 0;
+                        renderHairFrame(g_state);
+                    }
+                    break;
+                case XK_b: case XK_B:
+                    if (g_bench.active) {
+                        exitBenchmarkMode();
+                    } else {
+                        enterBenchmarkMode(g_c11scene);
+                    }
+                    break;
+                case XK_bracketleft:
+                    if (g_hair_mode) {
+                        g_hair_preset = (g_hair_preset == 0) ? 4 : g_hair_preset - 1;
+                        renderHairFrame(g_state);
+                    } else if (g_sss_mode) {
+                        g_sss_preset = (g_sss_preset == 0) ? 3 : g_sss_preset - 1;
+                        buildSSSScene(g_sss_preset);
+                    } else if (g_bench.active && g_bench.fineness > 16) {
+                        g_bench.fineness = std::max(16, g_bench.fineness / 2);
+                        regenerateBenchmark();
+                    }
+                    break;
+                case XK_bracketright:
+                    if (g_hair_mode) {
+                        g_hair_preset = (g_hair_preset == 4) ? 0 : g_hair_preset + 1;
+                        renderHairFrame(g_state);
+                    } else if (g_sss_mode) {
+                        g_sss_preset = (g_sss_preset == 3) ? 0 : g_sss_preset + 1;
+                        buildSSSScene(g_sss_preset);
+                    } else if (g_bench.active && g_bench.fineness < 256) {
+                        g_bench.fineness = std::min(256, g_bench.fineness * 2);
+                        regenerateBenchmark();
+                    }
+                    break;
                 case XK_Escape:
                     g_state.keys[KEY_ESCAPE] = true; break;
                 case XK_Shift_L: case XK_Shift_R:
@@ -250,6 +1632,8 @@ int main(int argc, char* argv[]) {
                 switch (ks) {
                 case XK_f: case XK_F:
                     g_state.keys[KEY_F] = false; break;
+                case XK_r: case XK_R:
+                    g_state.keys[KEY_R] = false; break;
                 case XK_s: case XK_S:
                     g_state.keys[KEY_S] = false; break;
                 case XK_plus: case XK_equal:
@@ -346,14 +1730,43 @@ int main(int argc, char* argv[]) {
             break;
         }
 
+        uint64_t frameStart = GetTimeNs();
+
         // Render
-        RenderFrame(g_state);
+        if (g_bench.active) {
+            RenderFrameX11(g_state, g_bench.c11scene);
+            drawBenchmarkOverlay(g_state);
+        } else if (g_sss_mode) {
+            RenderFrameX11(g_state, g_c11scene);
+            drawSSSOverlay(g_state);
+        } else if (g_hair_mode) {
+            drawHairOverlay(g_state);
+        } else {
+            // Normal interactive mode: frameless or full frame
+            if (g_state.framelessMode) {
+                RenderFrameless(g_state, g_c11scene);
+            } else {
+                RenderFullFrame(g_state, g_c11scene);
+            }
+            Tonemap(g_state);
+            DrawHUD(g_state, g_c11scene);
+        }
 
         // Blit to window via XPutImage
         // g_state.pixels is BGRA (uint32_t) which matches X11 ZPixmap on little-endian
         XPutImage(dpy, win, gc, ximg,
                   0, 0, 0, 0, g_state.width, g_state.height);
         XFlush(dpy);
+
+        // Frame rate limit: sleep remaining time in budget
+        uint64_t frameElapsed = GetTimeNs() - frameStart;
+        int64_t sleepNs = (int64_t)(g_state.frameBudgetMs * 1e6f) - (int64_t)frameElapsed;
+        if (sleepNs > 0) {
+            struct timespec ts;
+            ts.tv_sec = (long)(sleepNs / 1000000000L);
+            ts.tv_nsec = (long)(sleepNs % 1000000000L);
+            nanosleep(&ts, nullptr);
+        }
     }
 
     // Cleanup — set data to null so XDestroyImage doesn't free our buffer

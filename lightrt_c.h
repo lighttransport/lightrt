@@ -108,7 +108,7 @@ const char *lrt_scene_last_error(const lrt_scene *s);
 
 void lrt_scene_free(lrt_scene *s);
 
-/* Human-readable backend description, e.g. "LightRT MMapGenericBVH". */
+/* Human-readable backend description. */
 const char *lrt_backend_name(void);
 
 #ifdef __cplusplus

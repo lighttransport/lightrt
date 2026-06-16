@@ -1,6 +1,8 @@
 // Shared CPU renderer implementation.
 #include "common/renderer.hh"
 #include "common/sss.hh"
+#include "common/sss_render.hh"
+#include "common/hair_bsdf.hh"
 
 #include <algorithm>
 #include <cmath>
@@ -8,21 +10,38 @@
 
 namespace lightrt_common {
 
-// Resolve material for a hit
+// Resolve material for a hit (handles both triangle and curve hits)
 static const scene::MaterialData& resolveMaterial(const scene::Scene& scene,
                                                   const scene::HitInfo& hit) {
   static const scene::MaterialData kDefaultMat;
   if (hit.instance_id == lightrt::kInvalidIndex) return kDefaultMat;
 
-  const auto& mesh = scene.meshes[scene.instances[hit.instance_id].mesh_id];
-  if (hit.triangle_id < mesh.tri_material_ids.size()) {
-    int32_t mat_id = mesh.tri_material_ids[hit.triangle_id];
-    if (mat_id >= 0 && static_cast<size_t>(mat_id) < scene.materials.size())
-      return scene.materials[static_cast<size_t>(mat_id)];
+  const auto& inst = scene.instances[hit.instance_id];
+  if (hit.curve_id != lightrt::kInvalidIndex && inst.curve_mesh_id != lightrt::kInvalidIndex) {
+    // Curve hit
+    const auto& cb = scene.curve_meshes[inst.curve_mesh_id];
+    if (hit.curve_id < cb.curve_material_ids.size()) {
+      int32_t mid = cb.curve_material_ids[hit.curve_id];
+      if (mid >= 0 && static_cast<size_t>(mid) < scene.materials.size())
+        return scene.materials[static_cast<size_t>(mid)];
+    }
+    if (cb.default_material_id >= 0 &&
+        static_cast<size_t>(cb.default_material_id) < scene.materials.size())
+      return scene.materials[static_cast<size_t>(cb.default_material_id)];
+    return kDefaultMat;
   }
-  if (mesh.default_material_id >= 0 &&
-      static_cast<size_t>(mesh.default_material_id) < scene.materials.size())
-    return scene.materials[static_cast<size_t>(mesh.default_material_id)];
+
+  if (inst.mesh_id != lightrt::kInvalidIndex) {
+    const auto& mesh = scene.meshes[inst.mesh_id];
+    if (hit.triangle_id < mesh.tri_material_ids.size()) {
+      int32_t mat_id = mesh.tri_material_ids[hit.triangle_id];
+      if (mat_id >= 0 && static_cast<size_t>(mat_id) < scene.materials.size())
+        return scene.materials[static_cast<size_t>(mat_id)];
+    }
+    if (mesh.default_material_id >= 0 &&
+        static_cast<size_t>(mesh.default_material_id) < scene.materials.size())
+      return scene.materials[static_cast<size_t>(mesh.default_material_id)];
+  }
   return kDefaultMat;
 }
 
@@ -143,146 +162,6 @@ static scene::MaterialData resolveMaterialTextured(const scene::Scene& scene,
   return mat;
 }
 
-struct SSSResult {
-  lightrt::Vec3 exit_pos;
-  lightrt::Vec3 exit_normal;
-  lightrt::Vec3 throughput;
-  uint32_t exit_instance_id = lightrt::kInvalidIndex;
-  uint32_t exit_triangle_id = lightrt::kInvalidIndex;
-  bool success = false;
-};
-
-static lightrt::Vec3 computeWorldNormal(const scene::Scene& scene,
-                                        uint32_t inst_id, uint32_t tri_id,
-                                        float u = 0.333f, float v = 0.333f) {
-  const auto& inst = scene.instances[inst_id];
-  const auto& mesh = scene.meshes[inst.mesh_id];
-  lightrt::Vec3 local_n;
-  if (!mesh.tri_normals.empty() && tri_id * 9 + 8 < mesh.tri_normals.size()) {
-    size_t nb = tri_id * 9;
-    float w = 1.0f - u - v;
-    local_n = lightrt::Vec3(
-        mesh.tri_normals[nb + 0] * w + mesh.tri_normals[nb + 3] * u + mesh.tri_normals[nb + 6] * v,
-        mesh.tri_normals[nb + 1] * w + mesh.tri_normals[nb + 4] * u + mesh.tri_normals[nb + 7] * v,
-        mesh.tri_normals[nb + 2] * w + mesh.tri_normals[nb + 5] * u + mesh.tri_normals[nb + 8] * v)
-        .normalize();
-  } else {
-    const auto& tris = mesh.bvh.getTriangles();
-    const auto& tri = tris[tri_id];
-    local_n = (tri.v1 - tri.v0).cross(tri.v2 - tri.v0).normalize();
-  }
-  return scene::transformNormal(inst.inv_transform, local_n).normalize();
-}
-
-static SSSResult randomWalkSSS(const scene::Scene& scene,
-                               const lightrt::Vec3& entry_pos,
-                               const lightrt::Vec3& entry_N,
-                               uint32_t entry_instance_id,
-                               const scene::MaterialData& mat,
-                               std::mt19937& rng,
-                               std::uniform_real_distribution<float>& dist01) {
-  using namespace lightrt_common::sss;
-  SSSResult result{};
-
-  const SSSCoeffs c = computeCoeffsFromMaterial(mat);
-  if (c.sigma_t.x > 1e14f && c.sigma_t.y > 1e14f && c.sigma_t.z > 1e14f)
-    return result;
-
-  float g = std::max(-0.99f, std::min(0.99f, mat.subsurface_anisotropy));
-
-  float thickness = kInfThickness;
-  {
-    lightrt::Vec3 inward = entry_N * -1.0f;
-    lightrt::Ray probe(entry_pos + inward * 1e-3f, inward, 0.0f, 1000.0f);
-    scene::HitInfo probe_hit = scene::traceScene(scene, probe);
-    if (probe_hit.instance_id == entry_instance_id)
-      thickness = probe_hit.t + 1e-3f;
-  }
-
-  lightrt::Vec3 inward_N = entry_N * -1.0f;
-  lightrt::Vec3 ray_dir = sampleCosineHemisphere(inward_N,
-                                                 dist01(rng), dist01(rng));
-  if (ray_dir.dot(inward_N) <= 0.0f) ray_dir = ray_dir * -1.0f;
-
-  lightrt::Vec3 ray_pos = entry_pos + inward_N * 1e-3f;
-  lightrt::Vec3 throughput(1.0f, 1.0f, 1.0f);
-
-  constexpr int kMaxBounces = 512;
-  for (int bounce = 0; bounce < kMaxBounces; ++bounce) {
-    lightrt::Vec3 ch_pdf;
-    int ch = sampleChannel(throughput, c.sigma_s, dist01(rng), ch_pdf);
-    float t_max = sampleFreePath(c.sigma_t, ch, dist01(rng));
-    if (bounce == 0) t_max = std::min(t_max, thickness);
-
-    lightrt::Ray walk_ray(ray_pos, ray_dir, 1e-4f, t_max);
-    scene::HitInfo hit = scene::traceScene(scene, walk_ray);
-
-    if (hit.instance_id != lightrt::kInvalidIndex &&
-        hit.instance_id == entry_instance_id) {
-      float t = hit.t;
-      lightrt::Vec3 tau = transmittance(c.sigma_t, t);
-
-      float exit_pdf = ch_pdf.x * tau.x + ch_pdf.y * tau.y + ch_pdf.z * tau.z;
-      if (exit_pdf < 1e-16f) break;
-
-      throughput.x *= tau.x / exit_pdf;
-      throughput.y *= tau.y / exit_pdf;
-      throughput.z *= tau.z / exit_pdf;
-
-      lightrt::Vec3 exit_N = computeWorldNormal(scene,
-                                                hit.instance_id,
-                                                hit.triangle_id,
-                                                hit.u, hit.v);
-      if (exit_N.dot(ray_dir) < 0.0f) exit_N = exit_N * -1.0f;
-
-      constexpr float kMaxTp = 1e4f;
-      throughput.x = std::max(0.0f, std::min(throughput.x, kMaxTp));
-      throughput.y = std::max(0.0f, std::min(throughput.y, kMaxTp));
-      throughput.z = std::max(0.0f, std::min(throughput.z, kMaxTp));
-
-      result.exit_pos = ray_pos + ray_dir * t;
-      result.exit_normal = exit_N;
-      result.throughput = throughput;
-      result.exit_instance_id = hit.instance_id;
-      result.exit_triangle_id = hit.triangle_id;
-      result.success = true;
-      return result;
-    }
-
-    float t = t_max;
-    lightrt::Vec3 tau = transmittance(c.sigma_t, t);
-    float pdf_scatter = ch_pdf.x * c.sigma_t.x * tau.x +
-                        ch_pdf.y * c.sigma_t.y * tau.y +
-                        ch_pdf.z * c.sigma_t.z * tau.z;
-    if (pdf_scatter < 1e-16f) break;
-
-    throughput.x *= c.sigma_s.x * tau.x / pdf_scatter;
-    throughput.y *= c.sigma_s.y * tau.y / pdf_scatter;
-    throughput.z *= c.sigma_s.z * tau.z / pdf_scatter;
-
-    if (!std::isfinite(throughput.x) || !std::isfinite(throughput.y) ||
-        !std::isfinite(throughput.z)) break;
-
-    ray_pos = ray_pos + ray_dir * t;
-
-    float lum = 0.2126f * throughput.x +
-                0.7152f * throughput.y +
-                0.0722f * throughput.z;
-    lum = std::max(0.0f, std::min(1.0f, lum));
-    if (dist01(rng) >= lum) break;
-    throughput.x /= lum;
-    throughput.y /= lum;
-    throughput.z /= lum;
-
-    lightrt::Vec3 T, B;
-    buildONB(ray_dir, T, B);
-    lightrt::Vec3 local_scatter = sampleHGLocal(g, dist01(rng), dist01(rng));
-    ray_dir = toWorld(local_scatter, T, B, ray_dir).normalize();
-  }
-
-  return result;
-}
-
 void renderFrame(const scene::Scene& scene,
                  const RenderSettings& settings,
                  const CameraView& camera,
@@ -330,41 +209,71 @@ void renderFrame(const scene::Scene& scene,
           }
         } else {
           const auto& inst = scene.instances[hit.instance_id];
-          const auto& mesh_blas = scene.meshes[inst.mesh_id];
-          const auto& tris = mesh_blas.bvh.getTriangles();
-          const auto& tri = tris[hit.triangle_id];
-
-          lightrt::Vec3 local_n;
-          if (!mesh_blas.tri_normals.empty() && hit.triangle_id * 9 + 8 < mesh_blas.tri_normals.size()) {
-            size_t nb = hit.triangle_id * 9;
-            float w = 1.0f - hit.u - hit.v;
-            local_n = lightrt::Vec3(
-              mesh_blas.tri_normals[nb + 0] * w + mesh_blas.tri_normals[nb + 3] * hit.u + mesh_blas.tri_normals[nb + 6] * hit.v,
-              mesh_blas.tri_normals[nb + 1] * w + mesh_blas.tri_normals[nb + 4] * hit.u + mesh_blas.tri_normals[nb + 7] * hit.v,
-              mesh_blas.tri_normals[nb + 2] * w + mesh_blas.tri_normals[nb + 5] * hit.u + mesh_blas.tri_normals[nb + 8] * hit.v
-            ).normalize();
-          } else {
-            lightrt::Vec3 e1 = tri.v1 - tri.v0;
-            lightrt::Vec3 e2 = tri.v2 - tri.v0;
-            local_n = e1.cross(e2).normalize();
-          }
-
-          lightrt::Vec3 N = scene::transformNormal(inst.inv_transform, local_n).normalize();
-          lightrt::Vec3 V = dir * -1.0f;
-          if (N.dot(V) < 0.0f) N = N * -1.0f;
-
+          lightrt::Vec3 N, V = dir * -1.0f;
           lightrt::Vec3 hit_pos = camera.position + dir * hit.t;
+          lightrt::Vec3 fiber_T; // tangent (for hair BSDF)
           float bias = 0.001f;
+          bool is_curve = (hit.curve_id != lightrt::kInvalidIndex);
+          scene::MaterialData mat;
 
-          const scene::MaterialData mat = resolveMaterialTextured(scene, hit);
-
-          if (!mesh_blas.tri_uvs.empty() && hit.triangle_id * 6 + 5 < mesh_blas.tri_uvs.size()) {
-            float w = 1.0f - hit.u - hit.v;
-            size_t ub = hit.triangle_id * 6;
-            float tu = mesh_blas.tri_uvs[ub + 0] * w + mesh_blas.tri_uvs[ub + 2] * hit.u + mesh_blas.tri_uvs[ub + 4] * hit.v;
-            float tv = mesh_blas.tri_uvs[ub + 1] * w + mesh_blas.tri_uvs[ub + 3] * hit.u + mesh_blas.tri_uvs[ub + 5] * hit.v;
-            N = applyNormalMap(scene, hit, N, tu, tv);
+          if (is_curve) {
+            // Curve hit — compute normal + tangent from the fiber
+            const scene::CurveBLAS& cb = scene.curve_meshes[inst.curve_mesh_id];
+            const lightrt::Curve& curve = cb.curves[hit.curve_id];
+            lightrt::Vec3 pos = curve.evaluate(hit.curve_u);
+            fiber_T = curve.evaluateTangent(hit.curve_u).normalize();
+            float radius = curve.radiusAt(hit.curve_u);
+            // Fiber normal: direction from fiber centerline to hit point
+            lightrt::Vec3 to_hit = (hit_pos - pos);
+            N = to_hit - fiber_T * to_hit.dot(fiber_T);
+            float nlen = N.length();
+            if (nlen < 1e-8f) {
+              // Fallback: use a vector perpendicular to tangent
+              if (std::abs(fiber_T.y) < 0.9f)
+                N = fiber_T.cross(lightrt::Vec3(0,1,0)).normalize();
+              else
+                N = fiber_T.cross(lightrt::Vec3(1,0,0)).normalize();
+            } else {
+              N = N * (1.0f / nlen);
+            }
+            // Ensure N points outward (away from incidence)
             if (N.dot(V) < 0.0f) N = N * -1.0f;
+            // Resolve material (textured variant not needed for curves yet)
+            mat = resolveMaterial(scene, hit);
+          } else {
+            // Triangle hit (existing path)
+            const auto& mesh_blas = scene.meshes[inst.mesh_id];
+            const auto& tris = mesh_blas.bvh.getTriangles();
+            const auto& tri = tris[hit.triangle_id];
+
+            lightrt::Vec3 local_n;
+            if (!mesh_blas.tri_normals.empty() && hit.triangle_id * 9 + 8 < mesh_blas.tri_normals.size()) {
+              size_t nb = hit.triangle_id * 9;
+              float w = 1.0f - hit.u - hit.v;
+              local_n = lightrt::Vec3(
+                mesh_blas.tri_normals[nb + 0] * w + mesh_blas.tri_normals[nb + 3] * hit.u + mesh_blas.tri_normals[nb + 6] * hit.v,
+                mesh_blas.tri_normals[nb + 1] * w + mesh_blas.tri_normals[nb + 4] * hit.u + mesh_blas.tri_normals[nb + 7] * hit.v,
+                mesh_blas.tri_normals[nb + 2] * w + mesh_blas.tri_normals[nb + 5] * hit.u + mesh_blas.tri_normals[nb + 8] * hit.v
+              ).normalize();
+            } else {
+              lightrt::Vec3 e1 = tri.v1 - tri.v0;
+              lightrt::Vec3 e2 = tri.v2 - tri.v0;
+              local_n = e1.cross(e2).normalize();
+            }
+
+            N = scene::transformNormal(inst.inv_transform, local_n).normalize();
+            if (N.dot(V) < 0.0f) N = N * -1.0f;
+
+            mat = resolveMaterialTextured(scene, hit);
+
+            if (!mesh_blas.tri_uvs.empty() && hit.triangle_id * 6 + 5 < mesh_blas.tri_uvs.size()) {
+              float w = 1.0f - hit.u - hit.v;
+              size_t ub = hit.triangle_id * 6;
+              float tu = mesh_blas.tri_uvs[ub + 0] * w + mesh_blas.tri_uvs[ub + 2] * hit.u + mesh_blas.tri_uvs[ub + 4] * hit.v;
+              float tv = mesh_blas.tri_uvs[ub + 1] * w + mesh_blas.tri_uvs[ub + 3] * hit.u + mesh_blas.tri_uvs[ub + 5] * hit.v;
+              N = applyNormalMap(scene, hit, N, tu, tv);
+              if (N.dot(V) < 0.0f) N = N * -1.0f;
+            }
           }
 
           if (mat.emission_luminance > 0.0f) {
@@ -448,7 +357,13 @@ void renderFrame(const scene::Scene& scene,
                                           hit.triangle_id, ray_time))
                 continue;
 
-              lightrt::Vec3 brdf_ndl = evalBRDF(N, V, L, mat);
+              lightrt::Vec3 brdf_ndl;
+              if (is_curve && mat.hair_weight > 0.01f) {
+                lightrt_common::hair::HairParams hp = lightrt_common::hair::HairParams::fromMaterial(mat);
+                brdf_ndl = lightrt_common::hair::evalHair(hp, fiber_T, N, L, V);
+              } else {
+                brdf_ndl = evalBRDF(N, V, L, mat);
+              }
               lightrt::Vec3 light_contribution = light.color;
               if (light.type == scene::LightData::Point) {
                 float inv_r2 = 1.0f / (light_dist * light_dist);
@@ -564,7 +479,7 @@ void renderFrame(const scene::Scene& scene,
             }
 
             if (sss_weight > 1e-4f) {
-              SSSResult sss_r = randomWalkSSS(scene, hit_pos, N,
+              sss_render::SSSResult sss_r = sss_render::randomWalkSSS(scene, hit_pos, N,
                                               hit.instance_id, mat, rng, dist01);
               if (sss_r.success) {
                 const lightrt::Vec3& eN = sss_r.exit_normal;

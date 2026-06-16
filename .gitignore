@@ -2,9 +2,11 @@
 *.o
 *.a
 *.so
+*.node
 *.dylib
 *.dll
 *.exe
+__pycache__/
 
 # Compiled executables
 lightrt_example
@@ -26,6 +28,10 @@ webgpu/softrt.wasm
 # Build directories
 build/
 cmake-build-*/
+
+# Locally built toolchain (scripts/setup-and-build-glslang.sh)
+tools/
+build_glslang/
 
 # IDE files
 .vscode/

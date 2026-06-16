@@ -35,6 +35,7 @@ typedef int           Status;
 typedef struct _XDisplay Display;
 typedef struct _XGC     *GC;
 typedef struct _Visual   Visual;  /* only passed as pointer, never dereferenced */
+typedef struct _XScreen  Screen;  /* only passed as pointer, never dereferenced */
 
 /* ================================================================
  * XSetWindowAttributes — 15 fields, ABI-exact layout on LP64
@@ -271,6 +272,18 @@ typedef union _XEvent {
 #define XK_O                    0x004f
 #define XK_plus                 0x002b
 #define XK_equal                0x003d
+#define XK_minus                0x002d
+#define XK_underscore           0x005f
+#define XK_b                    0x0062
+#define XK_B                    0x0042
+#define XK_v                    0x0076
+#define XK_V                    0x0056
+#define XK_h                    0x0068
+#define XK_H                    0x0048
+#define XK_r                    0x0072
+#define XK_R                    0x0052
+#define XK_bracketleft          0x005b
+#define XK_bracketright         0x005d
 
 #ifdef __cplusplus
 }

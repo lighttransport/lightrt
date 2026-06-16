@@ -72,6 +72,15 @@ struct OpenPBRMaterial {
   // --- Geometry ---
   float          opacity               = 1.0f;
 
+  // --- Hair ---
+  float          hair_roughness_longitudinal = 0.3f;
+  float          hair_roughness_azimuthal    = 0.3f;
+  float          hair_ior                    = 1.55f;
+  float          hair_cuticle_angle          = 3.0f; // degrees
+  lightrt::Vec3  hair_absorption             = {0.0f, 0.0f, 0.0f};
+  lightrt::Vec3  hair_color                  = {0.8f, 0.5f, 0.2f};
+  float          hair_weight                 = 0.0f; // 0=standard, 1=full hair BSDF
+
   // --- Texture image indices (-1 = none) ---
   int32_t        base_color_tex_id     = -1;
   int32_t        metalness_tex_id      = -1;

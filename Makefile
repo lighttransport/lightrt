@@ -4,13 +4,16 @@
 
 CC ?= gcc
 CXX ?= g++
+CC ?= cc
 AR ?= ar
 
 # Compiler flags
 CFLAGS = -std=c11 -Wall -Wextra -O3
 CXXFLAGS = -std=c++17 -Wall -Wextra -O3 -fno-rtti -fno-exceptions
+CFLAGS = -std=c11 -Wall -Wextra -O3
 INCLUDES = -I.
 LDFLAGS =
+GLSLANG ?= glslangValidator
 
 # Detect architecture and enable SIMD
 ARCH := $(shell uname -m)
@@ -18,12 +21,14 @@ ARCH := $(shell uname -m)
 ifeq ($(ARCH),x86_64)
     # x86-64: Enable SSE2 (baseline) and optionally AVX
     CXXFLAGS += -msse2
+    C_SIMD = -msse4.1
     ifneq ($(NO_AVX),1)
         CXXFLAGS += -mavx
     endif
     # Optional: Enable AVX2 and FMA
     ifneq ($(NO_AVX2),1)
         CXXFLAGS += -mavx2 -mfma
+        C_SIMD += -mavx2 -mfma
     endif
     # Optional: Enable F16C for FP16 support
     ifneq ($(NO_F16C),1)
@@ -128,4 +133,21 @@ info:
 
 obj_bench: $(OBJ_BENCH_TARGET)
 
-.PHONY: all clean run benchmark obj_bench info
+# ---- Vulkan GPU interop (opt-in; runtime dlopen of libvulkan, no SDK, no -lvulkan) ----
+# Build + run the GPU-interop self-test:  make vk_test && ./lightrt_c_vk_test
+VK_SOURCES = lightrt_vkew.c lightrt_c_vk.c lightrt_c_tri.c
+VK_TEST_SRC = tests/test_lightrt_c_vk.c
+
+vk_test: $(VK_SOURCES) $(VK_TEST_SRC)
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -o lightrt_c_vk_test $^ -ldl -lm -lpthread
+	@echo "Built lightrt_c_vk_test (run: ./lightrt_c_vk_test)"
+
+# Optional: regenerate the checked-in SPIR-V headers (needs glslang; not in 'all').
+shaders:
+	GLSLANG=$(GLSLANG) bash scripts/compile_shaders.sh
+
+info_vk:
+	@echo "CC: $(CC)"
+	@echo "CFLAGS: $(CFLAGS) $(C_SIMD)"
+
+.PHONY: all clean run benchmark obj_bench info vk_test shaders info_vk

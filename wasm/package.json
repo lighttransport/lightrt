@@ -1,0 +1,13 @@
+{
+  "name": "lightrt-wasm",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "emcmake cmake -B build && cmake --build build && mkdir -p dist && cp build/a.out.js dist/lightrt.js && cp build/a.out.wasm dist/lightrt.wasm && cp package.npm.json dist/package.json",
+    "clean": "rm -rf build dist",
+    "test": "node --experimental-vm-modules tests/test.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.2"
+  }
+}
