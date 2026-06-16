@@ -90,8 +90,10 @@ struct lrt_hip_scene {
 
 /* prim_kind values mirrored from lightrt_c_tri.c (kept in sync). */
 #define HIP_PRIM_TRI 0u
+#define HIP_PRIM_RLCURVE 5u
 #define HIP_PRIM_SPHERE 3u
 #define HIP_PRIM_POINT 6u
+#define HIP_PRIM_FLATCURVE 7u
 #define HIP_PRIM_QUAD 9u
 #define HIP_PRIM_TETRA 10u
 #define HIP_POINT_SPHERE 0u
@@ -454,6 +456,202 @@ __device__ __forceinline__ bool hp_mt(float ox, float oy, float oz, float dx,
     return true;
 }
 
+/* ---- flat (ribbon) linear curve, port of tri_flat_isect_one -------------- */
+__device__ __forceinline__ bool hp_flat_one(float ox, float oy, float oz,
+                                            float dx, float dy, float dz,
+                                            const float p0[3], float r0,
+                                            const float p1[3], float r1,
+                                            float tmin, float best_t, float *t,
+                                            float *u) {
+    float Tx = p1[0] - p0[0], Ty = p1[1] - p0[1], Tz = p1[2] - p0[2];
+    float bx = Ty * dz - Tz * dy, by = Tz * dx - Tx * dz, bz = Tx * dy - Ty * dx;
+    float bl2 = bx * bx + by * by + bz * bz;
+    if (bl2 <= 1e-20f) return false;
+    float invb = 1.0f / sqrtf(bl2);
+    bx *= invb; by *= invb; bz *= invb;
+    float q[4][3] = {
+        {p0[0] + r0 * bx, p0[1] + r0 * by, p0[2] + r0 * bz},
+        {p1[0] + r1 * bx, p1[1] + r1 * by, p1[2] + r1 * bz},
+        {p1[0] - r1 * bx, p1[1] - r1 * by, p1[2] - r1 * bz},
+        {p0[0] - r0 * bx, p0[1] - r0 * by, p0[2] - r0 * bz}};
+    float Tl2 = Tx * Tx + Ty * Ty + Tz * Tz;
+    float best = best_t, hit_s = 0.0f;
+    int hit = 0;
+    for (int tri = 0; tri < 2; tri++) {
+        const float *a = q[0];
+        const float *bb = tri == 0 ? q[1] : q[2];
+        const float *cc = tri == 0 ? q[2] : q[3];
+        float e1x = bb[0] - a[0], e1y = bb[1] - a[1], e1z = bb[2] - a[2];
+        float e2x = cc[0] - a[0], e2y = cc[1] - a[1], e2z = cc[2] - a[2];
+        float px = dy * e2z - dz * e2y, py = dz * e2x - dx * e2z,
+              pz = dx * e2y - dy * e2x;
+        float det = e1x * px + e1y * py + e1z * pz;
+        if (det > -1e-12f && det < 1e-12f) continue;
+        float inv = 1.0f / det;
+        float tvx = ox - a[0], tvy = oy - a[1], tvz = oz - a[2];
+        float uu = (tvx * px + tvy * py + tvz * pz) * inv;
+        if (uu < 0.0f || uu > 1.0f) continue;
+        float qx = tvy * e1z - tvz * e1y, qy = tvz * e1x - tvx * e1z,
+              qz = tvx * e1y - tvy * e1x;
+        float vv = (dx * qx + dy * qy + dz * qz) * inv;
+        if (vv < 0.0f || uu + vv > 1.0f) continue;
+        float tt = (e2x * qx + e2y * qy + e2z * qz) * inv;
+        if (tt < tmin || tt >= best) continue;
+        best = tt;
+        hit = 1;
+        float hpx = ox + tt * dx, hpy = oy + tt * dy, hpz = oz + tt * dz;
+        float s = Tl2 > 0.0f ? ((hpx - p0[0]) * Tx + (hpy - p0[1]) * Ty +
+                                (hpz - p0[2]) * Tz) / Tl2
+                             : 0.0f;
+        hit_s = s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s);
+    }
+    if (hit) { *t = best; *u = hit_s; }
+    return hit != 0;
+}
+
+/* ---- round-linear (tapered cone) curve, port of tri_rlc_isect_one --------- */
+#define HIP_INF_F 3.402823466e+38f
+#define HIP_RLC_ULP 1.1920929e-7f
+#define HIP_RLC_MIN_A 1e-18f
+
+__device__ __forceinline__ bool hp_rlc_in_cone(const float cp0[3], float cr0,
+                                               const float cp1[3], float cr1,
+                                               const float p[3]) {
+    if (!(cp1[0] < HIP_INF_F) || !(cp0[0] < HIP_INF_F)) return false;
+    float dPx = cp1[0] - cp0[0], dPy = cp1[1] - cp0[1], dPz = cp1[2] - cp0[2];
+    float dPdP = dPx * dPx + dPy * dPy + dPz * dPz;
+    float dr = cr1 - cr0, r0dr = cr0 * dr, g = dPdP - dr * dr;
+    float p0px = p[0] - cp0[0], p0py = p[1] - cp0[1], p0pz = p[2] - cp0[2];
+    float y = p0px * dPx + p0py * dPy + p0pz * dPz;
+    if (!(y > -r0dr + HIP_RLC_ULP)) return false;
+    if (!(y < -cr1 * dr + dPdP)) return false;
+    float p0p2 = p0px * p0px + p0py * p0py + p0pz * p0pz;
+    return (p0p2 * g - y * y) < (dPdP * cr0 * cr0 + 2.0f * r0dr * y);
+}
+__device__ __forceinline__ bool hp_rlc_clip_plane(const float cp0[3], float cr0,
+                                                  const float cp1[3], float cr1,
+                                                  const float p[3]) {
+    if (!(cp1[0] < HIP_INF_F) || !(cp0[0] < HIP_INF_F)) return false;
+    float dPx = cp1[0] - cp0[0], dPy = cp1[1] - cp0[1], dPz = cp1[2] - cp0[2];
+    float r0dr = cr0 * (cr1 - cr0);
+    float p0px = p[0] - cp0[0], p0py = p[1] - cp0[1], p0pz = p[2] - cp0[2];
+    float y = p0px * dPx + p0py * dPy + p0pz * dPz;
+    return y > -r0dr;
+}
+
+__device__ __forceinline__ bool hp_rlc_one(float ox0, float oy0, float oz0,
+                                           float dirx, float diry, float dirz,
+                                           const float p0[3], float r0,
+                                           const float p1[3], float r1,
+                                           const float pL[3], float rL,
+                                           const float pR[3], float rR,
+                                           float tmin, float best_t, float *t_out,
+                                           float *u_out) {
+    const float POS_INF = HIP_INF_F, NEG_INF = -HIP_INF_F;
+    float dOdO = dirx * dirx + diry * diry + dirz * dirz;
+    if (dOdO <= 0.0f) return false;
+    float rcp_dOdO = 1.0f / dOdO;
+    float cx = 0.5f * (p0[0] + p1[0]), cy = 0.5f * (p0[1] + p1[1]),
+          cz = 0.5f * (p0[2] + p1[2]);
+    float dt = ((cx - ox0) * dirx + (cy - oy0) * diry + (cz - oz0) * dirz) *
+               rcp_dOdO;
+    float ox = ox0 + dt * dirx, oy = oy0 + dt * diry, oz = oz0 + dt * dirz;
+    float dPx = p1[0] - p0[0], dPy = p1[1] - p0[1], dPz = p1[2] - p0[2];
+    float dPdP = dPx * dPx + dPy * dPy + dPz * dPz;
+    float dr = r1 - r0, r0dr = r0 * dr, g = dPdP - dr * dr;
+    float Ox = ox - p0[0], Oy = oy - p0[1], Oz = oz - p0[2];
+    float OdP = Ox * dPx + Oy * dPy + Oz * dPz;
+    float dOdP = dirx * dPx + diry * dPy + dirz * dPz;
+    float yp = OdP + r0dr;
+    float t_cone_lo = POS_INF, t_cone_hi = NEG_INF, y_cone_lo = 0.0f,
+          y_cone_hi = 0.0f;
+    int cone_valid = 0;
+    {
+        float OO = Ox * Ox + Oy * Oy + Oz * Oz;
+        float OdO = dirx * Ox + diry * Oy + dirz * Oz;
+        float A = g * dOdO - dOdP * dOdP;
+        float B = 2.0f * (g * OdO - dOdP * yp);
+        float C = g * OO - OdP * OdP - r0 * r0 * dPdP - 2.0f * r0dr * OdP;
+        float D = B * B - 4.0f * A * C;
+        if (D >= 0.0f && g > 0.0f && (A > HIP_RLC_MIN_A || A < -HIP_RLC_MIN_A)) {
+            cone_valid = 1;
+            float Q = sqrtf(D), rcp_2A = 1.0f / (2.0f * A);
+            float tf = (-B - Q) * rcp_2A, yf = yp + tf * dOdP;
+            if (yf > -HIP_RLC_ULP && yf <= g) { t_cone_lo = tf; y_cone_lo = yf; }
+            float tb = (-B + Q) * rcp_2A, yb = yp + tb * dOdP;
+            if (yb > -HIP_RLC_ULP && yb <= g) { t_cone_hi = tb; y_cone_hi = yb; }
+        }
+    }
+    if (!cone_valid && g > 0.0f) return false;
+    if (t_cone_lo != POS_INF) {
+        float hp[3] = {ox + t_cone_lo * dirx, oy + t_cone_lo * diry,
+                       oz + t_cone_lo * dirz};
+        if (hp_rlc_in_cone(p0, r0, pL, rL, hp) ||
+            hp_rlc_in_cone(p1, r1, pR, rR, hp))
+            t_cone_lo = POS_INF;
+    }
+    if (t_cone_hi != NEG_INF) {
+        float hp[3] = {ox + t_cone_hi * dirx, oy + t_cone_hi * diry,
+                       oz + t_cone_hi * dirz};
+        if (hp_rlc_in_cone(p0, r0, pL, rL, hp) ||
+            hp_rlc_in_cone(p1, r1, pR, rR, hp))
+            t_cone_hi = NEG_INF;
+    }
+    float t_sph1_lo = POS_INF, t_sph1_hi = NEG_INF;
+    {
+        float O1x = ox - p1[0], O1y = oy - p1[1], O1z = oz - p1[2];
+        float O1dO = O1x * dirx + O1y * diry + O1z * dirz;
+        float O1O1 = O1x * O1x + O1y * O1y + O1z * O1z;
+        float h2 = O1dO * O1dO - dOdO * (O1O1 - r1 * r1);
+        if (h2 >= 0.0f) {
+            float rhs = sqrtf(h2);
+            float tf = (-O1dO - rhs) * rcp_dOdO;
+            float hf[3] = {ox + tf * dirx, oy + tf * diry, oz + tf * dirz};
+            if (yp + tf * dOdP > g && !hp_rlc_clip_plane(p1, r1, pR, rR, hf))
+                t_sph1_lo = tf;
+            float tb = (-O1dO + rhs) * rcp_dOdO;
+            float hb[3] = {ox + tb * dirx, oy + tb * diry, oz + tb * dirz};
+            if (yp + tb * dOdP > g && !hp_rlc_clip_plane(p1, r1, pR, rR, hb))
+                t_sph1_hi = tb;
+        }
+    }
+    float t_sph0_lo = POS_INF, t_sph0_hi = NEG_INF;
+    if (!(pL[0] < HIP_INF_F)) {
+        float O0x = ox - p0[0], O0y = oy - p0[1], O0z = oz - p0[2];
+        float O0dO = O0x * dirx + O0y * diry + O0z * dirz;
+        float O0O0 = O0x * O0x + O0y * O0y + O0z * O0z;
+        float h2 = O0dO * O0dO - dOdO * (O0O0 - r0 * r0);
+        if (h2 >= 0.0f) {
+            float rhs = sqrtf(h2);
+            float tf = (-O0dO - rhs) * rcp_dOdO;
+            if (yp + tf * dOdP < 0.0f) t_sph0_lo = tf;
+            float tb = (-O0dO + rhs) * rcp_dOdO;
+            if (yp + tb * dOdP < 0.0f) t_sph0_hi = tb;
+        }
+    }
+    float t_sph_lo = fminf(t_sph0_lo, t_sph1_lo);
+    float lo = fminf(t_cone_lo, t_sph_lo);
+    float t_sph_hi = fmaxf(t_sph0_hi, t_sph1_hi);
+    float hi = fmaxf(t_cone_hi, t_sph_hi);
+    int lo_valid = (lo != POS_INF) && (dt + lo >= tmin) && (dt + lo < best_t);
+    int hi_valid = (hi != NEG_INF) && (dt + hi >= tmin) && (dt + hi < best_t);
+    if (!lo_valid && !hi_valid) return false;
+    float tloc = lo_valid ? lo : hi;
+    float u;
+    if (tloc == t_cone_lo || tloc == t_cone_hi) {
+        float y = (tloc == t_cone_lo) ? y_cone_lo : y_cone_hi;
+        u = g > 0.0f ? y / g : 0.0f;
+        u = u < 0.0f ? 0.0f : (u > 1.0f ? 1.0f : u);
+    } else if (tloc == t_sph0_lo || tloc == t_sph0_hi) {
+        u = 0.0f;
+    } else {
+        u = 1.0f;
+    }
+    *t_out = dt + tloc;
+    *u_out = u;
+    return true;
+}
+
 /* One leaf block (4 lanes) against the ray, for the given prim_kind. blk = base
  * word index of the block; bsw = block stride in words. Updates best_*. */
 __device__ __forceinline__ void hp_leaf(const uint32_t *__restrict__ blocks,
@@ -535,6 +733,44 @@ __device__ __forceinline__ void hp_leaf(const uint32_t *__restrict__ blocks,
             float tb = projC0 + td;
             if (tb >= tmin && tb < *best_t) {
                 *best_t = tb; *best_u = 0.0f; *best_v = 0.0f; *best_prim = prim;
+            }
+        }
+    } else if (prim_kind == HIP_PRIM_FLATCURVE) { /* lrt_flat4: 36 words */
+        for (uint32_t l = 0; l < 4u; l++) {
+            uint32_t prim = blocks[blk + 32u + l];
+            if (prim == LRT_HIP_NO_HIT) continue;
+            float p0[3] = {fu(blocks[blk + 0u + l]), fu(blocks[blk + 4u + l]),
+                           fu(blocks[blk + 8u + l])};
+            float r0 = fu(blocks[blk + 12u + l]);
+            float p1[3] = {fu(blocks[blk + 16u + l]), fu(blocks[blk + 20u + l]),
+                           fu(blocks[blk + 24u + l])};
+            float r1 = fu(blocks[blk + 28u + l]);
+            float t, u;
+            if (hp_flat_one(ox, oy, oz, dx, dy, dz, p0, r0, p1, r1, tmin,
+                            *best_t, &t, &u)) {
+                *best_t = t; *best_u = u; *best_v = 0.0f; *best_prim = prim;
+            }
+        }
+    } else if (prim_kind == HIP_PRIM_RLCURVE) { /* lrt_rlc4: 68 words */
+        for (uint32_t l = 0; l < 4u; l++) {
+            uint32_t prim = blocks[blk + 64u + l];
+            if (prim == LRT_HIP_NO_HIT) continue;
+            float p0[3] = {fu(blocks[blk + 0u + l]), fu(blocks[blk + 4u + l]),
+                           fu(blocks[blk + 8u + l])};
+            float r0 = fu(blocks[blk + 12u + l]);
+            float p1[3] = {fu(blocks[blk + 16u + l]), fu(blocks[blk + 20u + l]),
+                           fu(blocks[blk + 24u + l])};
+            float r1 = fu(blocks[blk + 28u + l]);
+            float pL[3] = {fu(blocks[blk + 32u + l]), fu(blocks[blk + 36u + l]),
+                           fu(blocks[blk + 40u + l])};
+            float rL = fu(blocks[blk + 44u + l]);
+            float pR[3] = {fu(blocks[blk + 48u + l]), fu(blocks[blk + 52u + l]),
+                           fu(blocks[blk + 56u + l])};
+            float rR = fu(blocks[blk + 60u + l]);
+            float t, u;
+            if (hp_rlc_one(ox, oy, oz, dx, dy, dz, p0, r0, p1, r1, pL, rL, pR,
+                           rR, tmin, *best_t, &t, &u)) {
+                *best_t = t; *best_u = u; *best_v = 0.0f; *best_prim = prim;
             }
         }
     } else { /* QUAD or TETRA: 4-point leaf (52 words) */
@@ -1133,20 +1369,21 @@ extern "C" lrt_hip_scene *lrt_hip_scene_upload(lrt_hip_engine *e,
         if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
         return NULL;
     }
-    /* Supported on GPU: triangles (BVH4/BVH8) + analytic BVH4 prims
-     * (sphere/point/quad/tetra). Curves are Phase C/D (rejected here). */
+    /* Supported on GPU: triangles (BVH4/BVH8) + analytic/curve BVH4 prims
+     * (sphere/point/quad/tetra/round-linear/flat). Bezier is Phase D. */
     uint32_t pk = h->prim_kind;
-    int analytic = (pk == HIP_PRIM_SPHERE || pk == HIP_PRIM_POINT ||
-                    pk == HIP_PRIM_QUAD || pk == HIP_PRIM_TETRA);
-    if (pk != HIP_PRIM_TRI && !analytic) {
+    int bvh4_prim = (pk == HIP_PRIM_SPHERE || pk == HIP_PRIM_POINT ||
+                     pk == HIP_PRIM_QUAD || pk == HIP_PRIM_TETRA ||
+                     pk == HIP_PRIM_RLCURVE || pk == HIP_PRIM_FLATCURVE);
+    if (pk != HIP_PRIM_TRI && !bvh4_prim) {
         free(blob);
-        hip_set_err(e, "prim_kind not GPU-traceable yet (curve/bezier?)");
+        hip_set_err(e, "prim_kind not GPU-traceable yet (bezier/curve?)");
         if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
         return NULL;
     }
-    if (analytic && w != 4u) {
+    if (bvh4_prim && w != 4u) {
         free(blob);
-        hip_set_err(e, "analytic primitives are BVH4 only");
+        hip_set_err(e, "non-triangle primitives are BVH4 only");
         if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
         return NULL;
     }

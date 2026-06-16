@@ -639,6 +639,97 @@ static void test_analytic(lrt_hip_engine *e, const char *label,
     lrt_tri_scene_free(cpu);
 }
 
+static void test_gpu_curves(lrt_hip_engine *e) {
+    /* random hair strands: nstr strands of pps points each */
+    uint32_t nstr = 800, pps = 4;
+    uint32_t npoints = nstr * pps;
+    float *pts = (float *)malloc(npoints * 3 * sizeof(float));
+    float *rad = (float *)malloc(npoints * sizeof(float));
+    uint32_t *first = (uint32_t *)malloc(nstr * sizeof(uint32_t));
+    uint32_t *cnt = (uint32_t *)malloc(nstr * sizeof(uint32_t));
+    for (uint32_t s = 0; s < nstr; s++) {
+        float base[3] = {rnd_f(-2, 2), rnd_f(-2, 2), rnd_f(-2, 2)};
+        float dir[3] = {rnd_f(-1, 1), rnd_f(-1, 1), rnd_f(-1, 1)};
+        first[s] = s * pps;
+        cnt[s] = pps;
+        for (uint32_t p = 0; p < pps; p++) {
+            uint32_t i = s * pps + p;
+            float u = (float)p / (float)(pps - 1);
+            for (int k = 0; k < 3; k++)
+                pts[i * 3 + k] = base[k] + dir[k] * u + rnd_f(-0.05f, 0.05f);
+            rad[i] = rnd_f(0.02f, 0.06f);
+        }
+    }
+    lrt_hair_strands hs;
+    memset(&hs, 0, sizeof(hs));
+    hs.points = pts;
+    hs.radius = rad;
+    hs.strand_first = first;
+    hs.strand_count = cnt;
+    hs.nstrands = nstr;
+    hs.npoints = npoints;
+
+    lrt_tri_build_options o;
+    memset(&o, 0, sizeof(o));
+    o.num_threads = 1;
+    printf("== GPU curve primitives vs CPU oracle ==\n");
+
+    struct {
+        const char *name;
+        lrt_tri_scene *(*build)(const lrt_hair_strands *,
+                                const lrt_tri_build_options *, lrt_result *);
+    } kinds[2] = {{"roundcurve", lrt_roundcurve_scene_build},
+                  {"flatcurve", lrt_flatcurve_scene_build}};
+    for (int kk = 0; kk < 2; kk++) {
+        lrt_tri_scene *cpu = kinds[kk].build(&hs, &o, NULL);
+        if (!cpu) {
+            CHECK(0, "%s build", kinds[kk].name);
+            continue;
+        }
+        lrt_hip_scene *gs = lrt_hip_scene_upload(e, cpu, NULL);
+        CHECK(gs != NULL, "%s upload: %s", kinds[kk].name,
+              lrt_hip_engine_last_error(e));
+        if (!gs) {
+            lrt_tri_scene_free(cpu);
+            continue;
+        }
+        size_t nr = 30000, agree = 0;
+        double max_rel = 0.0;
+        lrt_ray *rays = (lrt_ray *)malloc(nr * sizeof(lrt_ray));
+        lrt_hit *gh = (lrt_hit *)malloc(nr * sizeof(lrt_hit));
+        for (size_t i = 0; i < nr; i++) make_random_ray(&rays[i]);
+        lrt_hip_scene_trace(e, gs, rays, (uint32_t)nr, gh, NULL);
+        for (size_t i = 0; i < nr; i++) {
+            lrt_hit c;
+            int ch = lrt_tri_intersect1(cpu, &rays[i], &c);
+            int g = gh[i].prim_id != LRT_TRI_NO_HIT;
+            if (ch == g && (!g || c.prim_id == gh[i].prim_id)) {
+                agree++;
+                if (g) {
+                    double rel = fabs((double)gh[i].t - c.t) / (1.0 + fabs(c.t));
+                    if (rel > max_rel) max_rel = rel;
+                }
+            } else if (ch && g) {
+                double rel = fabs((double)gh[i].t - c.t) / (1.0 + fabs(c.t));
+                if (rel < 1e-3) agree++;
+            }
+        }
+        double f = (double)agree / nr;
+        printf("  %-12s closest %.3f%% (max_rel_t %.2e)\n", kinds[kk].name,
+               f * 100.0, max_rel);
+        CHECK(f >= 0.995, "%s agreement %.3f%% < 99.5%%", kinds[kk].name,
+              f * 100.0);
+        free(rays);
+        free(gh);
+        lrt_hip_scene_free(e, gs);
+        lrt_tri_scene_free(cpu);
+    }
+    free(pts);
+    free(rad);
+    free(first);
+    free(cnt);
+}
+
 static void test_gpu_analytics(lrt_hip_engine *e) {
     lrt_tri_build_options o;
     memset(&o, 0, sizeof(o));
@@ -747,6 +838,8 @@ int main(void) {
     test_device_pipeline(e, soup, ntris);
 
     test_gpu_analytics(e);
+
+    test_gpu_curves(e);
 
     test_wmma(e);
 
