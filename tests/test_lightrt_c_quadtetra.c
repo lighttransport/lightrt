@@ -164,6 +164,40 @@ int main(void) {
     CHECK(tagree >= NR * 999 / 1000, "tetra closest agreement");
     CHECK(tocc >= NR * 999 / 1000, "tetra occlusion agreement");
 
+    /* Batch path (intersect1N/occluded1N) must match single-ray for these
+     * non-triangle kinds (regression guard: they must NOT take the
+     * triangle-only pipeline). */
+    {
+        size_t nb = 5000;
+        lrt_ray *br = (lrt_ray *)malloc(nb * sizeof(lrt_ray));
+        lrt_hit *h1 = (lrt_hit *)malloc(nb * sizeof(lrt_hit));
+        lrt_hit *hN = (lrt_hit *)malloc(nb * sizeof(lrt_hit));
+        uint8_t *o1 = (uint8_t *)malloc(nb);
+        uint8_t *oN = (uint8_t *)malloc(nb);
+        lrt_tri_scene *scenes[2] = {qs, ts};
+        const char *nm[2] = {"quad", "tetra"};
+        for (int sc = 0; sc < 2; sc++) {
+            for (size_t i = 0; i < nb; i++) make_ray(&br[i]);
+            for (size_t i = 0; i < nb; i++) {
+                if (!lrt_tri_intersect1(scenes[sc], &br[i], &h1[i]))
+                    h1[i].prim_id = LRT_TRI_NO_HIT;
+                o1[i] = (uint8_t)lrt_tri_occluded1(scenes[sc], &br[i]);
+            }
+            lrt_tri_intersect1N(scenes[sc], br, hN, nb, LRT_TRI_BATCH_INCOHERENT);
+            lrt_tri_occluded1N(scenes[sc], br, oN, nb, LRT_TRI_BATCH_INCOHERENT);
+            size_t a = 0, ao = 0;
+            for (size_t i = 0; i < nb; i++) {
+                if (h1[i].prim_id == hN[i].prim_id) a++;
+                if ((o1[i] != 0) == (oN[i] != 0)) ao++;
+            }
+            CHECK(a == nb, "%s intersect1N != intersect1 (%zu/%zu)", nm[sc], a,
+                  nb);
+            CHECK(ao == nb, "%s occluded1N != occluded1 (%zu/%zu)", nm[sc], ao,
+                  nb);
+        }
+        free(br); free(h1); free(hN); free(o1); free(oN);
+    }
+
     free(quads);
     free(tet);
     lrt_tri_scene_free(qs);

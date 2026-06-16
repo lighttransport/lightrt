@@ -1202,7 +1202,7 @@ __launch_bounds__(64) __global__
             sp++;
         }
     }
-    uint32_t hb = gid * 4u;
+    size_t hb = (size_t)gid * 4u;
     hits[hb + 0] = __float_as_uint(best_prim != LRT_HIP_NO_HIT ? best_t : 0.0f);
     hits[hb + 1] = __float_as_uint(best_u);
     hits[hb + 2] = __float_as_uint(best_v);
@@ -1684,7 +1684,7 @@ extern "C" lrt_hip_scene *lrt_hip_scene_upload(lrt_hip_engine *e,
                      pk == HIP_PRIM_BEZCURVE || pk == HIP_PRIM_SDF);
     if (pk != HIP_PRIM_TRI && !bvh4_prim) {
         free(blob);
-        hip_set_err(e, "prim_kind not GPU-traceable (user/sdf/qtri)");
+        hip_set_err(e, "prim_kind not GPU-traceable (user/qtri/legacy-curve)");
         if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
         return NULL;
     }

@@ -776,6 +776,15 @@ int lrt_vk_trace_scene(lrt_vk_engine *e, const lrt_tri_scene *s,
         return -1;
     }
     const vk_lrts_header *h = (const vk_lrts_header *)blob;
+    /* The trace shader is plain-triangle-only (hardcoded 10*W block stride).
+     * save_to_memory now also serializes non-triangle geometric kinds, so gate
+     * explicitly on prim_kind here. */
+    if (h->prim_kind != 0u /* TRI_PRIM_TRI */) {
+        free(blob);
+        vk_set_err(e, "only triangle scenes are GPU-traceable");
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return -1;
+    }
     uint32_t w = h->layout; /* 4 or 8 */
 
     lrt_tri_stats st;

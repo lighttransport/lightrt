@@ -8136,12 +8136,9 @@ void lrt_tri_intersect1N(const lrt_tri_scene *s, const lrt_ray *rays,
                          lrt_hit *hits, size_t n, lrt_tri_batch_hint hint) {
     if (!s || !rays || !hits) return;
     (void)hint; /* unused in scalar-only builds */
-    if (s->curve || s->prim_kind == TRI_PRIM_USER ||
-        s->prim_kind == TRI_PRIM_SPHERE || s->prim_kind == TRI_PRIM_QTRI ||
-        s->prim_kind == TRI_PRIM_RLCURVE || s->prim_kind == TRI_PRIM_POINT ||
-        s->prim_kind == TRI_PRIM_FLATCURVE || s->prim_kind == TRI_PRIM_BEZCURVE ||
-        s->qnode != 0) {
-        /* interleaved pipelines are triangle-specific; loop per ray */
+    /* The interleaved/packet pipelines are plain-triangle-only; every other
+     * prim_kind (and qnode-quantized triangle nodes) must loop per ray. */
+    if (s->prim_kind != TRI_PRIM_TRI || s->qnode != 0) {
         for (size_t i = 0; i < n; i++) lrt_tri_intersect1(s, &rays[i], &hits[i]);
         return;
     }
@@ -8198,11 +8195,8 @@ void lrt_tri_occluded1N(const lrt_tri_scene *s, const lrt_ray *rays,
                         uint8_t *occluded, size_t n, lrt_tri_batch_hint hint) {
     if (!s || !rays || !occluded) return;
     (void)hint; /* unused in scalar-only builds */
-    if (s->curve || s->prim_kind == TRI_PRIM_USER ||
-        s->prim_kind == TRI_PRIM_SPHERE || s->prim_kind == TRI_PRIM_QTRI ||
-        s->prim_kind == TRI_PRIM_RLCURVE || s->prim_kind == TRI_PRIM_POINT ||
-        s->prim_kind == TRI_PRIM_FLATCURVE || s->prim_kind == TRI_PRIM_BEZCURVE ||
-        s->qnode != 0) {
+    /* Plain-triangle-only pipelines; loop per ray for every other prim_kind. */
+    if (s->prim_kind != TRI_PRIM_TRI || s->qnode != 0) {
         for (size_t i = 0; i < n; i++) {
             occluded[i] = (uint8_t)lrt_tri_occluded1(s, &rays[i]);
         }
@@ -10335,7 +10329,8 @@ static void tri_recompute_stats(lrt_tri_scene *s) {
 }
 
 /* Expected leaf-block stride for a serializable prim_kind (0 = not
- * serializable: USER/SDF use host callbacks, QTRI needs out-of-header grid). */
+ * serializable: USER scenes use host callbacks; QTRI needs an out-of-header
+ * grid). */
 static uint32_t tri_kind_block_stride(int prim_kind, int layout) {
     switch (prim_kind) {
     case TRI_PRIM_TRI: return (uint32_t)tri_block_size(layout);
