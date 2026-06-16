@@ -2401,6 +2401,28 @@ static void test_curve_frame(void) {
             CHECK(q == LRT_RESULT_INVALID_ARGUMENT, "curve-frame: bezier scene");
             lrt_tri_scene_free(sbz);
         }
+        /* serialize/reload: the frame is reconstructed from the leaves and
+         * matches the original scene's frame. */
+        void *blob = NULL;
+        size_t bn = 0;
+        if (lrt_tri_scene_save_to_memory(sr, &blob, &bn) == LRT_RESULT_OK &&
+            blob) {
+            lrt_tri_scene *sl = lrt_tri_scene_load_from_memory(blob, bn, NULL);
+            if (sl) {
+                float Co[3], To[3], ro, Cl[3], Tl[3], rl;
+                lrt_result a = lrt_tri_curve_frame(sr, 3, 0.4f, Co, To, &ro);
+                lrt_result b = lrt_tri_curve_frame(sl, 3, 0.4f, Cl, Tl, &rl);
+                CHECK(a == LRT_RESULT_OK && b == LRT_RESULT_OK,
+                      "curve-frame: loaded query (%d/%d)", (int)a, (int)b);
+                if (a == LRT_RESULT_OK && b == LRT_RESULT_OK) {
+                    float d = fabsf(Co[0] - Cl[0]) + fabsf(To[0] - Tl[0]) +
+                              fabsf(ro - rl);
+                    CHECK(d < 1e-5f, "curve-frame: loaded mismatch %.2e", d);
+                }
+                lrt_tri_scene_free(sl);
+            }
+            free(blob);
+        }
     }
 
     if (sr) lrt_tri_scene_free(sr);

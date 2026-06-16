@@ -440,6 +440,10 @@ static inline size_t tri_block_size(int width) {
     return width == 4 ? sizeof(lrt_tri4) : sizeof(lrt_tri8);
 }
 
+/* Rebuild per-prim post-hit shade data from leaf blocks (defined below; used by
+ * the curve builders, the surface builders, and the deserialize/mmap path). */
+static void tri_build_shade_data(lrt_tri_scene *s);
+
 /* Generic view of a block: 9 float arrays then the prim_id array. */
 static inline const float *tri_block_floats(const void *blocks, uint32_t idx,
                                             int width) {
@@ -9605,24 +9609,6 @@ lrt_tri_scene *lrt_curve_scene_build(const float *segments, const float *radii,
     return s;
 }
 
-/* Retain per-segment centerline endpoints + radii (p0 r0 p1 r1, stride 8) for
- * the post-hit curve-frame query. segs is indexed by prim_id (== write order).
- * Shared by the round-linear and flat (ribbon) builders. */
-static void tri_retain_linear_curve(lrt_tri_scene *s, const tri_rlcseg *segs,
-                                    size_t nseg) {
-    float *d = (float *)malloc(nseg * 8 * sizeof(float));
-    if (!d) return; /* leave shade data absent -> query reports UNSUPPORTED */
-    for (size_t i = 0; i < nseg; i++) {
-        const tri_rlcseg *rs = &segs[i];
-        float *o = &d[i * 8];
-        o[0] = rs->p0[0]; o[1] = rs->p0[1]; o[2] = rs->p0[2]; o[3] = rs->r0;
-        o[4] = rs->p1[0]; o[5] = rs->p1[1]; o[6] = rs->p1[2]; o[7] = rs->r1;
-    }
-    s->shade_cps = d;
-    s->shade_nprims = (uint32_t)nseg;
-    s->shade_stride = 8;
-}
-
 /* Round-linear (Embree-style) hair scene: one tapered-cone segment per pair of
  * consecutive strand points, capped by end spheres, with CSG joint clipping
  * against the strand neighbors. No sub-segment subdivision (segments are short);
@@ -9827,7 +9813,6 @@ lrt_tri_scene *lrt_roundcurve_scene_build(const lrt_hair_strands *strands,
         }
     }
 
-    if (!bc.failed && s) tri_retain_linear_curve(s, segs, nseg);
     free(segs);
     free(bc.plo);
     free(bc.phi);
@@ -9841,6 +9826,7 @@ lrt_tri_scene *lrt_roundcurve_scene_build(const lrt_hair_strands *strands,
         tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
         return NULL;
     }
+    tri_build_shade_data(s); /* per-segment p0/r0/p1/r1 from the rlc leaves */
 
 #if LRT_TRI_HAS_SSE4
     s->kernel_name = "rlcurve-bvh4/sse4";
@@ -9988,13 +9974,13 @@ lrt_tri_scene *lrt_flatcurve_scene_build(const lrt_hair_strands *strands,
         }
     }
     tri_free_aabb_scratch(&bc);
-    if (!bc.failed && s) tri_retain_linear_curve(s, segs, nseg);
     free(segs);
     if (bc.failed) {
         lrt_tri_scene_free(s);
         tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
         return NULL;
     }
+    tri_build_shade_data(s); /* per-segment p0/r0/p1/r1 from the flat leaves */
 #if LRT_TRI_HAS_SSE4
     s->kernel_name = "flatcurve-bvh4/sse4";
 #else
@@ -10341,6 +10327,104 @@ lrt_tri_scene *lrt_sphere_scene_build(const float *spheres, size_t nprims,
     return s;
 }
 
+/* Rebuild the post-hit shade arrays (per-prim_id control points + NURBS domain)
+ * by scattering each leaf block's stored control points into prim_id order. The
+ * leaf blocks are the intersector's own source of truth, so the result is
+ * identical whether the scene was just built or loaded/mmapped from an LRTS blob
+ * — which is how lrt_tri_surface_normal / lrt_tri_curve_frame work after
+ * deserialization with no extra on-disk data. These kinds are BVH4-only and
+ * never split a prim across leaves, so each prim_id occupies exactly one lane.
+ * prim[4] is the final 16 bytes of every such leaf (pinned by _Static_asserts).
+ * Idempotent; a no-op for other kinds or when shade data already exists. */
+static void tri_build_shade_data(lrt_tri_scene *s) {
+    if (!s || s->shade_cps || !s->blocks || s->block_count == 0) return;
+    uint8_t stride;
+    int has_dom = 0;
+    switch (s->prim_kind) {
+        case TRI_PRIM_BILINEAR: stride = 12; break;
+        case TRI_PRIM_BEZPATCH: stride = 48; break;
+        case TRI_PRIM_RBEZPATCH:
+        case TRI_PRIM_TRIMNURBS: stride = 64; has_dom = 1; break;
+        case TRI_PRIM_RLCURVE:
+        case TRI_PRIM_FLATCURVE: stride = 8; break;
+        default: return;
+    }
+    if (s->layout != 4 || s->block_stride < 4u * sizeof(uint32_t)) return;
+    size_t prim_off = (size_t)s->block_stride - 4u * sizeof(uint32_t);
+
+    uint32_t nprims = 0;
+    int any = 0;
+    for (uint32_t b = 0; b < s->block_count; b++) {
+        const uint32_t *prim = (const uint32_t *)((const char *)s->blocks +
+                                                  (size_t)b * s->block_stride +
+                                                  prim_off);
+        for (int lane = 0; lane < 4; lane++) {
+            uint32_t p = prim[lane];
+            if (p == LRT_TRI_NO_HIT) continue;
+            if (!any || p >= nprims) nprims = p + 1u;
+            any = 1;
+        }
+    }
+    if (!any) return;
+    float *cps = (float *)calloc((size_t)nprims * stride, sizeof(float));
+    float *dom = has_dom ? (float *)calloc((size_t)nprims * 4, sizeof(float))
+                         : NULL;
+    if (!cps || (has_dom && !dom)) {
+        free(cps);
+        free(dom);
+        return;
+    }
+    for (uint32_t b = 0; b < s->block_count; b++) {
+        const void *blk =
+            (const char *)s->blocks + (size_t)b * s->block_stride;
+        const uint32_t *prim = (const uint32_t *)((const char *)blk + prim_off);
+        for (int lane = 0; lane < 4; lane++) {
+            uint32_t p = prim[lane];
+            if (p == LRT_TRI_NO_HIT) continue;
+            float *o = &cps[(size_t)p * stride];
+            switch (s->prim_kind) {
+                case TRI_PRIM_BILINEAR: {
+                    const lrt_quad4 *q = (const lrt_quad4 *)blk;
+                    o[0] = q->x0[lane]; o[1] = q->y0[lane]; o[2] = q->z0[lane];
+                    o[3] = q->x1[lane]; o[4] = q->y1[lane]; o[5] = q->z1[lane];
+                    o[6] = q->x2[lane]; o[7] = q->y2[lane]; o[8] = q->z2[lane];
+                    o[9] = q->x3[lane]; o[10] = q->y3[lane]; o[11] = q->z3[lane];
+                } break;
+                case TRI_PRIM_BEZPATCH: {
+                    const lrt_bezpatch4 *bp = (const lrt_bezpatch4 *)blk;
+                    for (int c = 0; c < 48; c++) o[c] = bp->cp[c][lane];
+                } break;
+                case TRI_PRIM_RBEZPATCH:
+                case TRI_PRIM_TRIMNURBS: {
+                    const lrt_rbezpatch4 *rp = (const lrt_rbezpatch4 *)blk;
+                    for (int c = 0; c < 64; c++) o[c] = rp->cp[c][lane];
+                    float *d = &dom[(size_t)p * 4];
+                    for (int c = 0; c < 4; c++) d[c] = rp->dom[c][lane];
+                } break;
+                case TRI_PRIM_RLCURVE: {
+                    const lrt_rlc4 *rl = (const lrt_rlc4 *)blk;
+                    o[0] = rl->p0x[lane]; o[1] = rl->p0y[lane];
+                    o[2] = rl->p0z[lane]; o[3] = rl->r0[lane];
+                    o[4] = rl->p1x[lane]; o[5] = rl->p1y[lane];
+                    o[6] = rl->p1z[lane]; o[7] = rl->r1[lane];
+                } break;
+                case TRI_PRIM_FLATCURVE: {
+                    const lrt_flat4 *fl = (const lrt_flat4 *)blk;
+                    o[0] = fl->p0x[lane]; o[1] = fl->p0y[lane];
+                    o[2] = fl->p0z[lane]; o[3] = fl->r0[lane];
+                    o[4] = fl->p1x[lane]; o[5] = fl->p1y[lane];
+                    o[6] = fl->p1z[lane]; o[7] = fl->r1[lane];
+                } break;
+                default: break;
+            }
+        }
+    }
+    s->shade_cps = cps;
+    s->shade_dom = dom;
+    s->shade_nprims = nprims;
+    s->shade_stride = stride;
+}
+
 /* Shared builder for the 4-point primitives (planar quad / solid tetra). quads =
  * 12*nprims floats (v0 v1 v2 v3 per primitive). prim_kind selects the leaf
  * intersector at query time. */
@@ -10403,17 +10487,9 @@ static lrt_tri_scene *tri_quadlike_scene_build(const float *quads, size_t nprims
     lrt_tri_scene *s =
         tri_finish_aabb_build(&bc, nprims, prim_kind, num_threads, err);
     tri_free_aabb_scratch(&bc);
-    /* Retain corners for the post-hit shading query (bilinear patches only; the
-     * planar quad/tetra kinds have a constant or face normal, not a parametric
-     * one, so they are not served by lrt_tri_surface_normal). */
-    if (s && prim_kind == TRI_PRIM_BILINEAR) {
-        s->shade_cps = (float *)malloc(nprims * 12 * sizeof(float));
-        if (s->shade_cps) {
-            memcpy(s->shade_cps, quads, nprims * 12 * sizeof(float));
-            s->shade_nprims = (uint32_t)nprims;
-            s->shade_stride = 12;
-        }
-    }
+    /* Bilinear patches feed the post-hit shading query (quad/tetra do not — they
+     * have a constant/face normal, not a parametric one). */
+    tri_build_shade_data(s);
     return s;
 }
 
@@ -10701,17 +10777,9 @@ lrt_tri_scene *lrt_nurbs_scene_build(const float *net, int nu, int nv,
     lrt_tri_scene *s =
         tri_finish_aabb_build(&bc, npatch, TRI_PRIM_RBEZPATCH, num_threads, err);
     tri_free_aabb_scratch(&bc);
-    if (s) {
-        /* Transfer the extracted rational patches + their (u,v) domains to the
-         * scene for the post-hit shading query (no extra copy). */
-        s->shade_cps = rbez;
-        s->shade_dom = dom;
-        s->shade_nprims = (uint32_t)npatch;
-        s->shade_stride = 64;
-    } else {
-        free(rbez);
-        free(dom);
-    }
+    free(rbez);
+    free(dom);
+    tri_build_shade_data(s); /* per-prim shade CPs from the rbez leaves */
     return s;
 }
 
@@ -10814,15 +10882,7 @@ lrt_tri_scene *lrt_bezpatch_scene_build(const float *cps, size_t npatch,
     lrt_tri_scene *s =
         tri_finish_aabb_build(&bc, npatch, TRI_PRIM_BEZPATCH, num_threads, err);
     tri_free_aabb_scratch(&bc);
-    /* Retain control points for the post-hit shading query. */
-    if (s) {
-        s->shade_cps = (float *)malloc(npatch * 48 * sizeof(float));
-        if (s->shade_cps) {
-            memcpy(s->shade_cps, cps, npatch * 48 * sizeof(float));
-            s->shade_nprims = (uint32_t)npatch;
-            s->shade_stride = 48;
-        }
-    }
+    tri_build_shade_data(s); /* per-prim shade CPs from the bezpatch leaves */
     return s;
 }
 
@@ -11884,6 +11944,10 @@ static lrt_tri_scene *tri_scene_from_buffer(const void *buf, size_t n, int copy,
             }
         }
     }
+    /* Reconstruct the post-hit shade arrays from the leaf blocks so
+     * lrt_tri_surface_normal / lrt_tri_curve_frame work on loaded/mmap scenes
+     * (heap-owned even for mmap; freed uniformly by scene_free). */
+    tri_build_shade_data(s);
     tri_set_kernel_name(s);
     tri_recompute_stats(s);
     tri_set_err(err, LRT_RESULT_OK);

@@ -411,10 +411,12 @@ lrt_tri_scene *lrt_trimnurbs_scene_build(
  * GLOBAL surface domain for NURBS/trimmed NURBS (remapped internally; the
  * returned tangents are w.r.t. those global parameters).
  *
- * Returns LRT_RESULT_OK; LRT_RESULT_INVALID_ARGUMENT (NULL scene, prim_id out
- * of range, or a non-surface scene); LRT_RESULT_UNSUPPORTED for a deserialized
- * or mmapped scene (the control data is not part of the LRTS blob). Curves and
- * the analytic primitives are not served by this query. Thread-safe. */
+ * Works on serialized/mmapped scenes too: the control data is reconstructed
+ * from the leaf blocks on load. Returns LRT_RESULT_OK; LRT_RESULT_INVALID_ARGUMENT
+ * (NULL scene, prim_id out of range, or a non-surface scene);
+ * LRT_RESULT_UNSUPPORTED only if the shade data could not be built (allocation
+ * failure). Curves and the analytic primitives are not served by this query.
+ * Thread-safe. */
 lrt_result lrt_tri_surface_normal(const lrt_tri_scene *s, uint32_t prim_id,
                                   float u, float v, float P_out[3],
                                   float Ng_out[3], float dPdu_out[3],
@@ -434,9 +436,11 @@ lrt_result lrt_tri_surface_normal(const lrt_tri_scene *s, uint32_t prim_id,
  * and reports u local to the (unrecorded) sub-arc, so a global segment
  * parameter cannot be reconstructed (returns LRT_RESULT_INVALID_ARGUMENT).
  *
- * Returns LRT_RESULT_OK; LRT_RESULT_INVALID_ARGUMENT (NULL scene, prim_id out
- * of range, or an unsupported scene kind); LRT_RESULT_UNSUPPORTED for a
- * deserialized or mmapped scene (curve scenes do not serialize). Thread-safe. */
+ * Works on serialized/mmapped scenes too (the per-segment data is reconstructed
+ * from the leaf blocks on load). Returns LRT_RESULT_OK; LRT_RESULT_INVALID_ARGUMENT
+ * (NULL scene, prim_id out of range, or an unsupported scene kind);
+ * LRT_RESULT_UNSUPPORTED only if the shade data could not be built (allocation
+ * failure). Thread-safe. */
 lrt_result lrt_tri_curve_frame(const lrt_tri_scene *s, uint32_t prim_id, float u,
                                float C_out[3], float T_out[3], float *r_out);
 

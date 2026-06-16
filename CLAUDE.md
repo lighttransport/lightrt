@@ -778,14 +778,13 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
     — the partials the intersectors already compute but discard. Works for all
     four surface kinds; NURBS `(u,v)` is global and is remapped to the per-patch
     local domain internally (tangents reported w.r.t. the global params). The
-    scene retains the per-prim control data (bilinear corners / Bézier CPs;
-    NURBS transfers ownership of the extracted rational patches + domains, so no
-    extra memory). Not part of the LRTS blob → returns `LRT_RESULT_UNSUPPORTED`
-    on a deserialized/mmapped scene; non-surface scenes return
+    per-prim control data is reconstructed from the leaf blocks
+    (`tri_build_shade_data`), so the query works on freshly built and
+    serialized/mmapped scenes alike; non-surface scenes return
     `INVALID_ARGUMENT`. CPU-side by design (normals are consumed at shade time
     on the host), so it is **not** mirrored on the HIP device — the `prim_kind`
-    trace-dispatch parity is unaffected. Curves are out of scope (a tube's
-    radial normal needs the ray-dependent hit point).
+    trace-dispatch parity is unaffected. Curves use `lrt_tri_curve_frame`
+    instead (a tube's radial normal needs the ray-dependent hit point).
 
 ### Implicit surfaces / SDF (`lrt_sdf_*`)
 - `lrt_sdf_sphere_trace` — standalone enhanced sphere tracing (over-relaxation
@@ -811,12 +810,16 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
   parametric-surfaces section.
 - `lrt_tri_curve_frame` — LINEAR curve (round-linear / flat) centerline point
   `C(u)`, tangent `T = dC/du`, and radius `r(u)` from a hit's `(prim_id, u)`; the
-  caller forms the shading normal by removing the tangential part of `P - C`. The
-  scene retains per-segment `p0 r0 p1 r1` (cheap). Cubic-Bezier curves are *not*
-  served — the build pre-subdivides each cubic and the reported `u` is local to
-  the unrecorded sub-arc, so a global segment parameter can't be reconstructed
-  (`INVALID_ARGUMENT`). Both queries are CPU-side and not part of the LRTS blob
-  (deserialized/mmap scene → `LRT_RESULT_UNSUPPORTED`).
+  caller forms the shading normal by removing the tangential part of `P - C`.
+  Cubic-Bezier curves are *not* served — the build pre-subdivides each cubic and
+  the reported `u` is local to the unrecorded sub-arc, so a global segment
+  parameter can't be reconstructed (`INVALID_ARGUMENT`).
+- Both queries are CPU-side. The per-prim control data is **reconstructed from
+  the leaf blocks** (`tri_build_shade_data`) — the leaves are the intersector's
+  own source of truth — so the queries work on freshly built *and*
+  serialized/mmapped scenes alike, with no extra on-disk data (a deserialized
+  scene rebuilds the arrays on load). `LRT_RESULT_UNSUPPORTED` only on an
+  allocation failure.
 
 ### Production
 - Serialization: `lrt_tri_scene_save[_to_memory]` / `load[_from_memory]`, plus

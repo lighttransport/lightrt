@@ -689,17 +689,30 @@ static void test_surface_normals(void) {
                   "normals: triangle scene -> INVALID");
             lrt_tri_scene_free(st);
         }
-        /* a deserialized surface scene drops the shade data -> UNSUPPORTED */
+        /* a deserialized surface scene reconstructs shade data from its leaves:
+         * the query works and matches the original scene's normal. */
         void *blob = NULL;
         size_t blob_sz = 0;
         if (lrt_tri_scene_save_to_memory(sb, &blob, &blob_sz) == LRT_RESULT_OK &&
             blob) {
             lrt_tri_scene *sl = lrt_tri_scene_load_from_memory(blob, blob_sz, NULL);
             if (sl) {
-                r = lrt_tri_surface_normal(sl, 0, 0.5f, 0.5f, tmp, NULL, NULL,
-                                           NULL);
-                CHECK(r == LRT_RESULT_UNSUPPORTED,
-                      "normals: loaded scene -> UNSUPPORTED (got %d)", (int)r);
+                float Po[3], No[3], Pl[3], Nl[3];
+                lrt_result ro = lrt_tri_surface_normal(sb, 7, 0.4f, 0.6f, Po, No,
+                                                       NULL, NULL);
+                lrt_result rl = lrt_tri_surface_normal(sl, 7, 0.4f, 0.6f, Pl, Nl,
+                                                       NULL, NULL);
+                CHECK(ro == LRT_RESULT_OK && rl == LRT_RESULT_OK,
+                      "normals: loaded scene query (got %d/%d)", (int)ro, (int)rl);
+                if (ro == LRT_RESULT_OK && rl == LRT_RESULT_OK) {
+                    float dP = fabsf(Po[0] - Pl[0]) + fabsf(Po[1] - Pl[1]) +
+                               fabsf(Po[2] - Pl[2]);
+                    float dN = fabsf(No[0] - Nl[0]) + fabsf(No[1] - Nl[1]) +
+                               fabsf(No[2] - Nl[2]);
+                    CHECK(dP < 1e-5f && dN < 1e-5f,
+                          "normals: loaded normal mismatch dP=%.2e dN=%.2e", dP,
+                          dN);
+                }
                 lrt_tri_scene_free(sl);
             }
             free(blob);
