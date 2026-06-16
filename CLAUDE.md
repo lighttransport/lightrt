@@ -831,6 +831,11 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
   (segu+1)×(segv+1) vertex grid per patch + a triangle index buffer (~what GPU
   vertex buffers / OBJ exporters want, far less vertex data); trimmed cells just
   omit their index triples.
+- `lrt_tri_surface_project` — closest-point projection (inverse of evaluation):
+  the (u,v) on a patch nearest a query point Q, via multi-start Gauss-Newton on
+  |S(u,v)-Q|² clamped to the patch domain. For collision response / decal
+  projection / snapping. Per-patch (caller picks prim_id; call over all patches
+  for a whole-surface nearest point).
 - `lrt_tri_curve_tessellate[_bound]` — tessellate a ROUND-LINEAR (hair) scene
   into a tube mesh: each segment a tapered cone frustum with `nsides` radial
   faces (2·nsides tris, no caps), vertices on the cone surface at r(t), outward

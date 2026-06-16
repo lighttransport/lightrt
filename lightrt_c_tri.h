@@ -490,6 +490,21 @@ lrt_result lrt_tri_surface_tessellate_indexed(
     float *uv, size_t vcap, uint32_t *indices, size_t icap, size_t *nverts_out,
     size_t *nidx_out);
 
+/* Closest-point projection: find the (u,v) on parametric SURFACE patch prim_id
+ * nearest to the query point Q (the inverse of evaluation), for collision
+ * response, decal/texture projection, or snapping. Gauss-Newton minimization of
+ * |S(u,v)-Q|^2 from several starts (robust to local minima on wavy patches),
+ * clamped to the patch's parameter domain. u_out/v_out get the parameters (in
+ * the global domain for NURBS, matching the intersector and surface_normal);
+ * P_out gets the foot point S(u,v) (any output NULL-able). The result is the
+ * nearest point on the GIVEN patch — for a whole NURBS surface, call per patch
+ * (prim_id over [0,shade_nprims)) and keep the closest. Returns LRT_RESULT_OK;
+ * INVALID_ARGUMENT (NULL/non-surface/prim_id out of range); UNSUPPORTED if shade
+ * data is unavailable. Thread-safe. */
+lrt_result lrt_tri_surface_project(const lrt_tri_scene *s, uint32_t prim_id,
+                                   const float Q[3], float *u_out, float *v_out,
+                                   float P_out[3]);
+
 /* Tessellate a ROUND-LINEAR curve (hair) scene into a tube mesh — for preview /
  * export / collision proxy. Each segment becomes a tapered cone frustum with
  * `nsides` (>= 3) radial faces, 2*nsides triangles, no end caps; vertices ride

@@ -11149,6 +11149,63 @@ lrt_result lrt_tri_surface_tessellate_indexed(
     return LRT_RESULT_OK;
 }
 
+lrt_result lrt_tri_surface_project(const lrt_tri_scene *s, uint32_t prim_id,
+                                   const float Q[3], float *u_out, float *v_out,
+                                   float P_out[3]) {
+    if (!s || !Q) return LRT_RESULT_INVALID_ARGUMENT;
+    if (!tri_is_surface_kind(s->prim_kind)) return LRT_RESULT_INVALID_ARGUMENT;
+    if (!s->shade_cps) return LRT_RESULT_UNSUPPORTED;
+    if (prim_id >= s->shade_nprims) return LRT_RESULT_INVALID_ARGUMENT;
+    float umin = 0, umax = 1, vmin = 0, vmax = 1;
+    if (s->shade_stride == 64) {
+        const float *d = &s->shade_dom[(size_t)prim_id * 4];
+        umin = d[0]; umax = d[1]; vmin = d[2]; vmax = d[3];
+    }
+    /* Gauss-Newton minimization of 0.5*|S(u,v)-Q|^2 (uses only first
+     * derivatives, which lrt_tri_surface_normal supplies), from several starts
+     * to dodge local minima on wavy patches; keep the closest foot. */
+    const float starts[5][2] = {{0.5f, 0.5f}, {0.1f, 0.1f},
+                                {0.9f, 0.1f}, {0.9f, 0.9f}, {0.1f, 0.9f}};
+    float best_d2 = TRI_INF_F, bu = 0.5f, bv = 0.5f, bP[3] = {0, 0, 0};
+    for (int st = 0; st < 5; st++) {
+        float u = umin + (umax - umin) * starts[st][0];
+        float v = vmin + (vmax - vmin) * starts[st][1];
+        float P[3] = {0, 0, 0}, du[3], dv[3];
+        for (int it = 0; it < 24; it++) {
+            lrt_tri_surface_normal(s, prim_id, u, v, P, NULL, du, dv);
+            float r[3] = {P[0] - Q[0], P[1] - Q[1], P[2] - Q[2]};
+            float a = du[0] * du[0] + du[1] * du[1] + du[2] * du[2];
+            float b = du[0] * dv[0] + du[1] * dv[1] + du[2] * dv[2];
+            float c = dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2];
+            float g0 = du[0] * r[0] + du[1] * r[1] + du[2] * r[2];
+            float g1 = dv[0] * r[0] + dv[1] * r[1] + dv[2] * r[2];
+            float det = a * c - b * b;
+            if (!(fabsf(det) > 1e-20f)) break; /* degenerate Jacobian */
+            float dU = (c * g0 - b * g1) / det;
+            float dV = (a * g1 - b * g0) / det;
+            u -= dU;
+            v -= dV;
+            u = u < umin ? umin : (u > umax ? umax : u);
+            v = v < vmin ? vmin : (v > vmax ? vmax : v);
+            if (fabsf(dU) + fabsf(dV) < 1e-7f) break;
+        }
+        lrt_tri_surface_normal(s, prim_id, u, v, P, NULL, NULL, NULL);
+        float d2 = (P[0] - Q[0]) * (P[0] - Q[0]) + (P[1] - Q[1]) * (P[1] - Q[1]) +
+                   (P[2] - Q[2]) * (P[2] - Q[2]);
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            bu = u; bv = v;
+            bP[0] = P[0]; bP[1] = P[1]; bP[2] = P[2];
+        }
+    }
+    if (u_out) *u_out = bu;
+    if (v_out) *v_out = bv;
+    if (P_out) {
+        P_out[0] = bP[0]; P_out[1] = bP[1]; P_out[2] = bP[2];
+    }
+    return LRT_RESULT_OK;
+}
+
 size_t lrt_tri_curve_tessellate_bound(const lrt_tri_scene *s, uint32_t nsides) {
     if (!s || nsides < 3 || !s->shade_cps || s->prim_kind != TRI_PRIM_RLCURVE)
         return 0;

@@ -1036,6 +1036,121 @@ static void test_surface_refit(void) {
     free(B);
 }
 
+/* ----- closest-point projection (lrt_tri_surface_project) -------------------
+ * Offset a known surface point S(u,v) along its normal by a small amount to get
+ * a query Q whose nearest surface point is S; project Q back and verify the foot
+ * matches S and (Q - foot) is perpendicular to the tangents. */
+static void test_surface_project(void) {
+    lrt_tri_build_options o;
+    memset(&o, 0, sizeof(o));
+    o.num_threads = 1;
+
+    /* bezpatch + NURBS (global-domain) projection */
+    for (int kind = 0; kind < 2; kind++) {
+        lrt_tri_scene *s = NULL;
+        size_t NPRIM = 0;
+        float *cps = NULL; /* bezpatch CPs for an independent check (kind 0) */
+        if (kind == 0) {
+            const size_t NP = 60;
+            cps = (float *)malloc(NP * 48 * sizeof(float));
+            for (size_t i = 0; i < NP; i++) {
+                float c[3] = {rf(-2, 2), rf(-2, 2), rf(-2, 2)};
+                float ax[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+                float ay[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+                float *cp = &cps[i * 48];
+                for (int jj = 0; jj < 4; jj++)
+                    for (int ii = 0; ii < 4; ii++) {
+                        float fu = ii / 3.0f - 0.5f, fv = jj / 3.0f - 0.5f;
+                        int idx = (jj * 4 + ii) * 3;
+                        for (int k = 0; k < 3; k++)
+                            cp[idx + k] = c[k] + 0.8f * fu * ax[k] +
+                                          0.8f * fv * ay[k] + rf(-0.08f, 0.08f);
+                    }
+            }
+            s = lrt_bezpatch_scene_build(cps, NP, &o, NULL);
+            NPRIM = NP;
+        } else {
+            const int nu = 4, nv = 4;
+            const float U[9] = {0, 0, 0, 0, 0.5f, 1, 1, 1, 1};
+            float net[25 * 3], w[25];
+            for (int jj = 0; jj <= nv; jj++)
+                for (int ii = 0; ii <= nu; ii++) {
+                    int idx = jj * (nu + 1) + ii;
+                    float fu = (float)ii / nu - 0.5f, fv = (float)jj / nv - 0.5f;
+                    net[idx * 3 + 0] = fu;
+                    net[idx * 3 + 1] = fv;
+                    net[idx * 3 + 2] = 0.3f * fu * fv;
+                    w[idx] = 1.0f;
+                }
+            s = lrt_nurbs_scene_build(net, nu, nv, U, U, w, 3, 3, &o, NULL);
+            NPRIM = 0; /* discovered below via the bound */
+        }
+        CHECK(s != NULL, "project: build (kind %d)", kind);
+        if (!s) {
+            free(cps);
+            continue;
+        }
+        size_t nprims = lrt_tri_surface_tessellate_bound(s, 1, 1) / 2; /* = nprims */
+        (void)NPRIM;
+        size_t trials = 0, foot_ok = 0, perp_ok = 0;
+        for (int t = 0; t < 4000; t++) {
+            uint32_t p = rnd_u32() % (uint32_t)nprims;
+            /* a parameter inside the patch domain (kind 1 uses global domain,
+             * but surface_normal accepts global (u,v); sample [0,1] global) */
+            float gu = rf(0.15f, 0.85f), gv = rf(0.15f, 0.85f);
+            float S[3], N[3];
+            if (lrt_tri_surface_normal(s, p, gu, gv, S, N, NULL, NULL) !=
+                LRT_RESULT_OK)
+                continue;
+            float nl = sqrtf(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]);
+            if (nl < 1e-6f) continue;
+            float Q[3];
+            float off = 0.02f;
+            for (int k = 0; k < 3; k++) Q[k] = S[k] + off * N[k] / nl;
+            float uu, vv, Pf[3];
+            lrt_tri_surface_project(s, p, Q, &uu, &vv, Pf);
+            trials++;
+            float df = fabsf(Pf[0] - S[0]) + fabsf(Pf[1] - S[1]) +
+                       fabsf(Pf[2] - S[2]);
+            if (df < 5e-3f) foot_ok++;
+            /* (Q - foot) perpendicular to the tangents at the recovered (u,v) */
+            float du[3], dv[3], Pc[3];
+            lrt_tri_surface_normal(s, p, uu, vv, Pc, NULL, du, dv);
+            float w0[3] = {Q[0] - Pf[0], Q[1] - Pf[1], Q[2] - Pf[2]};
+            float wl = sqrtf(w0[0] * w0[0] + w0[1] * w0[1] + w0[2] * w0[2]) + 1e-9f;
+            float lu = sqrtf(du[0]*du[0]+du[1]*du[1]+du[2]*du[2]) + 1e-9f;
+            float lv = sqrtf(dv[0]*dv[0]+dv[1]*dv[1]+dv[2]*dv[2]) + 1e-9f;
+            float au = fabsf(w0[0]*du[0]+w0[1]*du[1]+w0[2]*du[2]) / (wl*lu);
+            float av = fabsf(w0[0]*dv[0]+w0[1]*dv[1]+w0[2]*dv[2]) / (wl*lv);
+            if (au < 5e-2f && av < 5e-2f) perp_ok++;
+        }
+        double ff = trials ? (double)foot_ok / trials : 0;
+        double pf = trials ? (double)perp_ok / trials : 0;
+        printf("project[%s]: %zu trials, foot %.2f%% perp %.2f%%\n",
+               kind == 0 ? "bezpatch" : "nurbs", trials, ff * 100, pf * 100);
+        CHECK(trials > 1000, "project: too few trials (%zu)", trials);
+        CHECK(ff >= 0.98, "project[%d]: foot recovery %.2f%% < 98%%", kind,
+              ff * 100);
+        CHECK(pf >= 0.98, "project[%d]: perpendicularity %.2f%% < 98%%", kind,
+              pf * 100);
+        free(cps);
+        lrt_tri_scene_free(s);
+    }
+
+    /* edge cases */
+    {
+        float tri[9] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+        lrt_tri_scene *st = lrt_tri_scene_build(tri, 1, &o, NULL);
+        if (st) {
+            float Q[3] = {0.2f, 0.2f, 0.1f}, uu, vv;
+            CHECK(lrt_tri_surface_project(st, 0, Q, &uu, &vv, NULL) ==
+                      LRT_RESULT_INVALID_ARGUMENT,
+                  "project: tri scene rejected");
+            lrt_tri_scene_free(st);
+        }
+    }
+}
+
 int main(void) {
     test_bilinear();
     test_bezpatch();
@@ -1046,6 +1161,7 @@ int main(void) {
     test_surface_normals();
     test_tessellate();
     test_tessellate_indexed();
+    test_surface_project();
     test_surface_refit();
     if (g_fail) {
         printf("\n%d FAILURES\n", g_fail);
