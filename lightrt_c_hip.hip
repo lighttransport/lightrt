@@ -94,6 +94,7 @@ struct lrt_hip_scene {
 #define HIP_PRIM_SPHERE 3u
 #define HIP_PRIM_POINT 6u
 #define HIP_PRIM_FLATCURVE 7u
+#define HIP_PRIM_BEZCURVE 8u
 #define HIP_PRIM_QUAD 9u
 #define HIP_PRIM_TETRA 10u
 #define HIP_POINT_SPHERE 0u
@@ -652,6 +653,230 @@ __device__ __forceinline__ bool hp_rlc_one(float ox0, float oy0, float oz0,
     return true;
 }
 
+/* ---- cubic Bezier (round) curve, port of tri_bez_isect_one --------------- */
+__device__ __forceinline__ void hp_bez_eval(const float cp[16], float u,
+                                            float P[4], float dP[4],
+                                            float ddP[4]) {
+    float u1 = 1.0f - u;
+    for (int c = 0; c < 4; c++) {
+        float B0 = cp[c], B1 = cp[4 + c], B2 = cp[8 + c], B3 = cp[12 + c];
+        P[c] = u1 * u1 * u1 * B0 + 3.0f * u1 * u1 * u * B1 +
+               3.0f * u1 * u * u * B2 + u * u * u * B3;
+        float e0 = B1 - B0, e1 = B2 - B1, e2 = B3 - B2;
+        dP[c] = 3.0f * (u1 * u1 * e0 + 2.0f * u1 * u * e1 + u * u * e2);
+        ddP[c] = 6.0f * (u1 * (B2 - 2.0f * B1 + B0) + u * (B3 - 2.0f * B2 + B1));
+    }
+}
+
+__device__ __forceinline__ bool hp_bez_newton(const float cp[16],
+                                              const float dir[3], float tmin,
+                                              float u, float t, float best_t,
+                                              float *t_out, float *u_out) {
+    for (int it = 0; it < 8; it++) {
+        float P[4], dP[4], ddP[4];
+        hp_bez_eval(cp, u, P, dP, ddP);
+        float Rx = t * dir[0] - P[0], Ry = t * dir[1] - P[1],
+              Rz = t * dir[2] - P[2];
+        float dpd = dP[0] * dP[0] + dP[1] * dP[1] + dP[2] * dP[2];
+        if (dpd < 1e-20f) return false;
+        float rcpl = 1.0f / sqrtf(dpd);
+        float Tx = dP[0] * rcpl, Ty = dP[1] * rcpl, Tz = dP[2] * rcpl;
+        float Tdd = Tx * ddP[0] + Ty * ddP[1] + Tz * ddP[2];
+        float dTx = (ddP[0] - Tx * Tdd) * rcpl, dTy = (ddP[1] - Ty * Tdd) * rcpl,
+              dTz = (ddP[2] - Tz * Tdd) * rcpl;
+        float f = Rx * Tx + Ry * Ty + Rz * Tz;
+        float dfdu = (-dP[0] * Tx - dP[1] * Ty - dP[2] * Tz) +
+                     (Rx * dTx + Ry * dTy + Rz * dTz);
+        float dfdt = dir[0] * Tx + dir[1] * Ty + dir[2] * Tz;
+        float RR = Rx * Rx + Ry * Ry + Rz * Rz;
+        float K = RR - f * f;
+        if (K < 1e-20f) K = 1e-20f;
+        float sqrtK = sqrtf(K), rsK = 1.0f / sqrtK;
+        float r = P[3] > 0.0f ? P[3] : 0.0f;
+        float g = sqrtK - r;
+        float RdRdu = -(Rx * dP[0] + Ry * dP[1] + Rz * dP[2]);
+        float RdRdt = Rx * dir[0] + Ry * dir[1] + Rz * dir[2];
+        float dgdu = (RdRdu - f * dfdu) * rsK - dP[3];
+        float dgdt = (RdRdt - f * dfdt) * rsK;
+        float det = dfdu * dgdt - dfdt * dgdu;
+        if (fabsf(det) < 1e-20f) return false;
+        float invd = 1.0f / det;
+        u -= (dgdt * f - dfdt * g) * invd;
+        t -= (dfdu * g - dgdu * f) * invd;
+        float lenR = sqrtf(RR);
+        float eps = 1e-5f * (1.0f + lenR);
+        if (fabsf(f) < eps && fabsf(g) < eps) {
+            if (t >= tmin && t < best_t && u >= 0.0f && u <= 1.0f) {
+                *t_out = t; *u_out = u; return true;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+__device__ __forceinline__ bool hp_cone_seed(const float dir[3], float tmin,
+                                             float best, const float p0[3],
+                                             float r0, const float p1[3],
+                                             float r1, float *t_out,
+                                             float *s_out) {
+    float dOdO = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+    if (dOdO <= 0.0f) return false;
+    float rcp_dOdO = 1.0f / dOdO;
+    float cx = 0.5f * (p0[0] + p1[0]), cy = 0.5f * (p0[1] + p1[1]),
+          cz = 0.5f * (p0[2] + p1[2]);
+    float dt = (cx * dir[0] + cy * dir[1] + cz * dir[2]) * rcp_dOdO;
+    float ox = dt * dir[0], oy = dt * dir[1], oz = dt * dir[2];
+    float dPx = p1[0] - p0[0], dPy = p1[1] - p0[1], dPz = p1[2] - p0[2];
+    float dPdP = dPx * dPx + dPy * dPy + dPz * dPz;
+    float dr = r1 - r0, r0dr = r0 * dr, g = dPdP - dr * dr;
+    float Ox = ox - p0[0], Oy = oy - p0[1], Oz = oz - p0[2];
+    float OdP = Ox * dPx + Oy * dPy + Oz * dPz;
+    float dOdP = dir[0] * dPx + dir[1] * dPy + dir[2] * dPz;
+    float yp = OdP + r0dr;
+    float lo = best, slo = 0.0f;
+    int hit = 0;
+    if (g > 0.0f) {
+        float OO = Ox * Ox + Oy * Oy + Oz * Oz;
+        float OdO = dir[0] * Ox + dir[1] * Oy + dir[2] * Oz;
+        float A = g * dOdO - dOdP * dOdP;
+        float B = 2.0f * (g * OdO - dOdP * yp);
+        float C = g * OO - OdP * OdP - r0 * r0 * dPdP - 2.0f * r0dr * OdP;
+        float D = B * B - 4.0f * A * C;
+        if (D >= 0.0f && (A > 1e-18f || A < -1e-18f)) {
+            float Q = sqrtf(D), rcp2A = 1.0f / (2.0f * A);
+            for (int k = 0; k < 2; k++) {
+                float tl = (k == 0 ? (-B - Q) : (-B + Q)) * rcp2A;
+                float y = yp + tl * dOdP;
+                if (y > -1.2e-7f && y <= g) {
+                    float tw = dt + tl;
+                    if (tw >= tmin && tw < lo) {
+                        lo = tw;
+                        float s = y / g;
+                        slo = s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s);
+                        hit = 1;
+                    }
+                }
+            }
+        }
+    }
+    for (int e = 0; e < 2; e++) {
+        const float *c = e ? p1 : p0;
+        float rc2 = e ? r1 : r0;
+        float Ex = ox - c[0], Ey = oy - c[1], Ez = oz - c[2];
+        float EdO = Ex * dir[0] + Ey * dir[1] + Ez * dir[2];
+        float h2 = EdO * EdO - dOdO * (Ex * Ex + Ey * Ey + Ez * Ez - rc2 * rc2);
+        if (h2 < 0.0f) continue;
+        float tl = (-EdO - sqrtf(h2)) * rcp_dOdO;
+        float y = yp + tl * dOdP;
+        if (e ? (y > g) : (y < 0.0f)) {
+            float tw = dt + tl;
+            if (tw >= tmin && tw < lo) { lo = tw; slo = e ? 1.0f : 0.0f; hit = 1; }
+        }
+    }
+    if (hit) { *t_out = lo; *s_out = slo; }
+    return hit != 0;
+}
+
+/* Adaptive subdivision + cone-seed + Newton (port of tri_bez_isect_one). */
+__device__ __forceinline__ bool hp_bez_one(float ox, float oy, float oz,
+                                           float dx, float dy, float dz,
+                                           const float cp_in[16], float tmin,
+                                           float best_t, float *t_out,
+                                           float *u_out) {
+    float cp[16];
+    for (int k = 0; k < 4; k++) {
+        cp[k * 4 + 0] = cp_in[k * 4 + 0] - ox;
+        cp[k * 4 + 1] = cp_in[k * 4 + 1] - oy;
+        cp[k * 4 + 2] = cp_in[k * 4 + 2] - oz;
+        cp[k * 4 + 3] = cp_in[k * 4 + 3];
+    }
+    const float dir[3] = {dx, dy, dz};
+    float best = best_t, bu = 0.0f;
+    int hit = 0;
+    const int BEZ_MAXDEPTH = 5;
+    struct { float a, b; int depth; } stk[2 * 5 + 2];
+    int sp = 0;
+    stk[0].a = 0.0f; stk[0].b = 1.0f; stk[0].depth = 0; sp = 1;
+    while (sp > 0) {
+        float a = stk[--sp].a, b = stk[sp].b;
+        int depth = stk[sp].depth;
+        float h = b - a;
+        float Pa[4], dPa[4], dda[4], Pb[4], dPb[4], ddb[4];
+        hp_bez_eval(cp, a, Pa, dPa, dda);
+        hp_bez_eval(cp, b, Pb, dPb, ddb);
+        float cxd = Pb[0] - Pa[0], cyd = Pb[1] - Pa[1], czd = Pb[2] - Pa[2];
+        float cl2 = cxd * cxd + cyd * cyd + czd * czd;
+        float maxperp = 0.0f;
+        if (cl2 > 1e-20f) {
+            float inv = 1.0f / cl2;
+            float mid[2][3] = {
+                {Pa[0] + dPa[0] * h / 3.0f, Pa[1] + dPa[1] * h / 3.0f,
+                 Pa[2] + dPa[2] * h / 3.0f},
+                {Pb[0] - dPb[0] * h / 3.0f, Pb[1] - dPb[1] * h / 3.0f,
+                 Pb[2] - dPb[2] * h / 3.0f}};
+            for (int m = 0; m < 2; m++) {
+                float wx = mid[m][0] - Pa[0], wy = mid[m][1] - Pa[1],
+                      wz = mid[m][2] - Pa[2];
+                float tt = (wx * cxd + wy * cyd + wz * czd) * inv;
+                float ddx = wx - tt * cxd, ddy = wy - tt * cyd,
+                      ddz = wz - tt * czd;
+                float d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+                if (d2 > maxperp) maxperp = d2;
+            }
+            maxperp = sqrtf(maxperp);
+        }
+        float r1w = Pa[3] + dPa[3] * h / 3.0f, r2w = Pb[3] - dPb[3] * h / 3.0f;
+        float r0c = Pa[3] > r1w ? Pa[3] : r1w;
+        float r3c = Pb[3] > r2w ? Pb[3] : r2w;
+        r0c = (r0c > 0.0f ? r0c : 0.0f) + maxperp;
+        r3c = (r3c > 0.0f ? r3c : 0.0f) + maxperp;
+        float rcap = r0c > r3c ? r0c : r3c;
+        {
+            float a_ = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+            float bb = dir[0] * cxd + dir[1] * cyd + dir[2] * czd;
+            float cc = cl2;
+            float w0x = -Pa[0], w0y = -Pa[1], w0z = -Pa[2];
+            float dd = dir[0] * w0x + dir[1] * w0y + dir[2] * w0z;
+            float ed = cxd * w0x + cyd * w0y + czd * w0z;
+            float den = a_ * cc - bb * bb;
+            float ss = den > 1e-20f ? (a_ * ed - bb * dd) / den : 0.0f;
+            ss = ss < 0.0f ? 0.0f : (ss > 1.0f ? 1.0f : ss);
+            float tr = (bb * ss - dd) / (a_ > 1e-20f ? a_ : 1e-20f);
+            tr = tr < tmin ? tmin : (tr > best ? best : tr);
+            ss = (bb * tr + ed) / (cc > 1e-20f ? cc : 1e-20f);
+            ss = ss < 0.0f ? 0.0f : (ss > 1.0f ? 1.0f : ss);
+            float gx = tr * dir[0] - (Pa[0] + ss * cxd);
+            float gy = tr * dir[1] - (Pa[1] + ss * cyd);
+            float gz = tr * dir[2] - (Pa[2] + ss * czd);
+            if (gx * gx + gy * gy + gz * gz > rcap * rcap) continue;
+        }
+        if (depth >= BEZ_MAXDEPTH) {
+            if (r0c > 0.0f || r3c > 0.0f) {
+                float P0p[3] = {Pa[0], Pa[1], Pa[2]};
+                float P3p[3] = {Pb[0], Pb[1], Pb[2]};
+                float tseg, s;
+                if (hp_cone_seed(dir, tmin, best, P0p, r0c, P3p, r3c, &tseg,
+                                 &s)) {
+                    float th, uh;
+                    if (hp_bez_newton(cp, dir, tmin, a + s * h, tseg, best, &th,
+                                      &uh)) {
+                        best = th; bu = uh; hit = 1;
+                    } else {
+                        best = tseg; bu = a + s * h; hit = 1;
+                    }
+                }
+            }
+        } else {
+            float m = 0.5f * (a + b);
+            stk[sp].a = a; stk[sp].b = m; stk[sp].depth = depth + 1; sp++;
+            stk[sp].a = m; stk[sp].b = b; stk[sp].depth = depth + 1; sp++;
+        }
+    }
+    if (hit) { *t_out = best; *u_out = bu; }
+    return hit != 0;
+}
+
 /* One leaf block (4 lanes) against the ray, for the given prim_kind. blk = base
  * word index of the block; bsw = block stride in words. Updates best_*. */
 __device__ __forceinline__ void hp_leaf(const uint32_t *__restrict__ blocks,
@@ -770,6 +995,22 @@ __device__ __forceinline__ void hp_leaf(const uint32_t *__restrict__ blocks,
             float t, u;
             if (hp_rlc_one(ox, oy, oz, dx, dy, dz, p0, r0, p1, r1, pL, rL, pR,
                            rR, tmin, *best_t, &t, &u)) {
+                *best_t = t; *best_u = u; *best_v = 0.0f; *best_prim = prim;
+            }
+        }
+    } else if (prim_kind == HIP_PRIM_BEZCURVE) { /* lrt_bez4: 68 words */
+        for (uint32_t l = 0; l < 4u; l++) {
+            uint32_t prim = blocks[blk + 64u + l];
+            if (prim == LRT_HIP_NO_HIT) continue;
+            float cp[16];
+            for (int k = 0; k < 4; k++) {
+                cp[k * 4 + 0] = fu(blocks[blk + (uint32_t)(k * 16 + 0) + l]);
+                cp[k * 4 + 1] = fu(blocks[blk + (uint32_t)(k * 16 + 4) + l]);
+                cp[k * 4 + 2] = fu(blocks[blk + (uint32_t)(k * 16 + 8) + l]);
+                cp[k * 4 + 3] = fu(blocks[blk + (uint32_t)(k * 16 + 12) + l]);
+            }
+            float t, u;
+            if (hp_bez_one(ox, oy, oz, dx, dy, dz, cp, tmin, *best_t, &t, &u)) {
                 *best_t = t; *best_u = u; *best_v = 0.0f; *best_prim = prim;
             }
         }
@@ -1374,10 +1615,11 @@ extern "C" lrt_hip_scene *lrt_hip_scene_upload(lrt_hip_engine *e,
     uint32_t pk = h->prim_kind;
     int bvh4_prim = (pk == HIP_PRIM_SPHERE || pk == HIP_PRIM_POINT ||
                      pk == HIP_PRIM_QUAD || pk == HIP_PRIM_TETRA ||
-                     pk == HIP_PRIM_RLCURVE || pk == HIP_PRIM_FLATCURVE);
+                     pk == HIP_PRIM_RLCURVE || pk == HIP_PRIM_FLATCURVE ||
+                     pk == HIP_PRIM_BEZCURVE);
     if (pk != HIP_PRIM_TRI && !bvh4_prim) {
         free(blob);
-        hip_set_err(e, "prim_kind not GPU-traceable yet (bezier/curve?)");
+        hip_set_err(e, "prim_kind not GPU-traceable (user/sdf/qtri)");
         if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
         return NULL;
     }

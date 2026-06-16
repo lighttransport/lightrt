@@ -730,6 +730,70 @@ static void test_gpu_curves(lrt_hip_engine *e) {
     free(cnt);
 }
 
+static void test_gpu_bezier(lrt_hip_engine *e) {
+    uint32_t nseg = 1500;
+    float *cps = (float *)malloc(nseg * 16 * sizeof(float));
+    for (uint32_t s = 0; s < nseg; s++) {
+        float c[3] = {rnd_f(-2, 2), rnd_f(-2, 2), rnd_f(-2, 2)};
+        float d[3] = {rnd_f(-0.6f, 0.6f), rnd_f(-0.6f, 0.6f), rnd_f(-0.6f, 0.6f)};
+        float *cp = &cps[s * 16];
+        for (int k = 0; k < 4; k++) {
+            float u = (float)k / 3.0f;
+            cp[k * 4 + 0] = c[0] + d[0] * u + rnd_f(-0.1f, 0.1f);
+            cp[k * 4 + 1] = c[1] + d[1] * u + rnd_f(-0.1f, 0.1f);
+            cp[k * 4 + 2] = c[2] + d[2] * u + rnd_f(-0.1f, 0.1f);
+            cp[k * 4 + 3] = rnd_f(0.02f, 0.06f);
+        }
+    }
+    lrt_tri_build_options o;
+    memset(&o, 0, sizeof(o));
+    o.num_threads = 1;
+    lrt_tri_scene *cpu = lrt_bezcurve_scene_build(cps, nseg, &o, NULL);
+    printf("== GPU Bezier curves vs CPU oracle ==\n");
+    if (!cpu) {
+        CHECK(0, "bezier build");
+        free(cps);
+        return;
+    }
+    lrt_hip_scene *gs = lrt_hip_scene_upload(e, cpu, NULL);
+    CHECK(gs != NULL, "bezier upload: %s", lrt_hip_engine_last_error(e));
+    if (gs) {
+        size_t nr = 40000, agree = 0, hits = 0;
+        double max_rel = 0.0;
+        lrt_ray *rays = (lrt_ray *)malloc(nr * sizeof(lrt_ray));
+        lrt_hit *gh = (lrt_hit *)malloc(nr * sizeof(lrt_hit));
+        for (size_t i = 0; i < nr; i++) make_random_ray(&rays[i]);
+        lrt_hip_scene_trace(e, gs, rays, (uint32_t)nr, gh, NULL);
+        for (size_t i = 0; i < nr; i++) {
+            lrt_hit c;
+            int ch = lrt_tri_intersect1(cpu, &rays[i], &c);
+            int g = gh[i].prim_id != LRT_TRI_NO_HIT;
+            if (g) hits++;
+            if (ch == g && (!g || c.prim_id == gh[i].prim_id)) {
+                agree++;
+                if (g) {
+                    double rel = fabs((double)gh[i].t - c.t) / (1.0 + fabs(c.t));
+                    if (rel > max_rel) max_rel = rel;
+                }
+            } else if (ch && g) {
+                double rel = fabs((double)gh[i].t - c.t) / (1.0 + fabs(c.t));
+                if (rel < 1e-3) agree++;
+            }
+        }
+        double f = (double)agree / nr;
+        printf("  bezier       closest %.3f%% (hit_frac %.3f, max_rel_t %.2e)\n",
+               f * 100.0, (double)hits / nr, max_rel);
+        /* GPU mirrors the scalar adaptive sweep; CPU intersect1 uses the SSE
+         * adaptive sweep -> tiny silhouette differences. */
+        CHECK(f >= 0.99, "bezier agreement %.3f%% < 99%%", f * 100.0);
+        free(rays);
+        free(gh);
+        lrt_hip_scene_free(e, gs);
+    }
+    lrt_tri_scene_free(cpu);
+    free(cps);
+}
+
 static void test_gpu_analytics(lrt_hip_engine *e) {
     lrt_tri_build_options o;
     memset(&o, 0, sizeof(o));
@@ -840,6 +904,8 @@ int main(void) {
     test_gpu_analytics(e);
 
     test_gpu_curves(e);
+
+    test_gpu_bezier(e);
 
     test_wmma(e);
 
