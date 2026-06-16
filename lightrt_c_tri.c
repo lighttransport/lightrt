@@ -258,6 +258,18 @@ typedef struct lrt_quad4 {
 } lrt_quad4;
 _Static_assert(sizeof(lrt_quad4) == 208, "lrt_quad4");
 
+/* Built-in SDF / implicit leaf block (144 bytes, own stride): per lane a shape
+ * type, object-space center, bounding radius (for ray-interval clipping), and up
+ * to three shape params. Sphere-traced on CPU and GPU (no host callbacks). */
+typedef struct lrt_sdf4 {
+    float cx[4], cy[4], cz[4];
+    float brad[4];
+    uint32_t type[4];
+    float p0[4], p1[4], p2[4];
+    uint32_t prim[4];
+} lrt_sdf4;
+_Static_assert(sizeof(lrt_sdf4) == 144, "lrt_sdf4");
+
 /* Quantized triangle leaf blocks (4 tris each; store quantized absolute
  * v0,v1,v2 → decode → e1=v1-v0, e2=v2-v0 → Moller-Trumbore). These have their
  * own (smaller, format-specific) stride; the scene carries block_stride and the
@@ -313,7 +325,16 @@ enum {
     TRI_PRIM_FLATCURVE = 7, /* flat (ribbon) linear curve leaves (lrt_flat4) */
     TRI_PRIM_BEZCURVE = 8, /* round cubic Bezier curve leaves (lrt_bez4) */
     TRI_PRIM_QUAD = 9,  /* planar quad (2-triangle) leaves (lrt_quad4)   */
-    TRI_PRIM_TETRA = 10 /* solid tetrahedron (4-face) leaves (lrt_quad4) */
+    TRI_PRIM_TETRA = 10,/* solid tetrahedron (4-face) leaves (lrt_quad4) */
+    TRI_PRIM_SDF = 11   /* built-in implicit/SDF leaves (lrt_sdf4)       */
+};
+
+/* Built-in SDF shapes (lrt_sdf_shape in the header). Evaluated on-device too;
+ * no host callbacks, so SDF scenes serialize and GPU-trace. */
+enum {
+    TRI_SDF_SPHERE = 0, /* params: radius                                 */
+    TRI_SDF_BOX = 1,    /* params: half-extent x,y,z                      */
+    TRI_SDF_TORUS = 2   /* params: major R, minor r (axis = y)           */
 };
 
 /* Point-primitive kind (lrt_tri_scene.point_type), mirroring Embree's point
@@ -432,6 +453,10 @@ typedef struct tri_build_ctx {
     const float *bez_cps;    /* 16*nseg ORIGINAL Bezier CPs (TRI_PRIM_BEZCURVE) */
     uint32_t bez_split;      /* build-time de Casteljau pieces per cubic (>=1) */
     const float *quads;      /* 12*nprims v0v1v2v3 (TRI_PRIM_QUAD / _TETRA) */
+    const uint32_t *sdf_types;   /* nprims shape type (TRI_PRIM_SDF) */
+    const float *sdf_centers;    /* 3*nprims center (TRI_PRIM_SDF) */
+    const float *sdf_params;     /* 3*nprims params (TRI_PRIM_SDF) */
+    const float *sdf_brad;       /* nprims bounding radius (TRI_PRIM_SDF) */
     uint32_t block_stride;   /* leaf block stride override (0 = default 160) */
     int emit_kind;           /* TRI_PRIM_* */
 } tri_build_ctx;
@@ -2530,6 +2555,39 @@ static uint32_t tri_emit_leaf(tri_collapse_ctx *cc, const tri_bnode *bn) {
             (double)count;
         return TRI_MAKE_LEAF_REF(first_block, nblocks);
     }
+    if (bc->emit_kind == TRI_PRIM_SDF) { /* built-in implicit/SDF leaves (BVH4) */
+        for (uint32_t b = 0; b < nblocks; b++) {
+            lrt_sdf4 *blk = (lrt_sdf4 *)tri_block_ptr(s->blocks, s->block_count,
+                                                      s->block_stride);
+            s->block_count++;
+            for (uint32_t lane = 0; lane < 4u; lane++) {
+                uint32_t k = b * 4u + lane;
+                if (k < count) {
+                    uint32_t prim = bc->indices[bn->a + k];
+                    blk->cx[lane] = bc->sdf_centers[(size_t)prim * 3 + 0];
+                    blk->cy[lane] = bc->sdf_centers[(size_t)prim * 3 + 1];
+                    blk->cz[lane] = bc->sdf_centers[(size_t)prim * 3 + 2];
+                    blk->brad[lane] = bc->sdf_brad[prim];
+                    blk->type[lane] = bc->sdf_types[prim];
+                    blk->p0[lane] = bc->sdf_params[(size_t)prim * 3 + 0];
+                    blk->p1[lane] = bc->sdf_params[(size_t)prim * 3 + 1];
+                    blk->p2[lane] = bc->sdf_params[(size_t)prim * 3 + 2];
+                    blk->prim[lane] = prim;
+                } else {
+                    blk->cx[lane] = blk->cy[lane] = blk->cz[lane] = 0.0f;
+                    blk->brad[lane] = 0.0f;
+                    blk->type[lane] = 0u;
+                    blk->p0[lane] = blk->p1[lane] = blk->p2[lane] = 0.0f;
+                    blk->prim[lane] = LRT_TRI_NO_HIT;
+                }
+            }
+        }
+        cc->leaf_count++;
+        cc->sah_leaf +=
+            (double)(tri_surface_area(bn->lo, bn->hi) / cc->root_area) *
+            (double)count;
+        return TRI_MAKE_LEAF_REF(first_block, nblocks);
+    }
     if (bc->emit_kind == TRI_PRIM_QTRI) { /* quantized triangle leaves (BVH4) */
         for (uint32_t b = 0; b < nblocks; b++) {
             void *blk = tri_block_ptr(s->blocks, s->block_count, s->block_stride);
@@ -3878,6 +3936,74 @@ static inline void tri_tetra4_isect(const lrt_quad4 *blk, const tri_ray_ctx *rc,
     }
 }
 
+/* Built-in implicit distance field in object space (p = world - center). */
+static inline float tri_sdf_eval(uint32_t type, float px, float py, float pz,
+                                 float p0, float p1, float p2) {
+    if (type == TRI_SDF_SPHERE) return sqrtf(px * px + py * py + pz * pz) - p0;
+    if (type == TRI_SDF_BOX) {
+        float qx = fabsf(px) - p0, qy = fabsf(py) - p1, qz = fabsf(pz) - p2;
+        float mx = tri_maxf(qx, 0.0f), my = tri_maxf(qy, 0.0f),
+              mz = tri_maxf(qz, 0.0f);
+        float outside = sqrtf(mx * mx + my * my + mz * mz);
+        float inside = tri_minf(tri_maxf(qx, tri_maxf(qy, qz)), 0.0f);
+        return outside + inside;
+    }
+    /* torus (axis y): p0 = major R, p1 = minor r */
+    float lxz = sqrtf(px * px + pz * pz) - p0;
+    return sqrtf(lxz * lxz + py * py) - p1;
+}
+
+/* Sphere-trace one built-in SDF prim; clips the march to its bounding sphere. */
+static inline int tri_sdf_isect_one(const tri_ray_ctx *rc, float best_t,
+                                    float cx, float cy, float cz, float brad,
+                                    uint32_t type, float p0, float p1, float p2,
+                                    float *t_out) {
+    float dx = rc->dir[0], dy = rc->dir[1], dz = rc->dir[2];
+    float dOdO = dx * dx + dy * dy + dz * dz;
+    if (dOdO <= 1e-20f || brad <= 0.0f) return 0;
+    float ocx = rc->org[0] - cx, ocy = rc->org[1] - cy, ocz = rc->org[2] - cz;
+    float b = ocx * dx + ocy * dy + ocz * dz;
+    float c = ocx * ocx + ocy * ocy + ocz * ocz - brad * brad;
+    float disc = b * b - dOdO * c;
+    if (disc < 0.0f) return 0;
+    float sq = sqrtf(disc), inv = 1.0f / dOdO;
+    float t0 = (-b - sq) * inv, t1 = (-b + sq) * inv;
+    float tlo = rc->tmin > t0 ? rc->tmin : t0;
+    float thi = best_t < t1 ? best_t : t1;
+    if (tlo >= thi) return 0;
+    float invdl = 1.0f / sqrtf(dOdO);
+    float t = tlo;
+    for (int i = 0; i < 128; i++) {
+        float px = rc->org[0] + t * dx - cx, py = rc->org[1] + t * dy - cy,
+              pz = rc->org[2] + t * dz - cz;
+        float d = tri_sdf_eval(type, px, py, pz, p0, p1, p2);
+        if (d < 1e-4f) {
+            *t_out = t;
+            return 1;
+        }
+        t += d * invdl;
+        if (t >= thi) break;
+    }
+    return 0;
+}
+
+static inline void tri_sdf4_isect(const lrt_sdf4 *blk, const tri_ray_ctx *rc,
+                                  float *best_t, float *best_u, float *best_v,
+                                  uint32_t *best_prim) {
+    for (int lane = 0; lane < 4; lane++) {
+        if (blk->prim[lane] == LRT_TRI_NO_HIT) continue;
+        float t;
+        if (tri_sdf_isect_one(rc, *best_t, blk->cx[lane], blk->cy[lane],
+                              blk->cz[lane], blk->brad[lane], blk->type[lane],
+                              blk->p0[lane], blk->p1[lane], blk->p2[lane], &t)) {
+            *best_t = t;
+            *best_u = 0.0f;
+            *best_v = 0.0f;
+            *best_prim = blk->prim[lane];
+        }
+    }
+}
+
 /* Generic-width scalar traversal. */
 static int tri_intersect_scalar(const lrt_tri_scene *s, const lrt_ray *ray,
                                 lrt_hit *hit) {
@@ -3951,6 +4077,15 @@ static int tri_intersect_scalar(const lrt_tri_scene *s, const lrt_ray *ray,
                     else
                         tri_tetra4_isect(blk, &rc, &best_t, &best_u, &best_v,
                                          &best_prim);
+                }
+                continue;
+            }
+            if (s->prim_kind == TRI_PRIM_SDF) {
+                for (uint32_t b = 0; b < nblk; b++) {
+                    const lrt_sdf4 *blk = (const lrt_sdf4 *)tri_block_ptr(
+                        s->blocks, blk0 + b, s->block_stride);
+                    tri_sdf4_isect(blk, &rc, &best_t, &best_u, &best_v,
+                                   &best_prim);
                 }
                 continue;
             }
@@ -4157,6 +4292,17 @@ static int tri_occluded_scalar(const lrt_tri_scene *s, const lrt_ray *ray) {
                         tri_quad4_isect(blk, &rc, &t, &u, &v, &prim);
                     else
                         tri_tetra4_isect(blk, &rc, &t, &u, &v, &prim);
+                    if (prim != LRT_TRI_NO_HIT) return 1;
+                }
+                continue;
+            }
+            if (s->prim_kind == TRI_PRIM_SDF) {
+                for (uint32_t b = 0; b < nblk; b++) {
+                    const lrt_sdf4 *blk = (const lrt_sdf4 *)tri_block_ptr(
+                        s->blocks, blk0 + b, s->block_stride);
+                    float t = t_max, u = 0.0f, v = 0.0f;
+                    uint32_t prim = LRT_TRI_NO_HIT;
+                    tri_sdf4_isect(blk, &rc, &t, &u, &v, &prim);
                     if (prim != LRT_TRI_NO_HIT) return 1;
                 }
                 continue;
@@ -7906,7 +8052,8 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
         return tri_qtri_intersect_scalar(s, ray, hit);
 #endif
     }
-    if (s->prim_kind == TRI_PRIM_QUAD || s->prim_kind == TRI_PRIM_TETRA)
+    if (s->prim_kind == TRI_PRIM_QUAD || s->prim_kind == TRI_PRIM_TETRA ||
+        s->prim_kind == TRI_PRIM_SDF)
         return tri_intersect_scalar(s, ray, hit);
 #if LRT_TRI_HAS_SSE4
     if (s->curve) return tri_curve_intersect_bvh4(s, ray, hit);
@@ -7946,7 +8093,8 @@ int lrt_tri_occluded1(const lrt_tri_scene *s, const lrt_ray *ray) {
         return tri_qtri_occluded_scalar(s, ray);
 #endif
     }
-    if (s->prim_kind == TRI_PRIM_QUAD || s->prim_kind == TRI_PRIM_TETRA)
+    if (s->prim_kind == TRI_PRIM_QUAD || s->prim_kind == TRI_PRIM_TETRA ||
+        s->prim_kind == TRI_PRIM_SDF)
         return tri_occluded_scalar(s, ray);
 #if LRT_TRI_HAS_SSE4
     if (s->curve) return tri_curve_occluded_bvh4(s, ray);
@@ -9536,6 +9684,93 @@ lrt_tri_scene *lrt_tetra_scene_build(const float *tetras, size_t ntetras,
     return tri_quadlike_scene_build(tetras, ntetras, TRI_PRIM_TETRA, opts, err);
 }
 
+lrt_tri_scene *lrt_sdfprim_scene_build(const uint32_t *types,
+                                       const float *centers, const float *params,
+                                       size_t nprims,
+                                       const lrt_tri_build_options *opts,
+                                       lrt_result *err) {
+    tri_set_err(err, LRT_RESULT_OK);
+    if (!types || !centers || !params || nprims == 0 || nprims > 0x07FFFFFFu) {
+        tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
+        return NULL;
+    }
+    lrt_tri_build_options o;
+    if (opts)
+        o = *opts;
+    else
+        memset(&o, 0, sizeof(o));
+    unsigned num_threads = o.num_threads ? o.num_threads : 1u;
+    uint32_t max_leaf = o.max_leaf_size ? o.max_leaf_size : TRI_DEFAULT_LEAF;
+    if (max_leaf > TRI_MAX_LEAF) max_leaf = TRI_MAX_LEAF;
+
+    float *brad = (float *)malloc(nprims * sizeof(float));
+    if (!brad) {
+        tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+        return NULL;
+    }
+    tri_build_ctx bc;
+    memset(&bc, 0, sizeof(bc));
+    bc.ntris = nprims;
+    bc.max_leaf = max_leaf;
+    bc.block_shift = 2u;
+    bc.quality = LRT_TRI_BUILD_DEFAULT;
+    bc.sdf_types = types;
+    bc.sdf_centers = centers;
+    bc.sdf_params = params;
+    bc.sdf_brad = brad;
+    bc.emit_kind = TRI_PRIM_SDF;
+    bc.block_stride = (uint32_t)sizeof(lrt_sdf4);
+    if (tri_alloc_aabb_scratch(&bc, nprims)) {
+        free(brad);
+        tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+        return NULL;
+    }
+
+    int bad = 0;
+    for (size_t i = 0; i < nprims; i++) {
+        const float *c = &centers[i * 3];
+        const float *p = &params[i * 3];
+        for (int k = 0; k < 3; k++)
+            if (!isfinite(c[k]) || !isfinite(p[k])) bad = 1;
+        float ext[3], br;
+        switch (types[i]) {
+        case TRI_SDF_BOX:
+            ext[0] = fabsf(p[0]); ext[1] = fabsf(p[1]); ext[2] = fabsf(p[2]);
+            br = sqrtf(ext[0] * ext[0] + ext[1] * ext[1] + ext[2] * ext[2]);
+            break;
+        case TRI_SDF_TORUS: {
+            float Rr = fabsf(p[0]) + fabsf(p[1]);
+            ext[0] = Rr; ext[1] = fabsf(p[1]); ext[2] = Rr;
+            br = Rr;
+            break;
+        }
+        default: /* sphere */
+            ext[0] = ext[1] = ext[2] = fabsf(p[0]);
+            br = fabsf(p[0]);
+            break;
+        }
+        brad[i] = br;
+        for (int a = 0; a < 3; a++) {
+            bc.plo[i * 3 + a] = c[a] - ext[a];
+            bc.phi[i * 3 + a] = c[a] + ext[a];
+            bc.cen[i * 3 + a] = c[a];
+        }
+        bc.indices[i] = (uint32_t)i;
+    }
+    if (bad) {
+        tri_free_aabb_scratch(&bc);
+        free(brad);
+        tri_set_err(err, LRT_RESULT_INVALID_BOUNDS);
+        return NULL;
+    }
+
+    lrt_tri_scene *s =
+        tri_finish_aabb_build(&bc, nprims, TRI_PRIM_SDF, num_threads, err);
+    tri_free_aabb_scratch(&bc);
+    free(brad);
+    return s;
+}
+
 lrt_tri_scene *lrt_points_scene_build(const float *centers, const float *radii,
                                       const float *normals, int point_type,
                                       size_t nprims,
@@ -10109,6 +10344,7 @@ static uint32_t tri_kind_block_stride(int prim_kind, int layout) {
     case TRI_PRIM_POINT: return (uint32_t)tri_block_size(4);
     case TRI_PRIM_QUAD:
     case TRI_PRIM_TETRA: return (uint32_t)sizeof(lrt_quad4);
+    case TRI_PRIM_SDF: return (uint32_t)sizeof(lrt_sdf4);
     case TRI_PRIM_RLCURVE: return (uint32_t)sizeof(lrt_rlc4);
     case TRI_PRIM_FLATCURVE: return (uint32_t)sizeof(lrt_flat4);
     case TRI_PRIM_BEZCURVE: return (uint32_t)sizeof(lrt_bez4);

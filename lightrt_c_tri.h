@@ -343,6 +343,27 @@ lrt_tri_scene *lrt_tetra_scene_build(const float *tetras, size_t ntetras,
                                      const lrt_tri_build_options *opts,
                                      lrt_result *err);
 
+/* --- Built-in implicit / SDF primitives (GPU-resident, no callbacks) -------
+ *
+ * A device-friendly alternative to lrt_user_scene_build's host callbacks: each
+ * primitive is a built-in analytic distance field (sphere-traced on both CPU and
+ * GPU), so these scenes serialize and trace on the HIP backend. types = nprims
+ * shape ids (lrt_sdf_shape); centers = 3*nprims object-space centers; params =
+ * 3*nprims shape params (sphere: radius,_,_; box: half-extent x,y,z; torus:
+ * major R, minor r, _ — torus axis is y). Queried through lrt_tri_*; hits report
+ * prim_id, u=v=0. BVH4 only. */
+typedef enum lrt_sdf_shape {
+    LRT_SDF_SPHERE = 0,
+    LRT_SDF_BOX = 1,
+    LRT_SDF_TORUS = 2
+} lrt_sdf_shape;
+
+lrt_tri_scene *lrt_sdfprim_scene_build(const uint32_t *types,
+                                       const float *centers, const float *params,
+                                       size_t nprims,
+                                       const lrt_tri_build_options *opts,
+                                       lrt_result *err);
+
 /* --- Quantized triangle scenes (approximate / LOD / preview) ---------------
  *
  * Triangle vertices are stored in a low-precision format to cut memory and

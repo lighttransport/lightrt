@@ -97,6 +97,10 @@ struct lrt_hip_scene {
 #define HIP_PRIM_BEZCURVE 8u
 #define HIP_PRIM_QUAD 9u
 #define HIP_PRIM_TETRA 10u
+#define HIP_PRIM_SDF 11u
+#define HIP_SDF_SPHERE 0u
+#define HIP_SDF_BOX 1u
+#define HIP_SDF_TORUS 2u
 #define HIP_POINT_SPHERE 0u
 #define HIP_POINT_DISC 1u
 #define HIP_POINT_ORIENTED_DISC 2u
@@ -877,6 +881,52 @@ __device__ __forceinline__ bool hp_bez_one(float ox, float oy, float oz,
     return hit != 0;
 }
 
+/* ---- built-in SDF / implicit primitives (port of tri_sdf_*) -------------- */
+__device__ __forceinline__ float hp_sdf_eval(uint32_t type, float px, float py,
+                                             float pz, float p0, float p1,
+                                             float p2) {
+    if (type == HIP_SDF_SPHERE) return sqrtf(px * px + py * py + pz * pz) - p0;
+    if (type == HIP_SDF_BOX) {
+        float qx = fabsf(px) - p0, qy = fabsf(py) - p1, qz = fabsf(pz) - p2;
+        float mx = fmaxf(qx, 0.0f), my = fmaxf(qy, 0.0f), mz = fmaxf(qz, 0.0f);
+        float outside = sqrtf(mx * mx + my * my + mz * mz);
+        float inside = fminf(fmaxf(qx, fmaxf(qy, qz)), 0.0f);
+        return outside + inside;
+    }
+    float lxz = sqrtf(px * px + pz * pz) - p0;
+    return sqrtf(lxz * lxz + py * py) - p1;
+}
+
+__device__ __forceinline__ bool hp_sdf_one(float ox, float oy, float oz,
+                                           float dx, float dy, float dz,
+                                           float cx, float cy, float cz,
+                                           float brad, uint32_t type, float p0,
+                                           float p1, float p2, float tmin,
+                                           float best_t, float *t_out) {
+    float dOdO = dx * dx + dy * dy + dz * dz;
+    if (dOdO <= 1e-20f || brad <= 0.0f) return false;
+    float ocx = ox - cx, ocy = oy - cy, ocz = oz - cz;
+    float b = ocx * dx + ocy * dy + ocz * dz;
+    float c = ocx * ocx + ocy * ocy + ocz * ocz - brad * brad;
+    float disc = b * b - dOdO * c;
+    if (disc < 0.0f) return false;
+    float sq = sqrtf(disc), inv = 1.0f / dOdO;
+    float t0 = (-b - sq) * inv, t1 = (-b + sq) * inv;
+    float tlo = fmaxf(tmin, t0), thi = fminf(best_t, t1);
+    if (tlo >= thi) return false;
+    float invdl = 1.0f / sqrtf(dOdO);
+    float t = tlo;
+    for (int i = 0; i < 128; i++) {
+        float px = ox + t * dx - cx, py = oy + t * dy - cy,
+              pz = oz + t * dz - cz;
+        float d = hp_sdf_eval(type, px, py, pz, p0, p1, p2);
+        if (d < 1e-4f) { *t_out = t; return true; }
+        t += d * invdl;
+        if (t >= thi) break;
+    }
+    return false;
+}
+
 /* One leaf block (4 lanes) against the ray, for the given prim_kind. blk = base
  * word index of the block; bsw = block stride in words. Updates best_*. */
 __device__ __forceinline__ void hp_leaf(const uint32_t *__restrict__ blocks,
@@ -996,6 +1046,21 @@ __device__ __forceinline__ void hp_leaf(const uint32_t *__restrict__ blocks,
             if (hp_rlc_one(ox, oy, oz, dx, dy, dz, p0, r0, p1, r1, pL, rL, pR,
                            rR, tmin, *best_t, &t, &u)) {
                 *best_t = t; *best_u = u; *best_v = 0.0f; *best_prim = prim;
+            }
+        }
+    } else if (prim_kind == HIP_PRIM_SDF) { /* lrt_sdf4: 36 words */
+        for (uint32_t l = 0; l < 4u; l++) {
+            uint32_t prim = blocks[blk + 32u + l];
+            if (prim == LRT_HIP_NO_HIT) continue;
+            float cx = fu(blocks[blk + 0u + l]), cy = fu(blocks[blk + 4u + l]),
+                  cz = fu(blocks[blk + 8u + l]), brad = fu(blocks[blk + 12u + l]);
+            uint32_t type = blocks[blk + 16u + l];
+            float p0 = fu(blocks[blk + 20u + l]), p1 = fu(blocks[blk + 24u + l]),
+                  p2 = fu(blocks[blk + 28u + l]);
+            float t;
+            if (hp_sdf_one(ox, oy, oz, dx, dy, dz, cx, cy, cz, brad, type, p0,
+                           p1, p2, tmin, *best_t, &t)) {
+                *best_t = t; *best_u = 0.0f; *best_v = 0.0f; *best_prim = prim;
             }
         }
     } else if (prim_kind == HIP_PRIM_BEZCURVE) { /* lrt_bez4: 68 words */
@@ -1616,7 +1681,7 @@ extern "C" lrt_hip_scene *lrt_hip_scene_upload(lrt_hip_engine *e,
     int bvh4_prim = (pk == HIP_PRIM_SPHERE || pk == HIP_PRIM_POINT ||
                      pk == HIP_PRIM_QUAD || pk == HIP_PRIM_TETRA ||
                      pk == HIP_PRIM_RLCURVE || pk == HIP_PRIM_FLATCURVE ||
-                     pk == HIP_PRIM_BEZCURVE);
+                     pk == HIP_PRIM_BEZCURVE || pk == HIP_PRIM_SDF);
     if (pk != HIP_PRIM_TRI && !bvh4_prim) {
         free(blob);
         hip_set_err(e, "prim_kind not GPU-traceable (user/sdf/qtri)");

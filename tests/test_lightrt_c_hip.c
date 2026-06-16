@@ -730,6 +730,74 @@ static void test_gpu_curves(lrt_hip_engine *e) {
     free(cnt);
 }
 
+static void test_gpu_sdf(lrt_hip_engine *e) {
+    size_t N = 2000;
+    uint32_t *types = (uint32_t *)malloc(N * sizeof(uint32_t));
+    float *ctr = (float *)malloc(N * 3 * sizeof(float));
+    float *par = (float *)malloc(N * 3 * sizeof(float));
+    for (size_t i = 0; i < N; i++) {
+        types[i] = (uint32_t)(rnd_u32() % 3u); /* sphere/box/torus */
+        for (int k = 0; k < 3; k++) ctr[i * 3 + k] = rnd_f(-2, 2);
+        if (types[i] == LRT_SDF_SPHERE) {
+            par[i * 3 + 0] = rnd_f(0.1f, 0.3f);
+            par[i * 3 + 1] = par[i * 3 + 2] = 0;
+        } else if (types[i] == LRT_SDF_BOX) {
+            par[i * 3 + 0] = rnd_f(0.1f, 0.25f);
+            par[i * 3 + 1] = rnd_f(0.1f, 0.25f);
+            par[i * 3 + 2] = rnd_f(0.1f, 0.25f);
+        } else {
+            par[i * 3 + 0] = rnd_f(0.15f, 0.3f); /* R */
+            par[i * 3 + 1] = rnd_f(0.04f, 0.1f); /* r */
+            par[i * 3 + 2] = 0;
+        }
+    }
+    lrt_tri_build_options o;
+    memset(&o, 0, sizeof(o));
+    o.num_threads = 1;
+    lrt_tri_scene *cpu = lrt_sdfprim_scene_build(types, ctr, par, N, &o, NULL);
+    printf("== GPU built-in SDF primitives vs CPU oracle ==\n");
+    if (!cpu) {
+        CHECK(0, "sdf build");
+        free(types); free(ctr); free(par);
+        return;
+    }
+    lrt_hip_scene *gs = lrt_hip_scene_upload(e, cpu, NULL);
+    CHECK(gs != NULL, "sdf upload: %s", lrt_hip_engine_last_error(e));
+    if (gs) {
+        size_t nr = 30000, agree = 0, hits = 0;
+        double max_rel = 0.0;
+        lrt_ray *rays = (lrt_ray *)malloc(nr * sizeof(lrt_ray));
+        lrt_hit *gh = (lrt_hit *)malloc(nr * sizeof(lrt_hit));
+        for (size_t i = 0; i < nr; i++) make_random_ray(&rays[i]);
+        lrt_hip_scene_trace(e, gs, rays, (uint32_t)nr, gh, NULL);
+        for (size_t i = 0; i < nr; i++) {
+            lrt_hit c;
+            int ch = lrt_tri_intersect1(cpu, &rays[i], &c);
+            int g = gh[i].prim_id != LRT_TRI_NO_HIT;
+            if (g) hits++;
+            if (ch == g && (!g || c.prim_id == gh[i].prim_id)) {
+                agree++;
+                if (g) {
+                    double rel = fabs((double)gh[i].t - c.t) / (1.0 + fabs(c.t));
+                    if (rel > max_rel) max_rel = rel;
+                }
+            } else if (ch && g) {
+                double rel = fabs((double)gh[i].t - c.t) / (1.0 + fabs(c.t));
+                if (rel < 1e-3) agree++;
+            }
+        }
+        double f = (double)agree / nr;
+        printf("  sdf          closest %.3f%% (hit_frac %.3f, max_rel_t %.2e)\n",
+               f * 100.0, (double)hits / nr, max_rel);
+        CHECK(f >= 0.999, "sdf agreement %.3f%% < 99.9%%", f * 100.0);
+        free(rays);
+        free(gh);
+        lrt_hip_scene_free(e, gs);
+    }
+    lrt_tri_scene_free(cpu);
+    free(types); free(ctr); free(par);
+}
+
 static void test_gpu_bezier(lrt_hip_engine *e) {
     uint32_t nseg = 1500;
     float *cps = (float *)malloc(nseg * 16 * sizeof(float));
@@ -906,6 +974,8 @@ int main(void) {
     test_gpu_curves(e);
 
     test_gpu_bezier(e);
+
+    test_gpu_sdf(e);
 
     test_wmma(e);
 
