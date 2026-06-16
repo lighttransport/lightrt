@@ -751,6 +751,25 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
   a device-friendly custom-geometry path that needs no host callbacks (so it
   serializes and GPU-traces, unlike `lrt_user_scene_build`). `TRI_PRIM_SDF`,
   144-byte `lrt_sdf4` leaf (center, bounding radius, type, 3 params).
+- **Parametric surfaces (direct ray-patch intersection, no tessellation — a
+  superset of Embree, which has no native NURBS/Bézier-surface/trim types):**
+  - `lrt_bilinear_scene_build` — true **bilinear patch** (Embree GRID cell),
+    exact closed-form quadratic solve (Reshetov "Cool Patches"). `TRI_PRIM_
+    BILINEAR`, reuses the 208-byte `lrt_quad4` leaf.
+  - `lrt_bezpatch_scene_build` — **bicubic Bézier surface** (4×4 CPs), adaptive
+    (u,v) quadtree subdivision + Newton on (u,v,t). `TRI_PRIM_BEZPATCH`,
+    784-byte `lrt_bezpatch4` leaf (4 patches/block SoA).
+  - `lrt_nurbs_scene_build` — **NURBS surface** (control net + 2 knot vectors +
+    weights, any bidegree ≤8): build-time knot-insertion Bézier extraction
+    (NURBS Book A5.6) + degree-elevation to rational bicubic, intersected
+    directly (homogeneous eval + perspective divide). `TRI_PRIM_RBEZPATCH`,
+    1104-byte `lrt_rbezpatch4` leaf (16 homogeneous CPs + per-patch domain).
+  - `lrt_trimnurbs_scene_build` — **trimmed NURBS**: the above + (u,v) trim loops
+    (polylines; outer + holes, even-odd rule). A patch hit is kept only if its
+    global (u,v) is visible; trimmed hits are rejected and the search continues
+    for the nearest untrimmed hit. `TRI_PRIM_TRIMNURBS`, scene-owned trim side
+    buffers. Verified by residual (surface point on the ray) + the trim
+    invariant (every hit inside the trim region).
 
 ### Implicit surfaces / SDF (`lrt_sdf_*`)
 - `lrt_sdf_sphere_trace` — standalone enhanced sphere tracing (over-relaxation
@@ -933,8 +952,9 @@ or `make HIP_ARCH=...`.
 ### Non-triangle primitives on GPU (implemented)
 The HIP trace path is primitive-aware: alongside triangles (BVH4/BVH8) it traces
 all the BVH4 geometric primitives — **sphere, point (sphere/disc/oriented-disc),
-quad, tetra, round-linear & flat curves, cubic Bézier, and built-in SDF
-(sphere/box/torus)** — by carrying `prim_kind`/`point_type` through the LRTS
+quad, tetra, round-linear & flat curves, cubic Bézier, built-in SDF
+(sphere/box/torus), and the parametric surfaces (bilinear / bicubic Bézier /
+NURBS / trimmed NURBS)** — by carrying `prim_kind`/`point_type` through the LRTS
 header and dispatching `k_trace_prim`/`k_occluded_prim` (BVH4, runtime kind) to
 device intersectors ported byte-for-byte from the CPU scalars (`hp_*` in
 `lightrt_c_hip.hip`). CPU build → GPU trace; serialization opened up per kind
