@@ -401,6 +401,31 @@ lrt_tri_scene *lrt_trimnurbs_scene_build(
     const float *trim_pts, const uint32_t *loop_lengths, int nloops,
     const lrt_tri_build_options *opts, lrt_result *err);
 
+/* As lrt_trimnurbs_scene_build, but each trim loop is a CLOSED sequence of cubic
+ * Bezier segments in (u,v) space instead of a polyline. The library flattens the
+ * curves (adaptive de Casteljau to a max chord deviation of `tol` in (u,v)) into
+ * a polyline and builds the same trimmed scene — so it serializes and GPU-traces
+ * exactly like a polyline-trim scene. C0 continuity is assumed (each segment's
+ * 4th control point coincides with the next segment's 1st; the loop closes from
+ * the last segment's end back to the first segment's start).
+ *
+ *   trim_bez   = 8 floats per segment: 4 (u,v) control points, concatenated over
+ *                all segments of all loops in order.
+ *   seg_counts = nloops entries: cubic segments per loop (>= 1; >= 2 for a real
+ *                region — a loop that flattens to < 3 points is ignored, as in
+ *                the polyline path).
+ *   tol        = max (u,v) chord deviation for flattening (e.g. 1e-3); must be
+ *                > 0.
+ *
+ * Returns the trimmed scene; LRT_RESULT_INVALID_ARGUMENT (bad nloops / NULL
+ * arrays / tol <= 0 / a seg_count of 0) or OUT_OF_MEMORY. nloops == 0 builds an
+ * untrimmed NURBS. */
+lrt_tri_scene *lrt_trimnurbs_bezier_scene_build(
+    const float *net, int nu, int nv, const float *knots_u,
+    const float *knots_v, const float *weights, int degu, int degv,
+    const float *trim_bez, const uint32_t *seg_counts, int nloops, float tol,
+    const lrt_tri_build_options *opts, lrt_result *err);
+
 /* Post-hit shading data for the parametric SURFACE primitives (bilinear /
  * bicubic Bezier / NURBS / trimmed NURBS). Given a hit's prim_id and (u,v) as
  * reported by lrt_tri_intersect1, evaluates the surface point P, the geometric

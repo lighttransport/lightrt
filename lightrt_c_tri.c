@@ -10822,6 +10822,116 @@ lrt_tri_scene *lrt_trimnurbs_scene_build(
     return s;
 }
 
+/* ---- cubic-Bezier trim loops: flatten to polylines at build time ---------- */
+#define TRI_TRIMBEZ_MAXDEPTH 12
+
+/* Flatness test for a 2D cubic (8 floats: 4 (u,v) CPs): both interior CPs within
+ * `tol` of the chord c0->c3. */
+static int tri_bez2_flat(const float c[8], float tol) {
+    float ax = c[6] - c[0], ay = c[7] - c[1]; /* chord c0->c3 */
+    float L = ax * ax + ay * ay;
+    for (int k = 1; k <= 2; k++) {
+        float wx = c[k * 2 + 0] - c[0], wy = c[k * 2 + 1] - c[1];
+        float d2;
+        if (L > 1e-20f) {
+            float cr = wx * ay - wy * ax; /* 2*area of (chord, w) */
+            d2 = (cr * cr) / L;           /* squared perpendicular distance */
+        } else {
+            d2 = wx * wx + wy * wy; /* degenerate chord: distance from c0 */
+        }
+        if (d2 > tol * tol) return 0;
+    }
+    return 1;
+}
+
+/* de Casteljau split of a 2D cubic at t=0.5 (mirror of tri_bez_split3). */
+static void tri_bez2_split(const float c[8], float L[8], float R[8]) {
+    for (int k = 0; k < 2; k++) {
+        float p0 = c[k], p1 = c[2 + k], p2 = c[4 + k], p3 = c[6 + k];
+        float ab = 0.5f * (p0 + p1), bc = 0.5f * (p1 + p2), cd = 0.5f * (p2 + p3);
+        float abc = 0.5f * (ab + bc), bcd = 0.5f * (bc + cd);
+        float abcd = 0.5f * (abc + bcd);
+        L[k] = p0; L[2 + k] = ab; L[4 + k] = abc; L[6 + k] = abcd;
+        R[k] = abcd; R[2 + k] = bcd; R[4 + k] = cd; R[6 + k] = p3;
+    }
+}
+
+/* Emit the start point + interior split points of a 2D cubic (NOT the end, so a
+ * loop's shared joints aren't duplicated). out==NULL => only count into *n. */
+static void tri_bez2_emit(const float c[8], float tol, int depth, float *out,
+                          size_t *n, size_t cap) {
+    if (depth >= TRI_TRIMBEZ_MAXDEPTH || tri_bez2_flat(c, tol)) {
+        if (out && *n < cap) {
+            out[*n * 2 + 0] = c[0];
+            out[*n * 2 + 1] = c[1];
+        }
+        (*n)++;
+        return;
+    }
+    float Lh[8], Rh[8];
+    tri_bez2_split(c, Lh, Rh);
+    tri_bez2_emit(Lh, tol, depth + 1, out, n, cap);
+    tri_bez2_emit(Rh, tol, depth + 1, out, n, cap);
+}
+
+lrt_tri_scene *lrt_trimnurbs_bezier_scene_build(
+    const float *net, int nu, int nv, const float *knots_u,
+    const float *knots_v, const float *weights, int degu, int degv,
+    const float *trim_bez, const uint32_t *seg_counts, int nloops, float tol,
+    const lrt_tri_build_options *opts, lrt_result *err) {
+    if (nloops < 0 || (nloops > 0 && (!trim_bez || !seg_counts || tol <= 0.0f))) {
+        tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
+        return NULL;
+    }
+    if (nloops == 0)
+        return lrt_trimnurbs_scene_build(net, nu, nv, knots_u, knots_v, weights,
+                                         degu, degv, NULL, NULL, 0, opts, err);
+
+    /* Pass 1: count flattened points per loop. */
+    uint32_t *loop_len = (uint32_t *)malloc((size_t)nloops * sizeof(uint32_t));
+    if (!loop_len) {
+        tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+        return NULL;
+    }
+    size_t npts = 0, seg = 0;
+    for (int L = 0; L < nloops; L++) {
+        if (seg_counts[L] < 1u) {
+            free(loop_len);
+            tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
+            return NULL;
+        }
+        size_t before = npts;
+        for (uint32_t e = 0; e < seg_counts[L]; e++, seg++)
+            tri_bez2_emit(&trim_bez[seg * 8], tol, 0, NULL, &npts, 0);
+        loop_len[L] = (uint32_t)(npts - before);
+    }
+    if (npts == 0 || npts > 0x3FFFFFFFu) {
+        free(loop_len);
+        tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
+        return NULL;
+    }
+
+    /* Pass 2: fill the polyline. */
+    float *pts = (float *)malloc(npts * 2 * sizeof(float));
+    if (!pts) {
+        free(loop_len);
+        tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+        return NULL;
+    }
+    size_t w = 0;
+    seg = 0;
+    for (int L = 0; L < nloops; L++)
+        for (uint32_t e = 0; e < seg_counts[L]; e++, seg++)
+            tri_bez2_emit(&trim_bez[seg * 8], tol, 0, pts, &w, npts);
+
+    lrt_tri_scene *s = lrt_trimnurbs_scene_build(net, nu, nv, knots_u, knots_v,
+                                                 weights, degu, degv, pts,
+                                                 loop_len, nloops, opts, err);
+    free(pts);
+    free(loop_len);
+    return s;
+}
+
 lrt_tri_scene *lrt_bezpatch_scene_build(const float *cps, size_t npatch,
                                         const lrt_tri_build_options *opts,
                                         lrt_result *err) {

@@ -1044,6 +1044,7 @@ static void test_surface_project(void) {
     lrt_tri_build_options o;
     memset(&o, 0, sizeof(o));
     o.num_threads = 1;
+    g_rng = 0x5EED9012ull; /* deterministic, independent of test order */
 
     /* bezpatch + NURBS (global-domain) projection */
     for (int kind = 0; kind < 2; kind++) {
@@ -1110,9 +1111,12 @@ static void test_surface_project(void) {
             float uu, vv, Pf[3];
             lrt_tri_surface_project(s, p, Q, &uu, &vv, Pf);
             trials++;
-            float df = fabsf(Pf[0] - S[0]) + fabsf(Pf[1] - S[1]) +
-                       fabsf(Pf[2] - S[2]);
-            if (df < 5e-3f) foot_ok++;
+            /* correctness of a closest-point: the foot must be at least as close
+             * to Q as the constructed S (on a wavy patch a *different* point can
+             * be equally/closer — that's still correct), i.e. |Q-foot| <= off. */
+            float qf = sqrtf((Q[0]-Pf[0])*(Q[0]-Pf[0]) + (Q[1]-Pf[1])*(Q[1]-Pf[1]) +
+                             (Q[2]-Pf[2])*(Q[2]-Pf[2]));
+            if (qf <= off + 5e-3f) foot_ok++;
             /* (Q - foot) perpendicular to the tangents at the recovered (u,v) */
             float du[3], dv[3], Pc[3];
             lrt_tri_surface_normal(s, p, uu, vv, Pc, NULL, du, dv);
@@ -1151,6 +1155,146 @@ static void test_surface_project(void) {
     }
 }
 
+/* ----- cubic-Bezier trim loops (lrt_trimnurbs_bezier_scene_build) -----------
+ * Trim region = a cubic-Bezier circle (4 arcs, kappa control points). Validate
+ * that hits stay inside the disk and agree with a fine-polyline-circle oracle. */
+static void test_trim_bezier(void) {
+    const int degu = 3, degv = 3, nu = 4, nv = 4;
+    const float U[9] = {0, 0, 0, 0, 0.5f, 1, 1, 1, 1};
+    const float cx = 0.5f, cy = 0.5f, R = 0.3f, tol = 1e-3f;
+    const float K = 0.5522847498f; /* 4/3*tan(pi/8): quarter-circle Bezier */
+
+    /* 4 cubic arcs CCW around the circle; each arc's P3 == next P0 (C0). */
+    float bez[4 * 8];
+    for (int a = 0; a < 4; a++) {
+        float a0 = 1.5707963f * a, a1 = 1.5707963f * (a + 1);
+        float c0 = cosf(a0), s0 = sinf(a0), c1 = cosf(a1), s1 = sinf(a1);
+        float *b = &bez[a * 8];
+        b[0] = cx + R * c0;          b[1] = cy + R * s0;          /* P0 */
+        b[2] = cx + R * (c0 - K*s0); b[3] = cy + R * (s0 + K*c0); /* P1 */
+        b[4] = cx + R * (c1 + K*s1); b[5] = cy + R * (s1 - K*c1); /* P2 */
+        b[6] = cx + R * c1;          b[7] = cy + R * s1;          /* P3 */
+    }
+    uint32_t seg_counts[1] = {4};
+
+    /* oracle: a fine 128-gon polyline of the same circle */
+    const int NG = 128;
+    float *poly = (float *)malloc(NG * 2 * sizeof(float));
+    uint32_t poly_len[1] = {(uint32_t)NG};
+    for (int i = 0; i < NG; i++) {
+        float a = 6.2831853f * i / NG;
+        poly[i * 2 + 0] = cx + R * cosf(a);
+        poly[i * 2 + 1] = cy + R * sinf(a);
+    }
+
+    lrt_tri_build_options o;
+    memset(&o, 0, sizeof(o));
+    o.num_threads = 1;
+    const int NS = 60, RPS = 3000;
+    size_t thits = 0, inside_ok = 0, agree = 0, both = 0;
+    for (int s = 0; s < NS; s++) {
+        float net[25 * 3], w[25];
+        float c[3] = {rf(-2, 2), rf(-2, 2), rf(-2, 2)};
+        float ax[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+        float ay[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+        for (int j = 0; j <= nv; j++)
+            for (int i = 0; i <= nu; i++) {
+                int idx = j * (nu + 1) + i;
+                float fu = (float)i / nu - 0.5f, fv = (float)j / nv - 0.5f;
+                for (int k = 0; k < 3; k++)
+                    net[idx * 3 + k] = c[k] + 0.7f * fu * ax[k] + 0.7f * fv * ay[k];
+                w[idx] = rf(0.6f, 1.8f);
+            }
+        lrt_tri_scene *bz = lrt_trimnurbs_bezier_scene_build(
+            net, nu, nv, U, U, w, degu, degv, bez, seg_counts, 1, tol, &o, NULL);
+        lrt_tri_scene *pl = lrt_trimnurbs_scene_build(
+            net, nu, nv, U, U, w, degu, degv, poly, poly_len, 1, &o, NULL);
+        CHECK(bz && pl, "trim-bezier build");
+        if (!bz || !pl) {
+            if (bz) lrt_tri_scene_free(bz);
+            if (pl) lrt_tri_scene_free(pl);
+            continue;
+        }
+        for (int rr = 0; rr < RPS; rr++) {
+            lrt_ray r;
+            float o2[3] = {c[0] + rf(-3, 3), c[1] + rf(-3, 3), c[2] + rf(-3, 3)};
+            float d[3] = {c[0] - o2[0] + rf(-0.4f, 0.4f),
+                          c[1] - o2[1] + rf(-0.4f, 0.4f),
+                          c[2] - o2[2] + rf(-0.4f, 0.4f)};
+            float l = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]) + 1e-9f;
+            for (int k = 0; k < 3; k++) { r.org[k] = o2[k]; r.dir[k] = d[k] / l; }
+            r.tmin = 1e-4f;
+            r.tmax = 1e9f;
+            lrt_hit hb, hp;
+            int xb = lrt_tri_intersect1(bz, &r, &hb);
+            int xp = lrt_tri_intersect1(pl, &r, &hp);
+            if (xb) {
+                thits++;
+                float du = hb.u - cx, dv = hb.v - cy;
+                if (sqrtf(du * du + dv * dv) <= R + tol + 1e-3f) inside_ok++;
+            }
+            both++;
+            if (xb == xp && (!xb || (hb.prim_id == hp.prim_id &&
+                                     fabsf(hb.t - hp.t) < 1e-2f)))
+                agree++;
+        }
+        /* serialization round-trip on the last surface's bezier-trim scene */
+        if (s == NS - 1) {
+            void *buf = NULL;
+            size_t n = 0;
+            if (lrt_tri_scene_save_to_memory(bz, &buf, &n) == LRT_RESULT_OK && buf) {
+                lrt_tri_scene *ld = lrt_tri_scene_load_from_memory(buf, n, NULL);
+                size_t sn = 8000, sa = 0;
+                for (size_t i = 0; ld && i < sn; i++) {
+                    lrt_ray r;
+                    float o2[3] = {c[0]+rf(-3,3), c[1]+rf(-3,3), c[2]+rf(-3,3)};
+                    float d[3] = {c[0]-o2[0], c[1]-o2[1], c[2]-o2[2]};
+                    float l = sqrtf(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]) + 1e-9f;
+                    for (int k = 0; k < 3; k++) { r.org[k]=o2[k]; r.dir[k]=d[k]/l; }
+                    r.tmin = 1e-4f; r.tmax = 1e9f;
+                    lrt_hit a, b;
+                    int ia = lrt_tri_intersect1(bz, &r, &a);
+                    int ib = lrt_tri_intersect1(ld, &r, &b);
+                    if (ia == ib && (!ia || (a.prim_id == b.prim_id &&
+                                             fabsf(a.t - b.t) < 1e-5f)))
+                        sa++;
+                }
+                CHECK(!ld || sa >= (size_t)(0.9999 * sn),
+                      "trim-bezier: serialize round-trip %zu/%zu", sa, sn);
+                if (ld) lrt_tri_scene_free(ld);
+                free(buf);
+            }
+        }
+        lrt_tri_scene_free(bz);
+        lrt_tri_scene_free(pl);
+    }
+    double inside = thits ? (double)inside_ok / thits : 1.0;
+    double ag = both ? (double)agree / both : 1.0;
+    printf("trim-bezier: %zu hits, inside %.3f%%, vs-polyline %.3f%%\n", thits,
+           inside * 100.0, ag * 100.0);
+    CHECK(thits > (size_t)(NS * 30), "trim-bezier: too few hits");
+    CHECK(inside >= 0.999, "trim-bezier: hit outside disk %.3f%%", inside * 100.0);
+    CHECK(ag >= 0.99, "trim-bezier: polyline-oracle agreement %.3f%%", ag * 100.0);
+
+    /* edge cases */
+    {
+        float net[25 * 3], w[25];
+        for (int k = 0; k < 75; k++) net[k] = (float)(k % 5) * 0.2f;
+        for (int k = 0; k < 25; k++) w[k] = 1.0f;
+        lrt_result e = LRT_RESULT_OK;
+        lrt_tri_scene *bad = lrt_trimnurbs_bezier_scene_build(
+            net, nu, nv, U, U, w, degu, degv, bez, seg_counts, 1, 0.0f, &o, &e);
+        CHECK(bad == NULL && e == LRT_RESULT_INVALID_ARGUMENT,
+              "trim-bezier: tol<=0 rejected");
+        if (bad) lrt_tri_scene_free(bad);
+        lrt_tri_scene *unt = lrt_trimnurbs_bezier_scene_build(
+            net, nu, nv, U, U, w, degu, degv, NULL, NULL, 0, tol, &o, NULL);
+        CHECK(unt != NULL, "trim-bezier: nloops=0 builds untrimmed");
+        if (unt) lrt_tri_scene_free(unt);
+    }
+    free(poly);
+}
+
 int main(void) {
     test_bilinear();
     test_bezpatch();
@@ -1158,6 +1302,7 @@ int main(void) {
     test_nurbs_bad_knots();
     test_trimnurbs();
     test_trim_serialize();
+    test_trim_bezier();
     test_surface_normals();
     test_tessellate();
     test_tessellate_indexed();

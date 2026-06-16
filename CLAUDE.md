@@ -771,7 +771,11 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
     buffers. Verified by residual (surface point on the ray) + the trim
     invariant (every hit inside the trim region). Serializes via the **LRTS v2
     aux region** (trim loops ride after the blocks; v1 files still load — their
-    zero padding reads as aux_size 0).
+    zero padding reads as aux_size 0). `lrt_trimnurbs_bezier_scene_build` takes
+    **cubic-Bézier trim loops** (4 (u,v) CPs/segment, C0-closed) and flattens
+    them to a polyline at build time (adaptive de Casteljau to a `tol`), then
+    builds the same scene — so the trim test, serialization, and GPU trace are
+    unchanged (the GPU never sees curves; zero parity risk).
   - **Post-hit shading** (`lrt_tri_surface_normal`): given a hit's `prim_id` +
     `(u,v)`, re-evaluates the surface for the point `P`, geometric normal `Ng =
     cross(dP/du, dP/dv)`, and the two parametric tangents (any output NULL-able)
