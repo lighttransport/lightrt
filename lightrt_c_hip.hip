@@ -2047,7 +2047,7 @@ static lrt_hip_scene *hip_upload_trimnurbs(lrt_hip_engine *e,
         if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
         return NULL;
     }
-    sc->mem_bytes = nbytes + bbytes;
+    sc->mem_bytes = nbytes + bbytes + obytes + pbytes;
     if (err) *err = LRT_RESULT_OK;
     return sc;
 }

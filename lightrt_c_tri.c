@@ -10487,6 +10487,22 @@ lrt_tri_scene *lrt_nurbs_scene_build(const float *net, int nu, int nv,
         tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
         return NULL;
     }
+    /* The Bézier-extraction scratch is sized from tri_nurbs_breaks(); a valid
+     * (non-decreasing, finite) knot vector makes that match tri_nurbs_decompose's
+     * segment count. Reject malformed knots up front — otherwise the two
+     * disagree and the decompose writes past the scratch (heap overflow). */
+    for (int i = 0; i < nu + degu + 1; i++)
+        if (!isfinite(knots_u[i]) || !isfinite(knots_u[i + 1]) ||
+            knots_u[i + 1] < knots_u[i]) {
+            tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
+            return NULL;
+        }
+    for (int i = 0; i < nv + degv + 1; i++)
+        if (!isfinite(knots_v[i]) || !isfinite(knots_v[i + 1]) ||
+            knots_v[i + 1] < knots_v[i]) {
+            tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
+            return NULL;
+        }
     int ncpu = nu + 1, ncpv = nv + 1;
     /* homogeneous control net Pw[j*ncpu+i] = (w*x,w*y,w*z,w) */
     float *Pw = (float *)malloc((size_t)ncpu * ncpv * 4 * sizeof(float));
@@ -11586,8 +11602,10 @@ static int tri_header_check(const lrt_tri_file_header *h, size_t n) {
     if (h->node_offset + nodes_bytes > h->block_offset) return 1;
     if (h->block_offset + blocks_bytes > h->file_size) return 1;
     if (h->aux_size) { /* v2 aux region must sit after blocks, within the file */
+        /* overflow-safe bounds (aux_offset/aux_size are untrusted u64) */
+        if (h->aux_size > h->file_size) return 1;
+        if (h->aux_offset > h->file_size - h->aux_size) return 1;
         if (h->aux_offset < h->block_offset + blocks_bytes) return 1;
-        if (h->aux_offset + h->aux_size > h->file_size) return 1;
         if (h->aux_size < sizeof(lrt_tri_aux_header)) return 1;
     }
     return 0;
@@ -11674,17 +11692,31 @@ static lrt_tri_scene *tri_scene_from_buffer(const void *buf, size_t n, int copy,
         const unsigned char *ap = (const unsigned char *)buf + h->aux_offset;
         lrt_tri_aux_header ah;
         memcpy(&ah, ap, sizeof(ah));
-        size_t obytes = (size_t)(ah.nloops + 1) * sizeof(uint32_t);
-        size_t pbytes = (size_t)ah.npts * 2 * sizeof(float);
-        if (ah.nloops > 0 && sizeof(ah) + obytes + pbytes <= h->aux_size) {
+        /* size_t arithmetic (ah.nloops/npts are untrusted u32; +1 in u32 would
+         * wrap). */
+        size_t obytes = ((size_t)ah.nloops + 1u) * sizeof(uint32_t);
+        size_t pbytes = (size_t)ah.npts * 2u * sizeof(float);
+        if (ah.nloops > 0 &&
+            sizeof(ah) + obytes + pbytes <= h->aux_size) {
             uint32_t *off = (uint32_t *)malloc(obytes);
             float *pts = (float *)malloc(pbytes);
             if (off && pts) {
                 memcpy(off, ap + sizeof(ah), obytes);
                 memcpy(pts, ap + sizeof(ah) + obytes, pbytes);
-                s->trim_loop_off = off;
-                s->trim_pts = pts;
-                s->trim_nloops = ah.nloops;
+                /* validate the loop offsets: off[0]==0, non-decreasing, and
+                 * off[nloops]==npts — otherwise tri_trim_inside would read out
+                 * of the pts buffer on a crafted file. */
+                int ok = (off[0] == 0u && off[ah.nloops] == ah.npts);
+                for (uint32_t L = 0; ok && L < ah.nloops; L++)
+                    if (off[L + 1] < off[L]) ok = 0;
+                if (ok) {
+                    s->trim_loop_off = off;
+                    s->trim_pts = pts;
+                    s->trim_nloops = ah.nloops;
+                } else {
+                    free(off);
+                    free(pts); /* malformed trim: load as untrimmed */
+                }
             } else {
                 free(off);
                 free(pts);

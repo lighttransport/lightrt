@@ -491,10 +491,36 @@ static void test_trim_serialize(void) {
     lrt_tri_scene_free(orig);
 }
 
+/* Malformed knot vectors must be rejected, not crash (regression: a non-
+ * monotone knot vector previously overflowed the extraction scratch). */
+static void test_nurbs_bad_knots(void) {
+    float net[25 * 3];
+    for (int i = 0; i < 75; i++) net[i] = (float)(i % 5) * 0.3f;
+    float Vbad[9] = {0, 0, 0, 0, 0.5f, 1, 1, 1, 0}; /* trailing 0: non-monotone */
+    float Vok[9] = {0, 0, 0, 0, 0.5f, 1, 1, 1, 1};
+    lrt_tri_build_options o;
+    memset(&o, 0, sizeof(o));
+    o.num_threads = 1;
+    lrt_result err = LRT_RESULT_OK;
+    lrt_tri_scene *bad =
+        lrt_nurbs_scene_build(net, 4, 4, Vok, Vbad, NULL, 3, 3, &o, &err);
+    CHECK(bad == NULL && err == LRT_RESULT_INVALID_ARGUMENT,
+          "non-monotone knots should be rejected (got %p err=%d)", (void *)bad,
+          (int)err);
+    if (bad) lrt_tri_scene_free(bad);
+    /* the valid twin must still build */
+    lrt_tri_scene *good =
+        lrt_nurbs_scene_build(net, 4, 4, Vok, Vok, NULL, 3, 3, &o, NULL);
+    CHECK(good != NULL, "valid knots should build");
+    if (good) lrt_tri_scene_free(good);
+    printf("nurbs-knots: malformed rejected, valid accepted\n");
+}
+
 int main(void) {
     test_bilinear();
     test_bezpatch();
     test_nurbs();
+    test_nurbs_bad_knots();
     test_trimnurbs();
     test_trim_serialize();
     if (g_fail) {
