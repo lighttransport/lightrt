@@ -880,6 +880,73 @@ static void test_tessellate(void) {
     }
 }
 
+/* indexed (welded) tessellation: the index-buffer triangles must reconstruct
+ * exactly the same positions as the soup form, indices must be in range, and the
+ * vertex count must equal the welded grid. */
+static void test_tessellate_indexed(void) {
+    lrt_tri_build_options o;
+    memset(&o, 0, sizeof(o));
+    o.num_threads = 1;
+    const uint32_t SU = 5, SV = 6;
+    const size_t NP = 50;
+    float *cps = (float *)malloc(NP * 48 * sizeof(float));
+    for (size_t i = 0; i < NP; i++) {
+        float c[3] = {rf(-2, 2), rf(-2, 2), rf(-2, 2)};
+        float ax[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+        float ay[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+        float *cp = &cps[i * 48];
+        for (int jj = 0; jj < 4; jj++)
+            for (int ii = 0; ii < 4; ii++) {
+                float fu = ii / 3.0f - 0.5f, fv = jj / 3.0f - 0.5f;
+                int idx = (jj * 4 + ii) * 3;
+                for (int k = 0; k < 3; k++)
+                    cp[idx + k] = c[k] + 0.8f * fu * ax[k] + 0.8f * fv * ay[k] +
+                                  rf(-0.1f, 0.1f);
+            }
+    }
+    lrt_tri_scene *sp = lrt_bezpatch_scene_build(cps, NP, &o, NULL);
+    CHECK(sp != NULL, "tess-idx: build");
+    if (sp) {
+        size_t vb = 0, ib = 0;
+        lrt_tri_surface_tessellate_indexed_bound(sp, SU, SV, &vb, &ib);
+        CHECK(vb == NP * (SU + 1) * (SV + 1) && ib == NP * SU * SV * 6,
+              "tess-idx: bounds %zu %zu", vb, ib);
+        float *pos = (float *)malloc(vb * 3 * sizeof(float));
+        float *uv = (float *)malloc(vb * 2 * sizeof(float));
+        uint32_t *idxb = (uint32_t *)malloc(ib * sizeof(uint32_t));
+        size_t nv = 0, ni = 0;
+        lrt_result r = lrt_tri_surface_tessellate_indexed(
+            sp, SU, SV, pos, NULL, uv, vb, idxb, ib, &nv, &ni);
+        CHECK(r == LRT_RESULT_OK && nv == vb && ni == ib,
+              "tess-idx: counts %zu %zu", nv, ni);
+        /* every index in range; every indexed vertex lies on the surface */
+        size_t idx_ok = 0, resid_ok = 0;
+        for (size_t e = 0; e < ni; e++) {
+            uint32_t vi = idxb[e];
+            if (vi >= nv) continue;
+            idx_ok++;
+            int prim = (int)(vi / ((SU + 1) * (SV + 1)));
+            float S[3];
+            bezpatch_eval(&cps[(size_t)prim * 48], uv[vi * 2], uv[vi * 2 + 1], S);
+            float d = fabsf(S[0] - pos[vi * 3]) + fabsf(S[1] - pos[vi * 3 + 1]) +
+                      fabsf(S[2] - pos[vi * 3 + 2]);
+            if (d < 1e-4f) resid_ok++;
+        }
+        printf("tess-idx: %zu verts, %zu indices, in-range %.2f%% resid %.2f%%\n",
+               nv, ni, 100.0 * idx_ok / ni, 100.0 * resid_ok / ni);
+        CHECK(idx_ok == ni, "tess-idx: out-of-range indices");
+        CHECK(resid_ok == ni, "tess-idx: indexed verts off-surface");
+        /* the welded vertex count is far below the soup vertex count (3*tris) */
+        CHECK(vb < (size_t)(NP * SU * SV * 2) * 3,
+              "tess-idx: welding should shrink vertex count");
+        free(pos);
+        free(uv);
+        free(idxb);
+        lrt_tri_scene_free(sp);
+    }
+    free(cps);
+}
+
 /* ----- surface refit (lrt_tri_surface_refit) --------------------------------
  * Refit a scene built from CPs A to CPs B, then verify it traces identically to
  * a fresh scene built from B (same geometry, different tree topology -> hits
@@ -978,6 +1045,7 @@ int main(void) {
     test_trim_serialize();
     test_surface_normals();
     test_tessellate();
+    test_tessellate_indexed();
     test_surface_refit();
     if (g_fail) {
         printf("\n%d FAILURES\n", g_fail);

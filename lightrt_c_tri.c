@@ -11063,6 +11063,92 @@ lrt_result lrt_tri_surface_tessellate(const lrt_tri_scene *s, uint32_t segu,
     return LRT_RESULT_OK;
 }
 
+void lrt_tri_surface_tessellate_indexed_bound(const lrt_tri_scene *s,
+                                              uint32_t segu, uint32_t segv,
+                                              size_t *nverts, size_t *nindices) {
+    size_t nv = 0, ni = 0;
+    if (s && segu > 0 && segv > 0 && s->shade_cps &&
+        tri_is_surface_kind(s->prim_kind)) {
+        nv = (size_t)s->shade_nprims * (segu + 1) * (segv + 1);
+        ni = (size_t)s->shade_nprims * segu * segv * 6u;
+    }
+    if (nverts) *nverts = nv;
+    if (nindices) *nindices = ni;
+}
+
+lrt_result lrt_tri_surface_tessellate_indexed(
+    const lrt_tri_scene *s, uint32_t segu, uint32_t segv, float *pos, float *nrm,
+    float *uv, size_t vcap, uint32_t *indices, size_t icap, size_t *nverts_out,
+    size_t *nidx_out) {
+    if (nverts_out) *nverts_out = 0;
+    if (nidx_out) *nidx_out = 0;
+    if (!s || segu == 0 || segv == 0) return LRT_RESULT_INVALID_ARGUMENT;
+    if (!tri_is_surface_kind(s->prim_kind)) return LRT_RESULT_INVALID_ARGUMENT;
+    if (!s->shade_cps) return LRT_RESULT_UNSUPPORTED;
+    const int trimmed = (s->prim_kind == TRI_PRIM_TRIMNURBS);
+    const int has_dom = (s->shade_stride == 64);
+    const uint32_t gw = segu + 1, gh = segv + 1; /* grid dims per patch */
+    const size_t per = (size_t)gw * gh;          /* verts per patch */
+    size_t vtotal = (size_t)s->shade_nprims * per, itotal = 0;
+
+    /* Vertex pass: a full (gw x gh) grid per patch (even trimmed — unreferenced
+     * verts are harmless and keep the index math trivial). */
+    for (uint32_t p = 0; p < s->shade_nprims; p++) {
+        float umin = 0, umax = 1, vmin = 0, vmax = 1;
+        if (has_dom) {
+            const float *d = &s->shade_dom[(size_t)p * 4];
+            umin = d[0]; umax = d[1]; vmin = d[2]; vmax = d[3];
+        }
+        for (uint32_t j = 0; j < gh; j++)
+            for (uint32_t i = 0; i < gw; i++) {
+                size_t vi = (size_t)p * per + (size_t)j * gw + i;
+                if (vi >= vcap) continue;
+                float u = umin + (umax - umin) * (float)i / (float)segu;
+                float v = vmin + (vmax - vmin) * (float)j / (float)segv;
+                float P[3], N[3];
+                lrt_tri_surface_normal(s, p, u, v, P, N, NULL, NULL);
+                if (pos) {
+                    pos[vi * 3 + 0] = P[0]; pos[vi * 3 + 1] = P[1]; pos[vi * 3 + 2] = P[2];
+                }
+                if (nrm) {
+                    nrm[vi * 3 + 0] = N[0]; nrm[vi * 3 + 1] = N[1]; nrm[vi * 3 + 2] = N[2];
+                }
+                if (uv) {
+                    uv[vi * 2 + 0] = u; uv[vi * 2 + 1] = v;
+                }
+            }
+    }
+
+    /* Index pass: 2 triangles per (kept) cell, into the patch's vertex grid. */
+    for (uint32_t p = 0; p < s->shade_nprims; p++) {
+        float umin = 0, umax = 1, vmin = 0, vmax = 1;
+        if (has_dom) {
+            const float *d = &s->shade_dom[(size_t)p * 4];
+            umin = d[0]; umax = d[1]; vmin = d[2]; vmax = d[3];
+        }
+        size_t base = (size_t)p * per;
+        for (uint32_t j = 0; j < segv; j++)
+            for (uint32_t i = 0; i < segu; i++) {
+                if (trimmed) {
+                    float uc = umin + (umax - umin) * ((float)i + 0.5f) / segu;
+                    float vc = vmin + (vmax - vmin) * ((float)j + 0.5f) / segv;
+                    if (!tri_trim_inside(s->trim_loop_off, s->trim_pts,
+                                         s->trim_nloops, uc, vc))
+                        continue;
+                }
+                uint32_t v00 = (uint32_t)(base + (size_t)j * gw + i);
+                uint32_t v10 = v00 + 1, v01 = v00 + gw, v11 = v01 + 1;
+                uint32_t tri[6] = {v00, v10, v11, v00, v11, v01};
+                if (indices && itotal + 6 <= icap)
+                    for (int k = 0; k < 6; k++) indices[itotal + k] = tri[k];
+                itotal += 6;
+            }
+    }
+    if (nverts_out) *nverts_out = vtotal;
+    if (nidx_out) *nidx_out = itotal;
+    return LRT_RESULT_OK;
+}
+
 size_t lrt_tri_curve_tessellate_bound(const lrt_tri_scene *s, uint32_t nsides) {
     if (!s || nsides < 3 || !s->shade_cps || s->prim_kind != TRI_PRIM_RLCURVE)
         return 0;

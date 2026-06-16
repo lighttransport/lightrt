@@ -469,6 +469,27 @@ lrt_result lrt_tri_surface_tessellate(const lrt_tri_scene *s, uint32_t segu,
                                       uint32_t segv, float *pos, float *nrm,
                                       float *uv, size_t cap, size_t *ntris_out);
 
+/* Indexed (welded) variant: emits a shared (segu+1)x(segv+1) vertex grid per
+ * patch plus a triangle index buffer — what GPU vertex buffers / OBJ-style
+ * exporters want (~6x less vertex data than the soup form). Vertex v at patch p,
+ * grid (i,j) is at index p*(segu+1)*(segv+1) + j*(segu+1) + i; eval at the
+ * patch's (u,v). For trimmed NURBS the full vertex grid is still emitted (a few
+ * unreferenced verts) but only kept cells contribute index triples.
+ *
+ * _bound returns the vertex count (nprims*(segu+1)*(segv+1)) and the upper-bound
+ * index count (nprims*segu*segv*6) via the out-params (either may be NULL); both
+ * 0 for a non-surface/shadeless scene. The fill writes up to vcap verts and icap
+ * indices and reports the full counts in *nverts_out / *nidx_out (size with the
+ * bound to avoid truncation). Returns LRT_RESULT_OK; INVALID_ARGUMENT (NULL/zero
+ * seg/non-surface); UNSUPPORTED if shade data is unavailable. Thread-safe. */
+void lrt_tri_surface_tessellate_indexed_bound(const lrt_tri_scene *s,
+                                              uint32_t segu, uint32_t segv,
+                                              size_t *nverts, size_t *nindices);
+lrt_result lrt_tri_surface_tessellate_indexed(
+    const lrt_tri_scene *s, uint32_t segu, uint32_t segv, float *pos, float *nrm,
+    float *uv, size_t vcap, uint32_t *indices, size_t icap, size_t *nverts_out,
+    size_t *nidx_out);
+
 /* Tessellate a ROUND-LINEAR curve (hair) scene into a tube mesh — for preview /
  * export / collision proxy. Each segment becomes a tapered cone frustum with
  * `nsides` (>= 3) radial faces, 2*nsides triangles, no end caps; vertices ride

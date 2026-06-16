@@ -827,6 +827,10 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
   via `lrt_tri_surface_normal`; trimmed-NURBS cells whose centroid is outside
   the trim region are dropped (actual count ≤ the bound). Size buffers with
   `_bound`, then fill; `*ntris_out` reports the full count.
+  `lrt_tri_surface_tessellate_indexed[_bound]` is the welded variant: a shared
+  (segu+1)×(segv+1) vertex grid per patch + a triangle index buffer (~what GPU
+  vertex buffers / OBJ exporters want, far less vertex data); trimmed cells just
+  omit their index triples.
 - `lrt_tri_curve_tessellate[_bound]` — tessellate a ROUND-LINEAR (hair) scene
   into a tube mesh: each segment a tapered cone frustum with `nsides` radial
   faces (2·nsides tris, no caps), vertices on the cone surface at r(t), outward
