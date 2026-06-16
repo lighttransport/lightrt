@@ -869,7 +869,19 @@ and the test skips (exit 0) when no device is present.
   → matches `lrt_tri_intersect1` to ~99.999% (`max_rel_t < 1e-6`).
 - **Hybrid GPU build (Path B)**: `lrt_hip_build_scene` runs `k_centroids` +
   `k_morton` on the GPU (port of `build_morton.comp`), finishes the LBVH on the
-  CPU via `lrt_tri_scene_build_lbvh_morton`; matches a FAST CPU build.
+  CPU via `lrt_tri_scene_build_lbvh_morton`; matches a FAST CPU build (~50 ms).
+- **Full-GPU LBVH (`lrt_hip_scene_build_gpu`, `lightrt_hip_lbvh.hip`)**: builds
+  the whole BVH on the GPU with NO CPU hierarchy work — centroids + Morton, a
+  hipCUB radix sort of unique 64-bit `(morton<<32|index)` keys, a Karras (2012)
+  binary radix tree, bottom-up bounds via the atomic-flag walk-up, and emission
+  directly into the trace kernel's BVH4 wide-node format as a binary (2-wide)
+  tree (one triangle per leaf block). Returns a resident scene traceable
+  immediately. hipCUB-gated (`lrt_hip_have_gpu_build()`). On the 220k-tri
+  mandelbulb: **~2.2 ms build** (vs ~143 ms CPU SAH, ~50 ms hybrid) at
+  essentially the same primary trace throughput (~218 Mray/s) and 99.999% oracle
+  agreement — the fast-rebuild path for topology-changing dynamic scenes. The
+  un-collapsed 2-wide tree costs a little on incoherent rays; a GPU collapse to
+  4/8-wide is a possible future refinement.
 - **GPU refit (dynamic / motion-blur)**: `lrt_hip_scene_refit` updates leaf
   vertices + node bounds in place without rebuilding (multi-pass bottom-up;
   parent index < child index by construction). Matches a CPU refit 100%. On the
@@ -929,9 +941,9 @@ would not change the verdict, so it is skipped. int16 is not a WMMA input type
 (the integer GEMM accumulates int32 from iu8/iu4 inputs). Other experimental
 ideas with expected low/negative payoff: WMMA box/slab tests (the min/max
 reduction is not a matmul) and full coherent-packet traversal calling the WMMA
-leaf kernel inline. Remaining stretch for the dynamic path: full-GPU LBVH (a
-hipCUB radix sort + Karras tree + GPU collapse) to speed topology-changing
-rebuilds beyond the current hybrid GPU-Morton/CPU-finish build.
+leaf kernel inline. The full-GPU LBVH (above) is implemented; a remaining
+refinement is a GPU collapse of its binary tree to 4/8-wide nodes for faster
+incoherent traversal.
 
 ## Code Conventions
 

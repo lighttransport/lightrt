@@ -222,6 +222,61 @@ static void test_build(lrt_hip_engine *e, const char *label, const float *verts,
     lrt_tri_scene_free(cpu_scene);
 }
 
+/* Full-GPU LBVH: build entirely on the GPU, trace, compare to the CPU oracle.
+ * The GPU tree differs from the CPU SAH tree (binary Karras vs collapsed SAH),
+ * so we compare hits against an independent CPU scene built on the same soup. */
+static void test_gpu_build(lrt_hip_engine *e, const char *label,
+                           const float *verts, size_t ntris, size_t nrays) {
+    lrt_result er = LRT_RESULT_OK;
+    lrt_hip_scene *gs =
+        lrt_hip_scene_build_gpu(e, verts, (uint32_t)ntris, &er);
+    CHECK(gs != NULL, "%s: GPU build failed: %s", label,
+          lrt_hip_engine_last_error(e));
+    if (!gs) return;
+
+    lrt_tri_build_options opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.quality = LRT_TRI_BUILD_DEFAULT;
+    opts.layout = LRT_TRI_LAYOUT_BVH8;
+    opts.num_threads = 1;
+    lrt_tri_scene *cpu = lrt_tri_scene_build(verts, ntris, &opts, NULL);
+
+    lrt_ray *rays = (lrt_ray *)malloc(nrays * sizeof(lrt_ray));
+    lrt_hit *gh = (lrt_hit *)malloc(nrays * sizeof(lrt_hit));
+    for (size_t i = 0; i < nrays; i++) make_random_ray(&rays[i]);
+    lrt_hip_scene_trace(e, gs, rays, (uint32_t)nrays, gh, NULL);
+
+    size_t agree = 0;
+    double max_rel = 0.0;
+    for (size_t i = 0; i < nrays; i++) {
+        lrt_hit c;
+        int ch = lrt_tri_intersect1(cpu, &rays[i], &c);
+        int g = gh[i].prim_id != LRT_TRI_NO_HIT;
+        if (ch == g) {
+            if (!g) {
+                agree++;
+            } else if (c.prim_id == gh[i].prim_id) {
+                agree++;
+                double rel = fabs((double)gh[i].t - c.t) / (1.0 + fabs(c.t));
+                if (rel > max_rel) max_rel = rel;
+            } else {
+                double rel = fabs((double)gh[i].t - c.t) / (1.0 + fabs(c.t));
+                if (rel < 1e-4) agree++;
+            }
+        }
+    }
+    double frac = (double)agree / (double)nrays;
+    printf("  %-22s GPU-LBVH vs CPU agree %.4f%% (max_rel_t %.2e)\n", label,
+           frac * 100.0, max_rel);
+    CHECK(frac >= 0.999, "%s: GPU-LBVH agreement %.4f%% < 99.9%%", label,
+          frac * 100.0);
+
+    free(rays);
+    free(gh);
+    lrt_hip_scene_free(e, gs);
+    lrt_tri_scene_free(cpu);
+}
+
 /* Phase 2: WMMA leaf intersection. Verify scalar GPU leaf kernel matches a CPU
  * brute force exactly, and that the low-precision WMMA methods agree with the
  * scalar method above their expected thresholds (fp16 > bf16/int8). */
@@ -479,6 +534,14 @@ int main(void) {
     printf("== Path B (GPU-Morton build) vs CPU FAST ==\n");
     test_build(e, "build/BVH4", soup, ntris, LRT_TRI_LAYOUT_BVH4, 20000);
     test_build(e, "build/BVH8", grid, grid_n, LRT_TRI_LAYOUT_BVH8, 20000);
+
+    printf("== Full-GPU LBVH (lrt_hip_scene_build_gpu) vs CPU oracle ==\n");
+    if (lrt_hip_have_gpu_build()) {
+        test_gpu_build(e, "gpu-lbvh/random", soup, ntris, 20000);
+        test_gpu_build(e, "gpu-lbvh/grid", grid, grid_n, 20000);
+    } else {
+        printf("  (hipCUB not compiled in, skipping)\n");
+    }
 
     printf("== GPU refit (animation) vs CPU refit ==\n");
     test_refit(e, "refit/BVH4", soup, ntris, LRT_TRI_LAYOUT_BVH4, 20000);

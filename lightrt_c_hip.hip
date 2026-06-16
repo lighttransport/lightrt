@@ -672,10 +672,38 @@ extern "C" const char *lrt_hip_engine_last_error(const lrt_hip_engine *e) {
     return e ? e->err : "";
 }
 
-/* Internal: expose the engine stream to the WMMA TU (lightrt_hip_wmma.hip)
- * without sharing the struct definition. Not in the public header. */
+/* Internal: expose the engine stream to other HIP TUs (lightrt_hip_wmma.hip,
+ * lightrt_hip_lbvh.hip) without sharing the struct definition. Not public. */
 extern "C" void *lrt_hip_engine_stream_(const lrt_hip_engine *e) {
     return e ? (void *)e->stream : NULL;
+}
+
+/* Internal: wrap GPU-built device buffers in a resident scene (lrt_hip_scene_free
+ * owns/frees d_nodes and d_blocks). Used by the full-GPU LBVH builder. */
+extern "C" lrt_hip_scene *lrt_hip_scene_make_(uint32_t *d_nodes,
+                                              uint32_t *d_blocks,
+                                              uint32_t node_count,
+                                              uint32_t block_count,
+                                              uint32_t node_stride,
+                                              uint32_t block_stride,
+                                              uint32_t root, uint32_t layout,
+                                              uint32_t stack,
+                                              uint32_t max_depth) {
+    lrt_hip_scene *sc = (lrt_hip_scene *)calloc(1, sizeof(lrt_hip_scene));
+    if (!sc) return NULL;
+    sc->d_nodes = d_nodes;
+    sc->d_blocks = d_blocks;
+    sc->node_count = node_count;
+    sc->block_count = block_count;
+    sc->node_stride = node_stride;
+    sc->block_stride = block_stride;
+    sc->root = root;
+    sc->layout = layout;
+    sc->stack = stack;
+    sc->max_depth = max_depth;
+    sc->mem_bytes = (size_t)node_count * node_stride +
+                    (size_t)block_count * block_stride;
+    return sc;
 }
 
 /* Grow a device scratch buffer to at least `need` bytes. */

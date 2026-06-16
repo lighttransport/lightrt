@@ -220,7 +220,7 @@ int main(int argc, char **argv) {
     size_t want_tris = 200000;
     size_t nrays = 1000000;
     int iters = 5;
-    int do_cpu = 1, do_fp32 = 1, do_build = 1;
+    int do_cpu = 1, do_fp32 = 1, do_build = 1, do_gpubuild = 1;
     int have_backend_filter = 0;
     int leaf_mode = 0;
     uint32_t leaf_blocks = 262144, leaf_tris = 8;
@@ -242,11 +242,12 @@ int main(int argc, char **argv) {
             iters = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--backend") && i + 1 < argc) {
             const char *b = argv[++i];
-            do_cpu = do_fp32 = do_build = 0;
+            do_cpu = do_fp32 = do_build = do_gpubuild = 0;
             have_backend_filter = 1;
             if (strstr(b, "cpu")) do_cpu = 1;
             if (strstr(b, "hip-fp32")) do_fp32 = 1;
             if (strstr(b, "hip-build")) do_build = 1;
+            if (strstr(b, "hip-gpubuild")) do_gpubuild = 1;
         } else {
             printf("usage: %s [--scene random|mandelbulb|thinspan] [--tris N] "
                    "[--rays N] [--iters N] [--backend cpu,hip-fp32,hip-build]\n"
@@ -401,6 +402,41 @@ int main(int argc, char **argv) {
             lrt_tri_scene_free(gpu_scene);
         } else {
             printf("hip-build: failed: %s\n", lrt_hip_engine_last_error(e));
+        }
+    }
+
+    if (e && do_gpubuild && lrt_hip_have_gpu_build()) {
+        /* Full-GPU LBVH: build entirely on the GPU, trace the resident scene. */
+        double best_build = 1e30;
+        lrt_hip_scene *gs = NULL;
+        for (int it = 0; it < iters; it++) {
+            uint64_t b0 = bench_time_ns();
+            lrt_hip_scene *g =
+                lrt_hip_scene_build_gpu(e, verts, (uint32_t)ntris, NULL);
+            uint64_t b1 = bench_time_ns();
+            double m = bench_ns_to_ms(b1 - b0);
+            if (m < best_build) best_build = m;
+            if (gs) lrt_hip_scene_free(e, gs);
+            gs = g;
+        }
+        if (gs) {
+            lrt_hip_scene_trace(e, gs, primary, (uint32_t)nrays, gpu_hits, NULL);
+            double ag = agreement(gpu_hits, cpu_hits, nrays);
+            double pm = TIME_BEST(iters, nrays, {
+                lrt_hip_scene_trace(e, gs, primary, (uint32_t)nrays, gpu_hits,
+                                    NULL);
+            });
+            double im = TIME_BEST(iters, nrays, {
+                lrt_hip_scene_trace(e, gs, incoh, (uint32_t)nrays, gpu_hits,
+                                    NULL);
+            });
+            double sm = TIME_BEST(iters, nrays, {
+                lrt_hip_scene_occluded(e, gs, shadow, (uint32_t)nrays, occ,
+                                       NULL);
+            });
+            printf("%-12s %10.2f %12.1f %12.1f %12.1f %9.3f%% %8s\n",
+                   "hip-gpubuild", best_build, pm, im, sm, ag * 100.0, "-");
+            lrt_hip_scene_free(e, gs);
         }
     }
 

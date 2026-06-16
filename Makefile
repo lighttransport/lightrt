@@ -157,17 +157,22 @@ HIPCC ?= hipcc
 HIP_ARCH ?= gfx1201
 ROCM_PATH ?= /opt/rocm
 HIP_FLAGS = --offload-arch=$(HIP_ARCH) -ffp-contract=off -O2 $(INCLUDES)
-# rocWMMA is header-only; enable the matrix-core kernels when it is present.
+# rocWMMA / hipCUB are header-only; enable when present.
 HIP_WMMA := $(wildcard $(ROCM_PATH)/include/rocwmma/rocwmma.hpp)
 ifneq ($(HIP_WMMA),)
 HIP_WMMA_FLAGS = -DLIGHTRT_HIP_HAVE_WMMA -I$(ROCM_PATH)/include
 endif
+HIP_HIPCUB := $(wildcard $(ROCM_PATH)/include/hipcub/hipcub.hpp)
+ifneq ($(HIP_HIPCUB),)
+HIP_HIPCUB_FLAGS = -DLIGHTRT_HIP_HAVE_HIPCUB -I$(ROCM_PATH)/include
+endif
 HIP_C_OBJS = /tmp/lrt_hip_c.o /tmp/lrt_hip_c_tri.o
-HIP_DEV_OBJS = /tmp/lrt_hip_dev.o /tmp/lrt_hip_wmma.o
+HIP_DEV_OBJS = /tmp/lrt_hip_dev.o /tmp/lrt_hip_wmma.o /tmp/lrt_hip_lbvh.o
 
 hip_dev_objs:
 	$(HIPCC) $(HIP_FLAGS) -c lightrt_c_hip.hip -o /tmp/lrt_hip_dev.o
 	$(HIPCC) $(HIP_FLAGS) $(HIP_WMMA_FLAGS) -c lightrt_hip_wmma.hip -o /tmp/lrt_hip_wmma.o
+	$(HIPCC) $(HIP_FLAGS) $(HIP_HIPCUB_FLAGS) -c lightrt_hip_lbvh.hip -o /tmp/lrt_hip_lbvh.o
 
 hip_test: hip_dev_objs
 	$(CC) $(CFLAGS) $(INCLUDES) -c lightrt_c.c -o /tmp/lrt_hip_c.o

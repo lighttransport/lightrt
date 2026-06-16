@@ -186,6 +186,25 @@ int lrt_hip_build_scene(lrt_hip_engine *e, const float *vertices, uint32_t ntris
                         lrt_tri_layout layout, lrt_tri_scene **out,
                         lrt_result *err);
 
+/* --- Full-GPU LBVH build --------------------------------------------------
+ *
+ * Build a BVH entirely on the GPU (no CPU hierarchy work): centroids + 30-bit
+ * Morton on the GPU, hipCUB radix sort of unique 64-bit (morton<<32|index) keys,
+ * a Karras radix tree, bottom-up bounds via atomic flags, and emission directly
+ * into the trace kernel's BVH4 wide-node format as a binary (2-wide) tree.
+ * Returns a resident scene traceable immediately with lrt_hip_scene_trace.
+ *
+ * Far faster build than the hybrid lrt_hip_build_scene (which finishes on the
+ * CPU) — the path for topology-changing dynamic scenes. Traversal is a touch
+ * slower than a collapsed SAH BVH (the tree is un-collapsed 2-wide). Requires
+ * hipCUB; returns NULL with LRT_RESULT_NOT_BUILT if it was not compiled in
+ * (check lrt_hip_have_gpu_build()). Free with lrt_hip_scene_free(). */
+lrt_hip_scene *lrt_hip_scene_build_gpu(lrt_hip_engine *e, const float *vertices,
+                                       uint32_t ntris, lrt_result *err);
+
+/* 1 if the full-GPU LBVH builder was compiled in (hipCUB present). */
+int lrt_hip_have_gpu_build(void);
+
 #ifdef __cplusplus
 }
 #endif
