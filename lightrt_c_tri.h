@@ -343,6 +343,18 @@ lrt_tri_scene *lrt_tetra_scene_build(const float *tetras, size_t ntetras,
                                      const lrt_tri_build_options *opts,
                                      lrt_result *err);
 
+/* --- Bilinear patch (true ruled surface, exact intersection) --------------
+ *
+ * A curved bilinear patch P(u,v) = bilerp(q00,q10,q11,q01) — Embree's GRID cell
+ * / a non-planar quad — intersected exactly via the closed-form quadratic solve
+ * (Reshetov "Cool Patches"). corners = 12*npatch floats: q00 q10 q11 q01 in
+ * order around the patch. Hit reports prim_id = patch index and (u,v) in
+ * [0,1]^2. BVH4 only; queried through the lrt_tri_* functions. (Distinct from
+ * lrt_quad_scene_build, which is a planar two-triangle quad.) */
+lrt_tri_scene *lrt_bilinear_scene_build(const float *corners, size_t npatch,
+                                        const lrt_tri_build_options *opts,
+                                        lrt_result *err);
+
 /* --- Built-in implicit / SDF primitives (GPU-resident, no callbacks) -------
  *
  * A device-friendly alternative to lrt_user_scene_build's host callbacks: each

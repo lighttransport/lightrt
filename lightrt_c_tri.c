@@ -326,7 +326,8 @@ enum {
     TRI_PRIM_BEZCURVE = 8, /* round cubic Bezier curve leaves (lrt_bez4) */
     TRI_PRIM_QUAD = 9,  /* planar quad (2-triangle) leaves (lrt_quad4)   */
     TRI_PRIM_TETRA = 10,/* solid tetrahedron (4-face) leaves (lrt_quad4) */
-    TRI_PRIM_SDF = 11   /* built-in implicit/SDF leaves (lrt_sdf4)       */
+    TRI_PRIM_SDF = 11,  /* built-in implicit/SDF leaves (lrt_sdf4)       */
+    TRI_PRIM_BILINEAR = 12 /* bilinear patch leaves (lrt_quad4, exact)   */
 };
 
 /* Built-in SDF shapes (lrt_sdf_shape in the header). Evaluated on-device too;
@@ -2523,8 +2524,8 @@ static uint32_t tri_emit_leaf(tri_collapse_ctx *cc, const tri_bnode *bn) {
             (double)count;
         return TRI_MAKE_LEAF_REF(first_block, nblocks);
     }
-    if (bc->emit_kind == TRI_PRIM_QUAD ||
-        bc->emit_kind == TRI_PRIM_TETRA) { /* 4-point leaves (BVH4) */
+    if (bc->emit_kind == TRI_PRIM_QUAD || bc->emit_kind == TRI_PRIM_TETRA ||
+        bc->emit_kind == TRI_PRIM_BILINEAR) { /* 4-point leaves (BVH4) */
         for (uint32_t b = 0; b < nblocks; b++) {
             lrt_quad4 *blk = (lrt_quad4 *)tri_block_ptr(s->blocks,
                                                         s->block_count,
@@ -3936,6 +3937,96 @@ static inline void tri_tetra4_isect(const lrt_quad4 *blk, const tri_ray_ctx *rc,
     }
 }
 
+/* Exact ray vs bilinear patch P(u,v) = bilerp(q00,q10,q11,q01). Corners are
+ * stored in lrt_quad4 lanes as v0=q00, v1=q10, v2=q11, v3=q01 (around the face).
+ * The ray (org+t*dir) meets the ruled line A(u)+v*D(u) where A(u)=q00+u*e10 and
+ * D(u)=e00+u*(e11-e00); coplanarity dot(A(u)-org, dir x D(u))=0 is a quadratic
+ * in u. For each root in [0,1] solve t,v from the two skew lines. */
+static inline int tri_bilin_one(const float *o, const float *d,
+                                const float *q00, const float *q10,
+                                const float *q11, const float *q01, float tmin,
+                                float best, float *t_out, float *u_out,
+                                float *v_out) {
+    float e10[3] = {q10[0] - q00[0], q10[1] - q00[1], q10[2] - q00[2]};
+    float e00[3] = {q01[0] - q00[0], q01[1] - q00[1], q01[2] - q00[2]};
+    float e11[3] = {q11[0] - q10[0], q11[1] - q10[1], q11[2] - q10[2]};
+    float dd[3] = {e11[0] - e00[0], e11[1] - e00[1], e11[2] - e00[2]};
+    float Q0[3] = {q00[0] - o[0], q00[1] - o[1], q00[2] - o[2]};
+#define CROSS(r, a, b)                              \
+    do {                                            \
+        (r)[0] = (a)[1] * (b)[2] - (a)[2] * (b)[1]; \
+        (r)[1] = (a)[2] * (b)[0] - (a)[0] * (b)[2]; \
+        (r)[2] = (a)[0] * (b)[1] - (a)[1] * (b)[0]; \
+    } while (0)
+#define DOT(a, b) ((a)[0] * (b)[0] + (a)[1] * (b)[1] + (a)[2] * (b)[2])
+    float dxe00[3], dxdd[3];
+    CROSS(dxe00, d, e00);
+    CROSS(dxdd, d, dd);
+    float a = DOT(Q0, dxe00);
+    float c = DOT(e10, dxdd);
+    float b = DOT(Q0, dxdd) + DOT(e10, dxe00);
+    /* roots of a + b u + c u^2 = 0 */
+    float roots[2];
+    int nr = 0;
+    if (c > -1e-20f && c < 1e-20f) {
+        if (b > 1e-20f || b < -1e-20f) roots[nr++] = -a / b;
+    } else {
+        float disc = b * b - 4.0f * a * c;
+        if (disc < 0.0f) return 0;
+        float sq = sqrtf(disc);
+        float q = -0.5f * (b + (b >= 0.0f ? sq : -sq));
+        roots[nr++] = q / c;
+        if (q > 1e-30f || q < -1e-30f) roots[nr++] = a / q;
+    }
+    int hit = 0;
+    for (int i = 0; i < nr; i++) {
+        float u = roots[i];
+        if (u < 0.0f || u > 1.0f) continue;
+        float pa[3] = {Q0[0] + u * e10[0], Q0[1] + u * e10[1],
+                       Q0[2] + u * e10[2]};
+        float D[3] = {e00[0] + u * dd[0], e00[1] + u * dd[1], e00[2] + u * dd[2]};
+        float n[3];
+        CROSS(n, d, D);
+        float den = DOT(n, n);
+        if (den < 1e-30f) continue; /* ray parallel to the ruling */
+        float paxD[3], paxd[3];
+        CROSS(paxD, pa, D);
+        CROSS(paxd, pa, d);
+        float t = DOT(paxD, n) / den;
+        float v = DOT(paxd, n) / den;
+        if (v < 0.0f || v > 1.0f) continue;
+        if (t < tmin || t >= best) continue;
+        best = t;
+        *t_out = t;
+        *u_out = u;
+        *v_out = v;
+        hit = 1;
+    }
+#undef CROSS
+#undef DOT
+    return hit;
+}
+
+static inline void tri_bilin4_isect(const lrt_quad4 *blk, const tri_ray_ctx *rc,
+                                    float *best_t, float *best_u, float *best_v,
+                                    uint32_t *best_prim) {
+    for (int lane = 0; lane < 4; lane++) {
+        if (blk->prim[lane] == LRT_TRI_NO_HIT) continue;
+        float q00[3] = {blk->x0[lane], blk->y0[lane], blk->z0[lane]};
+        float q10[3] = {blk->x1[lane], blk->y1[lane], blk->z1[lane]};
+        float q11[3] = {blk->x2[lane], blk->y2[lane], blk->z2[lane]};
+        float q01[3] = {blk->x3[lane], blk->y3[lane], blk->z3[lane]};
+        float t, u, v;
+        if (tri_bilin_one(rc->org, rc->dir, q00, q10, q11, q01, rc->tmin,
+                          *best_t, &t, &u, &v)) {
+            *best_t = t;
+            *best_u = u;
+            *best_v = v;
+            *best_prim = blk->prim[lane];
+        }
+    }
+}
+
 /* Built-in implicit distance field in object space (p = world - center). */
 static inline float tri_sdf_eval(uint32_t type, float px, float py, float pz,
                                  float p0, float p1, float p2) {
@@ -4077,6 +4168,15 @@ static int tri_intersect_scalar(const lrt_tri_scene *s, const lrt_ray *ray,
                     else
                         tri_tetra4_isect(blk, &rc, &best_t, &best_u, &best_v,
                                          &best_prim);
+                }
+                continue;
+            }
+            if (s->prim_kind == TRI_PRIM_BILINEAR) {
+                for (uint32_t b = 0; b < nblk; b++) {
+                    const lrt_quad4 *blk = (const lrt_quad4 *)tri_block_ptr(
+                        s->blocks, blk0 + b, s->block_stride);
+                    tri_bilin4_isect(blk, &rc, &best_t, &best_u, &best_v,
+                                     &best_prim);
                 }
                 continue;
             }
@@ -4292,6 +4392,17 @@ static int tri_occluded_scalar(const lrt_tri_scene *s, const lrt_ray *ray) {
                         tri_quad4_isect(blk, &rc, &t, &u, &v, &prim);
                     else
                         tri_tetra4_isect(blk, &rc, &t, &u, &v, &prim);
+                    if (prim != LRT_TRI_NO_HIT) return 1;
+                }
+                continue;
+            }
+            if (s->prim_kind == TRI_PRIM_BILINEAR) {
+                for (uint32_t b = 0; b < nblk; b++) {
+                    const lrt_quad4 *blk = (const lrt_quad4 *)tri_block_ptr(
+                        s->blocks, blk0 + b, s->block_stride);
+                    float t = t_max, u = 0.0f, v = 0.0f;
+                    uint32_t prim = LRT_TRI_NO_HIT;
+                    tri_bilin4_isect(blk, &rc, &t, &u, &v, &prim);
                     if (prim != LRT_TRI_NO_HIT) return 1;
                 }
                 continue;
@@ -8053,7 +8164,7 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
 #endif
     }
     if (s->prim_kind == TRI_PRIM_QUAD || s->prim_kind == TRI_PRIM_TETRA ||
-        s->prim_kind == TRI_PRIM_SDF)
+        s->prim_kind == TRI_PRIM_SDF || s->prim_kind == TRI_PRIM_BILINEAR)
         return tri_intersect_scalar(s, ray, hit);
 #if LRT_TRI_HAS_SSE4
     if (s->curve) return tri_curve_intersect_bvh4(s, ray, hit);
@@ -8094,7 +8205,7 @@ int lrt_tri_occluded1(const lrt_tri_scene *s, const lrt_ray *ray) {
 #endif
     }
     if (s->prim_kind == TRI_PRIM_QUAD || s->prim_kind == TRI_PRIM_TETRA ||
-        s->prim_kind == TRI_PRIM_SDF)
+        s->prim_kind == TRI_PRIM_SDF || s->prim_kind == TRI_PRIM_BILINEAR)
         return tri_occluded_scalar(s, ray);
 #if LRT_TRI_HAS_SSE4
     if (s->curve) return tri_curve_occluded_bvh4(s, ray);
@@ -9678,6 +9789,15 @@ lrt_tri_scene *lrt_tetra_scene_build(const float *tetras, size_t ntetras,
     return tri_quadlike_scene_build(tetras, ntetras, TRI_PRIM_TETRA, opts, err);
 }
 
+lrt_tri_scene *lrt_bilinear_scene_build(const float *corners, size_t npatch,
+                                        const lrt_tri_build_options *opts,
+                                        lrt_result *err) {
+    /* corners = 12*npatch floats q00 q10 q11 q01 (around the patch). Reuses the
+     * 4-point leaf + AABB build; only the intersector is bilinear. */
+    return tri_quadlike_scene_build(corners, npatch, TRI_PRIM_BILINEAR, opts,
+                                    err);
+}
+
 lrt_tri_scene *lrt_sdfprim_scene_build(const uint32_t *types,
                                        const float *centers, const float *params,
                                        size_t nprims,
@@ -10338,7 +10458,8 @@ static uint32_t tri_kind_block_stride(int prim_kind, int layout) {
     case TRI_PRIM_SPHERE:
     case TRI_PRIM_POINT: return (uint32_t)tri_block_size(4);
     case TRI_PRIM_QUAD:
-    case TRI_PRIM_TETRA: return (uint32_t)sizeof(lrt_quad4);
+    case TRI_PRIM_TETRA:
+    case TRI_PRIM_BILINEAR: return (uint32_t)sizeof(lrt_quad4);
     case TRI_PRIM_SDF: return (uint32_t)sizeof(lrt_sdf4);
     case TRI_PRIM_RLCURVE: return (uint32_t)sizeof(lrt_rlc4);
     case TRI_PRIM_FLATCURVE: return (uint32_t)sizeof(lrt_flat4);
