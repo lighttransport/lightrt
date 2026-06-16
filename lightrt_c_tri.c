@@ -11321,6 +11321,48 @@ static size_t tri_node_stride(int layout, int quantized) {
                           : sizeof(lrt_bvh8_node);
 }
 
+/* Direct access to a scene's resident node/block buffers + metadata, for GPU
+ * backends that upload in-memory scenes without the LRTS blob round-trip (e.g.
+ * trimmed NURBS, whose trim side data is not in the v1 blob). Returns 0 on
+ * success; mmapped/quantized-node scenes are still returned (caller checks). */
+int lrt_tri_scene_raw(const lrt_tri_scene *s, const void **nodes,
+                      uint32_t *node_count, uint32_t *node_stride,
+                      const void **blocks, uint32_t *block_count,
+                      uint32_t *block_stride, uint32_t *root, uint32_t *layout,
+                      uint32_t *prim_kind, uint32_t *point_type) {
+    if (!s) return -1;
+    const void *np = s->layout == 4 ? (const void *)s->nodes4
+                     : s->quantized ? (const void *)s->nodes8q
+                                    : (const void *)s->nodes8;
+    if (nodes) *nodes = np;
+    if (node_count) *node_count = s->node_count;
+    if (node_stride) *node_stride = (uint32_t)tri_node_stride(s->layout, s->quantized);
+    if (blocks) *blocks = s->blocks;
+    if (block_count) *block_count = s->block_count;
+    if (block_stride) *block_stride = s->block_stride;
+    if (root) *root = s->root;
+    if (layout) *layout = (uint32_t)s->layout;
+    if (prim_kind) *prim_kind = (uint32_t)s->prim_kind;
+    if (point_type) *point_type = (uint32_t)s->point_type;
+    return 0;
+}
+
+/* Trim loops of a trimmed-NURBS scene (NULL/0 for other kinds). loop_off has
+ * nloops+1 prefix offsets into pts; npts = total (u,v) points. */
+int lrt_tri_scene_trim_data(const lrt_tri_scene *s, uint32_t *nloops,
+                            const uint32_t **loop_off, const float **pts,
+                            uint32_t *npts) {
+    if (!s) return -1;
+    if (nloops) *nloops = s->trim_nloops;
+    if (loop_off) *loop_off = s->trim_loop_off;
+    if (pts) *pts = s->trim_pts;
+    if (npts)
+        *npts = (s->trim_nloops && s->trim_loop_off)
+                    ? s->trim_loop_off[s->trim_nloops]
+                    : 0u;
+    return 0;
+}
+
 static int tri_ref_in_range(uint32_t ref, uint32_t node_count,
                             uint32_t block_count) {
     if (TRI_REF_IS_LEAF(ref)) {

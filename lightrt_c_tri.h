@@ -401,6 +401,22 @@ lrt_tri_scene *lrt_trimnurbs_scene_build(
     const float *trim_pts, const uint32_t *loop_lengths, int nloops,
     const lrt_tri_build_options *opts, lrt_result *err);
 
+/* Direct access to a scene's resident node/block buffers + metadata, for GPU
+ * backends that upload in-memory scenes without the LRTS serialization round
+ * trip (needed for trimmed NURBS, whose trim loops are not in the v1 blob).
+ * Any out pointer may be NULL. Returns 0 on success, -1 if s is NULL. */
+int lrt_tri_scene_raw(const lrt_tri_scene *s, const void **nodes,
+                      uint32_t *node_count, uint32_t *node_stride,
+                      const void **blocks, uint32_t *block_count,
+                      uint32_t *block_stride, uint32_t *root, uint32_t *layout,
+                      uint32_t *prim_kind, uint32_t *point_type);
+
+/* Trim loops of a trimmed-NURBS scene (nloops=0 for other kinds). loop_off has
+ * nloops+1 prefix offsets into pts; npts = total (u,v) points (2 floats each). */
+int lrt_tri_scene_trim_data(const lrt_tri_scene *s, uint32_t *nloops,
+                            const uint32_t **loop_off, const float **pts,
+                            uint32_t *npts);
+
 /* --- Built-in implicit / SDF primitives (GPU-resident, no callbacks) -------
  *
  * A device-friendly alternative to lrt_user_scene_build's host callbacks: each

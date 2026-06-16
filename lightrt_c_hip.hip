@@ -85,6 +85,10 @@ struct lrt_hip_scene {
     uint32_t max_depth;  /* wide-tree depth (refit bottom-up pass count) */
     uint32_t prim_kind;  /* TRI_PRIM_* (0 = triangle) */
     uint32_t point_type; /* lrt_tri_point_type (point scenes only) */
+    /* Trimmed-NURBS trim loops (device-resident; NULL for other kinds). */
+    uint32_t *d_trim_off;
+    float *d_trim_pts;
+    uint32_t trim_nloops;
     size_t mem_bytes;
 };
 
@@ -98,6 +102,10 @@ struct lrt_hip_scene {
 #define HIP_PRIM_QUAD 9u
 #define HIP_PRIM_TETRA 10u
 #define HIP_PRIM_SDF 11u
+#define HIP_PRIM_BILINEAR 12u
+#define HIP_PRIM_BEZPATCH 13u
+#define HIP_PRIM_RBEZPATCH 14u
+#define HIP_PRIM_TRIMNURBS 15u
 #define HIP_SDF_SPHERE 0u
 #define HIP_SDF_BOX 1u
 #define HIP_SDF_TORUS 2u
@@ -927,6 +935,268 @@ __device__ __forceinline__ bool hp_sdf_one(float ox, float oy, float oz,
     return false;
 }
 
+/* ---- parametric surface intersectors (port of the CPU tri_* surface code) -- */
+__device__ __forceinline__ bool hp_bilin_one(float ox, float oy, float oz,
+                                             float dx, float dy, float dz,
+                                             const float *q00, const float *q10,
+                                             const float *q11, const float *q01,
+                                             float tmin, float best, float *t_out,
+                                             float *u_out, float *v_out) {
+    float e10[3] = {q10[0]-q00[0], q10[1]-q00[1], q10[2]-q00[2]};
+    float e00[3] = {q01[0]-q00[0], q01[1]-q00[1], q01[2]-q00[2]};
+    float e11[3] = {q11[0]-q10[0], q11[1]-q10[1], q11[2]-q10[2]};
+    float dd[3] = {e11[0]-e00[0], e11[1]-e00[1], e11[2]-e00[2]};
+    float Q0[3] = {q00[0]-ox, q00[1]-oy, q00[2]-oz};
+    float d[3] = {dx, dy, dz};
+#define HX(r,a,b) do{(r)[0]=(a)[1]*(b)[2]-(a)[2]*(b)[1];(r)[1]=(a)[2]*(b)[0]-(a)[0]*(b)[2];(r)[2]=(a)[0]*(b)[1]-(a)[1]*(b)[0];}while(0)
+#define HD(a,b) ((a)[0]*(b)[0]+(a)[1]*(b)[1]+(a)[2]*(b)[2])
+    float dxe00[3], dxdd[3];
+    HX(dxe00, d, e00); HX(dxdd, d, dd);
+    float a = HD(Q0, dxe00), c = HD(e10, dxdd);
+    float b = HD(Q0, dxdd) + HD(e10, dxe00);
+    float roots[2]; int nr = 0;
+    if (c > -1e-20f && c < 1e-20f) {
+        if (b > 1e-20f || b < -1e-20f) roots[nr++] = -a / b;
+    } else {
+        float disc = b*b - 4.0f*a*c;
+        if (disc < 0.0f) return false;
+        float sq = sqrtf(disc);
+        float q = -0.5f*(b + (b>=0.0f?sq:-sq));
+        roots[nr++] = q / c;
+        if (q > 1e-30f || q < -1e-30f) roots[nr++] = a / q;
+    }
+    int hit = 0;
+    for (int i = 0; i < nr; i++) {
+        float u = roots[i];
+        if (u < 0.0f || u > 1.0f) continue;
+        float pa[3] = {Q0[0]+u*e10[0], Q0[1]+u*e10[1], Q0[2]+u*e10[2]};
+        float D[3] = {e00[0]+u*dd[0], e00[1]+u*dd[1], e00[2]+u*dd[2]};
+        float n[3]; HX(n, d, D);
+        float den = HD(n, n);
+        if (den < 1e-30f) continue;
+        float paxD[3], paxd[3]; HX(paxD, pa, D); HX(paxd, pa, d);
+        float t = HD(paxD, n)/den, v = HD(paxd, n)/den;
+        if (v < 0.0f || v > 1.0f) continue;
+        if (t < tmin || t >= best) continue;
+        best = t; *t_out = t; *u_out = u; *v_out = v; hit = 1;
+    }
+#undef HX
+#undef HD
+    return hit != 0;
+}
+
+__device__ __forceinline__ void hp_bcub1(float p0, float p1, float p2, float p3,
+                                         float u, float *val, float *der) {
+    float u1 = 1.0f - u;
+    *val = u1*u1*u1*p0 + 3.0f*u1*u1*u*p1 + 3.0f*u1*u*u*p2 + u*u*u*p3;
+    *der = 3.0f*(u1*u1*(p1-p0) + 2.0f*u1*u*(p2-p1) + u*u*(p3-p2));
+}
+__device__ __forceinline__ float hp_det3(const float a[3], const float b[3],
+                                        const float c[3]) {
+    return a[0]*(b[1]*c[2]-b[2]*c[1]) - a[1]*(b[0]*c[2]-b[2]*c[0]) +
+           a[2]*(b[0]*c[1]-b[1]*c[0]);
+}
+/* generic cubic split/restrict over NC components. */
+template <int NC>
+__device__ __forceinline__ void hp_bsplit(const float *c, float t, float *L,
+                                          float *R) {
+    for (int k = 0; k < NC; k++) {
+        float P0=c[k], P1=c[NC+k], P2=c[2*NC+k], P3=c[3*NC+k];
+        float ab=P0+(P1-P0)*t, bc=P1+(P2-P1)*t, cd=P2+(P3-P2)*t;
+        float abc=ab+(bc-ab)*t, bcd=bc+(cd-bc)*t, abcd=abc+(bcd-abc)*t;
+        L[k]=P0; L[NC+k]=ab; L[2*NC+k]=abc; L[3*NC+k]=abcd;
+        R[k]=abcd; R[NC+k]=bcd; R[2*NC+k]=cd; R[3*NC+k]=P3;
+    }
+}
+template <int NC>
+__device__ __forceinline__ void hp_bsub(const float *c, float a, float b,
+                                        float *out) {
+    float L[4*NC], R[4*NC];
+    hp_bsplit<NC>(c, b, L, R);
+    if (a > 0.0f) { float L2[4*NC]; hp_bsplit<NC>(L, a/b, L2, out); }
+    else for (int i = 0; i < 4*NC; i++) out[i] = L[i];
+}
+/* tensor restrict: NC components, point k=j*4+i at cp[k*NC..]. */
+template <int NC>
+__device__ __forceinline__ void hp_subpatch(const float *cp, float u0, float u1,
+                                            float v0, float v1, float *out) {
+    float tmp[16*NC];
+    for (int j = 0; j < 4; j++) {
+        float row[4*NC], sub[4*NC];
+        for (int i = 0; i < 4; i++) for (int k = 0; k < NC; k++) row[i*NC+k]=cp[(j*4+i)*NC+k];
+        hp_bsub<NC>(row, u0, u1, sub);
+        for (int i = 0; i < 4; i++) for (int k = 0; k < NC; k++) tmp[(j*4+i)*NC+k]=sub[i*NC+k];
+    }
+    for (int i = 0; i < 4; i++) {
+        float col[4*NC], sub[4*NC];
+        for (int j = 0; j < 4; j++) for (int k = 0; k < NC; k++) col[j*NC+k]=tmp[(j*4+i)*NC+k];
+        hp_bsub<NC>(col, v0, v1, sub);
+        for (int j = 0; j < 4; j++) for (int k = 0; k < NC; k++) out[(j*4+i)*NC+k]=sub[j*NC+k];
+    }
+}
+
+/* --- plain bicubic Bézier patch (NC=3) --- */
+__device__ __forceinline__ void hp_bezpatch_eval(const float cp[48], float u,
+                                                 float v, float S[3],
+                                                 float du[3], float dv[3]) {
+    for (int a = 0; a < 3; a++) {
+        float R[4], dR[4];
+        for (int j = 0; j < 4; j++)
+            hp_bcub1(cp[(j*4+0)*3+a], cp[(j*4+1)*3+a], cp[(j*4+2)*3+a],
+                     cp[(j*4+3)*3+a], u, &R[j], &dR[j]);
+        float sv, dsv, su, tmp;
+        hp_bcub1(R[0],R[1],R[2],R[3], v, &sv, &dsv);
+        hp_bcub1(dR[0],dR[1],dR[2],dR[3], v, &su, &tmp);
+        S[a]=sv; dv[a]=dsv; du[a]=su;
+    }
+}
+__device__ __forceinline__ bool hp_bezpatch_newton(const float cp[48],
+        const float *org, const float *dir, float u, float v, float t,
+        float tmin, float best, float *t_o, float *u_o, float *v_o) {
+    for (int it = 0; it < 8; it++) {
+        float S[3], du[3], dv[3];
+        hp_bezpatch_eval(cp, u, v, S, du, dv);
+        float R[3] = {S[0]-org[0]-t*dir[0], S[1]-org[1]-t*dir[1], S[2]-org[2]-t*dir[2]};
+        float nd[3] = {-dir[0],-dir[1],-dir[2]};
+        float det = hp_det3(du, dv, nd);
+        if (det > -1e-20f && det < 1e-20f) return false;
+        float inv = 1.0f/det;
+        u -= hp_det3(R, dv, nd)*inv; v -= hp_det3(du, R, nd)*inv; t -= hp_det3(du, dv, R)*inv;
+        float rr = sqrtf(R[0]*R[0]+R[1]*R[1]+R[2]*R[2]);
+        float sl = sqrtf(S[0]*S[0]+S[1]*S[1]+S[2]*S[2]);
+        if (rr < 1e-5f*(1.0f+sl)) {
+            if (u>=0.0f&&u<=1.0f&&v>=0.0f&&v<=1.0f&&t>=tmin&&t<best) {*t_o=t;*u_o=u;*v_o=v;return true;}
+            return false;
+        }
+    }
+    return false;
+}
+__device__ __forceinline__ bool hp_patch_box(const float *lo, const float *hi,
+        float ox, float oy, float oz, float ix, float iy, float iz,
+        float tmin, float best) {
+    float org[3]={ox,oy,oz}, invd[3]={ix,iy,iz};
+    float tn=tmin, tf=best;
+    for (int a=0;a<3;a++){
+        float t0=(lo[a]-org[a])*invd[a], t1=(hi[a]-org[a])*invd[a];
+        float lt=t0<t1?t0:t1, ht=t0<t1?t1:t0;
+        if(lt>tn)tn=lt; if(ht<tf)tf=ht; if(tn>tf) return false;
+    }
+    return true;
+}
+__device__ __forceinline__ bool hp_bezpatch_one(float ox,float oy,float oz,
+        float dx,float dy,float dz,float ix,float iy,float iz,const float cp[48],
+        float tmin,float best_t,float *t_o,float *u_o,float *v_o) {
+    struct { float u0,u1,v0,v1; int d; } stk[20];
+    int sp=0; stk[0].u0=0;stk[0].u1=1;stk[0].v0=0;stk[0].v1=1;stk[0].d=0; sp=1;
+    float best=best_t; int hit=0;
+    float org[3]={ox,oy,oz}, dir[3]={dx,dy,dz};
+    while (sp>0) {
+        sp--; float u0=stk[sp].u0,u1=stk[sp].u1,v0=stk[sp].v0,v1=stk[sp].v1; int d=stk[sp].d;
+        float sub[48]; hp_subpatch<3>(cp,u0,u1,v0,v1,sub);
+        float lo[3]={sub[0],sub[1],sub[2]}, hi[3]={sub[0],sub[1],sub[2]};
+        for (int k=1;k<16;k++) for(int a=0;a<3;a++){float c=sub[k*3+a]; if(c<lo[a])lo[a]=c; if(c>hi[a])hi[a]=c;}
+        if (!hp_patch_box(lo,hi,ox,oy,oz,ix,iy,iz,tmin,best)) continue;
+        if (d>=4) {
+            float uc=0.5f*(u0+u1), vc=0.5f*(v0+v1), S[3],du[3],dv[3];
+            hp_bezpatch_eval(cp,uc,vc,S,du,dv);
+            float dd=dx*dx+dy*dy+dz*dz;
+            float t0=((S[0]-ox)*dx+(S[1]-oy)*dy+(S[2]-oz)*dz)/(dd>1e-20f?dd:1e-20f);
+            float th,uh,vh;
+            if (hp_bezpatch_newton(cp,org,dir,uc,vc,t0,tmin,best,&th,&uh,&vh)) {
+                best=th; *t_o=th; *u_o=uh; *v_o=vh; hit=1;
+            }
+            continue;
+        }
+        float um=0.5f*(u0+u1), vm=0.5f*(v0+v1);
+        const float U2[2][2]={{u0,um},{um,u1}}, V2[2][2]={{v0,vm},{vm,v1}};
+        for (int a=0;a<2;a++) for(int b=0;b<2;b++){stk[sp].u0=U2[a][0];stk[sp].u1=U2[a][1];stk[sp].v0=V2[b][0];stk[sp].v1=V2[b][1];stk[sp].d=d+1;sp++;}
+    }
+    return hit != 0;
+}
+
+/* --- rational bicubic (NURBS / trimmed) (NC=4 homogeneous) --- */
+__device__ __forceinline__ void hp_rbez_eval(const float cp[64], float u,
+        float v, float S[3], float du[3], float dv[3]) {
+    float N[4], Nu[4], Nv[4];
+    for (int a = 0; a < 4; a++) {
+        float R[4], dR[4];
+        for (int j = 0; j < 4; j++)
+            hp_bcub1(cp[(j*4+0)*4+a], cp[(j*4+1)*4+a], cp[(j*4+2)*4+a],
+                     cp[(j*4+3)*4+a], u, &R[j], &dR[j]);
+        float sv,dsv,su,tmp;
+        hp_bcub1(R[0],R[1],R[2],R[3], v, &sv,&dsv);
+        hp_bcub1(dR[0],dR[1],dR[2],dR[3], v, &su,&tmp);
+        N[a]=sv; Nv[a]=dsv; Nu[a]=su;
+    }
+    float w=N[3], iw=1.0f/w, iw2=iw*iw;
+    for (int k=0;k<3;k++){S[k]=N[k]*iw; du[k]=(Nu[k]*w-N[k]*Nu[3])*iw2; dv[k]=(Nv[k]*w-N[k]*Nv[3])*iw2;}
+}
+__device__ __forceinline__ bool hp_rbez_newton(const float cp[64],
+        const float *org, const float *dir, float u, float v, float t,
+        float tmin, float best, float *t_o, float *u_o, float *v_o) {
+    for (int it=0; it<8; it++) {
+        float S[3],du[3],dv[3]; hp_rbez_eval(cp,u,v,S,du,dv);
+        float R[3]={S[0]-org[0]-t*dir[0],S[1]-org[1]-t*dir[1],S[2]-org[2]-t*dir[2]};
+        float nd[3]={-dir[0],-dir[1],-dir[2]};
+        float det=hp_det3(du,dv,nd);
+        if (det>-1e-20f&&det<1e-20f) return false;
+        float inv=1.0f/det;
+        u-=hp_det3(R,dv,nd)*inv; v-=hp_det3(du,R,nd)*inv; t-=hp_det3(du,dv,R)*inv;
+        float rr=sqrtf(R[0]*R[0]+R[1]*R[1]+R[2]*R[2]);
+        float sl=sqrtf(S[0]*S[0]+S[1]*S[1]+S[2]*S[2]);
+        if (rr<1e-5f*(1.0f+sl)){if(u>=0.0f&&u<=1.0f&&v>=0.0f&&v<=1.0f&&t>=tmin&&t<best){*t_o=t;*u_o=u;*v_o=v;return true;}return false;}
+    }
+    return false;
+}
+__device__ __forceinline__ int hp_trim_inside(const uint32_t *off,
+        const float *pts, uint32_t nl, float u, float v) {
+    if (nl == 0 || !off || !pts) return 1;
+    int cross = 0;
+    for (uint32_t L=0; L<nl; L++) {
+        uint32_t a=off[L], b=off[L+1], np=b-a;
+        if (np<3) continue;
+        for (uint32_t i=0;i<np;i++){
+            uint32_t j=(i+1==np)?0:i+1;
+            float ui=pts[(a+i)*2], vi=pts[(a+i)*2+1], uj=pts[(a+j)*2], vj=pts[(a+j)*2+1];
+            if ((vi>v)!=(vj>v)){ float ut=ui+(v-vi)/(vj-vi)*(uj-ui); if(u<ut)cross^=1; }
+        }
+    }
+    return cross;
+}
+__device__ __forceinline__ bool hp_rbez_one(float ox,float oy,float oz,
+        float dx,float dy,float dz,float ix,float iy,float iz,const float cp[64],
+        const float dom[4], const uint32_t *toff, const float *tpts, uint32_t tnl,
+        float tmin,float best_t,float *t_o,float *u_o,float *v_o) {
+    struct { float u0,u1,v0,v1; int d; } stk[20];
+    int sp=0; stk[0].u0=0;stk[0].u1=1;stk[0].v0=0;stk[0].v1=1;stk[0].d=0; sp=1;
+    float best=best_t; int hit=0;
+    float org[3]={ox,oy,oz}, dir[3]={dx,dy,dz};
+    while (sp>0) {
+        sp--; float u0=stk[sp].u0,u1=stk[sp].u1,v0=stk[sp].v0,v1=stk[sp].v1; int d=stk[sp].d;
+        float sub[64]; hp_subpatch<4>(cp,u0,u1,v0,v1,sub);
+        float lo[3],hi[3];
+        for(int a=0;a<3;a++){float p=sub[a]/sub[3]; lo[a]=hi[a]=p;}
+        for(int k=1;k<16;k++){float iw=1.0f/sub[k*4+3]; for(int a=0;a<3;a++){float p=sub[k*4+a]*iw; if(p<lo[a])lo[a]=p; if(p>hi[a])hi[a]=p;}}
+        if (!hp_patch_box(lo,hi,ox,oy,oz,ix,iy,iz,tmin,best)) continue;
+        if (d>=4) {
+            float uc=0.5f*(u0+u1), vc=0.5f*(v0+v1), S[3],du[3],dv[3];
+            hp_rbez_eval(cp,uc,vc,S,du,dv);
+            float dd=dx*dx+dy*dy+dz*dz;
+            float t0=((S[0]-ox)*dx+(S[1]-oy)*dy+(S[2]-oz)*dz)/(dd>1e-20f?dd:1e-20f);
+            float th,uh,vh;
+            if (hp_rbez_newton(cp,org,dir,uc,vc,t0,tmin,best,&th,&uh,&vh)) {
+                float gu=dom[0]+uh*(dom[1]-dom[0]), gv=dom[2]+vh*(dom[3]-dom[2]);
+                if (hp_trim_inside(toff,tpts,tnl,gu,gv)) {best=th;*t_o=th;*u_o=gu;*v_o=gv;hit=1;}
+            }
+            continue;
+        }
+        float um=0.5f*(u0+u1), vm=0.5f*(v0+v1);
+        const float U2[2][2]={{u0,um},{um,u1}}, V2[2][2]={{v0,vm},{vm,v1}};
+        for (int a=0;a<2;a++) for(int b=0;b<2;b++){stk[sp].u0=U2[a][0];stk[sp].u1=U2[a][1];stk[sp].v0=V2[b][0];stk[sp].v1=V2[b][1];stk[sp].d=d+1;sp++;}
+    }
+    return hit != 0;
+}
+
 /* One leaf block (4 lanes) against the ray, for the given prim_kind. blk = base
  * word index of the block; bsw = block stride in words. Updates best_*. */
 __device__ __forceinline__ void hp_leaf(const uint32_t *__restrict__ blocks,
@@ -934,7 +1204,10 @@ __device__ __forceinline__ void hp_leaf(const uint32_t *__restrict__ blocks,
                                         uint32_t point_type, float ox, float oy,
                                         float oz, float dx, float dy, float dz,
                                         float tmin, float *best_t, float *best_u,
-                                        float *best_v, uint32_t *best_prim) {
+                                        float *best_v, uint32_t *best_prim,
+                                        const uint32_t *trim_off,
+                                        const float *trim_pts,
+                                        uint32_t trim_nloops) {
     if (prim_kind == HIP_PRIM_SPHERE) {
         for (uint32_t l = 0; l < 4u; l++) {
             uint32_t prim = blocks[blk + 16u + l];
@@ -1079,7 +1352,7 @@ __device__ __forceinline__ void hp_leaf(const uint32_t *__restrict__ blocks,
                 *best_t = t; *best_u = u; *best_v = 0.0f; *best_prim = prim;
             }
         }
-    } else { /* QUAD or TETRA: 4-point leaf (52 words) */
+    } else if (prim_kind == HIP_PRIM_QUAD || prim_kind == HIP_PRIM_TETRA) {
         for (uint32_t l = 0; l < 4u; l++) {
             uint32_t prim = blocks[blk + 48u + l];
             if (prim == LRT_HIP_NO_HIT) continue;
@@ -1116,6 +1389,59 @@ __device__ __forceinline__ void hp_leaf(const uint32_t *__restrict__ blocks,
                 }
             }
         }
+    } else { /* parametric surface patches */
+        /* clamped inverse direction for the sub-patch AABB slab test */
+        float ix, iy, iz;
+        {
+            float dd[3] = {dx, dy, dz}, iv[3];
+            for (int k = 0; k < 3; k++) {
+                float v = 1.0f / dd[k];
+                if (!(v >= -LRT_HIP_INVD_MAX && v <= LRT_HIP_INVD_MAX)) {
+                    float s = (dd[k] == 0.0f) ? 1.0f : dd[k];
+                    v = (s < 0.0f) ? -LRT_HIP_INVD_MAX : LRT_HIP_INVD_MAX;
+                }
+                iv[k] = v;
+            }
+            ix = iv[0]; iy = iv[1]; iz = iv[2];
+        }
+        if (prim_kind == HIP_PRIM_BILINEAR) { /* lrt_quad4 (52 words) */
+            for (uint32_t l = 0; l < 4u; l++) {
+                uint32_t prim = blocks[blk + 48u + l];
+                if (prim == LRT_HIP_NO_HIT) continue;
+                float q00[3] = {fu(blocks[blk+0u+l]),fu(blocks[blk+4u+l]),fu(blocks[blk+8u+l])};
+                float q10[3] = {fu(blocks[blk+12u+l]),fu(blocks[blk+16u+l]),fu(blocks[blk+20u+l])};
+                float q11[3] = {fu(blocks[blk+24u+l]),fu(blocks[blk+28u+l]),fu(blocks[blk+32u+l])};
+                float q01[3] = {fu(blocks[blk+36u+l]),fu(blocks[blk+40u+l]),fu(blocks[blk+44u+l])};
+                float t, u, v;
+                if (hp_bilin_one(ox,oy,oz,dx,dy,dz,q00,q10,q11,q01,tmin,*best_t,&t,&u,&v)) {
+                    *best_t=t; *best_u=u; *best_v=v; *best_prim=prim;
+                }
+            }
+        } else if (prim_kind == HIP_PRIM_BEZPATCH) { /* lrt_bezpatch4 (196 words) */
+            for (uint32_t l = 0; l < 4u; l++) {
+                uint32_t prim = blocks[blk + 192u + l];
+                if (prim == LRT_HIP_NO_HIT) continue;
+                float cp[48];
+                for (int c = 0; c < 48; c++) cp[c] = fu(blocks[blk + (uint32_t)(c*4) + l]);
+                float t, u, v;
+                if (hp_bezpatch_one(ox,oy,oz,dx,dy,dz,ix,iy,iz,cp,tmin,*best_t,&t,&u,&v)) {
+                    *best_t=t; *best_u=u; *best_v=v; *best_prim=prim;
+                }
+            }
+        } else { /* RBEZPATCH / TRIMNURBS: lrt_rbezpatch4 (276 words) */
+            for (uint32_t l = 0; l < 4u; l++) {
+                uint32_t prim = blocks[blk + 272u + l];
+                if (prim == LRT_HIP_NO_HIT) continue;
+                float cp[64], dom[4];
+                for (int c = 0; c < 64; c++) cp[c] = fu(blocks[blk + (uint32_t)(c*4) + l]);
+                for (int d = 0; d < 4; d++) dom[d] = fu(blocks[blk + 256u + (uint32_t)(d*4) + l]);
+                float t, u, v;
+                if (hp_rbez_one(ox,oy,oz,dx,dy,dz,ix,iy,iz,cp,dom,trim_off,trim_pts,
+                                trim_nloops,tmin,*best_t,&t,&u,&v)) {
+                    *best_t=t; *best_u=u; *best_v=v; *best_prim=prim;
+                }
+            }
+        }
     }
 }
 
@@ -1127,7 +1453,9 @@ __launch_bounds__(64) __global__
                       const uint32_t *__restrict__ rays,
                       uint32_t *__restrict__ hits, uint32_t root,
                       uint32_t ray_count, uint32_t prim_kind,
-                      uint32_t point_type, uint32_t bsw) {
+                      uint32_t point_type, uint32_t bsw,
+                      const uint32_t *__restrict__ trim_off,
+                      const float *__restrict__ trim_pts, uint32_t trim_nloops) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= ray_count) return;
     constexpr uint32_t W = 4u, node_stride = 8u * W;
@@ -1164,7 +1492,7 @@ __launch_bounds__(64) __global__
             for (uint32_t b = 0; b < nblk; b++)
                 hp_leaf(blocks, (blk0 + b) * bsw, prim_kind, point_type, ox, oy,
                         oz, dx, dy, dz, tmin, &best_t, &best_u, &best_v,
-                        &best_prim);
+                        &best_prim, trim_off, trim_pts, trim_nloops);
             continue;
         }
         size_t nb = (size_t)(ref & 0x7FFFFFFFu) * node_stride;
@@ -1217,7 +1545,10 @@ __launch_bounds__(64) __global__
                          const uint32_t *__restrict__ rays,
                          uint8_t *__restrict__ occ, uint32_t root,
                          uint32_t ray_count, uint32_t prim_kind,
-                         uint32_t point_type, uint32_t bsw) {
+                         uint32_t point_type, uint32_t bsw,
+                         const uint32_t *__restrict__ trim_off,
+                         const float *__restrict__ trim_pts,
+                         uint32_t trim_nloops) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= ray_count) return;
     constexpr uint32_t W = 4u, node_stride = 8u * W;
@@ -1250,7 +1581,8 @@ __launch_bounds__(64) __global__
                 float bt = tmax, bu = 0.0f, bv = 0.0f;
                 uint32_t bp = LRT_HIP_NO_HIT;
                 hp_leaf(blocks, (blk0 + b) * bsw, prim_kind, point_type, ox, oy,
-                        oz, dx, dy, dz, tmin, &bt, &bu, &bv, &bp);
+                        oz, dx, dy, dz, tmin, &bt, &bu, &bv, &bp, trim_off,
+                        trim_pts, trim_nloops);
                 if (bp != LRT_HIP_NO_HIT) hit = 1u;
             }
             continue;
@@ -1465,7 +1797,8 @@ static hipError_t launch_trace(lrt_hip_engine *e, const lrt_hip_scene *s,
 #define LAUNCHP(st)                                                            \
     hipLaunchKernelGGL((k_trace_prim<st>), dim3(((n) + 63u) / 64u), dim3(64),  \
                        0, e->stream, s->d_nodes, s->d_blocks, d_rays, d_hits,  \
-                       root, n, s->prim_kind, s->point_type, bsw)
+                       root, n, s->prim_kind, s->point_type, bsw,              \
+                       s->d_trim_off, s->d_trim_pts, s->trim_nloops)
         if (S == 32u) LAUNCHP(32);
         else if (S == 64u) LAUNCHP(64);
         else if (S == 128u) LAUNCHP(128);
@@ -1501,7 +1834,8 @@ static hipError_t launch_occluded(lrt_hip_engine *e, const lrt_hip_scene *s,
 #define LAUNCHP(st)                                                            \
     hipLaunchKernelGGL((k_occluded_prim<st>), dim3(((n) + 63u) / 64u),         \
                        dim3(64), 0, e->stream, s->d_nodes, s->d_blocks, d_rays, \
-                       d_occ, root, n, s->prim_kind, s->point_type, bsw)
+                       d_occ, root, n, s->prim_kind, s->point_type, bsw,       \
+                       s->d_trim_off, s->d_trim_pts, s->trim_nloops)
         if (S == 32u) LAUNCHP(32);
         else if (S == 64u) LAUNCHP(64);
         else if (S == 128u) LAUNCHP(128);
@@ -1652,12 +1986,86 @@ static int hip_grow(lrt_hip_engine *e, void **buf, size_t *cap, size_t need) {
 /* ========================================================================= */
 /* Resident scene upload / trace.                                            */
 /* ========================================================================= */
+/* Upload a trimmed-NURBS scene directly from its resident buffers + trim loops
+ * (no LRTS blob; the trim side data is not serialized in v1). */
+static lrt_hip_scene *hip_upload_trimnurbs(lrt_hip_engine *e,
+                                           const lrt_tri_scene *s,
+                                           lrt_result *err) {
+    const void *nodes = NULL, *blocks = NULL;
+    uint32_t nc = 0, nstride = 0, bc = 0, bstride = 0, root = 0, layout = 0,
+             pk = 0, pt = 0;
+    lrt_tri_scene_raw(s, &nodes, &nc, &nstride, &blocks, &bc, &bstride, &root,
+                      &layout, &pk, &pt);
+    uint32_t nloops = 0, npts = 0;
+    const uint32_t *toff = NULL;
+    const float *tpts = NULL;
+    lrt_tri_scene_trim_data(s, &nloops, &toff, &tpts, &npts);
+
+    lrt_tri_stats st;
+    lrt_tri_scene_stats(s, &st);
+    uint32_t stack = trace_stack_for(st.max_depth, 4u);
+    if (layout != 4u || stack == 0) {
+        hip_set_err(e, "trimmed NURBS must be BVH4 and bounded depth");
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return NULL;
+    }
+    lrt_hip_scene *sc = (lrt_hip_scene *)calloc(1, sizeof(lrt_hip_scene));
+    if (!sc) {
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return NULL;
+    }
+    sc->node_count = nc;
+    sc->block_count = bc;
+    sc->node_stride = nstride;
+    sc->block_stride = bstride;
+    sc->root = root;
+    sc->layout = 4u;
+    sc->stack = stack;
+    sc->max_depth = st.max_depth;
+    sc->prim_kind = HIP_PRIM_TRIMNURBS;
+    sc->point_type = pt;
+    sc->trim_nloops = nloops;
+    size_t nbytes = (size_t)nc * nstride, bbytes = (size_t)bc * bstride;
+    size_t obytes = nloops ? (size_t)(nloops + 1u) * sizeof(uint32_t) : 0;
+    size_t pbytes = (size_t)npts * 2u * sizeof(float);
+    hipError_t hr;
+    if ((hr = hipMalloc((void **)&sc->d_nodes, nbytes)) != hipSuccess ||
+        (hr = hipMalloc((void **)&sc->d_blocks, bbytes)) != hipSuccess ||
+        (obytes && (hr = hipMalloc((void **)&sc->d_trim_off, obytes)) != hipSuccess) ||
+        (pbytes && (hr = hipMalloc((void **)&sc->d_trim_pts, pbytes)) != hipSuccess)) {
+        hip_set_err_hip(e, "hipMalloc(trimnurbs)", hr);
+        lrt_hip_scene_free(e, sc);
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return NULL;
+    }
+    if ((hr = hipMemcpy(sc->d_nodes, nodes, nbytes, hipMemcpyHostToDevice)) != hipSuccess ||
+        (hr = hipMemcpy(sc->d_blocks, blocks, bbytes, hipMemcpyHostToDevice)) != hipSuccess ||
+        (obytes && (hr = hipMemcpy(sc->d_trim_off, toff, obytes, hipMemcpyHostToDevice)) != hipSuccess) ||
+        (pbytes && (hr = hipMemcpy(sc->d_trim_pts, tpts, pbytes, hipMemcpyHostToDevice)) != hipSuccess)) {
+        hip_set_err_hip(e, "hipMemcpy(trimnurbs)", hr);
+        lrt_hip_scene_free(e, sc);
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return NULL;
+    }
+    sc->mem_bytes = nbytes + bbytes;
+    if (err) *err = LRT_RESULT_OK;
+    return sc;
+}
+
 extern "C" lrt_hip_scene *lrt_hip_scene_upload(lrt_hip_engine *e,
                                                const lrt_tri_scene *s,
                                                lrt_result *err) {
     if (!e || !s) {
         if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
         return NULL;
+    }
+    /* Trimmed NURBS is not in the v1 LRTS blob (its trim loops are scene side
+     * data); upload it directly from the live scene's resident buffers. */
+    {
+        uint32_t pk = 0;
+        lrt_tri_scene_raw(s, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, &pk,
+                          NULL);
+        if (pk == HIP_PRIM_TRIMNURBS) return hip_upload_trimnurbs(e, s, err);
     }
     void *blob = NULL;
     size_t blob_n = 0;
@@ -1681,7 +2089,9 @@ extern "C" lrt_hip_scene *lrt_hip_scene_upload(lrt_hip_engine *e,
     int bvh4_prim = (pk == HIP_PRIM_SPHERE || pk == HIP_PRIM_POINT ||
                      pk == HIP_PRIM_QUAD || pk == HIP_PRIM_TETRA ||
                      pk == HIP_PRIM_RLCURVE || pk == HIP_PRIM_FLATCURVE ||
-                     pk == HIP_PRIM_BEZCURVE || pk == HIP_PRIM_SDF);
+                     pk == HIP_PRIM_BEZCURVE || pk == HIP_PRIM_SDF ||
+                     pk == HIP_PRIM_BILINEAR || pk == HIP_PRIM_BEZPATCH ||
+                     pk == HIP_PRIM_RBEZPATCH);
     if (pk != HIP_PRIM_TRI && !bvh4_prim) {
         free(blob);
         hip_set_err(e, "prim_kind not GPU-traceable (user/qtri/legacy-curve)");
@@ -1758,6 +2168,8 @@ extern "C" void lrt_hip_scene_free(lrt_hip_engine *e, lrt_hip_scene *s) {
     if (!s) return;
     hip_free(s->d_nodes);
     hip_free(s->d_blocks);
+    hip_free(s->d_trim_off);
+    hip_free(s->d_trim_pts);
     free(s);
 }
 

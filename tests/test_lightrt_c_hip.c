@@ -862,6 +862,183 @@ static void test_gpu_bezier(lrt_hip_engine *e) {
     free(cps);
 }
 
+/* GPU parametric surfaces (bilinear / Bézier / NURBS): CPU build -> GPU trace,
+ * compared against the CPU oracle (same scene). */
+static void test_gpu_surfaces(lrt_hip_engine *e) {
+    lrt_tri_build_options o;
+    memset(&o, 0, sizeof(o));
+    o.num_threads = 1;
+    size_t N = 2000;
+    printf("== GPU parametric surfaces vs CPU oracle ==\n");
+
+    /* bilinear + bezier-patch from random control data */
+    float *corners = (float *)malloc(N * 12 * sizeof(float));
+    float *bcps = (float *)malloc(N * 48 * sizeof(float));
+    for (size_t p = 0; p < N; p++) {
+        float c[3] = {rnd_f(-2, 2), rnd_f(-2, 2), rnd_f(-2, 2)};
+        float ax[3] = {rnd_f(-1, 1), rnd_f(-1, 1), rnd_f(-1, 1)};
+        float ay[3] = {rnd_f(-1, 1), rnd_f(-1, 1), rnd_f(-1, 1)};
+        float *q = &corners[p * 12];
+        for (int k = 0; k < 3; k++) {
+            float w = rnd_f(-0.25f, 0.25f);
+            q[0 + k] = c[k] - 0.3f * ax[k] - 0.3f * ay[k];
+            q[3 + k] = c[k] + 0.3f * ax[k] - 0.3f * ay[k] + (k == 2 ? w : 0);
+            q[6 + k] = c[k] + 0.3f * ax[k] + 0.3f * ay[k];
+            q[9 + k] = c[k] - 0.3f * ax[k] + 0.3f * ay[k] - (k == 2 ? w : 0);
+        }
+        float *cp = &bcps[p * 48];
+        for (int j = 0; j < 4; j++)
+            for (int i = 0; i < 4; i++) {
+                float fu = (float)i / 3 - 0.5f, fv = (float)j / 3 - 0.5f;
+                for (int k = 0; k < 3; k++)
+                    cp[(j * 4 + i) * 3 + k] = c[k] + 0.5f * fu * ax[k] +
+                                              0.5f * fv * ay[k] +
+                                              rnd_f(-0.1f, 0.1f);
+            }
+    }
+    /* one NURBS surface (its own scene) */
+    const float U[9] = {0, 0, 0, 0, 0.5f, 1, 1, 1, 1};
+    float net[25 * 3], w[25];
+    for (int j = 0; j < 5; j++)
+        for (int i = 0; i < 5; i++) {
+            int idx = j * 5 + i;
+            for (int k = 0; k < 3; k++)
+                net[idx * 3 + k] = (k == 0 ? -1 : 0) + 0.5f * i * (k == 0) +
+                                   0.5f * j * (k == 1) + rnd_f(-0.15f, 0.15f);
+            w[idx] = rnd_f(0.6f, 1.8f);
+        }
+
+    struct {
+        const char *name;
+        lrt_tri_scene *s;
+    } cases[3] = {
+        {"bilinear", lrt_bilinear_scene_build(corners, N, &o, NULL)},
+        {"bezpatch", lrt_bezpatch_scene_build(bcps, N, &o, NULL)},
+        {"nurbs", lrt_nurbs_scene_build(net, 4, 4, U, U, w, 3, 3, &o, NULL)},
+    };
+    for (int ci = 0; ci < 3; ci++) {
+        lrt_tri_scene *cpu = cases[ci].s;
+        CHECK(cpu != NULL, "%s build", cases[ci].name);
+        if (!cpu) continue;
+        lrt_hip_scene *gs = lrt_hip_scene_upload(e, cpu, NULL);
+        CHECK(gs != NULL, "%s upload: %s", cases[ci].name,
+              lrt_hip_engine_last_error(e));
+        if (!gs) {
+            lrt_tri_scene_free(cpu);
+            continue;
+        }
+        size_t nr = (ci == 2) ? 60000 : 20000, agree = 0, hits = 0;
+        double max_rel = 0.0;
+        lrt_ray *rays = (lrt_ray *)malloc(nr * sizeof(lrt_ray));
+        lrt_hit *gh = (lrt_hit *)malloc(nr * sizeof(lrt_hit));
+        for (size_t i = 0; i < nr; i++) {
+            if (ci == 2) { /* NURBS near origin: aim rays at it */
+                float org[3] = {rnd_f(-3, 3), rnd_f(-3, 3), rnd_f(-3, 3)};
+                float d[3] = {-org[0] + rnd_f(-0.5f, 0.5f),
+                              -org[1] + rnd_f(-0.5f, 0.5f),
+                              -org[2] + rnd_f(-0.5f, 0.5f)};
+                float l = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) + 1e-9f;
+                for (int k = 0; k < 3; k++) {
+                    rays[i].org[k] = org[k];
+                    rays[i].dir[k] = d[k] / l;
+                }
+                rays[i].tmin = 1e-4f;
+                rays[i].tmax = 1e9f;
+            } else {
+                make_random_ray(&rays[i]);
+            }
+        }
+        lrt_hip_scene_trace(e, gs, rays, (uint32_t)nr, gh, NULL);
+        for (size_t i = 0; i < nr; i++) {
+            lrt_hit c;
+            int ch = lrt_tri_intersect1(cpu, &rays[i], &c);
+            int g = gh[i].prim_id != LRT_TRI_NO_HIT;
+            if (g) hits++;
+            if (ch == g && (!g || c.prim_id == gh[i].prim_id)) {
+                agree++;
+                if (g) {
+                    double rel = fabs((double)gh[i].t - c.t) / (1.0 + fabs(c.t));
+                    if (rel > max_rel) max_rel = rel;
+                }
+            } else if (ch && g) {
+                double rel = fabs((double)gh[i].t - c.t) / (1.0 + fabs(c.t));
+                if (rel < 1e-3) agree++;
+            }
+        }
+        double f = (double)agree / nr;
+        printf("  %-10s closest %.3f%% (hit_frac %.3f, max_rel_t %.2e)\n",
+               cases[ci].name, f * 100.0, (double)hits / nr, max_rel);
+        CHECK(f >= 0.999, "%s GPU agreement %.3f%% < 99.9%%", cases[ci].name,
+              f * 100.0);
+        free(rays);
+        free(gh);
+        lrt_hip_scene_free(e, gs);
+        lrt_tri_scene_free(cpu);
+    }
+    /* trimmed NURBS: GPU trace must match the CPU trimmed oracle */
+    {
+        int NG = 40;
+        float tp[40 * 2];
+        uint32_t ll[1] = {(uint32_t)NG};
+        for (int i = 0; i < NG; i++) {
+            float a = 6.2831853f * i / NG;
+            tp[i * 2] = 0.5f + 0.3f * cosf(a);
+            tp[i * 2 + 1] = 0.5f + 0.3f * sinf(a);
+        }
+        lrt_tri_scene *cpu = lrt_trimnurbs_scene_build(net, 4, 4, U, U, w, 3, 3,
+                                                       tp, ll, 1, &o, NULL);
+        CHECK(cpu != NULL, "trimnurbs build");
+        if (cpu) {
+            lrt_hip_scene *gs = lrt_hip_scene_upload(e, cpu, NULL);
+            CHECK(gs != NULL, "trimnurbs upload: %s",
+                  lrt_hip_engine_last_error(e));
+            if (gs) {
+                size_t nr = 60000, agree = 0, hits = 0;
+                lrt_ray *rays = (lrt_ray *)malloc(nr * sizeof(lrt_ray));
+                lrt_hit *gh = (lrt_hit *)malloc(nr * sizeof(lrt_hit));
+                for (size_t i = 0; i < nr; i++) {
+                    float og[3] = {rnd_f(-3, 3), rnd_f(-3, 3), rnd_f(-3, 3)};
+                    float d[3] = {-og[0] + rnd_f(-0.5f, 0.5f),
+                                  -og[1] + rnd_f(-0.5f, 0.5f),
+                                  -og[2] + rnd_f(-0.5f, 0.5f)};
+                    float l = sqrtf(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]) + 1e-9f;
+                    for (int k = 0; k < 3; k++) {
+                        rays[i].org[k] = og[k];
+                        rays[i].dir[k] = d[k] / l;
+                    }
+                    rays[i].tmin = 1e-4f;
+                    rays[i].tmax = 1e9f;
+                }
+                lrt_hip_scene_trace(e, gs, rays, (uint32_t)nr, gh, NULL);
+                for (size_t i = 0; i < nr; i++) {
+                    lrt_hit c;
+                    int ch = lrt_tri_intersect1(cpu, &rays[i], &c);
+                    int g = gh[i].prim_id != LRT_TRI_NO_HIT;
+                    if (g) hits++;
+                    if (ch == g && (!g || c.prim_id == gh[i].prim_id)) {
+                        agree++;
+                    } else if (ch && g) {
+                        double rel =
+                            fabs((double)gh[i].t - c.t) / (1.0 + fabs(c.t));
+                        if (rel < 1e-3) agree++;
+                    }
+                }
+                double f = (double)agree / nr;
+                printf("  %-10s closest %.3f%% (hit_frac %.3f)\n", "trimnurbs",
+                       f * 100.0, (double)hits / nr);
+                CHECK(f >= 0.999, "trimnurbs GPU agreement %.3f%%", f * 100.0);
+                free(rays);
+                free(gh);
+                lrt_hip_scene_free(e, gs);
+            }
+            lrt_tri_scene_free(cpu);
+        }
+    }
+
+    free(corners);
+    free(bcps);
+}
+
 static void test_gpu_analytics(lrt_hip_engine *e) {
     lrt_tri_build_options o;
     memset(&o, 0, sizeof(o));
@@ -976,6 +1153,8 @@ int main(void) {
     test_gpu_bezier(e);
 
     test_gpu_sdf(e);
+
+    test_gpu_surfaces(e);
 
     test_wmma(e);
 
