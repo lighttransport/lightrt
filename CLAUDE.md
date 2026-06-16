@@ -742,6 +742,15 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
   phase over caller AABBs, with a per-candidate intersect/occluded callback
   invoked only after a 4-wide AABB pretest. Far faster than the fp64
   `lightrt_c.h` path. Callbacks must be re-entrant for concurrent queries.
+- `lrt_quad_scene_build` / `lrt_tetra_scene_build` — **planar quad** (4-vertex
+  face, two-triangle MT) and **solid tetrahedron** (nearest of 4 faces); shared
+  208-byte `lrt_quad4` 4-point leaf, `TRI_PRIM_QUAD` / `_TETRA`. Input 12*n
+  floats (v0 v1 v2 v3). Serialize + GPU-trace.
+- `lrt_sdfprim_scene_build` — **built-in implicit/SDF primitives** (sphere/box/
+  torus via `lrt_sdf_shape`), sphere-traced analytically on both CPU and GPU —
+  a device-friendly custom-geometry path that needs no host callbacks (so it
+  serializes and GPU-traces, unlike `lrt_user_scene_build`). `TRI_PRIM_SDF`,
+  144-byte `lrt_sdf4` leaf (center, bounding radius, type, 3 params).
 
 ### Implicit surfaces / SDF (`lrt_sdf_*`)
 - `lrt_sdf_sphere_trace` — standalone enhanced sphere tracing (over-relaxation
@@ -920,6 +929,20 @@ On an RX 9070 XT (gfx1201) hip-fp32 traces a 220k-tri mandelbulb at ~210 Mray/s
 primary / ~135 Mray/s incoherent (vs ~19 / ~2 for 1-thread CPU); the GPU build is
 ~2.7× faster than the CPU SAH build. Override the arch with `-DCMAKE_HIP_ARCHITECTURES=...`
 or `make HIP_ARCH=...`.
+
+### Non-triangle primitives on GPU (implemented)
+The HIP trace path is primitive-aware: alongside triangles (BVH4/BVH8) it traces
+all the BVH4 geometric primitives — **sphere, point (sphere/disc/oriented-disc),
+quad, tetra, round-linear & flat curves, cubic Bézier, and built-in SDF
+(sphere/box/torus)** — by carrying `prim_kind`/`point_type` through the LRTS
+header and dispatching `k_trace_prim`/`k_occluded_prim` (BVH4, runtime kind) to
+device intersectors ported byte-for-byte from the CPU scalars (`hp_*` in
+`lightrt_c_hip.hip`). CPU build → GPU trace; serialization opened up per kind
+(USER/SDF-callback and QTRI still refuse). Agreement vs the CPU oracle: analytic
+prims, quad/tetra, round/flat curves, and SDF are 100% (max_rel_t 0); cubic
+Bézier ~99.96% (GPU scalar adaptive-sweep vs CPU SSE adaptive-sweep). Host
+function-pointer custom geometry (`lrt_user_scene_build`) cannot run on the GPU
+by construction; `lrt_sdfprim_scene_build` is the GPU-resident replacement.
 
 ### Phase 2 (implemented): WMMA + int-quantized leaf kernels
 `lightrt_hip_wmma.hip` (compiled into `lightrt_hip` when rocWMMA is present;
