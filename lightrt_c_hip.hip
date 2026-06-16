@@ -256,10 +256,11 @@ __launch_bounds__(64) __global__
                 hit_ref[j] = nodes[nb + 6u * W + i];
             }
         }
-        if ((uint32_t)sp + (uint32_t)nhit > STACK) {
-            best_prim = LRT_HIP_NO_HIT; /* depth-capped: never hit */
-            break;
-        }
+        /* Stack would overflow (unreachable for scenes accepted by
+         * trace_stack_for, which sizes STACK to the tree depth). Degrade
+         * gracefully: stop and return the closest hit found so far rather than
+         * resetting it to a miss. */
+        if ((uint32_t)sp + (uint32_t)nhit > STACK) break;
         for (int i = nhit - 1; i >= 0; i--) {
             stk_ref[sp] = hit_ref[i];
             stk_tn[sp] = hit_tn[i];
@@ -389,9 +390,12 @@ __launch_bounds__(64) __global__
             float tfar = fminf(fminf(fmaxf(tlx, thx), fmaxf(tly, thy)),
                                fminf(fmaxf(tlz, thz), tmax));
             if (tnear <= tfar) {
+                /* Stack would overflow (unreachable for scenes accepted by
+                 * trace_stack_for). Degrade conservatively: report occluded so
+                 * a too-deep BVH causes a spurious shadow rather than a light
+                 * leak. */
                 if ((uint32_t)sp >= STACK) {
-                    hit = 0u;
-                    sp = 0;
+                    hit = 1u;
                     break;
                 }
                 stk_ref[sp] = nodes[nb + 6u * W + i];
