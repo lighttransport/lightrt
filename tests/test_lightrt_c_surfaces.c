@@ -203,9 +203,121 @@ static void test_bezpatch(void) {
     lrt_tri_scene_free(s);
 }
 
+/* ---- reference NURBS evaluator (Cox-de Boor, NURBS Book A2.1/A2.2/A4.3) --- */
+static int ns_span(int n, int p, float u, const float *U) {
+    if (u >= U[n + 1]) return n;
+    if (u <= U[p]) return p;
+    int lo = p, hi = n + 1, mid = (lo + hi) / 2;
+    while (u < U[mid] || u >= U[mid + 1]) {
+        if (u < U[mid]) hi = mid; else lo = mid;
+        mid = (lo + hi) / 2;
+    }
+    return mid;
+}
+static void ns_basis(int span, float u, int p, const float *U, float *N) {
+    float left[16], right[16];
+    N[0] = 1.0f;
+    for (int j = 1; j <= p; j++) {
+        left[j] = u - U[span + 1 - j];
+        right[j] = U[span + j] - u;
+        float saved = 0.0f;
+        for (int r = 0; r < j; r++) {
+            float tmp = N[r] / (right[r + 1] + left[j - r]);
+            N[r] = saved + right[r + 1] * tmp;
+            saved = left[j - r] * tmp;
+        }
+        N[j] = saved;
+    }
+}
+static void nurbs_eval(const float *net, int nu, int nv, const float *U,
+                       const float *V, const float *w, int degu, int degv,
+                       float u, float v, float S[3]) {
+    int su = ns_span(nu, degu, u, U), sv = ns_span(nv, degv, v, V);
+    float Nu[16], Nv[16];
+    ns_basis(su, u, degu, U, Nu);
+    ns_basis(sv, v, degv, V, Nv);
+    float num[3] = {0, 0, 0}, den = 0.0f;
+    for (int l = 0; l <= degv; l++)
+        for (int k = 0; k <= degu; k++) {
+            int idx = (sv - degv + l) * (nu + 1) + (su - degu + k);
+            float wk = (w ? w[idx] : 1.0f);
+            float b = Nu[k] * Nv[l] * wk;
+            den += b;
+            for (int c = 0; c < 3; c++) num[c] += b * net[idx * 3 + c];
+        }
+    for (int c = 0; c < 3; c++) S[c] = num[c] / den;
+}
+
+static void test_nurbs(void) {
+    const int degu = 3, degv = 3, nu = 4, nv = 4; /* 5x5 bicubic */
+    const float U[9] = {0, 0, 0, 0, 0.5f, 1, 1, 1, 1};
+    const int NS = 60;     /* surfaces (each its own scene) */
+    const int RPS = 2000;  /* rays per surface */
+    size_t hits = 0, resid_ok = 0;
+    double max_resid = 0.0;
+    for (int s = 0; s < NS; s++) {
+        float net[25 * 3], w[25];
+        float c[3] = {rf(-2, 2), rf(-2, 2), rf(-2, 2)};
+        float ax[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+        float ay[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+        for (int j = 0; j <= nv; j++)
+            for (int i = 0; i <= nu; i++) {
+                int idx = j * (nu + 1) + i;
+                float fu = (float)i / nu - 0.5f, fv = (float)j / nv - 0.5f;
+                for (int k = 0; k < 3; k++)
+                    net[idx * 3 + k] = c[k] + 0.7f * fu * ax[k] +
+                                       0.7f * fv * ay[k] + rf(-0.1f, 0.1f);
+                w[idx] = rf(0.4f, 2.5f); /* positive weights */
+            }
+        lrt_tri_build_options o;
+        memset(&o, 0, sizeof(o));
+        o.num_threads = 1;
+        lrt_result err = LRT_RESULT_OK;
+        lrt_tri_scene *sc =
+            lrt_nurbs_scene_build(net, nu, nv, U, U, w, degu, degv, &o, &err);
+        CHECK(sc != NULL, "nurbs build (err=%d)", (int)err);
+        if (!sc) continue;
+        for (int rr = 0; rr < RPS; rr++) {
+            lrt_ray r;
+            float o2[3] = {c[0] + rf(-3, 3), c[1] + rf(-3, 3), c[2] + rf(-3, 3)};
+            float d[3] = {c[0] - o2[0] + rf(-0.4f, 0.4f),
+                          c[1] - o2[1] + rf(-0.4f, 0.4f),
+                          c[2] - o2[2] + rf(-0.4f, 0.4f)};
+            float l = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) + 1e-9f;
+            for (int k = 0; k < 3; k++) {
+                r.org[k] = o2[k];
+                r.dir[k] = d[k] / l;
+            }
+            r.tmin = 1e-4f;
+            r.tmax = 1e9f;
+            lrt_hit h;
+            if (lrt_tri_intersect1(sc, &r, &h)) {
+                hits++;
+                float ps[3], pr[3];
+                nurbs_eval(net, nu, nv, U, U, w, degu, degv, h.u, h.v, ps);
+                for (int k = 0; k < 3; k++) pr[k] = r.org[k] + h.t * r.dir[k];
+                float dd = sqrtf((ps[0] - pr[0]) * (ps[0] - pr[0]) +
+                                 (ps[1] - pr[1]) * (ps[1] - pr[1]) +
+                                 (ps[2] - pr[2]) * (ps[2] - pr[2]));
+                double rel = dd / (1.0 + fabs((double)h.t));
+                if (rel > max_resid) max_resid = rel;
+                if (rel < 2e-3) resid_ok++;
+            }
+        }
+        lrt_tri_scene_free(sc);
+    }
+    double rfrac = hits ? (double)resid_ok / (double)hits : 1.0;
+    printf("nurbs:    %zu hits over %d surfaces, residual ok %.3f%% (max %.2e)\n",
+           hits, NS, rfrac * 100.0, max_resid);
+    CHECK(hits > (size_t)(NS * 50), "nurbs: too few hits (%zu)", hits);
+    CHECK(rfrac >= 0.995, "nurbs residual agreement %.3f%% < 99.5%%",
+          rfrac * 100.0);
+}
+
 int main(void) {
     test_bilinear();
     test_bezpatch();
+    test_nurbs();
     if (g_fail) {
         printf("\n%d FAILURES\n", g_fail);
         return 1;

@@ -366,6 +366,25 @@ lrt_tri_scene *lrt_bezpatch_scene_build(const float *cps, size_t npatch,
                                         const lrt_tri_build_options *opts,
                                         lrt_result *err);
 
+/* --- NURBS surface (rational B-spline -> rational Bézier extraction) -------
+ *
+ * A single NURBS surface, decomposed at BUILD time into rational bicubic Bézier
+ * patches (knot insertion / Bézier extraction + degree elevation to bicubic),
+ * then intersected directly (no tessellation). Inputs:
+ *   net      = 3*(nu+1)*(nv+1) control points xyz, index (j*(nu+1)+i)*3 + axis
+ *              (i = u 0..nu, j = v 0..nv);
+ *   nu, nv   = last control-point index in u / v (so nu+1, nv+1 CPs);
+ *   knots_u  = nu+degu+2 floats; knots_v = nv+degv+2 floats (clamped);
+ *   weights  = (nu+1)*(nv+1) floats, all > 0, or NULL for all-ones;
+ *   degu,degv= surface degrees (1..8; elevated to bicubic internally).
+ * Hits report prim_id = extracted-patch index and (u,v) in the GLOBAL surface
+ * parameter domain. BVH4 only. */
+lrt_tri_scene *lrt_nurbs_scene_build(const float *net, int nu, int nv,
+                                     const float *knots_u, const float *knots_v,
+                                     const float *weights, int degu, int degv,
+                                     const lrt_tri_build_options *opts,
+                                     lrt_result *err);
+
 /* --- Built-in implicit / SDF primitives (GPU-resident, no callbacks) -------
  *
  * A device-friendly alternative to lrt_user_scene_build's host callbacks: each
