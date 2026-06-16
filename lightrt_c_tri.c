@@ -12034,6 +12034,17 @@ int lrt_tri_scene_trim_data(const lrt_tri_scene *s, uint32_t *nloops,
     return 0;
 }
 
+int lrt_tri_surface_shade_data(const lrt_tri_scene *s, const float **cps,
+                               const float **dom, uint32_t *nprims,
+                               uint32_t *stride) {
+    if (!s || !s->shade_cps) return -1;
+    if (cps) *cps = s->shade_cps;
+    if (dom) *dom = s->shade_dom;
+    if (nprims) *nprims = s->shade_nprims;
+    if (stride) *stride = s->shade_stride;
+    return 0;
+}
+
 static int tri_ref_in_range(uint32_t ref, uint32_t node_count,
                             uint32_t block_count) {
     if (TRI_REF_IS_LEAF(ref)) {

@@ -1039,6 +1039,172 @@ static void test_gpu_surfaces(lrt_hip_engine *e) {
     free(bcps);
 }
 
+/* GPU per-hit shading normals (lrt_hip_scene_trace_normals) vs the CPU oracle
+ * (lrt_tri_surface_normal for surfaces, the radial frame for round-linear). */
+static void test_gpu_normals(lrt_hip_engine *e) {
+    lrt_tri_build_options o;
+    memset(&o, 0, sizeof(o));
+    o.num_threads = 1;
+    printf("== GPU shading normals vs CPU oracle ==\n");
+    const float U[9] = {0, 0, 0, 0, 0.5f, 1, 1, 1, 1};
+    const size_t N = 1500;
+
+    /* bilinear + bezpatch control data */
+    float *corners = (float *)malloc(N * 12 * sizeof(float));
+    float *bcps = (float *)malloc(N * 48 * sizeof(float));
+    for (size_t p = 0; p < N; p++) {
+        float c[3] = {rnd_f(-2, 2), rnd_f(-2, 2), rnd_f(-2, 2)};
+        float ax[3] = {rnd_f(-1, 1), rnd_f(-1, 1), rnd_f(-1, 1)};
+        float ay[3] = {rnd_f(-1, 1), rnd_f(-1, 1), rnd_f(-1, 1)};
+        float *q = &corners[p * 12];
+        for (int k = 0; k < 3; k++) {
+            float wv = rnd_f(-0.25f, 0.25f);
+            q[0 + k] = c[k] - 0.3f * ax[k] - 0.3f * ay[k];
+            q[3 + k] = c[k] + 0.3f * ax[k] - 0.3f * ay[k] + (k == 2 ? wv : 0);
+            q[6 + k] = c[k] + 0.3f * ax[k] + 0.3f * ay[k];
+            q[9 + k] = c[k] - 0.3f * ax[k] + 0.3f * ay[k] - (k == 2 ? wv : 0);
+        }
+        float *cp = &bcps[p * 48];
+        for (int j = 0; j < 4; j++)
+            for (int i = 0; i < 4; i++) {
+                float fu = (float)i / 3 - 0.5f, fv = (float)j / 3 - 0.5f;
+                for (int k = 0; k < 3; k++)
+                    cp[(j * 4 + i) * 3 + k] =
+                        c[k] + 0.5f * fu * ax[k] + 0.5f * fv * ay[k] +
+                        rnd_f(-0.1f, 0.1f);
+            }
+    }
+    float net[25 * 3], w[25];
+    for (int j = 0; j < 5; j++)
+        for (int i = 0; i < 5; i++) {
+            int idx = j * 5 + i;
+            for (int k = 0; k < 3; k++)
+                net[idx * 3 + k] = (k == 0 ? -1 : 0) + 0.5f * i * (k == 0) +
+                                   0.5f * j * (k == 1) + rnd_f(-0.15f, 0.15f);
+            w[idx] = rnd_f(0.6f, 1.8f);
+        }
+
+    /* round-linear hair strands */
+    enum { NSTR = 200, PTS = 5 };
+    size_t npts = (size_t)NSTR * PTS;
+    float *hpts = (float *)malloc(npts * 3 * sizeof(float));
+    float *hrad = (float *)malloc(npts * sizeof(float));
+    uint32_t *sf = (uint32_t *)malloc(NSTR * sizeof(uint32_t));
+    uint32_t *sc = (uint32_t *)malloc(NSTR * sizeof(uint32_t));
+    for (int st = 0; st < NSTR; st++) {
+        sf[st] = (uint32_t)(st * PTS);
+        sc[st] = PTS;
+        float px = rnd_f(-2, 2), py = rnd_f(-2, 2), pz = rnd_f(-2, 2);
+        for (int p = 0; p < PTS; p++) {
+            size_t idx = (size_t)st * PTS + p;
+            px += rnd_f(-0.7f, 0.7f); py += rnd_f(-0.7f, 0.7f); pz += rnd_f(-0.7f, 0.7f);
+            hpts[idx * 3 + 0] = px; hpts[idx * 3 + 1] = py; hpts[idx * 3 + 2] = pz;
+            hrad[idx] = rnd_f(0.02f, 0.05f);
+        }
+    }
+    lrt_hair_strands hs = {0};
+    hs.points = hpts; hs.radius = hrad; hs.strand_first = sf;
+    hs.strand_count = sc; hs.nstrands = NSTR; hs.npoints = npts;
+
+    struct { const char *name; lrt_tri_scene *s; int curve; } cases[4] = {
+        {"bilinear", lrt_bilinear_scene_build(corners, N, &o, NULL), 0},
+        {"bezpatch", lrt_bezpatch_scene_build(bcps, N, &o, NULL), 0},
+        {"nurbs", lrt_nurbs_scene_build(net, 4, 4, U, U, w, 3, 3, &o, NULL), 0},
+        {"roundcurve", lrt_roundcurve_scene_build(&hs, NULL, NULL), 1},
+    };
+    for (int ci = 0; ci < 4; ci++) {
+        lrt_tri_scene *cpu = cases[ci].s;
+        CHECK(cpu != NULL, "%s build", cases[ci].name);
+        if (!cpu) continue;
+        lrt_hip_scene *gs = lrt_hip_scene_upload(e, cpu, NULL);
+        CHECK(gs != NULL, "%s upload: %s", cases[ci].name,
+              lrt_hip_engine_last_error(e));
+        if (!gs) { lrt_tri_scene_free(cpu); continue; }
+        size_t nr = 40000, hits = 0, agree = 0;
+        double max_dot = 1.0;
+        lrt_ray *rays = (lrt_ray *)malloc(nr * sizeof(lrt_ray));
+        lrt_hit *gh = (lrt_hit *)malloc(nr * sizeof(lrt_hit));
+        float *gn = (float *)malloc(nr * 3 * sizeof(float));
+        for (size_t i = 0; i < nr; i++) {
+            if (ci == 2) { /* aim at the NURBS near origin */
+                float org[3] = {rnd_f(-3, 3), rnd_f(-3, 3), rnd_f(-3, 3)};
+                float d[3] = {-org[0] + rnd_f(-0.5f, 0.5f),
+                              -org[1] + rnd_f(-0.5f, 0.5f),
+                              -org[2] + rnd_f(-0.5f, 0.5f)};
+                float l = sqrtf(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]) + 1e-9f;
+                for (int k = 0; k < 3; k++) { rays[i].org[k]=org[k]; rays[i].dir[k]=d[k]/l; }
+                rays[i].tmin = 1e-4f; rays[i].tmax = 1e9f;
+            } else {
+                make_random_ray(&rays[i]);
+            }
+        }
+        lrt_result er = LRT_RESULT_OK;
+        int rc = lrt_hip_scene_trace_normals(e, gs, rays, (uint32_t)nr, gh, gn, &er);
+        CHECK(rc >= 0 && er == LRT_RESULT_OK, "%s trace_normals err=%d",
+              cases[ci].name, (int)er);
+        for (size_t i = 0; i < nr; i++) {
+            if (gh[i].prim_id == LRT_TRI_NO_HIT) continue;
+            hits++;
+            float Ncpu[3];
+            if (cases[ci].curve) {
+                /* round-linear: radial normal from the centerline frame + hit P */
+                float C[3], T[3], rr;
+                if (lrt_tri_curve_frame(cpu, gh[i].prim_id, gh[i].u, C, T, &rr) !=
+                    LRT_RESULT_OK)
+                    continue;
+                float P[3];
+                for (int k = 0; k < 3; k++) P[k] = rays[i].org[k] + gh[i].t * rays[i].dir[k];
+                float d[3] = {P[0]-C[0], P[1]-C[1], P[2]-C[2]};
+                float tt = T[0]*T[0]+T[1]*T[1]+T[2]*T[2];
+                float pr = (d[0]*T[0]+d[1]*T[1]+d[2]*T[2])/(tt>1e-20f?tt:1e-20f);
+                for (int k = 0; k < 3; k++) Ncpu[k] = d[k] - pr * T[k];
+            } else {
+                if (lrt_tri_surface_normal(cpu, gh[i].prim_id, gh[i].u, gh[i].v,
+                                           NULL, Ncpu, NULL, NULL) != LRT_RESULT_OK)
+                    continue;
+            }
+            float lc = sqrtf(Ncpu[0]*Ncpu[0]+Ncpu[1]*Ncpu[1]+Ncpu[2]*Ncpu[2]);
+            const float *Ng = &gn[i * 3];
+            float lg = sqrtf(Ng[0]*Ng[0]+Ng[1]*Ng[1]+Ng[2]*Ng[2]);
+            if (lc < 1e-12f || lg < 1e-12f) { agree++; continue; } /* degenerate */
+            float dot = (Ncpu[0]*Ng[0]+Ncpu[1]*Ng[1]+Ncpu[2]*Ng[2]) / (lc*lg);
+            if (dot > 0.999f) agree++;
+            if (dot < max_dot) max_dot = dot;
+        }
+        double f = hits ? (double)agree / hits : 1.0;
+        printf("  %-10s normals %.3f%% (hits %zu, min cos %.5f)\n",
+               cases[ci].name, f * 100.0, hits, max_dot);
+        CHECK(hits > nr / 100, "%s: too few hits", cases[ci].name);
+        CHECK(f >= 0.999, "%s: GPU normal agreement %.3f%%", cases[ci].name,
+              f * 100.0);
+        free(rays); free(gh); free(gn);
+        lrt_hip_scene_free(e, gs);
+        lrt_tri_scene_free(cpu);
+    }
+
+    /* a triangle scene has no shade data -> UNSUPPORTED */
+    {
+        float tri[9] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+        lrt_tri_scene *ts = lrt_tri_scene_build(tri, 1, &o, NULL);
+        lrt_hip_scene *gs = ts ? lrt_hip_scene_upload(e, ts, NULL) : NULL;
+        if (gs) {
+            lrt_ray r;
+            make_random_ray(&r);
+            lrt_hit h;
+            float nrm[3];
+            lrt_result er = LRT_RESULT_OK;
+            int rc = lrt_hip_scene_trace_normals(e, gs, &r, 1, &h, nrm, &er);
+            CHECK(rc < 0 && er == LRT_RESULT_UNSUPPORTED,
+                  "triangle trace_normals should be UNSUPPORTED (rc=%d err=%d)",
+                  rc, (int)er);
+            lrt_hip_scene_free(e, gs);
+        }
+        if (ts) lrt_tri_scene_free(ts);
+    }
+    free(corners); free(bcps);
+    free(hpts); free(hrad); free(sf); free(sc);
+}
+
 static void test_gpu_analytics(lrt_hip_engine *e) {
     lrt_tri_build_options o;
     memset(&o, 0, sizeof(o));
@@ -1155,6 +1321,8 @@ int main(void) {
     test_gpu_sdf(e);
 
     test_gpu_surfaces(e);
+
+    test_gpu_normals(e);
 
     test_wmma(e);
 

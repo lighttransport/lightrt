@@ -1034,6 +1034,18 @@ Bézier ~99.96% (GPU scalar adaptive-sweep vs CPU SSE adaptive-sweep). Host
 function-pointer custom geometry (`lrt_user_scene_build`) cannot run on the GPU
 by construction; `lrt_sdfprim_scene_build` is the GPU-resident replacement.
 
+**On-device shading normals** (`lrt_hip_scene_trace_normals[_device]`): a
+post-pass `k_shade_normals` kernel computes the per-hit geometric normal for
+parametric surfaces (bilinear/bezpatch/NURBS/trimmed-NURBS — `Ng =
+cross(dP/du, dP/dv)` via the same `hp_bezpatch_eval`/`hp_rbez_eval` the
+intersector uses) and the radial normal for round-linear curves, mirroring the
+CPU `lrt_tri_surface_normal`/`lrt_tri_curve_frame`. Upload copies the CPU scene's
+per-prim shade control points to `d_shade_cps`/`d_shade_dom` (via the
+`lrt_tri_surface_shade_data` accessor); the kernel indexes them by the hit's
+`prim_id`. Verified on an RX 9070 XT: 100% normal agreement (min cos 1.00000) vs
+the CPU oracle across all four surface kinds + round-linear. Triangle/other
+scenes carry no shade data → `LRT_RESULT_UNSUPPORTED`.
+
 ### Phase 2 (implemented): WMMA + int-quantized leaf kernels
 `lightrt_hip_wmma.hip` (compiled into `lightrt_hip` when rocWMMA is present;
 `lrt_hip_have_wmma()` reports it). RDNA4 WMMA does `D=A·B+C` — fits batched dense

@@ -67,9 +67,11 @@ struct lrt_hip_engine {
     void *d_rays;
     void *d_hits;
     void *d_occ;
+    void *d_normals; /* 3 floats/ray, for lrt_hip_scene_trace_normals */
     size_t cap_rays;  /* bytes */
     size_t cap_hits;  /* bytes */
     size_t cap_occ;   /* bytes */
+    size_t cap_normals; /* bytes */
 };
 
 struct lrt_hip_scene {
@@ -89,6 +91,12 @@ struct lrt_hip_scene {
     uint32_t *d_trim_off;
     float *d_trim_pts;
     uint32_t trim_nloops;
+    /* Post-hit shade control points (device-resident; for on-device normals).
+     * NULL unless a parametric-surface / linear-curve scene was uploaded. */
+    float *d_shade_cps;
+    float *d_shade_dom; /* NURBS only (stride 64), else NULL */
+    uint32_t shade_nprims;
+    uint32_t shade_stride; /* floats/prim: 12/48/64 surfaces, 8 linear curve */
     size_t mem_bytes;
 };
 
@@ -1610,6 +1618,84 @@ __launch_bounds__(64) __global__
     occ[gid] = hit;
 }
 
+/* Post-pass: per-ray geometric normal for parametric-surface / linear-curve
+ * hits, mirroring the CPU lrt_tri_surface_normal / lrt_tri_curve_frame. Reads
+ * the hit (t,u,v,prim) written by k_trace_prim and the device-resident per-prim
+ * control points (shade_cps, indexed by prim_id). Writes 3 floats/ray (zero on
+ * miss). Surfaces: Ng = cross(dP/du, dP/dv). Round-linear curve: the radial
+ * normal at the hit point (needs the ray, hence the rays buffer). */
+__global__ void k_shade_normals(const float *__restrict__ shade_cps,
+                                const float *__restrict__ shade_dom,
+                                uint32_t stride, uint32_t prim_kind,
+                                const uint32_t *__restrict__ rays,
+                                const uint32_t *__restrict__ hits, uint32_t n,
+                                float *__restrict__ normals,
+                                uint32_t shade_nprims) {
+    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= n) return;
+    float nx = 0.0f, ny = 0.0f, nz = 0.0f;
+    const size_t hb = (size_t)gid * 4u;
+    uint32_t prim = hits[hb + 3u];
+    if (prim != LRT_HIP_NO_HIT && prim < shade_nprims) {
+        float u = fu(hits[hb + 1u]), v = fu(hits[hb + 2u]);
+        const float *cp = shade_cps + (size_t)prim * stride;
+        float du[3], dv[3], S[3];
+        int have = 0;
+        if (prim_kind == HIP_PRIM_BILINEAR) { /* stride 12: q00 q10 q11 q01 */
+            const float *q00 = cp, *q10 = cp + 3, *q11 = cp + 6, *q01 = cp + 9;
+            float u1 = 1.0f - u, v1 = 1.0f - v;
+            for (int a = 0; a < 3; a++) {
+                du[a] = v1 * (q10[a] - q00[a]) + v * (q11[a] - q01[a]);
+                dv[a] = u1 * (q01[a] - q00[a]) + u * (q11[a] - q10[a]);
+            }
+            have = 1;
+        } else if (prim_kind == HIP_PRIM_BEZPATCH) { /* stride 48 */
+            hp_bezpatch_eval(cp, u, v, S, du, dv);
+            have = 1;
+        } else if (prim_kind == HIP_PRIM_RBEZPATCH ||
+                   prim_kind == HIP_PRIM_TRIMNURBS) { /* stride 64, global uv */
+            const float *dom = shade_dom + (size_t)prim * 4u;
+            float ddu = dom[1] - dom[0], ddv = dom[3] - dom[2];
+            float lu = ddu != 0.0f ? (u - dom[0]) / ddu : 0.0f;
+            float lv = ddv != 0.0f ? (v - dom[2]) / ddv : 0.0f;
+            lu = lu < 0.0f ? 0.0f : (lu > 1.0f ? 1.0f : lu);
+            lv = lv < 0.0f ? 0.0f : (lv > 1.0f ? 1.0f : lv);
+            hp_rbez_eval(cp, lu, lv, S, du, dv); /* du/dv already global-invariant dir */
+            have = 1;
+        } else if (prim_kind == HIP_PRIM_RLCURVE) { /* stride 8: radial normal */
+            const size_t rb = (size_t)gid * 8u;
+            float ox = fu(rays[rb + 0u]), oy = fu(rays[rb + 1u]),
+                  oz = fu(rays[rb + 2u]);
+            float dx = fu(rays[rb + 4u]), dy = fu(rays[rb + 5u]),
+                  dz = fu(rays[rb + 6u]);
+            float t = fu(hits[hb + 0u]);
+            float P[3] = {ox + t * dx, oy + t * dy, oz + t * dz};
+            const float *p0 = cp, *p1 = cp + 4;
+            float T[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]};
+            float C[3] = {p0[0] + u * T[0], p0[1] + u * T[1], p0[2] + u * T[2]};
+            float d[3] = {P[0] - C[0], P[1] - C[1], P[2] - C[2]};
+            float tt = T[0] * T[0] + T[1] * T[1] + T[2] * T[2];
+            float pr = (d[0] * T[0] + d[1] * T[1] + d[2] * T[2]) /
+                       (tt > 1e-20f ? tt : 1e-20f);
+            float rad[3] = {d[0] - pr * T[0], d[1] - pr * T[1], d[2] - pr * T[2]};
+            float rl = sqrtf(rad[0] * rad[0] + rad[1] * rad[1] + rad[2] * rad[2]);
+            if (rl > 1e-20f) {
+                nx = rad[0] / rl; ny = rad[1] / rl; nz = rad[2] / rl;
+            }
+            have = 0; /* normal already set */
+        }
+        if (have) {
+            nx = du[1] * dv[2] - du[2] * dv[1];
+            ny = du[2] * dv[0] - du[0] * dv[2];
+            nz = du[0] * dv[1] - du[1] * dv[0];
+        }
+    }
+    const size_t nb = (size_t)gid * 3u;
+    normals[nb + 0u] = nx;
+    normals[nb + 1u] = ny;
+    normals[nb + 2u] = nz;
+}
+
 /* ========================================================================= */
 /* Build kernels — port of vk/shaders/build_morton.comp.                      */
 /* ========================================================================= */
@@ -1917,6 +2003,7 @@ extern "C" void lrt_hip_engine_destroy(lrt_hip_engine *e) {
     hip_free(e->d_rays);
     hip_free(e->d_hits);
     hip_free(e->d_occ);
+    hip_free(e->d_normals);
     if (e->stream) { hipError_t st = hipStreamDestroy(e->stream); (void)st; }
     free(e);
 }
@@ -1986,6 +2073,35 @@ static int hip_grow(lrt_hip_engine *e, void **buf, size_t *cap, size_t need) {
 /* ========================================================================= */
 /* Resident scene upload / trace.                                            */
 /* ========================================================================= */
+/* Upload the per-prim shade control points (for on-device normals) from the CPU
+ * scene, if present. Best-effort: on allocation failure the scene is still
+ * traceable, only lrt_hip_scene_trace_normals is unavailable. */
+static void hip_upload_shade(lrt_hip_engine *e, const lrt_tri_scene *s,
+                             lrt_hip_scene *sc) {
+    const float *cps = NULL, *dom = NULL;
+    uint32_t nprims = 0, stride = 0;
+    if (lrt_tri_surface_shade_data(s, &cps, &dom, &nprims, &stride) != 0 ||
+        !cps || nprims == 0 || stride == 0)
+        return;
+    size_t cbytes = (size_t)nprims * stride * sizeof(float);
+    size_t dbytes = (stride == 64u) ? (size_t)nprims * 4u * sizeof(float) : 0;
+    hipError_t hr;
+    if ((hr = hipMalloc((void **)&sc->d_shade_cps, cbytes)) != hipSuccess ||
+        (dbytes && (hr = hipMalloc((void **)&sc->d_shade_dom, dbytes)) != hipSuccess) ||
+        (hr = hipMemcpy(sc->d_shade_cps, cps, cbytes, hipMemcpyHostToDevice)) != hipSuccess ||
+        (dbytes && (hr = hipMemcpy(sc->d_shade_dom, dom, dbytes, hipMemcpyHostToDevice)) != hipSuccess)) {
+        (void)hr;
+        hip_free(sc->d_shade_cps);
+        hip_free(sc->d_shade_dom);
+        sc->d_shade_cps = NULL;
+        sc->d_shade_dom = NULL;
+        return;
+    }
+    sc->shade_nprims = nprims;
+    sc->shade_stride = stride;
+    sc->mem_bytes += cbytes + dbytes;
+}
+
 /* Upload a trimmed-NURBS scene directly from its resident buffers + trim loops
  * (reads the scene directly rather than parsing the LRTS v2 aux region). */
 static lrt_hip_scene *hip_upload_trimnurbs(lrt_hip_engine *e,
@@ -2048,6 +2164,7 @@ static lrt_hip_scene *hip_upload_trimnurbs(lrt_hip_engine *e,
         return NULL;
     }
     sc->mem_bytes = nbytes + bbytes + obytes + pbytes;
+    hip_upload_shade(e, s, sc); /* device normals for trimmed NURBS */
     if (err) *err = LRT_RESULT_OK;
     return sc;
 }
@@ -2161,6 +2278,9 @@ extern "C" lrt_hip_scene *lrt_hip_scene_upload(lrt_hip_engine *e,
         return NULL;
     }
     free(blob);
+    /* Surfaces (bilinear/bezpatch/rbez) + round-linear curve: upload shade CPs
+     * so lrt_hip_scene_trace_normals can compute device normals. */
+    hip_upload_shade(e, s, sc);
     if (err) *err = LRT_RESULT_OK;
     return sc;
 }
@@ -2172,6 +2292,8 @@ extern "C" void lrt_hip_scene_free(lrt_hip_engine *e, lrt_hip_scene *s) {
     hip_free(s->d_blocks);
     hip_free(s->d_trim_off);
     hip_free(s->d_trim_pts);
+    hip_free(s->d_shade_cps);
+    hip_free(s->d_shade_dom);
     free(s);
 }
 
@@ -2210,6 +2332,91 @@ extern "C" int lrt_hip_scene_trace(lrt_hip_engine *e, lrt_hip_scene *s,
     if ((hr = hipMemcpyAsync(out, e->d_hits, hbytes, hipMemcpyDeviceToHost,
                              e->stream)) != hipSuccess) {
         hip_set_err_hip(e, "hipMemcpyAsync(hits)", hr);
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return -1;
+    }
+    if ((hr = hipStreamSynchronize(e->stream)) != hipSuccess) {
+        hip_set_err_hip(e, "hipStreamSynchronize", hr);
+        if (err) *err = LRT_RESULT_NOT_BUILT;
+        return -1;
+    }
+    int hits = 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (out[i].prim_id != LRT_TRI_NO_HIT) hits++;
+    if (err) *err = LRT_RESULT_OK;
+    return hits;
+}
+
+/* True if this scene kind can produce device normals (shade CPs were uploaded). */
+static int hip_scene_has_normals(const lrt_hip_scene *s) {
+    return s && s->d_shade_cps != NULL && s->shade_nprims > 0u;
+}
+
+/* Launch k_shade_normals over device hit/ray/normal buffers. */
+static hipError_t launch_shade_normals(lrt_hip_engine *e, lrt_hip_scene *s,
+                                       const uint32_t *d_rays,
+                                       const uint32_t *d_hits, uint32_t n,
+                                       float *d_normals) {
+    hipLaunchKernelGGL(k_shade_normals, dim3((n + 63u) / 64u), dim3(64), 0,
+                       e->stream, s->d_shade_cps, s->d_shade_dom, s->shade_stride,
+                       s->prim_kind, d_rays, d_hits, n, d_normals,
+                       s->shade_nprims);
+    return hipGetLastError();
+}
+
+extern "C" int lrt_hip_scene_trace_normals(lrt_hip_engine *e, lrt_hip_scene *s,
+                                           const lrt_ray *rays, uint32_t n,
+                                           lrt_hit *out, float *out_normals,
+                                           lrt_result *err) {
+    if (!e || !s || (n && (!rays || !out || !out_normals))) {
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return -1;
+    }
+    if (n == 0) {
+        if (err) *err = LRT_RESULT_OK;
+        return 0;
+    }
+    if (!hip_scene_has_normals(s)) {
+        hip_set_err(e, "scene has no on-device shade data (not a surface/"
+                       "round-linear-curve scene, or upload OOM)");
+        if (err) *err = LRT_RESULT_UNSUPPORTED;
+        return -1;
+    }
+    size_t rbytes = (size_t)n * sizeof(lrt_ray);
+    size_t hbytes = (size_t)n * sizeof(lrt_hit);
+    size_t nbytes = (size_t)n * 3u * sizeof(float);
+    if (!hip_grow(e, &e->d_rays, &e->cap_rays, rbytes) ||
+        !hip_grow(e, &e->d_hits, &e->cap_hits, hbytes) ||
+        !hip_grow(e, &e->d_normals, &e->cap_normals, nbytes)) {
+        hip_set_err(e, "device scratch allocation failed");
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return -1;
+    }
+    hipError_t hr;
+    if ((hr = hipMemcpyAsync(e->d_rays, rays, rbytes, hipMemcpyHostToDevice,
+                             e->stream)) != hipSuccess) {
+        hip_set_err_hip(e, "hipMemcpyAsync(rays)", hr);
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return -1;
+    }
+    if ((hr = launch_trace(e, s, (const uint32_t *)e->d_rays,
+                           (uint32_t *)e->d_hits, n)) != hipSuccess) {
+        hip_set_err_hip(e, "k_trace launch", hr);
+        if (err) *err = LRT_RESULT_NOT_BUILT;
+        return -1;
+    }
+    if ((hr = launch_shade_normals(e, s, (const uint32_t *)e->d_rays,
+                                   (const uint32_t *)e->d_hits, n,
+                                   (float *)e->d_normals)) != hipSuccess) {
+        hip_set_err_hip(e, "k_shade_normals launch", hr);
+        if (err) *err = LRT_RESULT_NOT_BUILT;
+        return -1;
+    }
+    if ((hr = hipMemcpyAsync(out, e->d_hits, hbytes, hipMemcpyDeviceToHost,
+                             e->stream)) != hipSuccess ||
+        (hr = hipMemcpyAsync(out_normals, e->d_normals, nbytes,
+                             hipMemcpyDeviceToHost, e->stream)) != hipSuccess) {
+        hip_set_err_hip(e, "hipMemcpyAsync(hits/normals)", hr);
         if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
         return -1;
     }
@@ -2459,6 +2666,41 @@ extern "C" int lrt_hip_scene_trace_device(lrt_hip_engine *e, lrt_hip_scene *s,
                                  (uint32_t *)hits->ptr, n);
     if (hr != hipSuccess) {
         hip_set_err_hip(e, "k_trace launch (device)", hr);
+        if (err) *err = LRT_RESULT_NOT_BUILT;
+        return -1;
+    }
+    if ((hr = hipStreamSynchronize(e->stream)) != hipSuccess) {
+        hip_set_err_hip(e, "hipStreamSynchronize", hr);
+        if (err) *err = LRT_RESULT_NOT_BUILT;
+        return -1;
+    }
+    if (err) *err = LRT_RESULT_OK;
+    return 0;
+}
+
+extern "C" int lrt_hip_scene_trace_normals_device(
+    lrt_hip_engine *e, lrt_hip_scene *s, const lrt_hip_dbuffer *rays, uint32_t n,
+    lrt_hip_dbuffer *hits, lrt_hip_dbuffer *normals, lrt_result *err) {
+    if (!e || !s || !rays || !hits || !normals || n == 0 ||
+        rays->size < (size_t)n * sizeof(lrt_ray) ||
+        hits->size < (size_t)n * sizeof(lrt_hit) ||
+        normals->size < (size_t)n * 3u * sizeof(float)) {
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return -1;
+    }
+    if (!hip_scene_has_normals(s)) {
+        hip_set_err(e, "scene has no on-device shade data");
+        if (err) *err = LRT_RESULT_UNSUPPORTED;
+        return -1;
+    }
+    hipError_t hr = launch_trace(e, s, (const uint32_t *)rays->ptr,
+                                 (uint32_t *)hits->ptr, n);
+    if (hr == hipSuccess)
+        hr = launch_shade_normals(e, s, (const uint32_t *)rays->ptr,
+                                  (const uint32_t *)hits->ptr, n,
+                                  (float *)normals->ptr);
+    if (hr != hipSuccess) {
+        hip_set_err_hip(e, "trace+normals launch (device)", hr);
         if (err) *err = LRT_RESULT_NOT_BUILT;
         return -1;
     }

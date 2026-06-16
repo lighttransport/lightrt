@@ -566,6 +566,17 @@ int lrt_tri_scene_trim_data(const lrt_tri_scene *s, uint32_t *nloops,
                             const uint32_t **loop_off, const float **pts,
                             uint32_t *npts);
 
+/* Access the post-hit shade arrays (per-prim_id control points, indexed by
+ * prim_id), for GPU backends that compute surface/curve normals on the device.
+ * Layout matches lrt_tri_surface_normal / lrt_tri_curve_frame: stride floats/prim
+ * (12 bilinear, 48 bezpatch, 64 rational-bezier/NURBS, 8 linear-curve); dom is
+ * 4 floats/prim (umin,umax,vmin,vmax) for NURBS (stride 64), else NULL. Any out
+ * may be NULL. Returns 0 if shade data is present, -1 otherwise (non-surface/
+ * non-linear-curve scene, or shade data not built). */
+int lrt_tri_surface_shade_data(const lrt_tri_scene *s, const float **cps,
+                               const float **dom, uint32_t *nprims,
+                               uint32_t *stride);
+
 /* --- Built-in implicit / SDF primitives (GPU-resident, no callbacks) -------
  *
  * A device-friendly alternative to lrt_user_scene_build's host callbacks: each

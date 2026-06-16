@@ -100,6 +100,17 @@ void lrt_hip_scene_free(lrt_hip_engine *e, lrt_hip_scene *s);
 int lrt_hip_scene_trace(lrt_hip_engine *e, lrt_hip_scene *s, const lrt_ray *rays,
                         uint32_t n, lrt_hit *out, lrt_result *err);
 
+/* Closest-hit + per-ray geometric SURFACE/CURVE normal, computed on the device.
+ * Writes n hits to out and 3 floats/ray to out_normals (the unnormalized
+ * geometric normal Ng = cross(dP/du, dP/dv) for parametric surfaces — bilinear /
+ * bicubic Bezier / NURBS / trimmed NURBS — or the normalized radial normal for a
+ * round-linear curve; zero on miss). Mirrors lrt_tri_surface_normal /
+ * lrt_tri_curve_frame. Returns #hits, or -1 on error. LRT_RESULT_UNSUPPORTED if
+ * the scene kind carries no shade data (e.g. a triangle scene, or upload OOM). */
+int lrt_hip_scene_trace_normals(lrt_hip_engine *e, lrt_hip_scene *s,
+                                const lrt_ray *rays, uint32_t n, lrt_hit *out,
+                                float *out_normals, lrt_result *err);
+
 /* Any-hit (occlusion) n rays. occluded[i] = 0 or 1. Returns #occluded, or -1. */
 int lrt_hip_scene_occluded(lrt_hip_engine *e, lrt_hip_scene *s,
                            const lrt_ray *rays, uint32_t n, uint8_t *occluded,
@@ -244,6 +255,16 @@ int lrt_hip_scene_trace_device(lrt_hip_engine *e, lrt_hip_scene *s,
 int lrt_hip_scene_occluded_device(lrt_hip_engine *e, lrt_hip_scene *s,
                                   const lrt_hip_dbuffer *rays, uint32_t n,
                                   lrt_hip_dbuffer *occluded, lrt_result *err);
+
+/* As lrt_hip_scene_trace_device but also fills `normals` (3 floats/ray) with the
+ * on-device surface/curve geometric normal — the fully-resident shading path
+ * (no PCIe). normals->size must be >= n*3*sizeof(float). LRT_RESULT_UNSUPPORTED
+ * if the scene carries no shade data. Returns 0 on success, -1 on error. */
+int lrt_hip_scene_trace_normals_device(lrt_hip_engine *e, lrt_hip_scene *s,
+                                       const lrt_hip_dbuffer *rays, uint32_t n,
+                                       lrt_hip_dbuffer *hits,
+                                       lrt_hip_dbuffer *normals,
+                                       lrt_result *err);
 
 /* Refit / full-GPU build from a DEVICE vertex buffer (9*ntris floats already on
  * the GPU) — no per-frame H2D for animated geometry. */
