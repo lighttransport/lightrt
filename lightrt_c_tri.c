@@ -1,5 +1,5 @@
 /*
- * lightrt_c_tri.c — C11 triangle-native fp32 wide BVH (implementation).
+ * lightrt_c_tri.c - C11 triangle-native fp32 wide BVH (implementation).
  *
  * Pipeline:
  *   1. Precompute per-triangle AABBs + centroids (one pass, arena allocated).
@@ -71,6 +71,9 @@
 #define TRI_ISECT_COST 1.0f
 #define TRI_MAX_DEPTH 96u
 #define TRI_MEDIAN_DEPTH 48u /* force median splits beyond this depth */
+#define TRI_ISECT_DET_EPS_SCALE 1e-8f
+#define TRI_ISECT_DET_EPS_MIN 1e-12f
+#define TRI_ISECT_DET_EPS_MAX 1e-6f
 /* Wide-tree depth <= binary depth (TRI_MAX_DEPTH); each level leaves at most
  * width-1 entries on the stack -> 96*7 = 672 worst case for BVH8. */
 #define TRI_STACK_SIZE 1024
@@ -142,8 +145,8 @@ _Static_assert(sizeof(lrt_bvh8q4_node) == 96, "lrt_bvh8q4_node");
 
 /* Triangle blocks: SoA with precomputed edges, sized to the traversal SIMD
  * width (4 for BVH4/SSE, 8 for BVH8/AVX2). Both share the same generic float
- * layout — 9 arrays of `width` floats (v0xyz, e1xyz, e2xyz) followed by
- * `width` uint32 prim ids — so scalar code can address either width. Padding
+ * layout - 9 arrays of `width` floats (v0xyz, e1xyz, e2xyz) followed by
+ * `width` uint32 prim ids - so scalar code can address either width. Padding
  * lanes carry prim_id = LRT_TRI_NO_HIT and all-zero vertices (zero det ->
  * never hit). lrt_tri4 = 160 bytes, lrt_tri8 = 320 bytes. */
 typedef struct lrt_tri4 {
@@ -246,7 +249,7 @@ typedef struct lrt_bez4 {
 _Static_assert(sizeof(lrt_bez4) == 272, "lrt_bez4");
 
 /* Quantized triangle leaf blocks (4 tris each; store quantized absolute
- * v0,v1,v2 → decode → e1=v1-v0, e2=v2-v0 → Moller-Trumbore). These have their
+ * v0,v1,v2 -> decode -> e1=v1-v0, e2=v2-v0 -> Moller-Trumbore). These have their
  * own (smaller, format-specific) stride; the scene carries block_stride and the
  * qtri kernels address blocks by it instead of tri_block_size(). */
 typedef struct lrt_qtri16 { /* 16-bit, scene-global grid. 88 bytes. */
@@ -333,6 +336,7 @@ struct lrt_tri_scene {
     int prim_kind; /* TRI_PRIM_*: discriminates the leaf type / dispatch */
     int point_type; /* TRI_POINT_* (only for prim_kind == TRI_PRIM_POINT) */
     uint32_t root;
+    uint32_t original_ntris; /* original triangle count (for refit validation) */
     lrt_bvh4_node *nodes4;
     lrt_bvh8_node *nodes8;
     lrt_bvh8q_node *nodes8q;
@@ -952,7 +956,7 @@ static uint32_t tri_build_recursive(tri_build_ctx *c, uint32_t first,
  *
  * LRT_TRI_BUILD_FAST: quantize centroids to 30-bit Morton codes, radix-sort
  * (morton << 32) | prim keys, then build the binary tree by splitting each
- * sorted range at its highest differing Morton bit (binary search — no
+ * sorted range at its highest differing Morton bit (binary search - no
  * binning, no partitioning). Bounds are unioned bottom-up. ~O(N) build with
  * SAH quality typically within ~10-20% of the binned builder.
  */
@@ -1452,7 +1456,7 @@ static uint32_t tri_build_lbvh(tri_build_ctx *c, unsigned num_threads) {
  * duplicated into both children with plane-clipped bounds, removing the
  * child-box overlap that costs short (shadow) rays the most. References are
  * AABB-clipped; leaves store original prim ids, so a triangle may simply be
- * tested by more than one leaf — no other correctness impact.
+ * tested by more than one leaf - no other correctness impact.
  *
  * Ranges live in a shared refs array with slack distributed proportionally
  * to the children (extended ranges), so duplication never reallocates; when
@@ -2112,7 +2116,7 @@ static void tri_qtri_emit_block(lrt_tri_scene *s, void *blkv,
         margin[a] = m;
     }
     /* 2. dilate (conservative): scale each triangle about its centroid by sigma
-     *    (a homothety about an in-plane point — it grows the triangle WITHIN its
+     *    (a homothety about an in-plane point - it grows the triangle WITHIN its
      *    own plane, so the decoded triangle contains the true one without
      *    tilting the plane, which would otherwise make grazing rays miss). */
     float M = margin[0] > margin[1] ? margin[0] : margin[1];
@@ -2860,6 +2864,59 @@ static inline void tri_prefetch_ref(const lrt_tri_scene *s, uint32_t ref,
 /* Scalar kernels (always compiled; fallback + correctness oracle).          */
 /* ------------------------------------------------------------------------- */
 
+static inline int tri_isect_det_parallel(float e1x, float e1y, float e1z,
+                                         float e2x, float e2y, float e2z,
+                                         float det) {
+    float e1_len = sqrtf(e1x * e1x + e1y * e1y + e1z * e1z);
+    float e2_len = sqrtf(e2x * e2x + e2y * e2y + e2z * e2z);
+    float scale = e1_len + e2_len;
+    float rel_thresh = TRI_ISECT_DET_EPS_SCALE * scale * scale;
+    if (rel_thresh < TRI_ISECT_DET_EPS_MIN) rel_thresh = TRI_ISECT_DET_EPS_MIN;
+    if (rel_thresh > TRI_ISECT_DET_EPS_MAX) rel_thresh = TRI_ISECT_DET_EPS_MAX;
+    return (det > -rel_thresh && det < rel_thresh);
+}
+
+#if LRT_TRI_HAS_SSE4
+static inline __m128 tri_isect_det_parallel4(__m128 e1x, __m128 e1y, __m128 e1z,
+                                             __m128 e2x, __m128 e2y, __m128 e2z,
+                                             __m128 det) {
+    const __m128 abs_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+    __m128 e1_len2 = _mm_add_ps(_mm_mul_ps(e1x, e1x), _mm_mul_ps(e1y, e1y));
+    __m128 e2_len2 = _mm_add_ps(_mm_mul_ps(e2x, e2x), _mm_mul_ps(e2y, e2y));
+    e1_len2 = _mm_add_ps(e1_len2, _mm_mul_ps(e1z, e1z));
+    e2_len2 = _mm_add_ps(e2_len2, _mm_mul_ps(e2z, e2z));
+    __m128 e1_len = _mm_sqrt_ps(_mm_max_ps(e1_len2, _mm_set1_ps(0.0f)));
+    __m128 e2_len = _mm_sqrt_ps(_mm_max_ps(e2_len2, _mm_set1_ps(0.0f)));
+    __m128 scale = _mm_add_ps(e1_len, e2_len);
+    __m128 rel = _mm_mul_ps(_mm_set1_ps(TRI_ISECT_DET_EPS_SCALE),
+                            _mm_mul_ps(scale, scale));
+    rel = _mm_max_ps(_mm_set1_ps(TRI_ISECT_DET_EPS_MIN), rel);
+    rel = _mm_min_ps(_mm_set1_ps(TRI_ISECT_DET_EPS_MAX), rel);
+    return _mm_cmpgt_ps(_mm_and_ps(det, abs_mask), rel);
+}
+#endif
+
+#if LRT_TRI_HAS_AVX2
+static inline __m256 tri_isect_det_parallel8(__m256 e1x, __m256 e1y, __m256 e1z,
+                                             __m256 e2x, __m256 e2y, __m256 e2z,
+                                             __m256 det) {
+    const __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    __m256 e1_len2 = _mm256_add_ps(_mm256_mul_ps(e1x, e1x), _mm256_mul_ps(e1y, e1y));
+    __m256 e2_len2 = _mm256_add_ps(_mm256_mul_ps(e2x, e2x), _mm256_mul_ps(e2y, e2y));
+    e1_len2 = _mm256_add_ps(e1_len2, _mm256_mul_ps(e1z, e1z));
+    e2_len2 = _mm256_add_ps(e2_len2, _mm256_mul_ps(e2z, e2z));
+    __m256 e1_len = _mm256_sqrt_ps(_mm256_max_ps(e1_len2, _mm256_set1_ps(0.0f)));
+    __m256 e2_len = _mm256_sqrt_ps(_mm256_max_ps(e2_len2, _mm256_set1_ps(0.0f)));
+    __m256 scale = _mm256_add_ps(e1_len, e2_len);
+    __m256 rel = _mm256_mul_ps(_mm256_set1_ps(TRI_ISECT_DET_EPS_SCALE),
+                               _mm256_mul_ps(scale, scale));
+    rel = _mm256_max_ps(_mm256_set1_ps(TRI_ISECT_DET_EPS_MIN), rel);
+    rel = _mm256_min_ps(_mm256_set1_ps(TRI_ISECT_DET_EPS_MAX), rel);
+    return _mm256_cmp_ps(_mm256_and_ps(det, abs_mask),
+                         rel, _CMP_GT_OQ);
+}
+#endif
+
 /* Moller-Trumbore on one lane of a generic-width block (f = 9 float arrays of
  * `bw` lanes). Returns 1 on hit in (tmin, t_best). */
 static inline int tri_isect_lane(const float *f, int bw, int lane,
@@ -2871,7 +2928,7 @@ static inline int tri_isect_lane(const float *f, int bw, int lane,
     float py = rc->dir[2] * e2x - rc->dir[0] * e2z;
     float pz = rc->dir[0] * e2y - rc->dir[1] * e2x;
     float det = e1x * px + e1y * py + e1z * pz;
-    if (det > -1e-12f && det < 1e-12f) return 0;
+    if (tri_isect_det_parallel(e1x, e1y, e1z, e2x, e2y, e2z, det)) return 0;
     float inv_det = 1.0f / det;
     float tvx = rc->org[0] - f[0 * bw + lane];
     float tvy = rc->org[1] - f[1 * bw + lane];
@@ -2916,7 +2973,7 @@ static int tri_capsule_isect(float p0x, float p0y, float p0z, float dx,
         float A = ax * ax + ay * ay + az * az;
         float B = ax * bx + ay * by + az * bz;
         float C = bx * bx + by * by + bz * bz - r * r;
-        if (A > 1e-12f) {
+        if (A > TRI_ISECT_DET_EPS_MIN) {
             float disc = B * B - A * C;
             if (disc >= 0.0f) {
                 float sq = sqrtf(disc);
@@ -3257,7 +3314,7 @@ static inline void tri_point4_isect(const lrt_point4 *blk, const tri_ray_ctx *rc
 
 /* ---- Flat (ribbon) linear curve: ray-facing quad ------------------------- *
  * A segment p0(r0)->p1(r1) drawn as a ribbon whose width direction faces the
- * ray: b = normalize(cross(p1-p0, dir)); quad corners p0±r0*b, p1±r1*b. This is
+ * ray: b = normalize(cross(p1-p0, dir)); quad corners p0+-r0*b, p1+-r1*b. This is
  * the world-space equivalent of embree's ray-space ribbon for linear curves. */
 static int tri_flat_isect_one(const tri_ray_ctx *rc, float best_t,
                               const float p0[3], float r0, const float p1[3],
@@ -3288,7 +3345,7 @@ static int tri_flat_isect_one(const tri_ray_ctx *rc, float best_t,
         float px = dy * e2z - dz * e2y, py = dz * e2x - dx * e2z,
               pz = dx * e2y - dy * e2x;
         float det = e1x * px + e1y * py + e1z * pz;
-        if (det > -1e-12f && det < 1e-12f) continue;
+        if (tri_isect_det_parallel(e1x, e1y, e1z, e2x, e2y, e2z, det)) continue;
         float inv = 1.0f / det;
         float tvx = rc->org[0] - a[0], tvy = rc->org[1] - a[1],
               tvz = rc->org[2] - a[2];
@@ -4117,7 +4174,7 @@ static inline int tri_mt_scalar(const float v0[3], const float e1[3],
     float py = rc->dir[2] * e2[0] - rc->dir[0] * e2[2];
     float pz = rc->dir[0] * e2[1] - rc->dir[1] * e2[0];
     float det = e1[0] * px + e1[1] * py + e1[2] * pz;
-    if (det > -1e-12f && det < 1e-12f) return 0;
+    if (tri_isect_det_parallel(e1[0], e1[1], e1[2], e2[0], e2[1], e2[2], det)) return 0;
     float inv = 1.0f / det;
     float tvx = rc->org[0] - v0[0], tvy = rc->org[1] - v0[1],
           tvz = rc->org[2] - v0[2];
@@ -4339,8 +4396,7 @@ static inline void tri_block_isect_sse(const lrt_tri4 *blk,
 
     __m128 det = _mm_add_ps(_mm_add_ps(_mm_mul_ps(e1x, px), _mm_mul_ps(e1y, py)),
                             _mm_mul_ps(e1z, pz));
-    const __m128 abs_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
-    __m128 valid = _mm_cmpgt_ps(_mm_and_ps(det, abs_mask), _mm_set1_ps(1e-12f));
+    __m128 valid = tri_isect_det_parallel4(e1x, e1y, e1z, e2x, e2y, e2z, det);
     if (!_mm_movemask_ps(valid)) return;
 
     __m128 inv_det = _mm_div_ps(_mm_set1_ps(1.0f), det);
@@ -4430,8 +4486,7 @@ static inline void tri_mt4_decoded_sse(__m128 v0x, __m128 v0y, __m128 v0z,
     __m128 pz = _mm_sub_ps(_mm_mul_ps(sc->dirx, e2y), _mm_mul_ps(sc->diry, e2x));
     __m128 det = _mm_add_ps(_mm_add_ps(_mm_mul_ps(e1x, px), _mm_mul_ps(e1y, py)),
                             _mm_mul_ps(e1z, pz));
-    const __m128 abs_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
-    __m128 valid = _mm_cmpgt_ps(_mm_and_ps(det, abs_mask), _mm_set1_ps(1e-12f));
+    __m128 valid = tri_isect_det_parallel4(e1x, e1y, e1z, e2x, e2y, e2z, det);
     if (!_mm_movemask_ps(valid)) return;
     __m128 inv_det = _mm_div_ps(_mm_set1_ps(1.0f), det);
     __m128 tvx = _mm_sub_ps(sc->orgx, v0x);
@@ -4528,8 +4583,7 @@ static inline int tri_block_occluded_sse(const lrt_tri4 *blk,
     __m128 pz = _mm_sub_ps(_mm_mul_ps(sc->dirx, e2y), _mm_mul_ps(sc->diry, e2x));
     __m128 det = _mm_add_ps(_mm_add_ps(_mm_mul_ps(e1x, px), _mm_mul_ps(e1y, py)),
                             _mm_mul_ps(e1z, pz));
-    const __m128 abs_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
-    __m128 valid = _mm_cmpgt_ps(_mm_and_ps(det, abs_mask), _mm_set1_ps(1e-12f));
+    __m128 valid = tri_isect_det_parallel4(e1x, e1y, e1z, e2x, e2y, e2z, det);
     if (!_mm_movemask_ps(valid)) return 0;
     __m128 inv_det = _mm_div_ps(_mm_set1_ps(1.0f), det);
     __m128 tvx = _mm_sub_ps(sc->orgx, _mm_load_ps(blk->v0x));
@@ -5186,8 +5240,7 @@ static inline __m128 tri_flat_tri_sse(__m128 ax, __m128 ay, __m128 az,
     __m128 pvy = _mm_sub_ps(_mm_mul_ps(dirz, e2x), _mm_mul_ps(dirx, e2z));
     __m128 pvz = _mm_sub_ps(_mm_mul_ps(dirx, e2y), _mm_mul_ps(diry, e2x));
     __m128 det = rlc_dot4(e1x, e1y, e1z, pvx, pvy, pvz);
-    const __m128 absmask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
-    __m128 detok = _mm_cmpgt_ps(_mm_and_ps(det, absmask), _mm_set1_ps(1e-12f));
+    __m128 detok = tri_isect_det_parallel4(e1x, e1y, e1z, e2x, e2y, e2z, det);
     __m128 inv = _mm_div_ps(ONE, _mm_blendv_ps(ONE, det, detok));
     __m128 tvx = _mm_sub_ps(sc->orgx, ax), tvy = _mm_sub_ps(sc->orgy, ay),
            tvz = _mm_sub_ps(sc->orgz, az);
@@ -5702,7 +5755,7 @@ static inline void tri_bez4_isect_sse(const lrt_bez4 *blk, const tri_ray_ctx *rc
 
     /* Fire if the ray (t in [tmin, best]) comes within rcap of the axis SEGMENT
      * A0..A1. Robust closest ray-segment distance (handles any orientation incl.
-     * exactly parallel — the cylinder's roots/axial param degenerate there and
+     * exactly parallel - the cylinder's roots/axial param degenerate there and
      * silently under-fired). E = A1 - A0 = n*L. */
     __m128 Ex = _mm_mul_ps(nx, L), Ey = _mm_mul_ps(ny, L), Ez = _mm_mul_ps(nz, L);
     __m128 w0x = _mm_sub_ps(orgx, A0x), w0y = _mm_sub_ps(orgy, A0y),
@@ -6536,10 +6589,7 @@ static inline void tri_block_isect_avx(const lrt_tri8 *blk,
 
     __m256 det = _mm256_fmadd_ps(
         e1x, px, _mm256_fmadd_ps(e1y, py, _mm256_mul_ps(e1z, pz)));
-    const __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
-    __m256 valid =
-        _mm256_cmp_ps(_mm256_and_ps(det, abs_mask), _mm256_set1_ps(1e-12f),
-                      _CMP_GT_OQ);
+    __m256 valid = tri_isect_det_parallel8(e1x, e1y, e1z, e2x, e2y, e2z, det);
     if (!_mm256_movemask_ps(valid)) return;
 
     __m256 inv_det = _mm256_div_ps(_mm256_set1_ps(1.0f), det);
@@ -6605,10 +6655,7 @@ static inline int tri_block_occluded_avx(const lrt_tri8 *blk,
     __m256 pz = _mm256_fmsub_ps(ac->dirx, e2y, _mm256_mul_ps(ac->diry, e2x));
     __m256 det = _mm256_fmadd_ps(
         e1x, px, _mm256_fmadd_ps(e1y, py, _mm256_mul_ps(e1z, pz)));
-    const __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
-    __m256 valid =
-        _mm256_cmp_ps(_mm256_and_ps(det, abs_mask), _mm256_set1_ps(1e-12f),
-                      _CMP_GT_OQ);
+    __m256 valid = tri_isect_det_parallel8(e1x, e1y, e1z, e2x, e2y, e2z, det);
     if (!_mm256_movemask_ps(valid)) return 0;
     __m256 inv_det = _mm256_div_ps(_mm256_set1_ps(1.0f), det);
     __m256 tvx = _mm256_sub_ps(ac->orgx, _mm256_load_ps(blk->v0x));
@@ -7326,7 +7373,7 @@ static void tri_set_err(lrt_result *err, lrt_result v) {
  * grouping logic exactly (no writes). Lets the builders allocate the exact
  * sizes instead of the ntris worst-case upper bound, which otherwise reserves
  * ~5x the address space the tree actually uses (resident memory is unaffected
- * — the tail is never touched — but the virtual/committed reservation is). */
+ * - the tail is never touched - but the virtual/committed reservation is). */
 static void tri_collapse_count(const tri_build_ctx *bc, int width,
                                uint32_t b_idx, uint32_t *nodes,
                                uint32_t *blocks) {
@@ -7488,10 +7535,12 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
     /* 2*ntris covers any binary tree; +512 absorbs the per-task rounding of
      * the parallel builder's arena slices (2k vs the exact 2k-1). Spatial
      * splits (HQ) duplicate references, so their tree is bounded by the ref
-     * capacity instead. */
-    uint32_t bnode_cap = (o.quality == LRT_TRI_BUILD_HQ)
-                             ? (uint32_t)(2 * ntris * TRI_SBVH_SPLIT_FACTOR) + 512u
-                             : (uint32_t)(2 * ntris) + 512u;
+     * capacity instead. Computed in uint64_t to avoid uint32_t overflow. */
+    uint64_t bnode_cap64 = (o.quality == LRT_TRI_BUILD_HQ)
+                               ? (uint64_t)2 * ntris * TRI_SBVH_SPLIT_FACTOR + 512ull
+                               : (uint64_t)2 * ntris + 512ull;
+    if (bnode_cap64 > 0x7FFFFFFFu) bnode_cap64 = 0x7FFFFFFFu;
+    uint32_t bnode_cap = (uint32_t)bnode_cap64;
     bc.node_next = 0;
     bc.node_end = bnode_cap;
     bc.bnodes = (tri_bnode *)malloc((size_t)bnode_cap * sizeof(tri_bnode));
@@ -7586,6 +7635,7 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
         s->quantized = quantized;
         s->qnode = qnode;
         s->block_stride = (uint32_t)tri_block_size(layout);
+        s->original_ntris = (uint32_t)ntris;
         /* Allocate exactly what the collapse will emit (vs the ntris worst-case
          * bound, which over-reserves ~5x the address space). */
         uint32_t node_cap, block_cap;
@@ -7847,7 +7897,7 @@ void lrt_tri_intersect1N(const lrt_tri_scene *s, const lrt_ray *rays,
          * packet kernel is SSE4, matching the BVH4 single-ray kernel bit for
          * bit (so results stay identical to looping intersect1); BVH8 packets
          * would use SSE4 while BVH8 single-ray uses AVX2, breaking that, for a
-         * smaller win. Any-hit deliberately does NOT packetize — lockstep
+         * smaller win. Any-hit deliberately does NOT packetize - lockstep
          * traversal defeats per-ray early-out (see lrt_tri_occluded1N). */
         size_t i = 0;
         for (; i + 4 <= n; i += 4) {
@@ -8252,6 +8302,15 @@ static size_t tri_query_region(const lrt_tri_scene *s, const tri_region *rg,
 size_t lrt_tri_query_aabb(const lrt_tri_scene *s, const float lo[3],
                           const float hi[3], uint32_t *out, size_t cap) {
     if (!lo || !hi) return 0;
+    /* Validate: lo[a] <= hi[a] for each axis. Inverted bounds return empty. */
+    {
+        int valid = 1;
+        int a;
+        for (a = 0; a < 3; a++) {
+            if (lo[a] > hi[a]) { valid = 0; break; }
+        }
+        if (!valid) return 0;
+    }
     tri_region rg;
     memset(&rg, 0, sizeof(rg));
     rg.type = 0;
@@ -8988,7 +9047,7 @@ lrt_tri_scene *lrt_bezcurve_scene_build(const float *cps, size_t nseg,
     /* Pre-subdivide each cubic into TRI_BEZ_BUILD_SPLIT tight sub-arcs (de
      * Casteljau) so the BVH culls well. The sub-cubics are computed on the fly
      * (here for AABBs, again in tri_emit_leaf) rather than materialized into a
-     * temporary array — the original cubics are the only geometry input. The hit
+     * temporary array - the original cubics are the only geometry input. The hit
      * keeps the ORIGINAL segment id (seg = sub / K). */
     const uint32_t K = TRI_BEZ_BUILD_SPLIT;
     if (nseg > 0x07FFFFFFu / K) {
@@ -9373,7 +9432,7 @@ lrt_tri_scene *lrt_points_scene_build(const float *centers, const float *radii,
  * ------------------------------------------------------------------------ */
 
 /* AABB of a quantized leaf, decoded (used to set node bounds that enclose the
- * decoded — and, conservative-mode, dilated — geometry). */
+ * decoded - and, conservative-mode, dilated - geometry). */
 static void tri_qtri_leaf_box(const lrt_tri_scene *s, uint32_t ref, float lo[3],
                               float hi[3]) {
     lo[0] = lo[1] = lo[2] = TRI_INF_F;
@@ -10146,6 +10205,17 @@ lrt_result lrt_tri_scene_refit(lrt_tri_scene *s, const float *vertices,
     if (!s || !vertices || ntris == 0) return LRT_RESULT_INVALID_ARGUMENT;
     if (s->mem_mapped) return LRT_RESULT_INVALID_ARGUMENT; /* read-only */
     if (s->prim_kind != TRI_PRIM_TRI) return LRT_RESULT_INVALID_ARGUMENT;
+    /* Validate: ntris must match the original triangle count. */
+    if ((size_t)s->original_ntris != ntris)
+        return LRT_RESULT_INVALID_ARGUMENT;
+    /* Validate vertex finiteness - NaN/inf would corrupt BVH bounds. */
+    {
+        size_t i;
+        for (i = 0; i < ntris * 9; i++) {
+            if (!isfinite(vertices[i]))
+                return LRT_RESULT_INVALID_ARGUMENT;
+        }
+    }
     const int width = s->layout;
 
     /* 1. Scatter new vertices into the leaf blocks by original prim id. */
@@ -10542,6 +10612,16 @@ lrt_tlas *lrt_tlas_build(lrt_tri_scene *const *blas, size_t nblas,
         tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
         return NULL;
     }
+    /* Validate BLAS pointers are non-NULL. */
+    {
+        size_t i;
+        for (i = 0; i < nblas; i++) {
+            if (!blas[i]) {
+                tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
+                return NULL;
+            }
+        }
+    }
     unsigned num_threads = (opts && opts->num_threads) ? opts->num_threads : 1u;
     lrt_tlas *t = (lrt_tlas *)calloc(1, sizeof(lrt_tlas));
     if (!t) {
@@ -10815,8 +10895,7 @@ static inline __m128 tri_packet4_tri(const tri_packet4 *p, const float v0[3],
     __m128 pz = _mm_sub_ps(_mm_mul_ps(p->dirx, e2y), _mm_mul_ps(p->diry, e2x));
     __m128 det = _mm_add_ps(_mm_add_ps(_mm_mul_ps(e1x, px), _mm_mul_ps(e1y, py)),
                             _mm_mul_ps(e1z, pz));
-    const __m128 abs_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
-    __m128 valid = _mm_cmpgt_ps(_mm_and_ps(det, abs_mask), _mm_set1_ps(1e-12f));
+    __m128 valid = tri_isect_det_parallel4(e1x, e1y, e1z, e2x, e2y, e2z, det);
     __m128 inv_det = _mm_div_ps(_mm_set1_ps(1.0f), det);
     __m128 tvx = _mm_sub_ps(p->orgx, _mm_set1_ps(v0[0]));
     __m128 tvy = _mm_sub_ps(p->orgy, _mm_set1_ps(v0[1]));
