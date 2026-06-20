@@ -43,6 +43,10 @@ typedef struct {
     float sheen_weight;
     v3    sheen_color;
     float sheen_roughness;
+    /* thin-film iridescence (Belcour-Barla airy reflectance over the specular) */
+    float thin_film_weight;    /* blend of iridescent vs plain Fresnel [0,1] */
+    float thin_film_thickness; /* film thickness in nanometers (0 = off) */
+    float thin_film_ior;       /* refractive index of the film */
     /* emission */
     float emission;
     v3    emission_color;

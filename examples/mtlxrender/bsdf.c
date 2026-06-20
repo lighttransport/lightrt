@@ -47,6 +47,127 @@ static float sheen_V(float NdotV, float NdotL) {
     return 1.0f / (4.0f * (NdotL + NdotV - NdotL * NdotV) + 1e-4f);
 }
 
+/* ---- thin-film iridescence (Belcour & Barla 2017) --------------------- */
+/* Port of MaterialX's mx_fresnel_airy for the dielectric model: a thin film of
+ * index tf_ior and thickness (nm) over a dielectric substrate of index
+ * ior_substrate. Wave interference of the two interface reflections produces the
+ * view-dependent rainbow sheen. For a dielectric substrate (extinction = 0) the
+ * per-interface reflectances and phase shifts are scalar; the spectral content
+ * comes only from the Gaussian sensitivity fit, so we accumulate in XYZ and
+ * convert to RGB at the end. Returns the reflectance that replaces the plain
+ * Fresnel term of the specular lobe. */
+
+/* Polarized dielectric Fresnel reflectance (parallel, perpendicular) at a
+ * relative index `ior`. */
+static void fresnel_dielectric_pol(float cosTheta, float ior, float *Rp, float *Rs) {
+    float c = clampf(cosTheta, 0.0f, 1.0f);
+    float c2 = c * c, s2 = 1.0f - c2;
+    float t0 = maxf(ior * ior - s2, 0.0f);
+    float t1 = t0 + c2;
+    float t2 = 2.0f * sqrtf(t0) * c;
+    float rs = (t1 - t2) / (t1 + t2);
+    float t3 = c2 * t0 + s2 * s2;
+    float t4 = t2 * s2;
+    *Rs = rs; *Rp = rs * (t3 - t4) / (t3 + t4);
+}
+
+/* Second-interface (film->substrate) polarized reflectance, dielectric (k=0):
+ * the conductor form with zero extinction, which handles eta_sub<eta_film TIR. */
+static void fresnel_substrate_pol(float cosTheta, float n, float *Rp, float *Rs) {
+    float c = clampf(cosTheta, 0.0f, 1.0f);
+    float c2 = c * c, s2 = 1.0f - c2;
+    float t0 = n * n - s2;
+    float a2b2 = fabsf(t0); /* sqrt(t0*t0), k=0 */
+    float t1 = a2b2 + c2;
+    float a = sqrtf(maxf(0.5f * (a2b2 + t0), 0.0f));
+    float t2 = 2.0f * a * c;
+    float rs = (t1 - t2) / (t1 + t2);
+    float t3 = c2 * a2b2 + s2 * s2;
+    float t4 = t2 * s2;
+    *Rs = rs; *Rp = rs * (t3 - t4) / (t3 + t4);
+}
+
+/* Phase shift of the second-interface reflection (conductor phase, k=0). */
+static void fresnel_substrate_phase(float cosTheta, float eta_film, float eta_sub,
+                                    float *phiP, float *phiS) {
+    float c = cosTheta, sin2 = 1.0f - c * c;
+    float A = eta_sub * eta_sub - eta_film * eta_film * sin2;
+    float B = fabsf(A);
+    float U = sqrtf(maxf((A + B) * 0.5f, 0.0f));
+    float V = maxf(0.0f, sqrtf(maxf((B - A) * 0.5f, 0.0f)));
+    *phiS = atan2f(2.0f * eta_film * V * c, U * U + V * V - eta_film * eta_film * c * c);
+    float es2 = eta_sub * eta_sub;
+    *phiP = atan2f(-2.0f * eta_film * es2 * c * V,
+                   es2 * es2 * c * c - eta_film * eta_film * (U * U + V * V));
+}
+
+/* Gaussian-fit spectral sensitivity (XYZ) of the human eye to an optical path
+ * difference, with a constant phase shift. */
+static v3 eval_sensitivity(float opd, float shift) {
+    float phase = 2.0f * MTLX_PI * opd, p2 = phase * phase;
+    const float valx = 5.4856e-13f, valy = 4.4201e-13f, valz = 5.2481e-13f;
+    const float posx = 1.6810e+06f, posy = 1.7953e+06f, posz = 2.2084e+06f;
+    const float varx = 4.3278e+09f, vary = 9.3046e+09f, varz = 6.6121e+09f;
+    float x = valx * sqrtf(2.0f * MTLX_PI * varx) * cosf(posx * phase + shift) * expf(-varx * p2);
+    float y = valy * sqrtf(2.0f * MTLX_PI * vary) * cosf(posy * phase + shift) * expf(-vary * p2);
+    float z = valz * sqrtf(2.0f * MTLX_PI * varz) * cosf(posz * phase + shift) * expf(-varz * p2);
+    x += 9.7470e-14f * sqrtf(2.0f * MTLX_PI * 4.5282e+09f) * cosf(2.2399e+06f * phase + shift) * expf(-4.5282e+09f * p2);
+    return v3_scale(v3_make(x, y, z), 1.0f / 1.0685e-7f);
+}
+
+/* CIE-XYZ(E illuminant) -> linear RGB, the matrix MaterialX uses in the airy
+ * model (column-major mat3 * vec). */
+static v3 xyz_to_rgb_airy(v3 c) {
+    return v3_make(2.3706743f * c.x - 0.9000405f * c.y - 0.4706338f * c.z,
+                  -0.5138850f * c.x + 1.4253036f * c.y + 0.0885814f * c.z,
+                   0.0052982f * c.x - 0.0146949f * c.y + 1.0093968f * c.z);
+}
+
+static v3 fresnel_airy(float cosTheta, float ior_substrate, float tf_thickness_nm, float tf_ior) {
+    float eta1 = 1.0f, eta2 = maxf(tf_ior, eta1), eta3 = ior_substrate;
+    cosTheta = clampf(cosTheta, 0.0f, 1.0f);
+    float cosTt2 = 1.0f - (1.0f - cosTheta * cosTheta) * (eta1 / eta2) * (eta1 / eta2);
+    float cosThetaT = cosTt2 > 0.0f ? sqrtf(cosTt2) : 0.0f;
+
+    float R12p, R12s;
+    fresnel_dielectric_pol(cosTheta, eta2 / eta1, &R12p, &R12s);
+    if (cosThetaT <= 0.0f) { R12p = 1.0f; R12s = 1.0f; } /* TIR at first interface */
+    float T121p = 1.0f - R12p, T121s = 1.0f - R12s;
+
+    float R23p, R23s;
+    fresnel_substrate_pol(cosThetaT, eta3 / eta2, &R23p, &R23s);
+
+    float cosB = cosf(atanf(eta2 / eta1));
+    float phi21p = (cosTheta < cosB) ? 0.0f : MTLX_PI, phi21s = MTLX_PI;
+    float phi23p, phi23s;
+    fresnel_substrate_phase(cosThetaT, eta2, eta3, &phi23p, &phi23s);
+
+    float r123p = maxf(sqrtf(R12p * R23p), 0.0f);
+    float r123s = maxf(sqrtf(R12s * R23s), 0.0f);
+    float opd = 2.0f * eta2 * cosThetaT * (tf_thickness_nm * 1.0e-9f);
+
+    v3 I = v3_splat(0.0f);
+    /* parallel polarization */
+    float Rsp = (T121p * T121p * R23p) / (1.0f - R12p * R23p);
+    I = v3_add(I, v3_splat(R12p + Rsp));
+    float Cm = Rsp - T121p;
+    for (int m = 1; m <= 2; m++) {
+        Cm *= r123p;
+        I = v3_add(I, v3_scale(eval_sensitivity((float)m * opd, (float)m * (phi23p + phi21p)), 2.0f * Cm));
+    }
+    /* perpendicular polarization */
+    float Rss = (T121s * T121s * R23s) / (1.0f - R12s * R23s);
+    I = v3_add(I, v3_splat(R12s + Rss));
+    Cm = Rss - T121s;
+    for (int m = 1; m <= 2; m++) {
+        Cm *= r123s;
+        I = v3_add(I, v3_scale(eval_sensitivity((float)m * opd, (float)m * (phi23s + phi21s)), 2.0f * Cm));
+    }
+    I = v3_scale(I, 0.5f);
+    v3 rgb = xyz_to_rgb_airy(I);
+    return v3_make(clampf(rgb.x, 0.0f, 1.0f), clampf(rgb.y, 0.0f, 1.0f), clampf(rgb.z, 0.0f, 1.0f));
+}
+
 /* ---- layered material ------------------------------------------------- */
 typedef struct {
     v3    diff_color;  /* effective diffuse albedo (incl. subsurface tint) */
@@ -54,6 +175,7 @@ typedef struct {
     float alpha;       /* GGX roughness^2 */
     v3    sheen_color; float sheen_alpha, sheen_w;
     v3    coat_color; float coat_alpha, coat_w, coat_f0, coat_Ri;
+    float tf_weight, tf_thickness, tf_ior; /* thin-film iridescence */
     float glass_w, ior;
     /* normalized lobe selection probabilities (glass is delta) */
     float pd, ps, pc, pg;
@@ -91,6 +213,10 @@ static Layers extract(const OpenPBRParams *p) {
      * deeper, not washed out). Egan/Hilgeman polynomial in the coat IOR. */
     { float n = p->coat_ior;
       L.coat_Ri = (n > 1.001f) ? (-1.440f / (n * n) + 0.710f / n + 0.668f + 0.0636f * n) : 0.0f; }
+
+    L.tf_weight = clampf(p->thin_film_weight, 0.0f, 1.0f);
+    L.tf_thickness = p->thin_film_thickness;
+    L.tf_ior = p->thin_film_ior;
 
     L.glass_w = (1.0f - metal) * trans;
 
@@ -136,7 +262,11 @@ static v3 eval_reflection(const Layers *L, v3 N, v3 wo, v3 wi, float *pdf) {
     v3 diff = v3_mul(diff_alb, v3_scale(base_atten, MTLX_INV_PI));
 
     float D = ggx_D(NdotH, L->alpha), G = ggx_G(NdotV, NdotL, L->alpha);
+    /* Thin film replaces the plain Fresnel with the iridescent airy reflectance
+     * (blended by the film weight); the substrate index is the specular IOR. */
     v3 F = fresnel_schlick(VdotH, L->F0);
+    if (L->tf_weight > 0.0f && L->tf_thickness > 0.0f)
+        F = v3_lerp(F, fresnel_airy(VdotH, L->ior, L->tf_thickness, L->tf_ior), L->tf_weight);
     v3 spec = v3_mul(v3_scale(F, D * G / (4.0f * NdotV * NdotL)), base_atten);
 
     v3 sheen = v3_splat(0.0f);

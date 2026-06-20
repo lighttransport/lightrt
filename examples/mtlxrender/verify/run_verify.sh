@@ -49,6 +49,8 @@ MATERIALS=(
     "ss_brass_tiled|$EXAMPLES/StandardSurface/standard_surface_brass_tiled.mtlx|match"
     "opbr_default|$EXAMPLES/OpenPbr/open_pbr_default.mtlx|match"
     "opbr_carpaint|$EXAMPLES/OpenPbr/open_pbr_carpaint.mtlx|match"
+    "ss_thin_film|$EXAMPLES/StandardSurface/standard_surface_thin_film.mtlx|match"
+    "opbr_pearl|$EXAMPLES/OpenPbr/open_pbr_pearl.mtlx|divergent"
     "ss_glass|$EXAMPLES/StandardSurface/standard_surface_glass.mtlx|divergent"
     "opbr_honey|$EXAMPLES/OpenPbr/open_pbr_honey.mtlx|divergent"
 )

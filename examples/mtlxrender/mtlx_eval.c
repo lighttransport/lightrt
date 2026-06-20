@@ -445,6 +445,7 @@ void openpbr_defaults(OpenPBRParams *p) {
     p->subsurface_color = v3_splat(0.8f); p->subsurface_radius = v3_splat(1.0f); p->subsurface_scale = 1.0f;
     p->coat_color = v3_splat(1.0f); p->coat_roughness = 0.1f; p->coat_ior = 1.5f;
     p->sheen_color = v3_splat(1.0f); p->sheen_roughness = 0.3f;
+    p->thin_film_ior = 1.5f; /* weight/thickness default to 0 (off) via memset */
     p->emission_color = v3_splat(1.0f); p->opacity = 1.0f;
 }
 
@@ -503,6 +504,9 @@ int mtlx_eval_surface(ShadeContext *ctx, int surface_node, OpenPBRParams *out) {
         out->sheen_weight = in_float(ctx, n, "fuzz_weight", 0.0f);
         out->sheen_color = in_color(ctx, n, "fuzz_color", out->sheen_color);
         out->sheen_roughness = in_float(ctx, n, "fuzz_roughness", 0.3f);
+        out->thin_film_weight = in_float(ctx, n, "thin_film_weight", 0.0f);
+        out->thin_film_thickness = in_float(ctx, n, "thin_film_thickness", 0.0f) * 1000.0f; /* um -> nm */
+        out->thin_film_ior = in_float(ctx, n, "thin_film_ior", 1.4f);
         out->emission = in_float(ctx, n, "emission_luminance", 0.0f);
         out->emission_color = in_color(ctx, n, "emission_color", out->emission_color);
         out->opacity = in_float(ctx, n, "geometry_opacity", 1.0f);
@@ -571,6 +575,9 @@ int mtlx_eval_surface(ShadeContext *ctx, int surface_node, OpenPBRParams *out) {
         out->sheen_weight = in_float(ctx, n, "sheen", 0.0f);
         out->sheen_color = in_color(ctx, n, "sheen_color", out->sheen_color);
         out->sheen_roughness = in_float(ctx, n, "sheen_roughness", 0.3f);
+        out->thin_film_thickness = in_float(ctx, n, "thin_film_thickness", 0.0f); /* already nm */
+        out->thin_film_ior = in_float(ctx, n, "thin_film_IOR", 1.5f);
+        out->thin_film_weight = (out->thin_film_thickness > 0.0f) ? 1.0f : 0.0f;
         out->emission = in_float(ctx, n, "emission", 0.0f);
         out->emission_color = in_color(ctx, n, "emission_color", out->emission_color);
         apply_normal_input(ctx, n, "normal", out);
