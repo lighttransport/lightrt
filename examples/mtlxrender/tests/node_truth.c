@@ -18,6 +18,8 @@
 
 static int g_total = 0, g_fail = 0;
 
+static MtlxValue mv_from(v3 c) { MtlxValue v; memset(&v, 0, sizeof(v)); v.type = MV_COLOR3; v.v[0]=c.x; v.v[1]=c.y; v.v[2]=c.z; return v; }
+
 typedef struct { float uv[2]; v3 P, Ns; } Geo;
 
 /* Evaluate node `name` inside a one-graph snippet; return its value. */
@@ -42,6 +44,26 @@ static MtlxValue ev(const char *inner, const char *name, Geo g) {
 }
 
 static Geo geo0(void) { Geo g = { {0.25f, 0.75f}, {1, 2, 3}, {0, 1, 0} }; return g; }
+
+/* Evaluate a top-level surface shader node into OpenPBR params. */
+static OpenPBRParams eval_surf(const char *shader_xml, const char *name) {
+    char buf[8192];
+    snprintf(buf, sizeof(buf),
+             "<?xml version=\"1.0\"?>\n<materialx version=\"1.39\">\n%s\n</materialx>\n", shader_xml);
+    MtlxDoc *d = mtlx_load_string(buf);
+    OpenPBRParams p; openpbr_defaults(&p);
+    if (d) {
+        int id = mtlx_find_node(d, -1, name);
+        ShadeContext ctx; memset(&ctx, 0, sizeof(ctx));
+        ctx.doc = d; ctx.Ns = v3_make(0, 1, 0); ctx.Ng = ctx.Ns;
+        ctx.dpdu = v3_make(1, 0, 0); ctx.dpdv = v3_make(0, 0, 1);
+        ctx.memo = malloc(sizeof(MtlxValue) * (size_t)(d->nnode > 0 ? d->nnode : 1));
+        ctx.memo_done = malloc((size_t)(d->nnode > 0 ? d->nnode : 1));
+        mtlx_eval_surface(&ctx, id, &p);
+        free(ctx.memo); free(ctx.memo_done); mtlx_free(d);
+    }
+    return p;
+}
 
 static void chk1(const char *name, float got, float exp) {
     g_total++;
@@ -152,6 +174,61 @@ int main(void) {
     chk3("tangent",  ev("<tangent name=\"n\" type=\"vector3\"/>", "n", g), 1, 0, 0);
     { MtlxValue tc = ev("<texcoord name=\"n\" type=\"vector2\"/>", "n", g);
       chk1("texcoord.u", tc.v[0], 0.25f); chk1("texcoord.v", tc.v[1], 0.75f); }
+
+    /* ---- conditional / utility ---- */
+    chk1("ifgreater_t", ev("<ifgreater name=\"n\" type=\"float\"><input name=\"value1\" type=\"float\" value=\"3\"/>"
+                           "<input name=\"value2\" type=\"float\" value=\"2\"/><input name=\"in1\" type=\"float\" value=\"10\"/>"
+                           "<input name=\"in2\" type=\"float\" value=\"20\"/></ifgreater>", "n", g).v[0], 10.0f);
+    chk1("ifgreater_f", ev("<ifgreater name=\"n\" type=\"float\"><input name=\"value1\" type=\"float\" value=\"1\"/>"
+                           "<input name=\"value2\" type=\"float\" value=\"2\"/><input name=\"in1\" type=\"float\" value=\"10\"/>"
+                           "<input name=\"in2\" type=\"float\" value=\"20\"/></ifgreater>", "n", g).v[0], 20.0f);
+    chk1("ifequal", ev("<ifequal name=\"n\" type=\"float\"><input name=\"value1\" type=\"float\" value=\"5\"/>"
+                       "<input name=\"value2\" type=\"float\" value=\"5\"/><input name=\"in1\" type=\"float\" value=\"1\"/>"
+                       "<input name=\"in2\" type=\"float\" value=\"0\"/></ifequal>", "n", g).v[0], 1.0f);
+    chk1("switch_which2", ev("<switch name=\"n\" type=\"float\"><input name=\"in1\" type=\"float\" value=\"10\"/>"
+                             "<input name=\"in2\" type=\"float\" value=\"20\"/><input name=\"in3\" type=\"float\" value=\"30\"/>"
+                             "<input name=\"which\" type=\"integer\" value=\"2\"/></switch>", "n", g).v[0], 30.0f);
+    chk1("dot", ev("<dot name=\"n\" type=\"float\"><input name=\"in\" type=\"float\" value=\"7\"/></dot>", "n", g).v[0], 7.0f);
+    chk1("oneminus", ev("<oneminus name=\"n\" type=\"float\"><input name=\"in\" type=\"float\" value=\"0.3\"/></oneminus>", "n", g).v[0], 0.7f);
+    chk3("rotate2d_90", ev("<rotate2d name=\"n\" type=\"vector2\"><input name=\"in\" type=\"vector2\" value=\"1,0\"/>"
+                           "<input name=\"amount\" type=\"float\" value=\"90\"/></rotate2d>", "n", g), 0, 1, 0);
+    chk1("ramp4_br", ev("<ramp4 name=\"n\" type=\"float\"><input name=\"valuetl\" type=\"float\" value=\"1\"/>"
+                        "<input name=\"valuetr\" type=\"float\" value=\"2\"/><input name=\"valuebl\" type=\"float\" value=\"3\"/>"
+                        "<input name=\"valuebr\" type=\"float\" value=\"4\"/><input name=\"texcoord\" type=\"vector2\" value=\"1,1\"/></ramp4>", "n", g).v[0], 4.0f);
+
+    /* ---- more adjust / channel ---- */
+    chk1("saturate_gray", ev("<saturate name=\"n\" type=\"color3\"><input name=\"in\" type=\"color3\" value=\"1,0,0\"/>"
+                             "<input name=\"amount\" type=\"float\" value=\"0\"/></saturate>", "n", g).v[0], 0.2126f);
+    chk3("combine2_pad", ev("<combine2 name=\"n\" type=\"vector2\"><input name=\"in1\" type=\"float\" value=\"0.5\"/>"
+                            "<input name=\"in2\" type=\"float\" value=\"0.25\"/></combine2>", "n", g), 0.5f, 0.25f, 0.0f);
+    chk3("convert_f_to_c3", ev("<convert name=\"n\" type=\"color3\"><input name=\"in\" type=\"float\" value=\"0.4\"/></convert>", "n", g), 0.4f, 0.4f, 0.4f);
+
+    /* ---- surface shader -> OpenPBR parameter mapping ground truth ---- */
+    { OpenPBRParams p = eval_surf(
+        "<standard_surface name=\"s\" type=\"surfaceshader\">"
+        "<input name=\"base_color\" type=\"color3\" value=\"0.2,0.4,0.6\"/>"
+        "<input name=\"metalness\" type=\"float\" value=\"0.7\"/>"
+        "<input name=\"specular_roughness\" type=\"float\" value=\"0.25\"/></standard_surface>", "s");
+      chk3("std_surface.base_color", mv_from(p.base_color), 0.2f, 0.4f, 0.6f);
+      chk1("std_surface.metalness", p.metalness, 0.7f);
+      chk1("std_surface.roughness", p.specular_roughness, 0.25f); }
+    { OpenPBRParams p = eval_surf(
+        "<gltf_pbr name=\"s\" type=\"surfaceshader\">"
+        "<input name=\"base_color\" type=\"color3\" value=\"0.1,0.5,0.9\"/>"
+        "<input name=\"metallic\" type=\"float\" value=\"0.3\"/></gltf_pbr>", "s");
+      chk3("gltf_pbr.base_color", mv_from(p.base_color), 0.1f, 0.5f, 0.9f);
+      chk1("gltf_pbr.metalness", p.metalness, 0.3f); }
+    { OpenPBRParams p = eval_surf(
+        "<UsdPreviewSurface name=\"s\" type=\"surfaceshader\">"
+        "<input name=\"diffuseColor\" type=\"color3\" value=\"0.8,0.2,0.1\"/>"
+        "<input name=\"metallic\" type=\"float\" value=\"0.0\"/></UsdPreviewSurface>", "s");
+      chk3("usd.diffuse->base", mv_from(p.base_color), 0.8f, 0.2f, 0.1f); }
+    { OpenPBRParams p = eval_surf(
+        "<disney_principled name=\"s\" type=\"surfaceshader\">"
+        "<input name=\"baseColor\" type=\"color3\" value=\"0.3,0.6,0.3\"/>"
+        "<input name=\"subsurface\" type=\"float\" value=\"0.5\"/></disney_principled>", "s");
+      chk3("disney.base_color", mv_from(p.base_color), 0.3f, 0.6f, 0.3f);
+      chk1("disney.subsurface", p.subsurface, 0.5f); }
 
     /* ---- procedural invariants (implementation-defined values; check spec
      *      properties instead of exact numbers) ---- */

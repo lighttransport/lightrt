@@ -1,6 +1,7 @@
 #include "mtlx_eval.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 /* ---- MtlxValue helpers ------------------------------------------------- */
@@ -132,7 +133,9 @@ typedef enum {
     OP_MIX, OP_CLAMP, OP_SMOOTHSTEP, OP_REMAP, OP_LUMINANCE, OP_RGBTOHSV,
     OP_HSVTORGB, OP_SATURATE, OP_CONTRAST, OP_RANGE,
     OP_SEPARATE, OP_COMBINE2, OP_COMBINE3, OP_COMBINE4, OP_EXTRACT, OP_CONVERT,
-    OP_SWIZZLE, OP_NOISE3D, OP_FRACTAL3D, OP_CELLNOISE3D, OP_RAMPLR, OP_SPLITLR
+    OP_SWIZZLE, OP_NOISE3D, OP_FRACTAL3D, OP_CELLNOISE3D, OP_RAMPLR, OP_SPLITLR,
+    OP_IFGREATER, OP_IFGREATEREQ, OP_IFEQUAL, OP_SWITCH, OP_DOT, OP_RAMP4,
+    OP_ROTATE2D, OP_ONEMINUS
 } NodeOp;
 
 static NodeOp classify(const char *c) {
@@ -204,6 +207,15 @@ static NodeOp classify(const char *c) {
     if (!strcmp(c, "cellnoise3d")) return OP_CELLNOISE3D;
     if (!strcmp(c, "ramplr")) return OP_RAMPLR;
     if (!strcmp(c, "splitlr")) return OP_SPLITLR;
+    if (!strcmp(c, "ramp4")) return OP_RAMP4;
+    /* conditional / utility */
+    if (!strcmp(c, "ifgreater")) return OP_IFGREATER;
+    if (!strcmp(c, "ifgreatereq")) return OP_IFGREATEREQ;
+    if (!strcmp(c, "ifequal")) return OP_IFEQUAL;
+    if (!strcmp(c, "switch")) return OP_SWITCH;
+    if (!strcmp(c, "dot")) return OP_DOT;
+    if (!strcmp(c, "rotate2d")) return OP_ROTATE2D;
+    if (!strcmp(c, "oneminus")) return OP_ONEMINUS;
     return OP_UNKNOWN;
 }
 
@@ -354,6 +366,14 @@ static MtlxValue eval_node(ShadeContext *ctx, int node_id) {
         case OP_CELLNOISE3D: { MtlxValue pos=in_or(ctx,n,"position",mv_vec3(ctx->P)); float c=cellnoise(mv_as_v3(&pos)); r=(n->type==MV_FLOAT)?mv_float(c):mv_color3(v3_splat(c)); break; }
         case OP_RAMPLR: { MtlxValue l=in_or(ctx,n,"valuel",mv_zero(n->type)),rr=in_or(ctx,n,"valuer",mv_zero(n->type)),tc=in_or(ctx,n,"texcoord",mv_vec2(ctx->uv[0],ctx->uv[1])); float t=clampf(tc.v[0],0,1); int nc=ncomp_of(&l); r=l; for(int i=0;i<nc;i++) r.v[i]=l.v[i]*(1-t)+rr.v[i]*t; break; }
         case OP_SPLITLR: { MtlxValue l=in_or(ctx,n,"valuel",mv_zero(n->type)),rr=in_or(ctx,n,"valuer",mv_zero(n->type)),ct=in_or(ctx,n,"center",mv_float(0.5f)),tc=in_or(ctx,n,"texcoord",mv_vec2(ctx->uv[0],ctx->uv[1])); r=(tc.v[0]<ct.v[0])?l:rr; break; }
+        case OP_RAMP4: { MtlxValue tl=in_or(ctx,n,"valuetl",mv_zero(n->type)),tr=in_or(ctx,n,"valuetr",mv_zero(n->type)),bl=in_or(ctx,n,"valuebl",mv_zero(n->type)),br=in_or(ctx,n,"valuebr",mv_zero(n->type)),tc=in_or(ctx,n,"texcoord",mv_vec2(ctx->uv[0],ctx->uv[1])); float u=clampf(tc.v[0],0,1),vv=clampf(tc.v[1],0,1); int nc=ncomp_of(&tl); r=tl; for(int i=0;i<nc;i++){ float top=tl.v[i]*(1-u)+tr.v[i]*u, bot=bl.v[i]*(1-u)+br.v[i]*u; r.v[i]=top*(1-vv)+bot*vv; } break; }
+        case OP_IFGREATER: { MtlxValue v1=in_or(ctx,n,"value1",mv_float(0)),v2=in_or(ctx,n,"value2",mv_float(0)); r=(mv_as_float(&v1)>mv_as_float(&v2))?in_or(ctx,n,"in1",mv_zero(n->type)):in_or(ctx,n,"in2",mv_zero(n->type)); break; }
+        case OP_IFGREATEREQ: { MtlxValue v1=in_or(ctx,n,"value1",mv_float(0)),v2=in_or(ctx,n,"value2",mv_float(0)); r=(mv_as_float(&v1)>=mv_as_float(&v2))?in_or(ctx,n,"in1",mv_zero(n->type)):in_or(ctx,n,"in2",mv_zero(n->type)); break; }
+        case OP_IFEQUAL: { MtlxValue v1=in_or(ctx,n,"value1",mv_float(0)),v2=in_or(ctx,n,"value2",mv_float(0)); r=(mv_as_float(&v1)==mv_as_float(&v2))?in_or(ctx,n,"in1",mv_zero(n->type)):in_or(ctx,n,"in2",mv_zero(n->type)); break; }
+        case OP_SWITCH: { MtlxValue w=in_or(ctx,n,"which",mv_float(0)); int k=(int)(mv_as_float(&w)+0.5f); if(k<0)k=0; if(k>9)k=9; char nm[8]; snprintf(nm,sizeof(nm),"in%d",k+1); r=in_or(ctx,n,nm,mv_zero(n->type)); break; }
+        case OP_DOT: r=in_or(ctx,n,"in",mv_zero(n->type)); break;
+        case OP_ONEMINUS: { a=in_or(ctx,n,"in",mv_zero(n->type)); int nc=ncomp_of(&a); r=a; for(int i=0;i<nc;i++) r.v[i]=1.0f-a.v[i]; break; }
+        case OP_ROTATE2D: { a=in_or(ctx,n,"in",mv_vec2(0,0)); MtlxValue am=in_or(ctx,n,"amount",mv_float(0)); float ang=am.v[0]*(MTLX_PI/180.0f),cs=cosf(ang),sn=sinf(ang); r=mv_vec2(a.v[0]*cs-a.v[1]*sn, a.v[0]*sn+a.v[1]*cs); break; }
         case OP_UNKNOWN:
         default:
             if (n->ninput > 0) r = eval_input(ctx, &n->inputs[0]);

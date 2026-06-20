@@ -51,6 +51,11 @@ node_truth: $(TEST_DEPS)
 test: node_truth
 	./node_truth
 
+# Full verification: node ground-truth + golden render regression.
+check: node_truth mtlxrender
+	./node_truth
+	./golden.sh check
+
 $(BUILD)/%.o: %.c | $(BUILD)
 	$(CC) $(CFLAGS) $(WARN) -c $< -o $@
 
@@ -70,4 +75,4 @@ $(BUILD):
 clean:
 	rm -rf $(BUILD) mtlxrender node_truth
 
-.PHONY: clean test
+.PHONY: clean test check

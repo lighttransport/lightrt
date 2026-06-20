@@ -29,8 +29,10 @@ The same scene under a Radiance `.hdr` environment (image-based lighting):
   - **adjust/compositing**: `mix` `clamp` `smoothstep` `remap` `range`
     `contrast` `saturate` `luminance` `rgbtohsv` `hsvtorgb` `invert`
   - **channel**: `separate2/3/4` `combine2/3/4` `extract` `convert` `swizzle`
+  - **conditional/utility**: `ifgreater` `ifgreatereq` `ifequal` `switch` `dot`
+    `oneminus` `rotate2d`
   - **procedural**: `constant` `noise3d` `fractal3d` `cellnoise3d` `ramplr`
-    `splitlr`
+    `splitlr` `ramp4`
   - **geometric**: `texcoord` `position` `normal` `tangent` `bitangent`
     `geomcolor` `place2d`
 - Supports five surface shader models, all mapped onto the OpenPBR BSDF:
@@ -91,16 +93,21 @@ catches real correctness bugs, not just regressions. Each case feeds inputs
 through the real parse → doc → eval path (`mtlx_load_string` + a one-node graph).
 
 ```bash
-make test        # builds and runs node_truth (48 assertions, all PASS)
+make test        # builds and runs node_truth (67 assertions, all PASS)
+make check       # node ground-truth + golden render regression
 # or: ctest       (via CMake)
 ```
 
 Covers math (`power(2,3)=8`, `dotproduct=32`, `crossproduct`, `magnitude=5`, …),
 compositing/adjust (`mix`, `clamp`, `smoothstep`, `remap`, `range`, `contrast`,
-`luminance`, `invert`), color (`rgbtohsv`/`hsvtorgb` round-trip), channel
-(`combine3`, `extract`, `separate3.outg`), and geometric nodes. Procedural noise
-is checked for spec invariants (determinism, output range). The suite is clean
-under ASan/UBSan.
+`luminance`, `invert`, `saturate`), color (`rgbtohsv`/`hsvtorgb` round-trip),
+channel (`combine2/3`, `extract`, `convert`, `separate3.outg`), conditional/
+utility (`ifgreater`, `ifequal`, `switch`, `dot`, `oneminus`, `rotate2d`,
+`ramp4`), and geometric nodes. It also validates the **surface-shader parameter
+mapping** — `standard_surface` / `gltf_pbr` / `UsdPreviewSurface` /
+`disney_principled` inputs onto the OpenPBR params. Procedural noise is checked
+for spec invariants (determinism, output range). The suite is clean under
+ASan/UBSan.
 
 ### Golden reference renders
 
