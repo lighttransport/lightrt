@@ -87,7 +87,7 @@ static int add_node(Builder *b, const char *category, const char *name, MtlxType
     return b->d.nnode++;
 }
 
-static void node_add_input(MtlxNode *n, const XmlNode *x) {
+static void node_add_input(MtlxNode *n, const XmlNode *x, const char *fileprefix) {
     n->inputs = realloc(n->inputs, sizeof(MtlxInput) * (n->ninput + 1));
     MtlxInput *in = &n->inputs[n->ninput];
     memset(in, 0, sizeof(*in));
@@ -96,6 +96,17 @@ static void node_add_input(MtlxNode *n, const XmlNode *x) {
     in->type = parse_type(xml_attr(x, "type"));
     const char *val = xml_attr(x, "value");
     if (val) { in->has_value = 1; parse_value(val, in->type, &in->value); }
+    /* MaterialX `fileprefix` (on the <materialx> root and/or enclosing
+     * <nodegraph>) is prepended to every filename value in scope. e.g. the
+     * boombox material's fileprefix="boombox/" puts its textures in a
+     * subdirectory the search path could never reach by walking up. */
+    if (in->type == MV_FILENAME && in->value.s && fileprefix && fileprefix[0]) {
+        size_t L = strlen(fileprefix) + strlen(in->value.s) + 1;
+        char *full = (char *)malloc(L);
+        snprintf(full, L, "%s%s", fileprefix, in->value.s);
+        free(in->value.s);
+        in->value.s = full;
+    }
     const char *cs = xml_attr(x, "colorspace");
     if (cs && !strcmp(cs, "srgb_texture")) in->colorspace_srgb = 1;
     /* connection attrs stashed temporarily as strings in src_output/value.s;
@@ -168,6 +179,10 @@ static MtlxDoc *mtlx_build(XmlNode *root) {
     Builder b;
     memset(&b, 0, sizeof(b));
 
+    /* document-level file prefix (prepended to all filename values in scope) */
+    const char *root_pre = xml_attr(mx, "fileprefix");
+    if (!root_pre) root_pre = "";
+
     /* ---- pass A: create nodes, graphs, outputs, materials, assigns ---- */
     for (int i = 0; i < mx->nchild; i++) {
         const XmlNode *el = &mx->children[i];
@@ -175,6 +190,10 @@ static MtlxDoc *mtlx_build(XmlNode *root) {
 
         if (!strcmp(tag, "nodegraph")) {
             int gid = add_graph(&b, xml_attr(el, "name"));
+            /* nodegraph fileprefix concatenates after the document one */
+            const char *gfp = xml_attr(el, "fileprefix");
+            char gpre[1024];
+            snprintf(gpre, sizeof(gpre), "%s%s", root_pre, gfp ? gfp : "");
             for (int j = 0; j < el->nchild; j++) {
                 const XmlNode *c = &el->children[j];
                 if (!strcmp(c->tag, "output")) {
@@ -191,19 +210,19 @@ static MtlxDoc *mtlx_build(XmlNode *root) {
                      * whose self-input carries the interface's value (or an
                      * upstream connection). Referenced via interfacename. */
                     int nid = add_node(&b, "input", xml_attr(c, "name"), parse_type(xml_attr(c, "type")), gid);
-                    node_add_input(&b.d.nodes[nid], c);
+                    node_add_input(&b.d.nodes[nid], c, gpre);
                 } else {
                     int nid = add_node(&b, c->tag, xml_attr(c, "name"), parse_type(xml_attr(c, "type")), gid);
                     for (int k = 0; k < c->nchild; k++)
                         if (!strcmp(c->children[k].tag, "input"))
-                            node_add_input(&b.d.nodes[nid], &c->children[k]);
+                            node_add_input(&b.d.nodes[nid], &c->children[k], gpre);
                 }
             }
         } else if (is_shader_category(tag)) {
             int nid = add_node(&b, tag, xml_attr(el, "name"), parse_type(xml_attr(el, "type")), -1);
             for (int k = 0; k < el->nchild; k++)
                 if (!strcmp(el->children[k].tag, "input"))
-                    node_add_input(&b.d.nodes[nid], &el->children[k]);
+                    node_add_input(&b.d.nodes[nid], &el->children[k], root_pre);
         } else if (!strcmp(tag, "surfacematerial")) {
             b.d.mats = realloc(b.d.mats, sizeof(MtlxMaterial) * (b.d.nmat + 1));
             b.mat_shadernames = realloc(b.mat_shadernames, sizeof(char *) * (b.d.nmat + 1));
@@ -235,7 +254,7 @@ static MtlxDoc *mtlx_build(XmlNode *root) {
             int nid = add_node(&b, tag, xml_attr(el, "name"), parse_type(xml_attr(el, "type")), -1);
             for (int k = 0; k < el->nchild; k++)
                 if (!strcmp(el->children[k].tag, "input"))
-                    node_add_input(&b.d.nodes[nid], &el->children[k]);
+                    node_add_input(&b.d.nodes[nid], &el->children[k], root_pre);
         }
     }
 
