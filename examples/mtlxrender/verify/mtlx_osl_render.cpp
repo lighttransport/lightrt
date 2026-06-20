@@ -135,7 +135,11 @@ int main(int argc, char** argv)
         if (outDir.empty()) outDir = ".";
         renderer->setOslOutputFilePath(mx::FilePath(outDir));
         renderer->setOslShaderName(shaderName);
-        renderer->setAaLit(8);
+        // testrender traces AA*AA samples/pixel, so AaLit=16 -> 256 spp. The
+        // higher count is needed because the matte/diffuse materials are
+        // IBL-noise-dominated at lower sampling (the residual vs lightrt is the
+        // path tracer's own Monte-Carlo grain, not a shading difference).
+        renderer->setAaLit(16);
         renderer->setAaUnlit(2);
         renderer->createProgram(shader);
         renderer->setSize(W, H);
@@ -162,7 +166,12 @@ int main(int argc, char** argv)
         if (!image)
             return fail("captureImage returned null");
 
-        if (!imageHandler->saveImage(mx::FilePath(outPng), image, true))
+        // testrender's captured framebuffer has a bottom-up origin; save without
+        // the loader's extra vertical flip so the PNG is top-down like the lightrt
+        // and GLSL renders (verified: chrome reflection aligns, masked-RMSE 0.35
+        // -> 0.009). This matches MaterialX's own OslShaderRenderTester::saveImage,
+        // which also passes verticalFlip=false.
+        if (!imageHandler->saveImage(mx::FilePath(outPng), image, false))
             return fail("failed to save " + outPng);
 
         std::cout << "mtlx_osl_render: wrote " << outPng << " (" << W << "x" << H
