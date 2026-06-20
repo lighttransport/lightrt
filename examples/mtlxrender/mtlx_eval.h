@@ -1,0 +1,70 @@
+/*
+ * mtlx_eval.h - demand-driven MaterialX node-graph evaluator.
+ *
+ * Given a shade point (uv + tangent frame) and a surface shader node, walk the
+ * graph and produce a flat OpenPBRParams the BSDF can consume. standard_surface
+ * inputs map onto the OpenPBR layering ~1:1.
+ */
+#ifndef MTLXRENDER_MTLX_EVAL_H_
+#define MTLXRENDER_MTLX_EVAL_H_
+
+#include "mtlx_doc.h"
+#include "texture.h"
+#include "vecmath.h"
+
+typedef struct {
+    /* base / diffuse */
+    float base_weight;
+    v3    base_color;
+    float diffuse_roughness;
+    float metalness;
+    /* specular (GGX dielectric) */
+    float specular_weight;
+    v3    specular_color;
+    float specular_roughness;
+    float specular_ior;
+    /* transmission */
+    float transmission;
+    v3    transmission_color;
+    /* subsurface */
+    float subsurface;
+    v3    subsurface_color;
+    v3    subsurface_radius;
+    float subsurface_scale;
+    /* coat */
+    float coat_weight;
+    v3    coat_color;
+    float coat_roughness;
+    float coat_ior;
+    /* sheen */
+    float sheen_weight;
+    v3    sheen_color;
+    float sheen_roughness;
+    /* emission */
+    float emission;
+    v3    emission_color;
+    /* geometry */
+    v3    normal;   /* world-space shading normal (normal-map applied) */
+    float opacity;
+} OpenPBRParams;
+
+typedef struct {
+    const MtlxDoc *doc;
+    TextureCache  *tex;
+    /* shade point */
+    float uv[2];
+    v3    Ns;      /* shading normal (world) */
+    v3    Ng;      /* geometric normal (world) */
+    v3    dpdu, dpdv; /* tangent frame for normal mapping */
+    /* per-shade-point memo (size doc->nnode) */
+    MtlxValue *memo;
+    char      *memo_done;
+} ShadeContext;
+
+/* Set sane OpenPBR defaults. */
+void openpbr_defaults(OpenPBRParams *p);
+
+/* Evaluate a surface shader node into params. Returns 0 on success. */
+int mtlx_eval_surface(ShadeContext *ctx, int surface_node, OpenPBRParams *out);
+
+#endif /* MTLXRENDER_MTLX_EVAL_H_ */

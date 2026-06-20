@@ -1,0 +1,8 @@
+build/
+cmbuild/
+mtlxrender
+*.o
+*.exr
+*.png
+!docs/*.png
+deps/
