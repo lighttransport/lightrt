@@ -164,17 +164,27 @@ int bsdf_sample(const OpenPBRParams *p, v3 Ns, v3 wo, pcg32 *rng, BsdfSample *ou
         float eta = entering ? (1.0f / L.ior) : L.ior;
         float cosi = clampf(v3_dot(m, wo), 0.0f, 1.0f);
         float Fr = fresnel_dielectric(cosi, eta);
-        v3 wi;
+        v3 wi; int refracted;
         if (pcg32_f(rng) < Fr) {
             wi = v3_sub(v3_scale(m, 2.0f * v3_dot(m, wo)), wo);
             if (v3_dot(wi, N) <= 0.0f) return 0; /* reflected below surface: reject */
+            refracted = 0;
         } else {
             float sint2 = eta * eta * (1.0f - cosi * cosi);
             float cost = sqrtf(maxf(0.0f, 1.0f - sint2));
             wi = v3_normalize(v3_sub(v3_scale(m, eta * cosi - cost), v3_scale(wo, eta)));
+            refracted = 1;
         }
-        out->wi = wi; out->throughput = p->transmission_color; out->pdf = 1.0f;
-        out->specular = 1; out->transmission = 1; out->subsurface = 0;
+        /* When transmission_depth > 0 the tint lives in the volume (applied as
+         * Beer-Lambert absorption by the path tracer over the internal path
+         * length), so the interface itself is clear; otherwise transmission_color
+         * is a thin per-interface tint. Reflections carry the specular color. */
+        out->throughput = !refracted ? p->specular_color
+                        : (p->transmission_depth > 0.0f ? v3_splat(1.0f)
+                                                        : p->transmission_color);
+        out->wi = wi; out->pdf = 1.0f;
+        out->specular = 1; out->transmission = 1; out->crossed = refracted;
+        out->subsurface = 0;
         return 1;
     }
 
@@ -197,9 +207,20 @@ int bsdf_sample(const OpenPBRParams *p, v3 Ns, v3 wo, pcg32 *rng, BsdfSample *ou
     out->wi = wi;
     out->throughput = v3_scale(f, v3_dot(N, wi) / pdf);
     out->pdf = pdf;
-    out->specular = 0; out->transmission = 0;
+    out->specular = 0; out->transmission = 0; out->crossed = 0;
     out->subsurface = (p->subsurface > 0.5f) ? 1 : 0;
     return 1;
+}
+
+v3 transmission_sigma_a(const OpenPBRParams *p) {
+    if (p->transmission_depth <= 0.0f) return v3_splat(0.0f);
+    /* sigma_a = -ln(clamp(transmission_color)) / depth, per channel. Clamp the
+     * color away from 0 (infinite absorption) and 1 (none) for stability. */
+    v3 c = p->transmission_color;
+    float inv = 1.0f / p->transmission_depth;
+    return v3_make(-logf(clampf(c.x, 1e-3f, 1.0f)) * inv,
+                   -logf(clampf(c.y, 1e-3f, 1.0f)) * inv,
+                   -logf(clampf(c.z, 1e-3f, 1.0f)) * inv);
 }
 
 v3 bsdf_eval(const OpenPBRParams *p, v3 Ns, v3 wo, v3 wi, float *pdf_out) {

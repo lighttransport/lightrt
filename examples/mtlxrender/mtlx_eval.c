@@ -489,6 +489,7 @@ int mtlx_eval_surface(ShadeContext *ctx, int surface_node, OpenPBRParams *out) {
         out->specular_ior = in_float(ctx, n, "specular_ior", 1.5f);
         out->transmission = in_float(ctx, n, "transmission_weight", 0.0f);
         out->transmission_color = in_color(ctx, n, "transmission_color", out->transmission_color);
+        out->transmission_depth = in_float(ctx, n, "transmission_depth", 0.0f);
         out->subsurface = in_float(ctx, n, "subsurface_weight", 0.0f);
         out->subsurface_color = in_color(ctx, n, "subsurface_color", out->subsurface_color);
         out->subsurface_radius = v3_splat(in_float(ctx, n, "subsurface_radius", 1.0f));
@@ -552,6 +553,7 @@ int mtlx_eval_surface(ShadeContext *ctx, int surface_node, OpenPBRParams *out) {
         out->specular_ior = in_float(ctx, n, "specular_IOR", 1.5f);
         out->transmission = in_float(ctx, n, "transmission", 0.0f);
         out->transmission_color = in_color(ctx, n, "transmission_color", out->transmission_color);
+        out->transmission_depth = in_float(ctx, n, "transmission_depth", 0.0f);
         out->subsurface = in_float(ctx, n, "subsurface", 0.0f);
         out->subsurface_color = in_color(ctx, n, "subsurface_color", out->subsurface_color);
         out->subsurface_radius = in_color(ctx, n, "subsurface_radius", v3_splat(1.0f));

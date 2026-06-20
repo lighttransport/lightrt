@@ -110,6 +110,8 @@ static v3 trace_path(const Scene *s, const MtlxDoc *doc, const MaterialBinding *
     v3 throughput = v3_splat(1.0f);
     int specular_bounce = 1;
     float prev_pdf = 0.0f;
+    int in_medium = 0;            /* inside a transmissive volume (after refraction) */
+    v3 medium_sigma = v3_splat(0.0f); /* Beer-Lambert absorption coeff of that volume */
 
     ShadeContext ctx;
     ctx.doc = doc; ctx.tex = tex; ctx.memo = memo; ctx.memo_done = memo_done;
@@ -127,6 +129,14 @@ static v3 trace_path(const Scene *s, const MtlxDoc *doc, const MaterialBinding *
                 radiance = v3_add(radiance, v3_mul(throughput, v3_scale(Le, w)));
             }
             break;
+        }
+
+        /* Beer-Lambert: attenuate over the path length just traversed inside a
+         * transmissive medium (the segment from the entry refraction to here). */
+        if (in_medium) {
+            throughput = v3_mul(throughput, v3_make(expf(-medium_sigma.x * hit.t),
+                                                    expf(-medium_sigma.y * hit.t),
+                                                    expf(-medium_sigma.z * hit.t)));
         }
 
         HitInfo hi;
@@ -198,6 +208,13 @@ static v3 trace_path(const Scene *s, const MtlxDoc *doc, const MaterialBinding *
             float q = clampf(v3_maxc(throughput), 0.02f, 0.95f);
             if (pcg32_f(rng) >= q) break;
             throughput = v3_scale(throughput, 1.0f / q);
+        }
+
+        /* A refraction crosses the interface: toggle in/out of the medium and,
+         * on entry, capture that material's absorption coefficient. */
+        if (bs.crossed) {
+            if (!in_medium) { in_medium = 1; medium_sigma = transmission_sigma_a(&params); }
+            else            { in_medium = 0; }
         }
 
         ray = make_ray(hi.P, bs.wi, hi.Ng, 1e30f);

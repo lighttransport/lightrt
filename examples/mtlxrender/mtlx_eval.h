@@ -26,6 +26,7 @@ typedef struct {
     /* transmission */
     float transmission;
     v3    transmission_color;
+    float transmission_depth; /* Beer-Lambert distance for transmission_color (0 = no absorption) */
     /* subsurface */
     float subsurface;
     v3    subsurface_color;

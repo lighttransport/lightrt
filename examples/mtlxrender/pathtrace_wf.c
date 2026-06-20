@@ -77,6 +77,8 @@ typedef struct {
     pcg32 rng;
     float prev_pdf;
     uint8_t alive, spec;
+    uint8_t in_medium;   /* inside a transmissive volume (after refraction) */
+    v3 medium_sigma;     /* Beer-Lambert absorption coeff of that volume */
 } Path;
 
 /* shadow-ray slot (two per shaded hit: env NEE + sun NEE) */
@@ -115,6 +117,14 @@ static void shade_range(ShadeJob *j, int k0, int k1, MtlxValue *memo, char *memo
             }
             p->alive = 0;
             continue;
+        }
+
+        /* Beer-Lambert: attenuate over the path length just traversed inside a
+         * transmissive medium (entry refraction -> here). */
+        if (p->in_medium) {
+            p->thr = v3_mul(p->thr, v3_make(expf(-p->medium_sigma.x * hit->t),
+                                            expf(-p->medium_sigma.y * hit->t),
+                                            expf(-p->medium_sigma.z * hit->t)));
         }
 
         HitInfo hi;
@@ -173,6 +183,13 @@ static void shade_range(ShadeJob *j, int k0, int k1, MtlxValue *memo, char *memo
         p->spec = (uint8_t)bs.specular;
         p->prev_pdf = bs.pdf;
         if (!v3_is_finite(p->thr)) { p->alive = 0; continue; }
+
+        /* A refraction crosses the interface: toggle in/out of the medium and,
+         * on entry, capture that material's absorption coefficient. */
+        if (bs.crossed) {
+            if (!p->in_medium) { p->in_medium = 1; p->medium_sigma = transmission_sigma_a(&params); }
+            else               { p->in_medium = 0; }
+        }
 
         /* Russian roulette is applied to survivors after the bounce (apply_rr). */
         p->ray = make_ray(hi.P, bs.wi, hi.Ng, 1e30f);
@@ -250,6 +267,7 @@ void render_wavefront(const Scene *scene, const MtlxDoc *doc,
                 p->rad = v3_splat(0.0f);
                 p->prev_pdf = 0.0f;
                 p->alive = 1; p->spec = 1;
+                p->in_medium = 0; p->medium_sigma = v3_splat(0.0f);
             }
         }
 
