@@ -139,18 +139,23 @@ int bsdf_sample(const OpenPBRParams *p, v3 Ns, v3 wo, pcg32 *rng, BsdfSample *ou
     v3 T, B; onb(N, &T, &B);
     float u = pcg32_f(rng), u1 = pcg32_f(rng), u2 = pcg32_f(rng);
 
-    /* glass (smooth dielectric) */
+    /* glass (dielectric; microfacet-roughened when alpha is significant) */
     if (u < L.pg) {
+        /* sample a microfacet normal m (= N for smooth glass) and reflect/
+         * refract about it, giving frosted glass for rough surfaces. */
+        v3 m = (L.alpha > 1e-3f) ? v3_normalize(to_world(sample_ggx_h(L.alpha, u1, u2), T, B, N)) : N;
+        if (v3_dot(m, wo) < 0.0f) m = v3_neg(m);
         float eta = 1.0f / L.ior;
-        float cosi = clampf(v3_dot(N, wo), 0.0f, 1.0f);
+        float cosi = clampf(v3_dot(m, wo), 0.0f, 1.0f);
         float Fr = fresnel_dielectric(cosi, eta);
         v3 wi;
         if (pcg32_f(rng) < Fr) {
-            wi = v3_sub(v3_scale(N, 2.0f * v3_dot(N, wo)), wo);
+            wi = v3_sub(v3_scale(m, 2.0f * v3_dot(m, wo)), wo);
+            if (v3_dot(wi, N) <= 0.0f) return 0; /* reflected below surface: reject */
         } else {
             float sint2 = eta * eta * (1.0f - cosi * cosi);
             float cost = sqrtf(maxf(0.0f, 1.0f - sint2));
-            wi = v3_normalize(v3_sub(v3_scale(N, eta * cosi - cost), v3_scale(wo, eta)));
+            wi = v3_normalize(v3_sub(v3_scale(m, eta * cosi - cost), v3_scale(wo, eta)));
         }
         out->wi = wi; out->throughput = p->transmission_color; out->pdf = 1.0f;
         out->specular = 1; out->transmission = 1; out->subsurface = 0;
