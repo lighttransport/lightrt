@@ -2,7 +2,9 @@ build/
 cmbuild/
 mtlxrender
 node_truth
+mtlxvk
 *.o
+*.ppm
 *.exr
 *.png
 !docs/*.png

@@ -51,6 +51,16 @@ node_truth: $(TEST_DEPS)
 test: node_truth
 	./node_truth
 
+# MaterialX -> GPU shading bridge (bakes per-material OpenPBR params and shades
+# one sphere per material on the GPU via the Vulkan backend). Needs the vk
+# sources from the repo root + libdl for the runtime Vulkan loader.
+MTLXVK_OBJ = $(BUILD)/mtlxvk.o $(BUILD)/mtlx_doc.o $(BUILD)/mtlx_xml.o \
+             $(BUILD)/mtlx_eval.o $(BUILD)/texture.o $(BUILD)/color.o \
+             $(BUILD)/tp_third_party_impl.o $(BUILD)/tp_lightrt_c_tri.o \
+             $(BUILD)/tp_lightrt_vkew.o $(BUILD)/tp_lightrt_c_vk.o
+mtlxvk: $(MTLXVK_OBJ)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -ldl
+
 # Full verification: node ground-truth + golden render regression.
 check: node_truth mtlxrender
 	./node_truth
@@ -73,6 +83,6 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 clean:
-	rm -rf $(BUILD) mtlxrender node_truth
+	rm -rf $(BUILD) mtlxrender node_truth mtlxvk
 
 .PHONY: clean test check

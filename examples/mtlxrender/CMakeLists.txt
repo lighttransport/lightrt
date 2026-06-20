@@ -52,6 +52,30 @@ set_source_files_properties(${APP_SRC} PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra
 find_package(Threads REQUIRED)
 target_link_libraries(mtlxrender PRIVATE Threads::Threads m)
 
+# MaterialX -> GPU shading bridge (Vulkan compute). Opt-in; runtime dlopen of
+# libvulkan via lightrt_vkew (no Vulkan SDK / find_package(Vulkan) needed).
+option(MTLXVK "Build the MaterialX->GPU (Vulkan) shading bridge" ON)
+if(MTLXVK)
+    add_executable(mtlxvk
+        mtlxvk.c mtlx_doc.c mtlx_xml.c mtlx_eval.c texture.c color.c
+        third_party_impl.c
+        ${LIGHTRT_ROOT}/lightrt_c_tri.c
+        ${LIGHTRT_ROOT}/lightrt_vkew.c
+        ${LIGHTRT_ROOT}/lightrt_c_vk.c)
+    target_include_directories(mtlxvk PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${LIGHTRT_ROOT} ${DEPS})
+    target_compile_definitions(mtlxvk PRIVATE _POSIX_C_SOURCE=200809L)
+    set_source_files_properties(
+        third_party_impl.c ${LIGHTRT_ROOT}/lightrt_c_tri.c
+        ${LIGHTRT_ROOT}/lightrt_vkew.c ${LIGHTRT_ROOT}/lightrt_c_vk.c
+        PROPERTIES COMPILE_OPTIONS "-w")
+    if(HAS_SSE41)
+        set_source_files_properties(${LIGHTRT_ROOT}/lightrt_c_tri.c
+            PROPERTIES COMPILE_OPTIONS "-w;-msse4.1")
+    endif()
+    target_link_libraries(mtlxvk PRIVATE m ${CMAKE_DL_LIBS})
+endif()
+
 # Per-node numeric ground-truth tests.
 enable_testing()
 add_executable(node_truth

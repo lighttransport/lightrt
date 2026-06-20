@@ -48,6 +48,33 @@ The same scene under a Radiance `.hdr` environment (image-based lighting):
 `standard_surface` inputs map onto a single OpenPBR-style BSDF (~1:1), so the
 chess set renders unchanged.
 
+## MaterialX → GPU shading bridge (`mtlxvk`)
+
+`mtlxvk` is the GPU counterpart: it evaluates every `<surfacematerial>` with the
+same CPU node-graph interpreter (at one representative shade point) to **bake
+constant OpenPBR parameters**, then renders **one sphere per material on the
+GPU** through LightRT's Vulkan compute shading backend
+(`lrt_vk_shade_analytic` / the resident `lrt_vk_shade_scene` API in
+`lightrt_c_vk.h`). The node graph stays on the CPU; only the baked per-material
+parameters cross to the GPU — the design the Vulkan backend is built for.
+
+![mtlxvk material grid](docs/mtlxvk_chess.png)
+
+```bash
+make mtlxvk          # links the mtlx evaluator + the repo-root Vulkan backend
+MTLX=~/work/MaterialX/resources/Materials/Examples/StandardSurface/standard_surface_chess_set.mtlx
+./mtlxvk --mtlx $MTLX --w 800 --h 600 --spp 8 --out mtlxvk_chess.ppm
+```
+
+The chess `.mtlx` bakes to 15 spheres: the gold castles/queens come back as
+metal (`metalness=1`) reflecting the sky, the black/white pieces as dielectrics.
+The Vulkan loader is opened at runtime (`dlopen`, no SDK); with no GPU present
+`mtlxvk` prints a notice and exits 0. Because each material is collapsed to one
+baked colour, spatially varying textures become a single tint per sphere, and
+the GPU BSDF is the OpenPBR **core** (diffuse + metallic/dielectric GGX) — coat /
+sheen / transmission / subsurface are CPU-only. See `examples/vk_shade` for the
+backend itself and its GPU-vs-CPU validation.
+
 ## Build
 
 ```bash
