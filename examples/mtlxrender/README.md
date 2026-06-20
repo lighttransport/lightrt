@@ -32,10 +32,14 @@ chess set renders unchanged.
 
 ```bash
 # from this directory
+./vendor_deps.sh     # fetch third-party libs into deps/ (git-ignored)
 make                 # -> ./mtlxrender
 # or
 cmake -S . -B build && cmake --build build -j
 ```
+
+`vendor_deps.sh` prefers local clones under `$HOME/work` (override with
+`TINYGLTF_DIR=` / `TINYEXR_DIR=`) and falls back to cloning from GitHub.
 
 Everything is C11. It links `lightrt_c_tri.c`, `tiny_gltf_v3.c`, and the
 tinyexr v3 `src/*.c` directly (vendored under `deps/`). No external libraries.
