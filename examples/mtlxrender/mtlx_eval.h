@@ -68,4 +68,7 @@ void openpbr_defaults(OpenPBRParams *p);
 /* Evaluate a surface shader node into params. Returns 0 on success. */
 int mtlx_eval_surface(ShadeContext *ctx, int surface_node, OpenPBRParams *out);
 
+/* Evaluate any node by id (resets the per-shade memo first). For tests. */
+MtlxValue mtlx_eval_node_test(ShadeContext *ctx, int node_id);
+
 #endif /* MTLXRENDER_MTLX_EVAL_H_ */

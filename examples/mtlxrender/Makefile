@@ -40,6 +40,17 @@ LDFLAGS = -lm -lpthread
 mtlxrender: $(APP_OBJ) $(TP_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+# Per-node numeric ground-truth tests (reuses the app object files).
+TEST_DEPS = $(BUILD)/node_truth.o $(BUILD)/mtlx_doc.o $(BUILD)/mtlx_xml.o \
+            $(BUILD)/mtlx_eval.o $(BUILD)/texture.o $(BUILD)/color.o \
+            $(BUILD)/tp_third_party_impl.o
+$(BUILD)/node_truth.o: tests/node_truth.c | $(BUILD)
+	$(CC) $(CFLAGS) $(WARN) -c $< -o $@
+node_truth: $(TEST_DEPS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+test: node_truth
+	./node_truth
+
 $(BUILD)/%.o: %.c | $(BUILD)
 	$(CC) $(CFLAGS) $(WARN) -c $< -o $@
 
@@ -57,6 +68,6 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 clean:
-	rm -rf $(BUILD) mtlxrender
+	rm -rf $(BUILD) mtlxrender node_truth
 
-.PHONY: clean
+.PHONY: clean test

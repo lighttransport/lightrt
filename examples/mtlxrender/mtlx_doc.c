@@ -153,8 +153,7 @@ static const char *is_shader_category(const char *tag) {
     return NULL;
 }
 
-MtlxDoc *mtlx_load(const char *path) {
-    XmlNode *root = xml_parse_file(path);
+static MtlxDoc *mtlx_build(XmlNode *root) {
     if (!root) return NULL;
     const XmlNode *mx = xml_child(root, "materialx");
     if (!mx) { xml_free(root); return NULL; }
@@ -277,6 +276,14 @@ MtlxDoc *mtlx_load(const char *path) {
     MtlxDoc *out = malloc(sizeof(MtlxDoc));
     *out = b.d;
     return out;
+}
+
+MtlxDoc *mtlx_load(const char *path) {
+    return mtlx_build(xml_parse_file(path));
+}
+
+MtlxDoc *mtlx_load_string(const char *xml) {
+    return mtlx_build(xml_parse_memory(xml, strlen(xml)));
 }
 
 void mtlx_free(MtlxDoc *d) {

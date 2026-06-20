@@ -51,3 +51,13 @@ set_source_files_properties(${APP_SRC} PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra
 
 find_package(Threads REQUIRED)
 target_link_libraries(mtlxrender PRIVATE Threads::Threads m)
+
+# Per-node numeric ground-truth tests.
+enable_testing()
+add_executable(node_truth
+    tests/node_truth.c mtlx_doc.c mtlx_xml.c mtlx_eval.c texture.c color.c third_party_impl.c)
+target_include_directories(node_truth PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${LIGHTRT_ROOT} ${DEPS})
+target_compile_definitions(node_truth PRIVATE _POSIX_C_SOURCE=200809L)
+set_source_files_properties(third_party_impl.c PROPERTIES COMPILE_OPTIONS "-w")
+target_link_libraries(node_truth PRIVATE m)
+add_test(NAME node_truth COMMAND node_truth)

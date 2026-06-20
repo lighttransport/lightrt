@@ -80,7 +80,29 @@ drop it for soft dome-only lighting. `--env` accepts both **Radiance `.hdr`**
 and **`.exr`** lat-long environment maps (importance-sampled). Run
 `./mtlxrender --help` for the full option list (camera orbit, thread count, etc.).
 
-## Golden reference tests
+## Tests
+
+### Per-node ground truth
+
+`tests/node_truth.c` validates each MaterialX node against an **independently
+computed ground-truth value** derived from the node's spec definition (basic
+math / the documented formula), *not* from our own implementation — so it
+catches real correctness bugs, not just regressions. Each case feeds inputs
+through the real parse → doc → eval path (`mtlx_load_string` + a one-node graph).
+
+```bash
+make test        # builds and runs node_truth (48 assertions, all PASS)
+# or: ctest       (via CMake)
+```
+
+Covers math (`power(2,3)=8`, `dotproduct=32`, `crossproduct`, `magnitude=5`, …),
+compositing/adjust (`mix`, `clamp`, `smoothstep`, `remap`, `range`, `contrast`,
+`luminance`, `invert`), color (`rgbtohsv`/`hsvtorgb` round-trip), channel
+(`combine3`, `extract`, `separate3.outg`), and geometric nodes. Procedural noise
+is checked for spec invariants (determinism, output range). The suite is clean
+under ASan/UBSan.
+
+### Golden reference renders
 
 `golden.sh` renders a curated set of example materials (across all five shader
 models) on the MaterialX shaderball, plus the chess scene, under an HDRI, and

@@ -59,6 +59,8 @@ typedef struct MtlxDoc {
 
 /* Build a document from a .mtlx file. Returns NULL on error. */
 MtlxDoc *mtlx_load(const char *path);
+/* Build a document from an in-memory .mtlx string (for tests). */
+MtlxDoc *mtlx_load_string(const char *xml);
 void mtlx_free(MtlxDoc *d);
 
 /* Lookups used by material binding. */

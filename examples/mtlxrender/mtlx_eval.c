@@ -93,7 +93,7 @@ static v3 hsv_to_rgb(v3 c) {
 
 /* ---- value noise (hash-based gradient-ish) ----------------------------- */
 static float hash3(int x, int y, int z) {
-    uint32_t h = (uint32_t)(x * 374761393 + y * 668265263 + z * 1274126177);
+    uint32_t h = (uint32_t)x * 374761393u + (uint32_t)y * 668265263u + (uint32_t)z * 1274126177u;
     h = (h ^ (h >> 13)) * 1274126177u;
     h = h ^ (h >> 16);
     return (h & 0xFFFFFF) / 16777215.0f; /* [0,1] */
@@ -361,6 +361,11 @@ static MtlxValue eval_node(ShadeContext *ctx, int node_id) {
     }
     ctx->memo[node_id] = r;
     return r;
+}
+
+MtlxValue mtlx_eval_node_test(ShadeContext *ctx, int node_id) {
+    memset(ctx->memo_done, 0, (size_t)ctx->doc->nnode);
+    return eval_node(ctx, node_id);
 }
 
 /* ---- public surface evaluation ---------------------------------------- */

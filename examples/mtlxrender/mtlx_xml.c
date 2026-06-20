@@ -149,6 +149,20 @@ static XmlNode *parse_element(Cur *c) {
     return n;
 }
 
+XmlNode *xml_parse_memory(const char *data, size_t len) {
+    Cur c = {data, data + len};
+    XmlNode *root = node_new(dup_range("#root", 5));
+    for (;;) {
+        while (c.s < c.end && *c.s != '<') c.s++;
+        if (c.s >= c.end) break;
+        if (skip_misc(&c)) continue;
+        XmlNode *el = parse_element(&c);
+        if (!el) break;
+        node_add_child(root, el);
+    }
+    return root;
+}
+
 XmlNode *xml_parse_file(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (!fp) { fprintf(stderr, "xml: cannot open '%s'\n", path); return NULL; }
@@ -159,17 +173,7 @@ XmlNode *xml_parse_file(const char *path) {
     char *buf = (char *)malloc((size_t)sz);
     if (fread(buf, 1, (size_t)sz, fp) != (size_t)sz) { fclose(fp); free(buf); return NULL; }
     fclose(fp);
-
-    Cur c = {buf, buf + sz};
-    XmlNode *root = node_new(dup_range("#root", 5));
-    for (;;) {
-        while (c.s < c.end && *c.s != '<') c.s++;
-        if (c.s >= c.end) break;
-        if (skip_misc(&c)) continue;
-        XmlNode *el = parse_element(&c);
-        if (!el) break;
-        node_add_child(root, el);
-    }
+    XmlNode *root = xml_parse_memory(buf, (size_t)sz);
     free(buf);
     return root;
 }

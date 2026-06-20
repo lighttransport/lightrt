@@ -8,6 +8,8 @@
 #ifndef MTLXRENDER_MTLX_XML_H_
 #define MTLXRENDER_MTLX_XML_H_
 
+#include <stddef.h>
+
 typedef struct { char *name; char *value; } XmlAttr;
 
 typedef struct XmlNode {
@@ -21,6 +23,9 @@ typedef struct XmlNode {
 /* Parse a file. Returns a synthetic root whose children are the document's
  * top-level elements, or NULL on error. Free with xml_free(). */
 XmlNode *xml_parse_file(const char *path);
+
+/* Parse from an in-memory buffer (same return contract as xml_parse_file). */
+XmlNode *xml_parse_memory(const char *data, size_t len);
 void xml_free(XmlNode *root);
 
 /* Attribute lookup by name; NULL if absent. */
