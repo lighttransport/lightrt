@@ -14,11 +14,18 @@
 #include "framebuffer.h"
 
 typedef struct {
+    int   enabled;
+    v3    dir;      /* direction TOWARD the sun (unit) */
+    v3    radiance; /* color * intensity */
+} SunLight;
+
+typedef struct {
     int   width, height;
     int   spp;
     int   max_bounces;
     int   nthreads;
     int   sss_walk;     /* enable random-walk subsurface scattering */
+    SunLight sun;       /* optional directional delta light */
     unsigned seed;
 } RenderConfig;
 

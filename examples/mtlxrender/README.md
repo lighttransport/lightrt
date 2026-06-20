@@ -51,13 +51,16 @@ MTLX=~/work/MaterialX/resources/Materials/Examples/StandardSurface/standard_surf
 GLB=~/work/MaterialX/resources/Geometry/chess_set.glb
 
 ./mtlxrender --gltf $GLB --mtlx $MTLX \
-    --w 800 --h 600 --spp 128 --bounces 6 --sky \
-    --cam-yaw 30 --cam-pitch 22 --cam-dist 1.05 --exposure 1.6 \
+    --w 800 --h 600 --spp 128 --bounces 6 \
+    --sky --sun --sun-az 125 --sun-el 38 --sun-intensity 3.5 \
+    --cam-yaw 30 --cam-pitch 22 --cam-dist 1.05 --exposure 1.3 \
     --out chess.exr --png chess.png
 ```
 
-Run `./mtlxrender --help` for the full option list (camera orbit, environment
-HDRI via `--env file.exr`, thread count, etc.).
+`--sun` adds a directional light (NEE shadow rays) for crisp cast shadows;
+drop it for soft dome-only lighting. Run `./mtlxrender --help` for the full
+option list (camera orbit, environment HDRI via `--env file.exr`, thread
+count, etc.).
 
 ## Dependencies (vendored, under `deps/`, git-ignored)
 

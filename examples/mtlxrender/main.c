@@ -52,6 +52,10 @@ static void usage(const char *prog) {
         "  --env-intensity <f>    env scale (default 1)\n"
         "  --env-rotation <deg>   HDRI azimuth rotation (default 0)\n"
         "  --sky                  procedural sky gradient (default: gray dome)\n"
+        "  --sun                  add a directional sun (crisp shadows)\n"
+        "  --sun-az <deg>         sun azimuth (default 130)\n"
+        "  --sun-el <deg>         sun elevation (default 45)\n"
+        "  --sun-intensity <f>    sun radiance scale (default 3)\n"
         "  --exposure <f>         PNG tonemap exposure (default 1)\n"
         "  --sss-walk             enable random-walk subsurface scattering\n"
         "  --hq                   high-quality SBVH build\n"
@@ -65,6 +69,9 @@ int main(int argc, char **argv) {
     int W = 800, H = 600, spp = 64, bounces = 8, threads = 0, hq = 0, sss_walk = 0, sky = 0;
     float exposure = 1.0f, env_intensity = 1.0f, env_rot = 0.0f;
     float cam_yaw = 35.0f, cam_pitch = 25.0f, cam_dist = 1.6f;
+    int sun_on = 0;
+    float sun_az = 130.0f, sun_el = 45.0f, sun_intensity = 3.0f;
+    v3 sun_color = {1.0f, 0.95f, 0.85f};
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -82,6 +89,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--env-intensity")) env_intensity = (float)atof(NEXT);
         else if (!strcmp(a, "--env-rotation")) env_rot = (float)atof(NEXT);
         else if (!strcmp(a, "--sky")) sky = 1;
+        else if (!strcmp(a, "--sun")) sun_on = 1;
+        else if (!strcmp(a, "--sun-az")) sun_az = (float)atof(NEXT);
+        else if (!strcmp(a, "--sun-el")) sun_el = (float)atof(NEXT);
+        else if (!strcmp(a, "--sun-intensity")) sun_intensity = (float)atof(NEXT);
         else if (!strcmp(a, "--exposure")) exposure = (float)atof(NEXT);
         else if (!strcmp(a, "--sss-walk")) sss_walk = 1;
         else if (!strcmp(a, "--hq")) hq = 1;
@@ -137,6 +148,14 @@ int main(int argc, char **argv) {
     cfg.width = W; cfg.height = H; cfg.spp = spp; cfg.max_bounces = bounces;
     cfg.nthreads = threads > 0 ? threads : (int)cpu_count();
     cfg.sss_walk = sss_walk; cfg.seed = 12345u;
+
+    /* directional sun from azimuth/elevation (degrees) */
+    cfg.sun.enabled = sun_on;
+    if (sun_on) {
+        float az = sun_az * (MTLX_PI / 180.0f), el = sun_el * (MTLX_PI / 180.0f);
+        cfg.sun.dir = v3_normalize(v3_make(cosf(el) * sinf(az), sinf(el), cosf(el) * cosf(az)));
+        cfg.sun.radiance = v3_scale(sun_color, sun_intensity);
+    }
 
     fprintf(stderr, "render %dx%d spp=%d bounces=%d threads=%d\n",
             W, H, spp, bounces, cfg.nthreads);

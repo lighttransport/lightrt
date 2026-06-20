@@ -103,7 +103,7 @@ static int sss_walk(const Scene *s, v3 *P, v3 N, const OpenPBRParams *p, pcg32 *
 }
 
 static v3 trace_path(const Scene *s, const MtlxDoc *doc, const MaterialBinding *bind,
-                     TextureCache *tex, const Env *env, lrt_ray ray,
+                     TextureCache *tex, const Env *env, const SunLight *sun, lrt_ray ray,
                      int max_bounces, int sss_walk_enabled, pcg32 *rng,
                      MtlxValue *memo, char *memo_done) {
     v3 radiance = v3_splat(0.0f);
@@ -155,6 +155,20 @@ static v3 trace_path(const Scene *s, const MtlxDoc *doc, const MaterialBinding *
                                                            v3_scale(L, ndl * w / pdf_l)));
                     }
                 }
+            }
+        }
+
+        /* ---- NEE for the directional sun (delta light, no MIS) ---- */
+        if (sun && sun->enabled) {
+            v3 wi_s = sun->dir;
+            float pdf_b;
+            v3 f = bsdf_eval(&params, Nsh, wo, wi_s, &pdf_b);
+            float ndl = fabsf(v3_dot(v3_normalize(Nsh), wi_s));
+            if ((f.x + f.y + f.z) > 0.0f && ndl > 0.0f) {
+                lrt_ray sr = make_ray(hi.P, wi_s, hi.Ng, 1e30f);
+                if (!lrt_tri_occluded1(s->bvh, &sr))
+                    radiance = v3_add(radiance, v3_mul(v3_mul(throughput, f),
+                                                       v3_scale(sun->radiance, ndl)));
             }
         }
 
@@ -219,7 +233,7 @@ static void *worker(void *arg) {
                     float px = (x + pcg32_f(&rng)) / W;
                     float py = (y + pcg32_f(&rng)) / H;
                     lrt_ray r = camera_ray(j->cam, px, py);
-                    v3 L = trace_path(j->s, j->doc, j->bind, j->tex, j->env, r,
+                    v3 L = trace_path(j->s, j->doc, j->bind, j->tex, j->env, &j->cfg->sun, r,
                                       j->cfg->max_bounces, j->cfg->sss_walk, &rng, memo, memo_done);
                     if (v3_is_finite(L)) sum = v3_add(sum, L);
                 }
