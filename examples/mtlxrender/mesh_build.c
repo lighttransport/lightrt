@@ -85,6 +85,16 @@ int scene_from_tribuf(Scene *out, TriBuf *tb, int build_quality_hq) {
     out->bvh = lrt_tri_scene_build(out->verts, out->ntri, &bopts, &err);
     if (!out->bvh) {
         fprintf(stderr, "mesh: BVH build failed (%d)\n", (int)err);
+        /* The tb arrays were moved into `out`; free them here (and geom_names)
+         * so the contract "on failure frees tb" holds and `out` is left clean
+         * for the caller (which still owns out->mat_names). */
+        free(out->verts); free(out->tri_uv); free(out->tri_n);
+        free(out->tri_mat); free(out->tri_geom); free(out->geom_names);
+        out->verts = out->tri_n = out->tri_uv = NULL;
+        out->tri_mat = out->tri_geom = NULL;
+        out->geom_names = NULL;
+        out->ntri = 0; out->ngeom = 0;
+        memset(tb, 0, sizeof(*tb)); /* arrays were moved; drop dangling ptrs */
         return 1;
     }
     return 0;

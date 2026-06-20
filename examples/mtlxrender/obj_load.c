@@ -100,11 +100,13 @@ int scene_load_obj(const char *path, Scene *out, int build_quality_hq) {
             vec_push3(&vp, x, y, z);
         } else if (line[0] == 'v' && line[1] == 'n') {
             float x = 0, y = 0, z = 0;
-            sscanf(line + 3, "%f %f %f", &x, &y, &z);
+            /* line + 2 (not + 3): %f skips the leading space, and for a bare
+             * "vn" at EOF (line[2]=='\0') this stays in-bounds (no over-read). */
+            sscanf(line + 2, "%f %f %f", &x, &y, &z);
             vec_push3(&vn, x, y, z);
         } else if (line[0] == 'v' && line[1] == 't') {
             float u = 0, v = 0;
-            sscanf(line + 3, "%f %f", &u, &v);
+            sscanf(line + 2, "%f %f", &u, &v);
             vec_push2(&vt, u, v);
         } else if (line[0] == 'f' && (line[1] == ' ' || line[1] == '\t')) {
             if (cur_geom < 0) cur_geom = tribuf_geom_intern(&tb, "default", 7);

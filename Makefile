@@ -202,7 +202,9 @@ info_hip:
 # Override the target arch:        make cuda_test CUDA_ARCH=sm_90
 NVCC ?= nvcc
 CUDA_ARCH ?= sm_120
-CUDA_FLAGS = -std=c++17 -O2 -arch=$(CUDA_ARCH) $(INCLUDES)
+# --fmad=false keeps the GPU kernel bit-faithful to the scalar C kernel (matches
+# the HIP backend's -ffp-contract=off and the CMake build's --fmad=false).
+CUDA_FLAGS = -std=c++17 -O2 -arch=$(CUDA_ARCH) --fmad=false $(INCLUDES)
 
 cuda_test:
 	$(NVCC) $(CUDA_FLAGS) -c lightrt_c_cuda.cu -o /tmp/lrt_cuda_dev.o

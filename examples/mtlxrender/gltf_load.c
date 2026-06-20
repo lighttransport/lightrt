@@ -305,7 +305,9 @@ int scene_load_gltf(const char *path, Scene *out, int build_quality_hq) {
 
     tg3_model_free(&model);
 
-    if (scene_from_tribuf(out, &tb, build_quality_hq)) return 1;
+    /* On failure scene_from_tribuf frees the moved tb arrays; scene_free then
+     * releases out->mat_names (allocated above) and zeroes the struct. */
+    if (scene_from_tribuf(out, &tb, build_quality_hq)) { scene_free(out); return 1; }
 
     fprintf(stderr, "gltf: %zu triangles, %d materials, kernel=%s\n",
             out->ntri, out->nmat, lrt_tri_kernel_name(out->bvh));
