@@ -1086,6 +1086,60 @@ leaf kernel inline. The full-GPU LBVH (above) is implemented; a remaining
 refinement is a GPU collapse of its binary tree to 4/8-wide nodes for faster
 incoherent traversal.
 
+## CUDA GPU Backend (`lightrt_c_cuda.h`)
+
+Optional CUDA (NVIDIA) GPU backend for the C11 triangle kernel — a port of the
+HIP backend's **fp32 build + trace** path (Phase 1), with the same
+device-resident scene model and public-API shape (`lrt_cuda_*` mirroring
+`lrt_hip_*`). Implementation is a single `lightrt_c_cuda.cu` (compiled by `nvcc`
+as C++, all symbols `extern "C"`); the header is pure C11 so the C
+library/test include it cleanly. Build is opt-in and the test skips (exit 0)
+when no CUDA device is present. Defaults to Blackwell (`sm_120`, e.g. RTX
+50-series); override with `make CUDA_ARCH=sm_90` or
+`-DCMAKE_CUDA_ARCHITECTURES=90`.
+
+The port reuses the HIP `.hip` source verbatim through a one-line launch shim
+(`#define hipLaunchKernelGGL(k,grid,block,shmem,stream,...) k<<<grid,block,shmem,stream>>>(__VA_ARGS__)`)
+and the runtime-API rename (`hipX`→`cudaX`); the device intersectors (`hp_*`:
+triangle, sphere/point, quad/tetra, round/flat curves, cubic Bézier, SDF,
+parametric surfaces) and kernels (`k_trace`/`k_occluded`/`k_trace_prim`/
+`k_occluded_prim`/`k_shade_normals`/`k_raygen_camera`/`k_refit_*`/`k_centroids`/
+`k_morton`) are byte-for-byte identical, compiled `--fmad=false` to stay
+bit-faithful to the scalar C kernel.
+
+### Implemented (Phase 1, fp32)
+- **Resident trace**: `lrt_cuda_scene_upload` (CPU-built BVH4/BVH8 → device via
+  the LRTS blob) then `lrt_cuda_scene_trace` / `_occluded`. Bit-exact vs the CPU
+  oracle (`tests/test_lightrt_c_cuda.c`: 50k rays, all hits match
+  `lrt_tri_intersect1`, 0 hit/miss mismatch, 0 t-disagreement on an RTX 5060 Ti).
+- **Hybrid GPU build (Path B)**: `lrt_cuda_build_scene` (`k_centroids`+`k_morton`
+  on GPU, LBVH finish on CPU).
+- **GPU refit**: `lrt_cuda_scene_refit` (in-place vertex+bounds update, no
+  rebuild) — animation path.
+- **Device-resident dynamic pipeline**: `lrt_cuda_dbuffer` + `_raygen_camera` /
+  `_scene_trace_device` / `_occluded_device` / `_scene_refit_device`.
+- **On-device shading normals**: `lrt_cuda_scene_trace_normals[_device]`.
+- **One-shot**: `lrt_cuda_trace_scene` (upload+trace+free).
+- Engine: `lrt_cuda_engine_create`/`_destroy`/`_caps`/`_device_name`/
+  `_last_error`. Caps report `LRT_CUDA_CAP_COMPUTE` only (fp32-only port).
+
+### Not ported (HIP-only for now, stubbed → `NOT_BUILT`)
+The Phase-2 **WMMA** matrix-core leaf kernels (`lightrt_hip_wmma.hip`, rocWMMA)
+and the **full-GPU LBVH** builder (`lightrt_hip_lbvh.hip`, hipCUB radix sort)
+live in separate TUs that depend on AMD-specific libraries; their public entry
+points (`lrt_cuda_have_wmma`/`_have_gpu_build`/`_scene_build_gpu[_device]`/
+`_leaf_bench`/`_transform_bench`) are stubbed to return `0`/`NULL`/`NOT_BUILT`.
+Porting them would mean nvcuda::wmma + CUB, but the HIP "honest verdict" found
+WMMA loses to scalar fp32 for leaf intersection, so it is low priority; the
+hybrid Path-B build covers fast rebuilds.
+
+### Build / test
+```bash
+cmake -S . -B build_cuda -DLIGHTRT_BUILD_CUDA=ON -DBUILD_TESTING=ON
+cmake --build build_cuda && ctest --test-dir build_cuda -R lightrt_c_cuda_test
+make cuda_test && ./lightrt_c_cuda_test         # Makefile path (opt-in, needs nvcc)
+```
+
 ## Code Conventions
 
 - C++17, no RTTI (`-fno-rtti`), no exceptions (`-fno-exceptions`)

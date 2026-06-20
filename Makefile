@@ -195,4 +195,25 @@ info_hip:
 	@echo "HIP_ARCH: $(HIP_ARCH)"
 	@echo "HIP_FLAGS: $(HIP_FLAGS)"
 
-.PHONY: all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip
+# ---- CUDA (NVIDIA) GPU backend (opt-in; needs nvcc) ----
+# A port of the HIP backend's fp32 build+trace path. The WMMA/integer-quantized
+# leaf kernels and the full-GPU LBVH builder are HIP-only for now (stubbed).
+# Build + run the CUDA self-test:  make cuda_test && ./lightrt_c_cuda_test
+# Override the target arch:        make cuda_test CUDA_ARCH=sm_90
+NVCC ?= nvcc
+CUDA_ARCH ?= sm_120
+CUDA_FLAGS = -std=c++17 -O2 -arch=$(CUDA_ARCH) $(INCLUDES)
+
+cuda_test:
+	$(NVCC) $(CUDA_FLAGS) -c lightrt_c_cuda.cu -o /tmp/lrt_cuda_dev.o
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -c lightrt_c_tri.c -o /tmp/lrt_cuda_c_tri.o
+	$(CC) $(CFLAGS) $(INCLUDES) -c tests/test_lightrt_c_cuda.c -o /tmp/lrt_cuda_test.o
+	$(NVCC) -arch=$(CUDA_ARCH) /tmp/lrt_cuda_test.o /tmp/lrt_cuda_dev.o /tmp/lrt_cuda_c_tri.o -o lightrt_c_cuda_test -lm
+	@echo "Built lightrt_c_cuda_test (run: ./lightrt_c_cuda_test)"
+
+info_cuda:
+	@echo "NVCC: $(NVCC)"
+	@echo "CUDA_ARCH: $(CUDA_ARCH)"
+	@echo "CUDA_FLAGS: $(CUDA_FLAGS)"
+
+.PHONY: all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip cuda_test info_cuda

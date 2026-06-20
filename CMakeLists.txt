@@ -374,6 +374,55 @@ if(LIGHTRT_BUILD_HIP)
     install(FILES lightrt_c_hip.h DESTINATION include)
 endif()
 
+# --- CUDA (NVIDIA) GPU backend (opt-in) -----------------------------------
+# Enables the CUDA triangle-BVH trace/build backend (lightrt_c_cuda.{h,cu}) and
+# its self-test. A port of the HIP backend's fp32 build+trace path; the WMMA /
+# integer-quantized leaf kernels and the full-GPU LBVH builder are HIP-only for
+# now (stubbed in the .cu). Requires nvcc + CMake >= 3.18 for the CUDA language.
+# The test skips (exit 0) when no CUDA device is present, so GPU-less CI stays
+# green.
+option(LIGHTRT_BUILD_CUDA "Build the CUDA (NVIDIA) GPU backend" OFF)
+if(LIGHTRT_BUILD_CUDA)
+    if(CMAKE_VERSION VERSION_LESS 3.18)
+        message(FATAL_ERROR "LIGHTRT_BUILD_CUDA requires CMake >= 3.18 for the CUDA language")
+    endif()
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        # Default to Blackwell (sm_120, e.g. RTX 50-series); override with
+        # -DCMAKE_CUDA_ARCHITECTURES=90 etc. for other GPUs.
+        set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA target archs")
+    endif()
+    enable_language(CUDA)
+
+    # Static library exposing the CUDA backend to other targets. The single TU
+    # carries the fp32 trace/build/refit kernels plus #ifdef-free NOT_BUILT
+    # stubs for the Phase-2 WMMA / full-GPU-LBVH entry points (HIP-only so far).
+    add_library(lightrt_cuda STATIC lightrt_c_cuda.cu)
+    target_include_directories(lightrt_cuda PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    # -fmad=false keeps the GPU kernel bit-faithful to the scalar C kernel
+    # (matches the HIP backend's -ffp-contract=off).
+    target_compile_options(lightrt_cuda PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+
+    if(BUILD_TESTING)
+        add_executable(lightrt_c_cuda_test
+            lightrt_c.c lightrt_c_tri.c tests/test_lightrt_c_cuda.c)
+        set_source_files_properties(lightrt_c.c lightrt_c_tri.c
+            tests/test_lightrt_c_cuda.c PROPERTIES LANGUAGE C)
+        target_include_directories(lightrt_c_cuda_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        if(LIGHTRT_C_TRI_SIMD_FLAGS)
+            target_compile_options(lightrt_c_cuda_test PRIVATE
+                $<$<COMPILE_LANGUAGE:C>:${LIGHTRT_C_TRI_SIMD_FLAGS}>)
+        endif()
+        target_link_libraries(lightrt_c_cuda_test lightrt_cuda)
+        if(NOT MSVC)
+            target_link_libraries(lightrt_c_cuda_test m)
+        endif()
+        add_test(NAME lightrt_c_cuda_test COMMAND lightrt_c_cuda_test)
+    endif()
+
+    install(FILES lightrt_c_cuda.h DESTINATION include)
+endif()
+
 # Optional: regenerate the checked-in SPIR-V headers (developers with glslang
 # only; never part of the default build / ALL target).
 find_program(LIGHTRT_GLSLANG glslangValidator)
