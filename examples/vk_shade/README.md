@@ -17,9 +17,12 @@ then uploaded and shaded en masse on the GPU.
   ray, intersects every primitive (linear scan), and forward-shades the closest
   hit with an **OpenPBR-core BSDF** — Lambert diffuse + GGX specular with
   metallic/dielectric Schlick Fresnel — lit by one directional **sun** (hard
-  shadow ray / NEE) plus a 2-colour **hemisphere environment** (ambient +
-  background). Anti-aliased with deterministic sub-pixel jitter.
+  shadow ray / NEE) plus a 2-colour **hemisphere environment**: diffuse
+  irradiance *and* a Fresnel-weighted specular reflection of the env in the
+  roughness-blurred mirror direction (so metals show their tinted reflection).
+  Anti-aliased with deterministic sub-pixel jitter.
 - Reads back a linear RGBA image and writes a tonemapped **PPM**.
+- Reports GPU vs (single-threaded) CPU **shading throughput** and speedup.
 
 The host API lives in `lightrt_c_vk.h`:
 
@@ -58,6 +61,15 @@ cmake --build build --target lightrt_vk_shade
 If no Vulkan device/loader is present the program writes the CPU reference image,
 prints a notice, and exits 0 (so GPU-less CI stays green). It is also registered
 as the `lightrt_vk_shade` CTest case when `LIGHTRT_BUILD_VK=ON`.
+
+### Performance note
+
+The reported GPU number reflects dispatch **plus** scene upload / image readback:
+this v1 backend (like the rest of `lightrt_c_vk`) uses `HOST_VISIBLE | COHERENT`
+buffers and re-uploads per call — no `DEVICE_LOCAL` staging yet — so the GPU
+write/readback crosses PCIe. The speedup over the single-threaded CPU reference
+still grows with resolution as the fixed per-call overhead amortizes (≈5× at
+512×384, ≈10× at 1024²). A resident-buffer fast path is a natural follow-up.
 
 ## Regenerating the shader
 

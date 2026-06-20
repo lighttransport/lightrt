@@ -21,8 +21,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "lightrt_c_vk.h"
+
+/* Portable wall-clock seconds (C11 timespec_get; no feature macros needed). */
+static double now_sec(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
 
 /* ---- tiny vec3 ----------------------------------------------------------- */
 typedef struct { float x, y, z; } v3;
@@ -314,10 +322,15 @@ int main(int argc, char **argv) {
 
     printf("vk_shade: %ux%u, spp=%u, %u analytic prims\n", w, h, spp, nprims);
 
+    double mpix = (double)npix * 1e-6;
+
     /* CPU reference (always). */
+    double t0 = now_sec();
     shade_cpu(prims, nprims, &desc, cpu);
+    double cpu_ms = (now_sec() - t0) * 1e3;
     write_ppm("vk_shade_cpu.ppm", cpu, w, h);
-    printf("wrote vk_shade_cpu.ppm (CPU reference)\n");
+    printf("wrote vk_shade_cpu.ppm (CPU reference, single-threaded)\n");
+    printf("CPU shade: %8.2f ms   %6.1f Mpix/s\n", cpu_ms, mpix / (cpu_ms * 1e-3));
 
     /* GPU shading. */
     lrt_result err = LRT_RESULT_OK;
@@ -333,14 +346,22 @@ int main(int argc, char **argv) {
     }
     printf("GPU: %s  caps=0x%x\n", lrt_vk_engine_device_name(e), lrt_vk_engine_caps(e));
 
+    /* Warm-up run builds the pipeline + descriptor pool; the timed run then
+     * reflects dispatch + buffer upload/readback (this v1 backend re-uploads
+     * the scene per call). */
     if (lrt_vk_shade_analytic(e, prims, nprims, &desc, gpu, &err) != 0) {
         fprintf(stderr, "lrt_vk_shade_analytic failed: %s\n", lrt_vk_engine_last_error(e));
         lrt_vk_engine_destroy(e);
         free(cpu); free(gpu);
         return 1;
     }
+    t0 = now_sec();
+    lrt_vk_shade_analytic(e, prims, nprims, &desc, gpu, &err);
+    double gpu_ms = (now_sec() - t0) * 1e3;
     write_ppm("vk_shade_gpu.ppm", gpu, w, h);
     printf("wrote vk_shade_gpu.ppm (GPU)\n");
+    printf("GPU shade: %8.2f ms   %6.1f Mpix/s   (%.1fx vs CPU)\n",
+           gpu_ms, mpix / (gpu_ms * 1e-3), cpu_ms / gpu_ms);
 
     /* Compare. Interior pixels must match closely; a small fraction of
      * silhouette/shadow-edge pixels legitimately differ because a sub-sample
