@@ -39,6 +39,31 @@ void texcache_free(TextureCache *tc) {
     free(tc);
 }
 
+/* Resolve a texture filename the way MaterialX does: it is given relative to a
+ * search path, not just the document directory. Example materials reference
+ * images by bare name (e.g. "brick_normal.jpg") that live in resources/Images/,
+ * several levels above the .mtlx. Walk up from base_dir and try both <dir>/<rel>
+ * and <dir>/Images/<rel> at each ancestor level. */
+static unsigned char *load_searchpath(const char *base_dir, const char *rel,
+                                      int *w, int *h, int *comp) {
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s", (base_dir && base_dir[0]) ? base_dir : ".");
+    for (int up = 0; up < 12; up++) {
+        char path[1100];
+        snprintf(path, sizeof(path), "%s/%s", dir, rel);
+        unsigned char *px = stbi_load(path, w, h, comp, 0);
+        if (px) return px;
+        snprintf(path, sizeof(path), "%s/Images/%s", dir, rel);
+        px = stbi_load(path, w, h, comp, 0);
+        if (px) return px;
+        char *slash = strrchr(dir, '/');
+        if (!slash) break;
+        *slash = '\0';
+        if (!dir[0]) break;
+    }
+    return NULL;
+}
+
 int texcache_get(TextureCache *tc, const char *rel_path, int srgb) {
     if (!rel_path || !rel_path[0]) return -1;
     char key[1024];
@@ -48,12 +73,9 @@ int texcache_get(TextureCache *tc, const char *rel_path, int srgb) {
 
     if (tc->frozen) return -1; /* render-time miss: never mutate the cache */
 
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/%s", tc->base_dir, rel_path);
-
     int w, h, comp;
-    unsigned char *px = stbi_load(path, &w, &h, &comp, 0);
-    if (!px) { fprintf(stderr, "texture: failed to load '%s'\n", path); return -1; }
+    unsigned char *px = load_searchpath(tc->base_dir, rel_path, &w, &h, &comp);
+    if (!px) { fprintf(stderr, "texture: failed to load '%s' (searched from '%s')\n", rel_path, tc->base_dir); return -1; }
 
     if (tc->ntex >= tc->cap) {
         tc->cap = tc->cap ? tc->cap * 2 : 16;
@@ -69,7 +91,11 @@ int texcache_get(TextureCache *tc, const char *rel_path, int srgb) {
 void texcache_preload(TextureCache *tc, const MtlxDoc *doc) {
     for (int i = 0; i < doc->nnode; i++) {
         const MtlxNode *n = &doc->nodes[i];
-        if (strcmp(n->category, "image") && strcmp(n->category, "tiledimage")) continue;
+        /* match every image variant the evaluator treats as OP_IMAGE, else its
+         * file never enters the cache and the frozen render-time lookup misses. */
+        const char *c = n->category;
+        if (strcmp(c, "image") && strcmp(c, "tiledimage") && strcmp(c, "hextiledimage") &&
+            strcmp(c, "gltf_image") && strcmp(c, "gltf_colorimage")) continue;
         for (int j = 0; j < n->ninput; j++) {
             const MtlxInput *in = &n->inputs[j];
             if (strcmp(in->name, "file") == 0 && in->value.s)

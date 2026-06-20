@@ -45,6 +45,8 @@ MATERIALS=(
     "ss_marble|$EXAMPLES/StandardSurface/standard_surface_marble_solid.mtlx|match"
     "ss_velvet|$EXAMPLES/StandardSurface/standard_surface_velvet.mtlx|match"
     "opbr_velvet|$EXAMPLES/OpenPbr/open_pbr_velvet.mtlx|match"
+    "ss_brick|$EXAMPLES/StandardSurface/standard_surface_brick_procedural.mtlx|match"
+    "ss_brass_tiled|$EXAMPLES/StandardSurface/standard_surface_brass_tiled.mtlx|match"
     "opbr_default|$EXAMPLES/OpenPbr/open_pbr_default.mtlx|match"
     "opbr_carpaint|$EXAMPLES/OpenPbr/open_pbr_carpaint.mtlx|match"
     "ss_glass|$EXAMPLES/StandardSurface/standard_surface_glass.mtlx|divergent"
