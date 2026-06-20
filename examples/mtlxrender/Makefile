@@ -20,10 +20,14 @@ else
   SIMD =
 endif
 
-BUILD = build
+# Separate object dirs for CPU vs VK builds so toggling VK never links stale,
+# differently-compiled objects (the .o files don't track -DMTLX_HAVE_VK).
+BUILD = build$(if $(VK),-vk,)
 
-# our first-party sources (full warnings)
-APP_SRC = main.c pathtrace.c bsdf.c env.c framebuffer.c color.c \
+# our first-party sources (full warnings). raytracer_vk.c is empty unless
+# MTLX_HAVE_VK is defined, so it is always listed.
+APP_SRC = main.c pathtrace.c pathtrace_wf.c raytracer.c raytracer_vk.c \
+          bsdf.c env.c framebuffer.c color.c \
           gltf_load.c mesh_build.c obj_load.c mtlx_xml.c mtlx_doc.c mtlx_eval.c \
           material_bind.c texture.c
 # third-party sources (compiled quietly with -w)
@@ -32,11 +36,19 @@ TP_SRC  = third_party_impl.c \
           $(DEPS)/tiny_gltf_v3.c \
           $(wildcard $(TINYEXR)/src/*.c)
 
+LDFLAGS = -lm -lpthread
+
+# VK=1 enables the Vulkan GPU-traced backend (runtime dlopen of libvulkan).
+ifdef VK
+  DEFS    += -DMTLX_HAVE_VK
+  TP_SRC  += $(LIGHTRT)/lightrt_vkew.c $(LIGHTRT)/lightrt_c_vk.c
+  LDFLAGS += -ldl
+endif
+
 APP_OBJ = $(addprefix $(BUILD)/,$(notdir $(APP_SRC:.c=.o)))
 TP_OBJ  = $(addprefix $(BUILD)/tp_,$(notdir $(TP_SRC:.c=.o)))
 
 CFLAGS  = $(CSTD) $(OPT) $(SIMD) $(DEFS) $(INCLUDES)
-LDFLAGS = -lm -lpthread
 
 mtlxrender: $(APP_OBJ) $(TP_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
@@ -84,6 +96,6 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 clean:
-	rm -rf $(BUILD) mtlxrender node_truth mtlxvk
+	rm -rf build build-vk mtlxrender node_truth mtlxvk
 
 .PHONY: clean test check

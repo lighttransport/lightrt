@@ -50,6 +50,23 @@ endif()
 set_source_files_properties(${TP_SRC} PROPERTIES COMPILE_OPTIONS "-w")
 set_source_files_properties(${APP_SRC} PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra")
 
+set(APP_VK_SRC raytracer.c pathtrace_wf.c raytracer_vk.c)
+target_sources(mtlxrender PRIVATE ${APP_VK_SRC})
+set_source_files_properties(${APP_VK_SRC} PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra")
+
+# MTLXRENDER_VK: build mtlxrender's Vulkan GPU-traced backend (--backend vk /
+# --gpu-validate). Runtime dlopen of libvulkan; no Vulkan SDK / find_package.
+option(MTLXRENDER_VK "Build mtlxrender with the Vulkan GPU-traced backend" OFF)
+if(MTLXRENDER_VK)
+    target_sources(mtlxrender PRIVATE
+        ${LIGHTRT_ROOT}/lightrt_vkew.c ${LIGHTRT_ROOT}/lightrt_c_vk.c)
+    set_source_files_properties(
+        ${LIGHTRT_ROOT}/lightrt_vkew.c ${LIGHTRT_ROOT}/lightrt_c_vk.c
+        PROPERTIES COMPILE_OPTIONS "-w")
+    target_compile_definitions(mtlxrender PRIVATE MTLX_HAVE_VK)
+    target_link_libraries(mtlxrender PRIVATE ${CMAKE_DL_LIBS})
+endif()
+
 find_package(Threads REQUIRED)
 target_link_libraries(mtlxrender PRIVATE Threads::Threads m)
 

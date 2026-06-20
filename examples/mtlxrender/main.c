@@ -20,6 +20,8 @@
 #include "camera.h"
 #include "framebuffer.h"
 #include "pathtrace.h"
+#include "pathtrace_wf.h"
+#include "raytracer.h"
 #include "vecmath.h"
 #include "exr.h"
 #include "stb_image.h"
@@ -121,7 +123,10 @@ static void usage(const char *prog) {
         "  --exposure <f>         PNG tonemap exposure (default 1)\n"
         "  --sss-walk             enable random-walk subsurface scattering\n"
         "  --hq                   high-quality SBVH build\n"
-        "  --cam-yaw <deg> --cam-pitch <deg> --cam-dist <f>   orbit camera\n",
+        "  --cam-yaw <deg> --cam-pitch <deg> --cam-dist <f>   orbit camera\n"
+        "  --backend <cpu|vk>     cpu = tiled tracer (default); vk = GPU-traced\n"
+        "                         wavefront (needs a VK build + device)\n"
+        "  --gpu-validate         render the wavefront on CPU and GPU, report RMSE\n",
         prog);
 }
 
@@ -138,6 +143,8 @@ int main(int argc, char **argv) {
     int sun_on = 0;
     float sun_az = 130.0f, sun_el = 45.0f, sun_intensity = 3.0f;
     v3 sun_color = {1.0f, 0.95f, 0.85f};
+    const char *backend = "cpu"; /* cpu (tiled) | vk (GPU-traced wavefront) */
+    int gpu_validate = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -166,6 +173,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--cam-yaw")) cam_yaw = (float)atof(NEXT);
         else if (!strcmp(a, "--cam-pitch")) cam_pitch = (float)atof(NEXT);
         else if (!strcmp(a, "--cam-dist")) cam_dist = (float)atof(NEXT);
+        else if (!strcmp(a, "--backend")) backend = NEXT;
+        else if (!strcmp(a, "--gpu-validate")) gpu_validate = 1;
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
         else { fprintf(stderr, "unknown option '%s'\n", a); usage(argv[0]); return 1; }
         #undef NEXT
@@ -228,17 +237,64 @@ int main(int argc, char **argv) {
         cfg.sun.radiance = v3_scale(sun_color, sun_intensity);
     }
 
-    fprintf(stderr, "render %dx%d spp=%d bounces=%d threads=%d\n",
-            W, H, spp, bounces, cfg.nthreads);
+    fprintf(stderr, "render %dx%d spp=%d bounces=%d threads=%d backend=%s\n",
+            W, H, spp, bounces, cfg.nthreads, gpu_validate ? "gpu-validate" : backend);
 
     Framebuffer fb;
     fb_init(&fb, W, H);
-    render(&scene, doc, &bind, tex, env, &cam, &cfg, &fb);
+
+    if (gpu_validate) {
+        /* Same wavefront integrator, CPU vs GPU ray backend -> compare RMSE. */
+#ifdef MTLX_HAVE_VK
+        RayTracer *rt_vk = rt_vk_create(&scene);
+        if (!rt_vk) {
+            fprintf(stderr, "gpu-validate: no Vulkan device available\n");
+            fb_free(&fb); goto teardown;
+        }
+        fprintf(stderr, "gpu-validate: GPU = %s\n", rt_name(rt_vk));
+        Framebuffer fb_cpu; fb_init(&fb_cpu, W, H);
+        RayTracer *rt_cpu = rt_cpu_create(&scene);
+        render_wavefront(&scene, doc, &bind, tex, env, &cam, &cfg, &fb_cpu, rt_cpu);
+        render_wavefront(&scene, doc, &bind, tex, env, &cam, &cfg, &fb, rt_vk);
+        rt_destroy(rt_cpu); rt_destroy(rt_vk);
+        double se = 0.0, maxd = 0.0; size_t np = (size_t)W * H;
+        for (size_t i = 0; i < np; i++) {
+            v3 a = v3_scale(fb_cpu.accum[i], 1.0f / (float)spp);
+            v3 b = v3_scale(fb.accum[i], 1.0f / (float)spp);
+            float d[3] = {a.x - b.x, a.y - b.y, a.z - b.z};
+            for (int c = 0; c < 3; c++) { se += (double)d[c] * d[c]; if (fabs(d[c]) > maxd) maxd = fabs(d[c]); }
+        }
+        double rmse = sqrt(se / (double)(np * 3));
+        fprintf(stderr, "gpu-validate: CPU vs GPU wavefront RMSE=%.6f maxdiff=%.6f\n", rmse, maxd);
+        fb_free(&fb_cpu);
+#else
+        fprintf(stderr, "gpu-validate: this binary was built without Vulkan (use VK=1)\n");
+        fb_free(&fb); goto teardown;
+#endif
+    } else if (!strcmp(backend, "vk")) {
+#ifdef MTLX_HAVE_VK
+        RayTracer *rt = rt_vk_create(&scene);
+        if (rt) {
+            fprintf(stderr, "backend vk: GPU = %s\n", rt_name(rt));
+            render_wavefront(&scene, doc, &bind, tex, env, &cam, &cfg, &fb, rt);
+            rt_destroy(rt);
+        } else {
+            fprintf(stderr, "backend vk: no Vulkan device; falling back to CPU\n");
+            render(&scene, doc, &bind, tex, env, &cam, &cfg, &fb);
+        }
+#else
+        fprintf(stderr, "backend vk: built without Vulkan (use VK=1); using CPU\n");
+        render(&scene, doc, &bind, tex, env, &cam, &cfg, &fb);
+#endif
+    } else {
+        render(&scene, doc, &bind, tex, env, &cam, &cfg, &fb);
+    }
 
     fb_write_exr(&fb, out_path);
     if (png_path) fb_write_png(&fb, png_path, TONEMAP_ACES, exposure);
-
     fb_free(&fb);
+
+teardown:
     env_free(env);
     texcache_free(tex);
     material_binding_free(&bind);

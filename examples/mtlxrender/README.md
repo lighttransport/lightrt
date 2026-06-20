@@ -12,7 +12,10 @@ The same scene under a Radiance `.hdr` environment (image-based lighting):
 
 ## What it does
 
-- Loads a (binary) **glTF** mesh via **tinygltf v3** (pure-C `tg3_*` API).
+- Loads a (binary) **glTF** mesh via **tinygltf v3** (pure-C `tg3_*` API), or a
+  **Wavefront `.obj`** via a dependency-free C11 parser (`--obj`). Both feed the
+  same flat `Scene`/BVH (shared `mesh_build`), so everything downstream is
+  format-agnostic.
 - Parses a **`.mtlx`** document with a hand-written C11 XML parser and builds an
   in-memory node graph.
 - Binds materials to geometry **by name** (`<materialassign geom="...">` matches
@@ -47,6 +50,39 @@ The same scene under a Radiance `.hdr` environment (image-based lighting):
 
 `standard_surface` inputs map onto a single OpenPBR-style BSDF (~1:1), so the
 chess set renders unchanged.
+
+## Render backends: CPU and Vulkan GPU trace
+
+The renderer can resolve its ray queries on the CPU or on the GPU behind a small
+**ray-query backend seam** (`raytracer.h`: `rt_closest` / `rt_occluded`). A future
+CUDA backend implements the same three ops with no integrator change.
+
+- `--backend cpu` *(default)*: the recursive, tiled, multi-threaded path tracer
+  (`pathtrace.c`) — full NEE+MIS, subsurface, etc.
+- `--backend vk`: a **wavefront** integrator (`pathtrace_wf.c`) that issues ray
+  *batches* (camera / shadow / bounce) and traces them on the GPU via
+  `lrt_vk_trace_scene` (LightRT's Vulkan BVH trace). **Shading stays on the CPU
+  with the full MaterialX node graph** — only the ray queries cross to the GPU.
+
+```bash
+make VK=1                       # link the Vulkan backend (runtime dlopen libvulkan)
+# or: cmake -S . -B build -DMTLXRENDER_VK=ON
+
+./mtlxrender --gltf chess_set.glb --mtlx chess.mtlx --backend vk ...   # GPU-traced
+./mtlxrender --obj model.obj     --mtlx m.mtlx       --gpu-validate ... # CPU vs GPU
+```
+
+`--gpu-validate` runs the *same* wavefront on the CPU and the GPU ray backend and
+reports RMSE — a simple correctness check. On an RTX 5060 Ti the cube validates
+bit-identically (RMSE 0); the chess set differs only by ~1e-3 RMSE (a few
+silhouette pixels where the GPU and CPU traces pick different triangles at an
+edge — `lrt_vk_trace_scene` matches the CPU `t` to fp tolerance). Without a
+Vulkan build or device, `--backend vk` falls back to the CPU tracer and
+`--gpu-validate` reports that no device is present.
+
+> Note: this v1 `lrt_vk_trace_scene` re-uploads the scene BVH per ray batch, so a
+> multi-bounce GPU wavefront pays that each batch; it demonstrates GPU traversal
+> of real meshes. A resident-scene trace path is a natural follow-up.
 
 ## MaterialX → GPU shading bridge (`mtlxvk`)
 
