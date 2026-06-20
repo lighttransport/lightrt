@@ -44,6 +44,7 @@ MATERIALS=(
     "GltfPbr/gltf_pbr_default.mtlx"
     "GltfPbr/gltf_pbr_gold.mtlx"
     "GltfPbr/gltf_pbr_glass.mtlx"
+    "GltfPbr/gltf_pbr_boombox.mtlx"
     "DisneyPrincipled/disney_principled_default.mtlx"
     "DisneyPrincipled/disney_principled_gold.mtlx"
     "DisneyPrincipled/disney_principled_plastic.mtlx"

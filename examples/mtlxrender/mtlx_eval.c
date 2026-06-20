@@ -311,7 +311,15 @@ static MtlxValue eval_image(ShadeContext *ctx, const MtlxNode *n) {
 }
 
 static MtlxValue eval_normalmap(ShadeContext *ctx, const MtlxNode *n) {
-    MtlxValue in = eval_input(ctx, find_input(n, "in"));
+    /* `normalmap` takes an `in` tangent-space vector (usually from an image),
+     * but the gltf convenience node `gltf_normalmap` embeds the texture `file`
+     * directly. Sample it like an image node in that case, else no normal map
+     * is ever applied for gltf assets. */
+    const MtlxInput *inp = find_input(n, "in");
+    MtlxValue in;
+    if (inp && (inp->src_node >= 0 || inp->has_value)) in = eval_input(ctx, inp);
+    else if (find_input(n, "file")) in = eval_image(ctx, n);
+    else in = mv_vec3(v3_make(0.5f, 0.5f, 1.0f)); /* flat tangent-space normal */
     v3 t = mv_as_v3(&in);
     v3 ts = v3_make(2 * t.x - 1, 2 * t.y - 1, 2 * t.z - 1);
     const MtlxInput *scin = find_input(n, "scale");

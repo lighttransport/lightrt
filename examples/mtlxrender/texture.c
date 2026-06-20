@@ -95,7 +95,8 @@ void texcache_preload(TextureCache *tc, const MtlxDoc *doc) {
          * file never enters the cache and the frozen render-time lookup misses. */
         const char *c = n->category;
         if (strcmp(c, "image") && strcmp(c, "tiledimage") && strcmp(c, "hextiledimage") &&
-            strcmp(c, "gltf_image") && strcmp(c, "gltf_colorimage")) continue;
+            strcmp(c, "gltf_image") && strcmp(c, "gltf_colorimage") &&
+            strcmp(c, "normalmap") && strcmp(c, "gltf_normalmap")) continue;
         for (int j = 0; j < n->ninput; j++) {
             const MtlxInput *in = &n->inputs[j];
             if (strcmp(in->name, "file") == 0 && in->value.s)
