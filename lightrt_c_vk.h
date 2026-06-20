@@ -174,10 +174,33 @@ typedef struct lrt_vk_shade_desc {
 } lrt_vk_shade_desc;
 
 /* Shade `nprims` analytic primitives into out_rgba (width*height*4 floats,
- * linear, caller-allocated). Returns 0 on success, -1 on error (err set). */
+ * linear, caller-allocated). Returns 0 on success, -1 on error (err set).
+ *
+ * This one-shot form (re)allocates and uploads every buffer per call. For
+ * repeated rendering of the same scene (animation, an orbit, parameter sweeps)
+ * prefer the resident API below, which uploads the primitives once and reuses
+ * the device buffers + descriptor set across frames. */
 int lrt_vk_shade_analytic(lrt_vk_engine *e, const lrt_vk_shade_prim *prims,
                           uint32_t nprims, const lrt_vk_shade_desc *desc,
                           float *out_rgba, lrt_result *err);
+
+/* Resident analytic-shading scene: upload the primitives ONCE and render many
+ * frames against them. The primitive buffer and descriptor set are reused; the
+ * output buffer is reused and only grown when a larger frame is requested. The
+ * engine must outlive the scene. */
+typedef struct lrt_vk_shade_scene lrt_vk_shade_scene;
+
+lrt_vk_shade_scene *lrt_vk_shade_scene_build(lrt_vk_engine *e,
+                                             const lrt_vk_shade_prim *prims,
+                                             uint32_t nprims, lrt_result *err);
+
+/* Render one frame of a resident scene into out_rgba (width*height*4 floats).
+ * Uploads only the small per-frame description; reuses everything else. */
+int lrt_vk_shade_scene_render(lrt_vk_engine *e, lrt_vk_shade_scene *s,
+                              const lrt_vk_shade_desc *desc, float *out_rgba,
+                              lrt_result *err);
+
+void lrt_vk_shade_scene_free(lrt_vk_engine *e, lrt_vk_shade_scene *s);
 
 #ifdef __cplusplus
 }

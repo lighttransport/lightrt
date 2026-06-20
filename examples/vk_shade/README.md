@@ -62,14 +62,20 @@ If no Vulkan device/loader is present the program writes the CPU reference image
 prints a notice, and exits 0 (so GPU-less CI stays green). It is also registered
 as the `lightrt_vk_shade` CTest case when `LIGHTRT_BUILD_VK=ON`.
 
-### Performance note
+### Performance
 
-The reported GPU number reflects dispatch **plus** scene upload / image readback:
-this v1 backend (like the rest of `lightrt_c_vk`) uses `HOST_VISIBLE | COHERENT`
-buffers and re-uploads per call — no `DEVICE_LOCAL` staging yet — so the GPU
-write/readback crosses PCIe. The speedup over the single-threaded CPU reference
-still grows with resolution as the fixed per-call overhead amortizes (≈5× at
-512×384, ≈10× at 1024²). A resident-buffer fast path is a natural follow-up.
+The demo uses the **resident-scene API** (`lrt_vk_shade_scene_build` /
+`_render` / `_free`): the primitives are uploaded once and the device buffers +
+descriptor set are reused across frames (it times an average of 30 renders, like
+an animation loop). The output lives in `DEVICE_LOCAL` memory — the shader writes
+it at full bandwidth instead of over PCIe to host-coherent memory — and is copied
+to a host-visible staging buffer for readback in the same submission.
+
+On an RTX 5060 Ti this sustains ≈9 Mpix/s, **9–20× the single-threaded CPU
+reference** (the ratio grows with resolution / spp as the CPU cost rises). The
+one-shot `lrt_vk_shade_analytic()` is simpler but re-allocates and uploads every
+buffer per call (host-visible), so it is roughly half as fast for repeated
+rendering — use the resident API in a loop.
 
 ## Regenerating the shader
 

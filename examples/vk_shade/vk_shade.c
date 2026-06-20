@@ -346,22 +346,34 @@ int main(int argc, char **argv) {
     }
     printf("GPU: %s  caps=0x%x\n", lrt_vk_engine_device_name(e), lrt_vk_engine_caps(e));
 
-    /* Warm-up run builds the pipeline + descriptor pool; the timed run then
-     * reflects dispatch + buffer upload/readback (this v1 backend re-uploads
-     * the scene per call). */
-    if (lrt_vk_shade_analytic(e, prims, nprims, &desc, gpu, &err) != 0) {
-        fprintf(stderr, "lrt_vk_shade_analytic failed: %s\n", lrt_vk_engine_last_error(e));
+    /* Resident scene: upload the primitives once, render many frames reusing
+     * the device buffers + descriptor set (mirrors an animation / orbit loop). */
+    lrt_vk_shade_scene *scene = lrt_vk_shade_scene_build(e, prims, nprims, &err);
+    if (!scene) {
+        fprintf(stderr, "lrt_vk_shade_scene_build failed: %s\n", lrt_vk_engine_last_error(e));
         lrt_vk_engine_destroy(e);
         free(cpu); free(gpu);
         return 1;
     }
+    /* Warm-up render builds the pipeline + descriptor set + output buffer. */
+    if (lrt_vk_shade_scene_render(e, scene, &desc, gpu, &err) != 0) {
+        fprintf(stderr, "lrt_vk_shade_scene_render failed: %s\n", lrt_vk_engine_last_error(e));
+        lrt_vk_shade_scene_free(e, scene);
+        lrt_vk_engine_destroy(e);
+        free(cpu); free(gpu);
+        return 1;
+    }
+    const int FRAMES = 30;
     t0 = now_sec();
-    lrt_vk_shade_analytic(e, prims, nprims, &desc, gpu, &err);
-    double gpu_ms = (now_sec() - t0) * 1e3;
+    for (int fr = 0; fr < FRAMES; fr++)
+        lrt_vk_shade_scene_render(e, scene, &desc, gpu, &err);
+    double gpu_ms = (now_sec() - t0) * 1e3 / (double)FRAMES;
+    lrt_vk_shade_scene_free(e, scene);
+
     write_ppm("vk_shade_gpu.ppm", gpu, w, h);
-    printf("wrote vk_shade_gpu.ppm (GPU)\n");
-    printf("GPU shade: %8.2f ms   %6.1f Mpix/s   (%.1fx vs CPU)\n",
-           gpu_ms, mpix / (gpu_ms * 1e-3), cpu_ms / gpu_ms);
+    printf("wrote vk_shade_gpu.ppm (GPU, resident scene)\n");
+    printf("GPU shade: %8.2f ms   %6.1f Mpix/s   (%.1fx vs CPU, avg of %d frames)\n",
+           gpu_ms, mpix / (gpu_ms * 1e-3), cpu_ms / gpu_ms, FRAMES);
 
     /* Compare. Interior pixels must match closely; a small fraction of
      * silhouette/shadow-edge pixels legitimately differ because a sub-sample

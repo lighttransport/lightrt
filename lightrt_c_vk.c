@@ -229,6 +229,11 @@ static int vk_buffer_read(lrt_vk_engine *e, vk_buffer *b, void *dst,
     return 1;
 }
 
+/* One-shot command-buffer helpers (defined later, used by the resident shading
+ * path for a dispatch + device->host copy in a single submission). */
+static VkCommandBuffer vk_cmd_begin(lrt_vk_engine *e);
+static int vk_cmd_end_submit(lrt_vk_engine *e, VkCommandBuffer cb);
+
 /* ------------------------------------------------------------------------- */
 /* Compute pipeline construction.                                            */
 /* ------------------------------------------------------------------------- */
@@ -1096,6 +1101,176 @@ fail:
     vk_buffer_destroy(e, &b_glob);
     if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
     return -1;
+}
+
+/* Resident scene: prims uploaded once, buffers + descriptor set reused. The
+ * output is DEVICE_LOCAL (the shader writes at full bandwidth, not over PCIe to
+ * host-coherent memory) and copied to a host-visible staging buffer for
+ * readback in the same submission. */
+struct lrt_vk_shade_scene {
+    vk_buffer prims;
+    vk_buffer glob;
+    vk_buffer out;           /* DEVICE_LOCAL: STORAGE | TRANSFER_SRC      */
+    vk_buffer staging;       /* HOST_VISIBLE: TRANSFER_DST (readback)     */
+    uint32_t nprims;
+    uint32_t out_pixels;     /* current output-buffer capacity, in pixels */
+    VkDescriptorPool pool;
+    VkDescriptorSet set;
+    int bound;
+};
+
+lrt_vk_shade_scene *lrt_vk_shade_scene_build(lrt_vk_engine *e,
+                                             const lrt_vk_shade_prim *prims,
+                                             uint32_t nprims, lrt_result *err) {
+    if (!e || (nprims && !prims)) {
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return NULL;
+    }
+    if (!shade_get_pipeline(e)) {
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return NULL;
+    }
+    lrt_vk_shade_scene *s =
+        (lrt_vk_shade_scene *)calloc(1, sizeof(*s));
+    if (!s) {
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return NULL;
+    }
+    s->nprims = nprims;
+    size_t prim_bytes = (size_t)nprims * sizeof(lrt_vk_shade_prim);
+    if (!vk_buffer_create(e, prim_bytes, &s->prims) ||
+        !vk_buffer_create(e, 32u * sizeof(float), &s->glob)) {
+        lrt_vk_shade_scene_free(e, s);
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return NULL;
+    }
+    if (prim_bytes && !vk_buffer_write(e, &s->prims, prims, prim_bytes)) {
+        lrt_vk_shade_scene_free(e, s);
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return NULL;
+    }
+    if (err) *err = LRT_RESULT_OK;
+    return s;
+}
+
+int lrt_vk_shade_scene_render(lrt_vk_engine *e, lrt_vk_shade_scene *s,
+                              const lrt_vk_shade_desc *desc, float *out_rgba,
+                              lrt_result *err) {
+    if (!e || !s || !desc || !out_rgba || desc->width == 0 ||
+        desc->height == 0) {
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return -1;
+    }
+    vk_pipeline *pipe = shade_get_pipeline(e);
+    if (!pipe) {
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return -1;
+    }
+
+    uint32_t npix = desc->width * desc->height;
+    size_t out_bytes = (size_t)npix * 4u * sizeof(float);
+
+    /* Grow (and rebind) the output buffers only when a larger frame appears. */
+    if (npix > s->out_pixels) {
+        if (s->bound) {
+            vkDestroyDescriptorPool(e->device, s->pool, NULL);
+            s->bound = 0;
+        }
+        vk_buffer_destroy(e, &s->out);
+        vk_buffer_destroy(e, &s->staging);
+        int ok = vk_buffer_create_ex(
+                     e, out_bytes,
+                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     0, 0, &s->out) &&
+                 vk_buffer_create_ex(e, out_bytes,
+                                     VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1, 0,
+                                     &s->staging);
+        if (!ok) {
+            vk_buffer_destroy(e, &s->out);
+            vk_buffer_destroy(e, &s->staging);
+            s->out_pixels = 0;
+            if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+            return -1;
+        }
+        s->out_pixels = npix;
+    }
+    if (!s->bound) {
+        vk_buffer set_bufs[3] = {s->prims, s->out, s->glob};
+        if (!vk_descriptors_bind(e, pipe->dsl, set_bufs, 3, &s->pool, &s->set)) {
+            if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+            return -1;
+        }
+        s->bound = 1;
+    }
+
+    float glob[32];
+    shade_pack_globals(desc, glob);
+    if (!vk_buffer_write(e, &s->glob, glob, sizeof(glob))) {
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return -1;
+    }
+
+    shade_push pc;
+    pc.width = desc->width;
+    pc.height = desc->height;
+    pc.nprims = s->nprims;
+    pc.spp = desc->spp ? desc->spp : 1u;
+    uint32_t groups = (npix + 63u) / 64u;
+
+    /* Dispatch into the device-local output, then copy it to the host-visible
+     * staging buffer — all in one submission, with the two barriers the copy
+     * and the host read require. */
+    VkCommandBuffer cb = vk_cmd_begin(e);
+    if (cb == VK_NULL_HANDLE) {
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return -1;
+    }
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->layout, 0,
+                            1, &s->set, 0, NULL);
+    vkCmdPushConstants(cb, pipe->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       (uint32_t)sizeof(pc), &pc);
+    vkCmdDispatch(cb, groups, 1, 1);
+    VkMemoryBarrier mb;
+    memset(&mb, 0, sizeof(mb));
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0,
+                         NULL);
+    VkBufferCopy region;
+    region.srcOffset = 0;
+    region.dstOffset = 0;
+    region.size = out_bytes;
+    vkCmdCopyBuffer(cb, s->out.buf, s->staging.buf, 1, &region);
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0,
+                         NULL);
+    if (!vk_cmd_end_submit(e, cb)) {
+        vk_set_err(e, "shade dispatch/copy submission failed");
+        if (err) *err = LRT_RESULT_TRAVERSAL_OVERFLOW;
+        return -1;
+    }
+    if (!vk_buffer_read(e, &s->staging, out_rgba, out_bytes)) {
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return -1;
+    }
+    if (err) *err = LRT_RESULT_OK;
+    return 0;
+}
+
+void lrt_vk_shade_scene_free(lrt_vk_engine *e, lrt_vk_shade_scene *s) {
+    if (!s) return;
+    if (s->bound) vkDestroyDescriptorPool(e->device, s->pool, NULL);
+    vk_buffer_destroy(e, &s->prims);
+    vk_buffer_destroy(e, &s->glob);
+    vk_buffer_destroy(e, &s->out);
+    vk_buffer_destroy(e, &s->staging);
+    free(s);
 }
 
 /* ------------------------------------------------------------------------- */
