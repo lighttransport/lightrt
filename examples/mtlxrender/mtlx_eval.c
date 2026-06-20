@@ -501,6 +501,8 @@ int mtlx_eval_surface(ShadeContext *ctx, int surface_node, OpenPBRParams *out) {
         out->coat_roughness = in_float(ctx, n, "coat_roughness", 0.0f);
         out->coat_ior = in_float(ctx, n, "coat_ior", 1.6f);
         out->sheen_weight = in_float(ctx, n, "fuzz_weight", 0.0f);
+        out->sheen_color = in_color(ctx, n, "fuzz_color", out->sheen_color);
+        out->sheen_roughness = in_float(ctx, n, "fuzz_roughness", 0.3f);
         out->emission = in_float(ctx, n, "emission_luminance", 0.0f);
         out->emission_color = in_color(ctx, n, "emission_color", out->emission_color);
         out->opacity = in_float(ctx, n, "geometry_opacity", 1.0f);
