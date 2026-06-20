@@ -1592,7 +1592,8 @@ static void test_serialization(void) {
         lrt_tri_scene_free(s);
     }
 
-    /* curve scenes serialize too; user/sphere scenes must refuse. */
+    /* curve and sphere scenes serialize too (LRTS v2 reconstructs shade data
+     * from leaves); user scenes still refuse. */
     {
         lrt_result err = LRT_RESULT_OK;
         float segs[6] = {-1, 0, 0, 1, 0.2f, 0.1f};
@@ -1619,10 +1620,18 @@ static void test_serialization(void) {
         if (sp) {
             void *buf = NULL;
             size_t n = 0;
-            CHECK(lrt_tri_scene_save_to_memory(sp, &buf, &n) ==
-                      LRT_RESULT_INVALID_ARGUMENT,
-                  "sphere scene should refuse serialization");
-            free(buf);
+            CHECK(lrt_tri_scene_save_to_memory(sp, &buf, &n) == LRT_RESULT_OK,
+                  "sphere save failed");
+            if (buf) {
+                lrt_tri_scene *ld = lrt_tri_scene_load_from_memory(buf, n, &err);
+                CHECK(ld != NULL, "sphere load failed");
+                if (ld) {
+                    CHECK(scenes_disagree(sp, ld, 5000) == 0,
+                          "sphere serialization differs");
+                    lrt_tri_scene_free(ld);
+                }
+                free(buf);
+            }
             lrt_tri_scene_free(sp);
         }
     }

@@ -742,6 +742,53 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
   phase over caller AABBs, with a per-candidate intersect/occluded callback
   invoked only after a 4-wide AABB pretest. Far faster than the fp64
   `lightrt_c.h` path. Callbacks must be re-entrant for concurrent queries.
+- `lrt_quad_scene_build` / `lrt_tetra_scene_build` — **planar quad** (4-vertex
+  face, two-triangle MT) and **solid tetrahedron** (nearest of 4 faces); shared
+  208-byte `lrt_quad4` 4-point leaf, `TRI_PRIM_QUAD` / `_TETRA`. Input 12*n
+  floats (v0 v1 v2 v3). Serialize + GPU-trace.
+- `lrt_sdfprim_scene_build` — **built-in implicit/SDF primitives** (sphere/box/
+  torus via `lrt_sdf_shape`), sphere-traced analytically on both CPU and GPU —
+  a device-friendly custom-geometry path that needs no host callbacks (so it
+  serializes and GPU-traces, unlike `lrt_user_scene_build`). `TRI_PRIM_SDF`,
+  144-byte `lrt_sdf4` leaf (center, bounding radius, type, 3 params).
+- **Parametric surfaces (direct ray-patch intersection, no tessellation — a
+  superset of Embree, which has no native NURBS/Bézier-surface/trim types):**
+  - `lrt_bilinear_scene_build` — true **bilinear patch** (Embree GRID cell),
+    exact closed-form quadratic solve (Reshetov "Cool Patches"). `TRI_PRIM_
+    BILINEAR`, reuses the 208-byte `lrt_quad4` leaf.
+  - `lrt_bezpatch_scene_build` — **bicubic Bézier surface** (4×4 CPs), adaptive
+    (u,v) quadtree subdivision + Newton on (u,v,t). `TRI_PRIM_BEZPATCH`,
+    784-byte `lrt_bezpatch4` leaf (4 patches/block SoA).
+  - `lrt_nurbs_scene_build` — **NURBS surface** (control net + 2 knot vectors +
+    weights, any bidegree ≤8): build-time knot-insertion Bézier extraction
+    (NURBS Book A5.6) + degree-elevation to rational bicubic, intersected
+    directly (homogeneous eval + perspective divide). `TRI_PRIM_RBEZPATCH`,
+    1104-byte `lrt_rbezpatch4` leaf (16 homogeneous CPs + per-patch domain).
+  - `lrt_trimnurbs_scene_build` — **trimmed NURBS**: the above + (u,v) trim loops
+    (polylines; outer + holes, even-odd rule). A patch hit is kept only if its
+    global (u,v) is visible; trimmed hits are rejected and the search continues
+    for the nearest untrimmed hit. `TRI_PRIM_TRIMNURBS`, scene-owned trim side
+    buffers. Verified by residual (surface point on the ray) + the trim
+    invariant (every hit inside the trim region). Serializes via the **LRTS v2
+    aux region** (trim loops ride after the blocks; v1 files still load — their
+    zero padding reads as aux_size 0). `lrt_trimnurbs_bezier_scene_build` takes
+    **cubic-Bézier trim loops** (4 (u,v) CPs/segment, C0-closed) and flattens
+    them to a polyline at build time (adaptive de Casteljau to a `tol`), then
+    builds the same scene — so the trim test, serialization, and GPU trace are
+    unchanged (the GPU never sees curves; zero parity risk).
+  - **Post-hit shading** (`lrt_tri_surface_normal`): given a hit's `prim_id` +
+    `(u,v)`, re-evaluates the surface for the point `P`, geometric normal `Ng =
+    cross(dP/du, dP/dv)`, and the two parametric tangents (any output NULL-able)
+    — the partials the intersectors already compute but discard. Works for all
+    four surface kinds; NURBS `(u,v)` is global and is remapped to the per-patch
+    local domain internally (tangents reported w.r.t. the global params). The
+    per-prim control data is reconstructed from the leaf blocks
+    (`tri_build_shade_data`), so the query works on freshly built and
+    serialized/mmapped scenes alike; non-surface scenes return
+    `INVALID_ARGUMENT`. CPU-side by design (normals are consumed at shade time
+    on the host), so it is **not** mirrored on the HIP device — the `prim_kind`
+    trace-dispatch parity is unaffected. Curves use `lrt_tri_curve_frame`
+    instead (a tube's radial normal needs the ray-dependent hit point).
 
 ### Implicit surfaces / SDF (`lrt_sdf_*`)
 - `lrt_sdf_sphere_trace` — standalone enhanced sphere tracing (over-relaxation
@@ -760,6 +807,57 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
   (+ `lrt_frustum_from_matrix`).
 - Coherent ray packets `lrt_tri_intersect4/8`, `lrt_tri_occluded4/8`.
 - Filtered any-hit `lrt_tri_occluded1_filtered` (alpha-tested shadows).
+
+### Post-hit shading data (CPU; geometry-aware)
+- `lrt_tri_surface_normal` — parametric SURFACE point / geometric normal (`Ng =
+  cross(dP/du, dP/dv)`) / tangents from a hit's `(prim_id, u, v)`. See the
+  parametric-surfaces section.
+- `lrt_tri_curve_frame` — LINEAR curve (round-linear / flat) centerline point
+  `C(u)`, tangent `T = dC/du`, and radius `r(u)` from a hit's `(prim_id, u)`; the
+  caller forms the shading normal by removing the tangential part of `P - C`.
+  Cubic-Bezier curves are *not* served — the build pre-subdivides each cubic and
+  the reported `u` is local to the unrecorded sub-arc, so a global segment
+  parameter can't be reconstructed (`INVALID_ARGUMENT`).
+- Both queries are CPU-side. The per-prim control data is **reconstructed from
+  the leaf blocks** (`tri_build_shade_data`) — the leaves are the intersector's
+  own source of truth — so the queries work on freshly built *and*
+  serialized/mmapped scenes alike, with no extra on-disk data (a deserialized
+  scene rebuilds the arrays on load). `LRT_RESULT_UNSUPPORTED` only on an
+  allocation failure.
+- `lrt_tri_surface_tessellate[_bound]` — dice a parametric SURFACE scene into a
+  triangle mesh (positions + geometric normals + (u,v), 2·segu·segv tris/patch)
+  for rasterization preview / OBJ export / collision proxy. Samples each patch
+  over its parameter domain (per-patch (u,v) span for NURBS, [0,1]² otherwise)
+  via `lrt_tri_surface_normal`; trimmed-NURBS cells whose centroid is outside
+  the trim region are dropped (actual count ≤ the bound). Size buffers with
+  `_bound`, then fill; `*ntris_out` reports the full count.
+  `lrt_tri_surface_tessellate_indexed[_bound]` is the welded variant: a shared
+  (segu+1)×(segv+1) vertex grid per patch + a triangle index buffer (~what GPU
+  vertex buffers / OBJ exporters want, far less vertex data); trimmed cells just
+  omit their index triples.
+- `lrt_tri_surface_project` — closest-point projection (inverse of evaluation):
+  the (u,v) on a patch nearest a query point Q, via multi-start Gauss-Newton on
+  |S(u,v)-Q|² clamped to the patch domain. For collision response / decal
+  projection / snapping. Per-patch (caller picks prim_id; call over all patches
+  for a whole-surface nearest point).
+- `lrt_tri_curve_tessellate[_bound]` — tessellate a ROUND-LINEAR (hair) scene
+  into a tube mesh: each segment a tapered cone frustum with `nsides` radial
+  faces (2·nsides tris, no caps), vertices on the cone surface at r(t), outward
+  cone-surface normals. Round-linear only (flat is a view-dependent ribbon;
+  Bézier u is sub-arc-local) → others return `INVALID_ARGUMENT`.
+- `lrt_tri_surface_refit` — in-place refit for animation (deforming patches):
+  replace control points and recompute node bounds without rebuilding the tree
+  (mirrors `lrt_tri_scene_refit` for triangles; shared `tri_refit_propagate`
+  tail + a `prim_kind`-dispatched `tri_leaf_box`). Bilinear (12 floats/patch) and
+  bicubic Bézier (48) only — the direct-control-point kinds; NURBS leaves are
+  extracted rational patches with no 1:1 map to the input net, so they are
+  rejected. Refreshes the shade cache, so the normal/tessellate queries reflect
+  the new geometry. Traces identically to a fresh build of the new CPs.
+- `lrt_curve_refit` — in-place refit for animated hair: re-derive the segments
+  (incl. round-linear CSG-neighbor data) from a new strand set and recompute node
+  bounds without a rebuild. Round-linear + flat curves; the strand topology must
+  match the original (same segment count). Refreshes the shade cache. Traces
+  identically to a fresh build (round joints included).
 
 ### Production
 - Serialization: `lrt_tri_scene_save[_to_memory]` / `load[_from_memory]`, plus
@@ -846,6 +944,147 @@ cmake -S benchmark_c -B build_bench_c -DLRTBENCH_VK=ON
   follow-ups).
 - Path B v1 is hybrid (GPU front end, CPU hierarchy); full-GPU LBVH (radix sort /
   Karras tree / collapse on GPU) is a planned v2/v3.
+
+## HIP GPU Backend (`lightrt_c_hip.h`)
+
+Optional HIP (ROCm/AMD) GPU backend for the C11 triangle kernel, parallel to the
+Vulkan path but with a **device-resident scene** (upload the BVH once, trace many
+batches) and Phase-2 hooks for WMMA / int-quantized low-precision tracing.
+Targets RDNA4 (gfx1201, wave32) but runs on any HIP device. Implementation is
+`lightrt_c_hip.hip` (compiled by `hipcc` as C++, all symbols `extern "C"`); the
+header is pure C11 so the C library/benchmark include it cleanly. Build is opt-in
+and the test skips (exit 0) when no device is present.
+
+### Phase 1 (implemented): fp32 build + trace
+- **Resident trace**: `lrt_hip_scene_upload` (CPU-built BVH4/BVH8 → device via the
+  LRTS serialization blob, byte-identical to the Vulkan path) then
+  `lrt_hip_scene_trace` / `lrt_hip_scene_occluded` (reused/grown device ray/hit
+  scratch). The `k_trace<W,STACK>` / `k_occluded<W,STACK>` kernels are a
+  byte-for-byte port of `vk/shaders/trace_bvh.comp` over raw `uint32_t*` node/leaf
+  buffers (node stride `8*W` words, block stride `10*W`, prim at `9*W`; parity
+  constants `INVD_MAX=1e18`, MT det `±1e-12`, deferred tnear cull, far-to-near
+  push). Compiled `-ffp-contract=off` to stay bit-faithful to the scalar C kernel
+  → matches `lrt_tri_intersect1` to ~99.999% (`max_rel_t < 1e-6`).
+- **Hybrid GPU build (Path B)**: `lrt_hip_build_scene` runs `k_centroids` +
+  `k_morton` on the GPU (port of `build_morton.comp`), finishes the LBVH on the
+  CPU via `lrt_tri_scene_build_lbvh_morton`; matches a FAST CPU build (~50 ms).
+- **Full-GPU LBVH (`lrt_hip_scene_build_gpu`, `lightrt_hip_lbvh.hip`)**: builds
+  the whole BVH on the GPU with NO CPU hierarchy work — centroids + Morton, a
+  hipCUB radix sort of unique 64-bit `(morton<<32|index)` keys, a Karras (2012)
+  binary radix tree, bottom-up bounds via the atomic-flag walk-up, and emission
+  directly into the trace kernel's BVH4 wide-node format as a binary (2-wide)
+  tree (one triangle per leaf block). Returns a resident scene traceable
+  immediately. hipCUB-gated (`lrt_hip_have_gpu_build()`). On the 220k-tri
+  mandelbulb: **~2.2 ms build** (vs ~143 ms CPU SAH, ~50 ms hybrid) at
+  essentially the same primary trace throughput (~218 Mray/s) and 99.999% oracle
+  agreement — the fast-rebuild path for topology-changing dynamic scenes. The
+  un-collapsed 2-wide tree costs a little on incoherent rays; a GPU collapse to
+  4/8-wide is a possible future refinement.
+- **GPU refit (dynamic / motion-blur)**: `lrt_hip_scene_refit` updates leaf
+  vertices + node bounds in place without rebuilding (multi-pass bottom-up;
+  parent index < child index by construction). Matches a CPU refit 100%. On the
+  220k-tri mandelbulb it is ~1 ms vs ~136 ms for a full build (~140× faster) —
+  the realtime animation path.
+- **Fully GPU-resident dynamic pipeline (no per-frame PCIe)**: for animation /
+  motion blur the whole loop stays on-device. `lrt_hip_dbuffer` holds resident
+  vertex/ray/hit buffers; `lrt_hip_raygen_camera` generates pinhole primary rays
+  on the GPU; `lrt_hip_scene_trace_device` / `_occluded_device` trace
+  device→device; `lrt_hip_scene_refit_device` / `lrt_hip_scene_build_gpu_device`
+  refit/rebuild from a device vertex buffer. The full-GPU build derives Morton
+  base/scale on-device (`kl_init6`+`kl_basescale`) — no D2H readback at all.
+  Only one-time vertex upload and a final present/debug download cross PCIe.
+  `bench_hip --dynamic` runs an orbiting-camera frame loop (1280×720, 220k tris,
+  zero per-frame PCIe): ~1500 fps raygen+trace, ~975 fps refit+raygen+trace
+  (deforming mesh), ~430 fps full-GPU-rebuild+raygen+trace (topology change).
+  Note refit suits the shallow collapsed BVH8 (depth ~20); the GPU binary tree
+  is depth ~64, for which a full rebuild is the better dynamic path.
+- **One-shot**: `lrt_hip_trace_scene` (upload+trace+free).
+- Engine: `lrt_hip_engine_create`/`_destroy`/`_caps`/`_device_name`/`_last_error`.
+  Caps report `WMMA`/`FP8`/`INT8`/`INT4` (inferred from gfx11xx/gfx12xx arch).
+- `lrt_hip_scene_trace_ex(mode, ...)` selects precision; Phase-2 modes
+  (`WMMA_BF16`/`WMMA_FP8`/`WMMA_F32SEED`/`INT8`/`INT4`) currently fall back to fp32.
+
+### Build / test / benchmark
+```bash
+cmake -S . -B build_hip -DLIGHTRT_BUILD_HIP=ON -DLIGHTRT_BUILD_BENCHMARK_HIP=ON -DBUILD_TESTING=ON
+cmake --build build_hip && ctest --test-dir build_hip -R lightrt_c_hip_test
+./build_hip/benchmark_hip/bench_hip --scene mandelbulb --tris 200000 --rays 2000000
+make hip_test && ./lightrt_c_hip_test           # Makefile path (opt-in, needs hipcc)
+make benchmark_hip && ./bench_hip               # benchmark
+```
+The benchmark (`benchmark_hip/`) reports build_ms + primary/incoherent/shadow
+Mray/s + agreement vs the CPU oracle, for `cpu-bvh8` / `hip-fp32` / `hip-build`.
+On an RX 9070 XT (gfx1201) hip-fp32 traces a 220k-tri mandelbulb at ~210 Mray/s
+primary / ~135 Mray/s incoherent (vs ~19 / ~2 for 1-thread CPU); the GPU build is
+~2.7× faster than the CPU SAH build. Override the arch with `-DCMAKE_HIP_ARCHITECTURES=...`
+or `make HIP_ARCH=...`.
+
+### Non-triangle primitives on GPU (implemented)
+The HIP trace path is primitive-aware: alongside triangles (BVH4/BVH8) it traces
+all the BVH4 geometric primitives — **sphere, point (sphere/disc/oriented-disc),
+quad, tetra, round-linear & flat curves, cubic Bézier, built-in SDF
+(sphere/box/torus), and the parametric surfaces (bilinear / bicubic Bézier /
+NURBS / trimmed NURBS)** — by carrying `prim_kind`/`point_type` through the LRTS
+header and dispatching `k_trace_prim`/`k_occluded_prim` (BVH4, runtime kind) to
+device intersectors ported byte-for-byte from the CPU scalars (`hp_*` in
+`lightrt_c_hip.hip`). CPU build → GPU trace; serialization opened up per kind
+(USER/SDF-callback and QTRI still refuse). Agreement vs the CPU oracle: analytic
+prims, quad/tetra, round/flat curves, and SDF are 100% (max_rel_t 0); cubic
+Bézier ~99.96% (GPU scalar adaptive-sweep vs CPU SSE adaptive-sweep). Host
+function-pointer custom geometry (`lrt_user_scene_build`) cannot run on the GPU
+by construction; `lrt_sdfprim_scene_build` is the GPU-resident replacement.
+
+**On-device shading normals** (`lrt_hip_scene_trace_normals[_device]`): a
+post-pass `k_shade_normals` kernel computes the per-hit geometric normal for
+parametric surfaces (bilinear/bezpatch/NURBS/trimmed-NURBS — `Ng =
+cross(dP/du, dP/dv)` via the same `hp_bezpatch_eval`/`hp_rbez_eval` the
+intersector uses) and the radial normal for round-linear curves, mirroring the
+CPU `lrt_tri_surface_normal`/`lrt_tri_curve_frame`. Upload copies the CPU scene's
+per-prim shade control points to `d_shade_cps`/`d_shade_dom` (via the
+`lrt_tri_surface_shade_data` accessor); the kernel indexes them by the hit's
+`prim_id`. Verified on an RX 9070 XT (host D2H *and* the device-resident
+`_device` path, bit-identical): 100% normal agreement (min cos 1.00000) vs the
+CPU oracle across all four surface kinds + round-linear. Triangle/other scenes
+carry no shade data → `LRT_RESULT_UNSUPPORTED`. `bench_hip --normals` reports the
+post-pass cost: on a 20k-patch bezpatch scene the `k_shade_normals` pass adds
+only ~5% on primary rays and <1% on incoherent (traversal-bound) over trace-only.
+
+### Phase 2 (implemented): WMMA + int-quantized leaf kernels
+`lightrt_hip_wmma.hip` (compiled into `lightrt_hip` when rocWMMA is present;
+`lrt_hip_have_wmma()` reports it). RDNA4 WMMA does `D=A·B+C` — fits batched dense
+math, NOT divergent traversal — so the leaf intersection of a coherent 16-ray
+tile vs <=16 triangles is cast as the **Plücker edge-side GEMM**: ray Plücker
+`A=[dir, cross(org,dir)]` (M=16, K=6) times per-edge Plücker `B_k=[moment;dir]`
+(3 edges -> 3 16x16x16 mma ops), fp32/int32 accumulate; the sign of the three
+edge functions classifies in/out and `t` is recovered in fp32. Methods
+(`lrt_hip_leaf_bench`, `lrt_hip_isect_method`): `SCALAR` (fp32 Moller-Trumbore
+baseline), `WMMA_BF16`, `WMMA_FP16`, `WMMA_FP8` (e4m3, leaf-local normalized),
+`WMMA_INT8` (leaf-local quantized iu8). `lrt_hip_transform_bench` is the batched
+ray transform / motion-blur keyframe-lerp kernel (instancing path).
+
+**Honest verdict (RX 9070 XT, `bench_hip --leaf`, 16 rays/leaf, full-wave
+scalar baseline):** scalar fp32 FMA **beats** WMMA for leaf intersection — WMMA
+tops out at ~0.5x scalar (fp16) in both coherent and incoherent regimes. The
+K=6 tiles waste 10/16 of the WMMA K dimension and the shared-memory staging +
+3 GEMMs/leaf cost more than the lean scalar Moller-Trumbore. This is the
+expected result for tiny one-tile-per-leaf ops and matches the design's
+prediction; the benchmark reports it rather than hiding it. Classification
+accuracy vs scalar: fp16 ~98–99.6%, int8 ~94–98%, fp8 ~94–97%, bf16 ~88–97%
+(fp16 best; coherent rays graze shared edges so agree slightly lower than
+incoherent). Takeaway: on RDNA4 the matrix cores do not accelerate these
+CPU-style RT primitives; the precise fp32 trace (Phase 1) is the path to use.
+Transform batching is memory-bound, so WMMA does not help it either.
+
+Notes / not implemented: int4 (iu4) WMMA is not exposed by rocWMMA 2.2 (would
+need raw `__builtin_amdgcn_wmma_i32_16x16x16_iu4_w32`); since int8/fp16 already
+lose to scalar for leaf intersection, lower-precision int4 (same staging cost)
+would not change the verdict, so it is skipped. int16 is not a WMMA input type
+(the integer GEMM accumulates int32 from iu8/iu4 inputs). Other experimental
+ideas with expected low/negative payoff: WMMA box/slab tests (the min/max
+reduction is not a matmul) and full coherent-packet traversal calling the WMMA
+leaf kernel inline. The full-GPU LBVH (above) is implemented; a remaining
+refinement is a GPU collapse of its binary tree to 4/8-wide nodes for faster
+incoherent traversal.
 
 ## Code Conventions
 

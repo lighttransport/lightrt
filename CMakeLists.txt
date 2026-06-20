@@ -140,25 +140,17 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
     endif()
 endif()
 
-# C binding implementation. lightrt_c.c is a standalone pure-C11 BVH +
-# callback implementation; the C API does not depend on the C++ BVH wrapper.
+# C binding implementation. lightrt_c.c is a standalone pure-C11 implementation
+# of the lightrt_c.h API.
 option(LIGHTRT_BUILD_FUZZERS
        "Build libFuzzer harnesses for LightRT"
        OFF)
-# Vulkan GPU interop (lightrt_vkew + lightrt_c_vk). Runtime dlopen of libvulkan;
-# NO Vulkan SDK headers and NO link-time -lvulkan (we deliberately do not call
-# find_package(Vulkan)). SPIR-V is checked in under vk/shaders, so no shader
-# toolchain is needed either.
-option(LIGHTRT_BUILD_VK
-       "Build the Vulkan GPU-interop trace/build backend"
-       OFF)
-set(LIGHTRT_C_BINDING_SRC lightrt_c.c)
 
 # Library target
 add_library(lightrt STATIC
     lightrt.cc
     lightrt.hh
-    ${LIGHTRT_C_BINDING_SRC}
+    lightrt_c.c
     lightrt_c.h
     lightrt_c_tri.c
     lightrt_c_tri.h
@@ -227,6 +219,34 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME lightrt_c_tri_test COMMAND lightrt_c_tri_test)
 
+    # Planar-quad + solid-tetra primitive self-test
+    add_executable(lightrt_c_quadtetra_test
+        lightrt_c_tri.c tests/test_lightrt_c_quadtetra.c)
+    if(LIGHTRT_C_TRI_SIMD_FLAGS)
+        target_compile_options(lightrt_c_quadtetra_test PRIVATE ${LIGHTRT_C_TRI_SIMD_FLAGS})
+    endif()
+    if(Threads_FOUND)
+        target_link_libraries(lightrt_c_quadtetra_test Threads::Threads)
+    endif()
+    if(NOT MSVC)
+        target_link_libraries(lightrt_c_quadtetra_test m)
+    endif()
+    add_test(NAME lightrt_c_quadtetra_test COMMAND lightrt_c_quadtetra_test)
+
+    # Parametric surface primitive self-test (bilinear / Bezier / NURBS)
+    add_executable(lightrt_c_surfaces_test
+        lightrt_c_tri.c tests/test_lightrt_c_surfaces.c)
+    if(LIGHTRT_C_TRI_SIMD_FLAGS)
+        target_compile_options(lightrt_c_surfaces_test PRIVATE ${LIGHTRT_C_TRI_SIMD_FLAGS})
+    endif()
+    if(Threads_FOUND)
+        target_link_libraries(lightrt_c_surfaces_test Threads::Threads)
+    endif()
+    if(NOT MSVC)
+        target_link_libraries(lightrt_c_surfaces_test m)
+    endif()
+    add_test(NAME lightrt_c_surfaces_test COMMAND lightrt_c_surfaces_test)
+
     # Vulkan GPU interop self-test. Skips (exit 0) when no Vulkan device is
     # present, so GPU-less CI stays green.
     if(LIGHTRT_BUILD_VK)
@@ -269,6 +289,89 @@ if(LIGHTRT_BUILD_VK)
     if(BUILD_TESTING)
         add_test(NAME lightrt_vk_shade COMMAND lightrt_vk_shade --w 128 --h 96 --spp 2)
     endif()
+endif()
+
+# --- HIP (ROCm/AMD) GPU backend (opt-in) ----------------------------------
+# Enables the HIP triangle-BVH trace/build backend (lightrt_c_hip.{h,hip}) and
+# its self-test. Requires hipcc + CMake >= 3.21 for the HIP language. The test
+# skips (exit 0) when no HIP device is present, so GPU-less CI stays green.
+option(LIGHTRT_BUILD_HIP "Build the HIP (ROCm/AMD) GPU backend" OFF)
+if(LIGHTRT_BUILD_HIP)
+    if(CMAKE_VERSION VERSION_LESS 3.21)
+        message(FATAL_ERROR "LIGHTRT_BUILD_HIP requires CMake >= 3.21 for the HIP language")
+    endif()
+    if(NOT DEFINED ROCM_PATH)
+        if(DEFINED ENV{ROCM_PATH})
+            set(ROCM_PATH $ENV{ROCM_PATH} CACHE PATH "ROCm install root")
+        else()
+            set(ROCM_PATH "/opt/rocm" CACHE PATH "ROCm install root")
+        endif()
+    endif()
+    list(APPEND CMAKE_PREFIX_PATH "${ROCM_PATH}" "${ROCM_PATH}/lib/cmake")
+    if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
+        set(CMAKE_HIP_ARCHITECTURES gfx1201 CACHE STRING "HIP offload archs")
+    endif()
+    enable_language(HIP)
+
+    # rocWMMA (matrix cores) for the Phase-2 WMMA leaf/transform kernels. Header-
+    # only; detected via find_package or a direct header probe under ROCM_PATH.
+    set(LIGHTRT_HIP_WMMA_OK OFF)
+    find_package(rocwmma QUIET)
+    if(rocwmma_FOUND OR EXISTS "${ROCM_PATH}/include/rocwmma/rocwmma.hpp")
+        set(LIGHTRT_HIP_WMMA_OK ON)
+    endif()
+
+    # hipCUB (radix sort) for the full-GPU LBVH builder. Header-only.
+    set(LIGHTRT_HIP_HIPCUB_OK OFF)
+    find_package(hipcub QUIET)
+    if(hipcub_FOUND OR EXISTS "${ROCM_PATH}/include/hipcub/hipcub.hpp")
+        set(LIGHTRT_HIP_HIPCUB_OK ON)
+    endif()
+
+    # Static library exposing the HIP backend to other targets. All three TUs
+    # are always compiled — the WMMA and LBVH files self-stub via #ifdef (their
+    # #else branches define NOT_BUILT versions of the public symbols), so the
+    # test/benchmark always link even when rocWMMA / hipCUB are absent. Only the
+    # feature -D defines below are conditional.
+    set(LIGHTRT_HIP_SOURCES lightrt_c_hip.hip lightrt_hip_wmma.hip
+        lightrt_hip_lbvh.hip)
+    add_library(lightrt_hip STATIC ${LIGHTRT_HIP_SOURCES})
+    set_source_files_properties(${LIGHTRT_HIP_SOURCES} PROPERTIES LANGUAGE HIP)
+    target_include_directories(lightrt_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_include_directories(lightrt_hip PRIVATE ${ROCM_PATH}/include)
+    # -ffp-contract=off keeps the GPU kernel bit-faithful to the scalar C kernel.
+    target_compile_options(lightrt_hip PRIVATE -ffp-contract=off)
+    if(LIGHTRT_HIP_WMMA_OK)
+        target_compile_definitions(lightrt_hip PRIVATE LIGHTRT_HIP_HAVE_WMMA)
+        message(STATUS "  HIP: rocWMMA found (matrix-core kernels enabled)")
+    else()
+        message(STATUS "  HIP: rocWMMA NOT found (WMMA kernels stubbed out)")
+    endif()
+    if(LIGHTRT_HIP_HIPCUB_OK)
+        target_compile_definitions(lightrt_hip PRIVATE LIGHTRT_HIP_HAVE_HIPCUB)
+        message(STATUS "  HIP: hipCUB found (full-GPU LBVH enabled)")
+    else()
+        message(STATUS "  HIP: hipCUB NOT found (full-GPU LBVH stubbed out)")
+    endif()
+
+    if(BUILD_TESTING)
+        add_executable(lightrt_c_hip_test
+            lightrt_c.c lightrt_c_tri.c tests/test_lightrt_c_hip.c)
+        set_source_files_properties(lightrt_c.c lightrt_c_tri.c
+            tests/test_lightrt_c_hip.c PROPERTIES LANGUAGE C)
+        target_include_directories(lightrt_c_hip_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        if(LIGHTRT_C_TRI_SIMD_FLAGS)
+            target_compile_options(lightrt_c_hip_test PRIVATE
+                $<$<COMPILE_LANGUAGE:C>:${LIGHTRT_C_TRI_SIMD_FLAGS}>)
+        endif()
+        target_link_libraries(lightrt_c_hip_test lightrt_hip)
+        if(NOT MSVC)
+            target_link_libraries(lightrt_c_hip_test m)
+        endif()
+        add_test(NAME lightrt_c_hip_test COMMAND lightrt_c_hip_test)
+    endif()
+
+    install(FILES lightrt_c_hip.h DESTINATION include)
 endif()
 
 # Optional: regenerate the checked-in SPIR-V headers (developers with glslang
@@ -331,6 +434,15 @@ endif()
 option(LIGHTRT_BUILD_BENCHMARK_C "Build the C11 lightrt-vs-Embree benchmark" OFF)
 if(LIGHTRT_BUILD_BENCHMARK_C)
     add_subdirectory(benchmark_c)
+endif()
+
+# HIP (ROCm/AMD) GPU benchmark (benchmark_hip/). Implies LIGHTRT_BUILD_HIP.
+option(LIGHTRT_BUILD_BENCHMARK_HIP "Build the HIP GPU ray-tracing benchmark" OFF)
+if(LIGHTRT_BUILD_BENCHMARK_HIP)
+    if(NOT LIGHTRT_BUILD_HIP)
+        message(FATAL_ERROR "LIGHTRT_BUILD_BENCHMARK_HIP requires LIGHTRT_BUILD_HIP=ON")
+    endif()
+    add_subdirectory(benchmark_hip)
 endif()
 
 # Print configuration summary

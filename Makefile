@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Light Transport Entertainment, Inc.
 # SPDX-License-Identifier: MIT
 
+CC ?= gcc
 CXX ?= g++
 CC ?= cc
 AR ?= ar
@@ -45,6 +46,8 @@ endif
 
 # Debug build
 ifeq ($(DEBUG),1)
+    CFLAGS := $(filter-out -O3,$(CFLAGS))
+    CFLAGS += -O0 -g -DDEBUG
     CXXFLAGS := $(filter-out -O3,$(CXXFLAGS))
     CXXFLAGS += -O0 -g -DDEBUG
 endif
@@ -57,6 +60,8 @@ TARGET_BENCHMARK = lightrt_benchmark
 # Source files
 SOURCES = lightrt.cc
 OBJECTS = $(SOURCES:.cc=.o)
+C_SOURCES = lightrt_c.c
+C_OBJECTS = $(C_SOURCES:.c=.o)
 
 # Example source
 EXAMPLE_SOURCES = example.cc
@@ -75,7 +80,7 @@ OBJ_BENCH_OBJECTS = benchmark/obj_bvh_bench.o
 all: $(TARGET_LIB) $(TARGET_EXAMPLE) $(TARGET_BENCHMARK)
 
 # Build static library
-$(TARGET_LIB): $(OBJECTS)
+$(TARGET_LIB): $(OBJECTS) $(C_OBJECTS)
 	$(AR) rcs $@ $^
 	@echo "Built $(TARGET_LIB)"
 
@@ -98,12 +103,15 @@ $(OBJ_BENCH_TARGET): $(OBJ_BENCH_OBJECTS) $(TARGET_LIB)
 %.o: %.cc lightrt.hh
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
+%.o: %.c lightrt_c.h
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
 benchmark/%.o: benchmark/%.cc lightrt.hh
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 # Clean build artifacts
 clean:
-	rm -f $(OBJECTS) $(EXAMPLE_OBJECTS) $(BENCHMARK_OBJECTS) $(OBJ_BENCH_OBJECTS) $(TARGET_LIB) $(TARGET_EXAMPLE) $(TARGET_BENCHMARK) $(OBJ_BENCH_TARGET) lightrt_c_vk_test
+	rm -f $(OBJECTS) $(C_OBJECTS) $(EXAMPLE_OBJECTS) $(BENCHMARK_OBJECTS) $(OBJ_BENCH_OBJECTS) $(TARGET_LIB) $(TARGET_EXAMPLE) $(TARGET_BENCHMARK) $(OBJ_BENCH_TARGET)
 	@echo "Cleaned build artifacts"
 
 # Run example
@@ -141,4 +149,50 @@ info_vk:
 	@echo "CC: $(CC)"
 	@echo "CFLAGS: $(CFLAGS) $(C_SIMD)"
 
-.PHONY: all clean run benchmark obj_bench info vk_test shaders info_vk
+# ---- HIP (ROCm/AMD) GPU backend (opt-in; needs hipcc) ----
+# Build + run the HIP self-test:        make hip_test && ./lightrt_c_hip_test
+# Build the HIP benchmark:              make benchmark_hip && ./bench_hip
+HIPCC ?= hipcc
+HIP_ARCH ?= gfx1201
+ROCM_PATH ?= /opt/rocm
+HIP_FLAGS = --offload-arch=$(HIP_ARCH) -ffp-contract=off -O2 $(INCLUDES)
+# rocWMMA / hipCUB are header-only; enable when present.
+HIP_WMMA := $(wildcard $(ROCM_PATH)/include/rocwmma/rocwmma.hpp)
+ifneq ($(HIP_WMMA),)
+HIP_WMMA_FLAGS = -DLIGHTRT_HIP_HAVE_WMMA -I$(ROCM_PATH)/include
+endif
+HIP_HIPCUB := $(wildcard $(ROCM_PATH)/include/hipcub/hipcub.hpp)
+ifneq ($(HIP_HIPCUB),)
+HIP_HIPCUB_FLAGS = -DLIGHTRT_HIP_HAVE_HIPCUB -I$(ROCM_PATH)/include
+endif
+HIP_C_OBJS = /tmp/lrt_hip_c.o /tmp/lrt_hip_c_tri.o
+HIP_DEV_OBJS = /tmp/lrt_hip_dev.o /tmp/lrt_hip_wmma.o /tmp/lrt_hip_lbvh.o
+
+hip_dev_objs:
+	$(HIPCC) $(HIP_FLAGS) -c lightrt_c_hip.hip -o /tmp/lrt_hip_dev.o
+	$(HIPCC) $(HIP_FLAGS) $(HIP_WMMA_FLAGS) -c lightrt_hip_wmma.hip -o /tmp/lrt_hip_wmma.o
+	$(HIPCC) $(HIP_FLAGS) $(HIP_HIPCUB_FLAGS) -c lightrt_hip_lbvh.hip -o /tmp/lrt_hip_lbvh.o
+
+hip_test: hip_dev_objs
+	$(CC) $(CFLAGS) $(INCLUDES) -c lightrt_c.c -o /tmp/lrt_hip_c.o
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -c lightrt_c_tri.c -o /tmp/lrt_hip_c_tri.o
+	$(CC) $(CFLAGS) $(INCLUDES) -c tests/test_lightrt_c_hip.c -o /tmp/lrt_hip_test.o
+	$(HIPCC) --offload-arch=$(HIP_ARCH) -O2 /tmp/lrt_hip_test.o $(HIP_DEV_OBJS) $(HIP_C_OBJS) -o lightrt_c_hip_test -lm
+	@echo "Built lightrt_c_hip_test (run: ./lightrt_c_hip_test)"
+
+benchmark_hip: hip_dev_objs
+	$(CC) $(CFLAGS) $(INCLUDES) -c lightrt_c.c -o /tmp/lrt_hip_c.o
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -c lightrt_c_tri.c -o /tmp/lrt_hip_c_tri.o
+	$(CC) $(CFLAGS) $(INCLUDES) -c benchmark_c/rays.c -o /tmp/lrt_hip_rays.o
+	$(CC) $(CFLAGS) $(INCLUDES) -c benchmark_c/scene_mandelbulb.c -o /tmp/lrt_hip_mb.o
+	$(CC) $(CFLAGS) $(INCLUDES) -c benchmark_c/scene_thinspan.c -o /tmp/lrt_hip_ts.o
+	$(CC) -std=gnu11 $(filter-out -std=c11,$(CFLAGS)) $(INCLUDES) -c benchmark_hip/bench_hip_main.c -o /tmp/lrt_hip_bench.o
+	$(HIPCC) --offload-arch=$(HIP_ARCH) -O2 /tmp/lrt_hip_bench.o $(HIP_DEV_OBJS) $(HIP_C_OBJS) /tmp/lrt_hip_rays.o /tmp/lrt_hip_mb.o /tmp/lrt_hip_ts.o -o bench_hip -lm
+	@echo "Built bench_hip (run: ./bench_hip --scene mandelbulb  |  ./bench_hip --leaf)"
+
+info_hip:
+	@echo "HIPCC: $(HIPCC)"
+	@echo "HIP_ARCH: $(HIP_ARCH)"
+	@echo "HIP_FLAGS: $(HIP_FLAGS)"
+
+.PHONY: all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip
