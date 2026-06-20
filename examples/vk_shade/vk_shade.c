@@ -143,6 +143,27 @@ static v3 env_eval(const lrt_vk_shade_desc *d, v3 dir) {
     v3 bot = V(d->env_bottom[0], d->env_bottom[1], d->env_bottom[2]);
     return lerp3(bot, top, clampf(dir.y * 0.5f + 0.5f, 0.0f, 1.0f));
 }
+static v3 reflect3(v3 i, v3 n) { return sub(i, scl(n, 2.0f * dot(i, n))); }
+static v3 spec_f0(const lrt_vk_shade_prim *m) {
+    v3 base = V(m->base_color[0], m->base_color[1], m->base_color[2]);
+    float f0d = (m->specular_ior - 1.0f) / (m->specular_ior + 1.0f);
+    f0d = f0d * f0d;
+    return lerp3(V(f0d, f0d, f0d), base, m->metalness);
+}
+/* Ambient env: (1-F)-weighted diffuse irradiance + Fresnel specular reflection
+ * of the env in the roughness-blurred mirror direction. rd = view ray dir. */
+static v3 ambient_env(const lrt_vk_shade_desc *d, const lrt_vk_shade_prim *m,
+                      v3 N, v3 wo, v3 rd) {
+    float rough = clampf(m->roughness, 0.02f, 1.0f);
+    v3 F0 = spec_f0(m);
+    v3 Fr = fresnel(fmaxf(dot(N, wo), 0.0f), F0);
+    v3 R = reflect3(rd, N);
+    v3 Rb = nrm(lerp3(R, N, rough));
+    v3 albedo = scl(V(m->base_color[0], m->base_color[1], m->base_color[2]), 1.0f - m->metalness);
+    v3 diff = mul(mul(albedo, env_eval(d, N)), sub(V(1, 1, 1), Fr));
+    v3 spec = mul(Fr, env_eval(d, Rb));
+    return add(diff, spec);
+}
 static void shade_cpu(const lrt_vk_shade_prim *p, uint32_t n,
                       const lrt_vk_shade_desc *d, float *out) {
     v3 ro = V(d->cam_origin[0], d->cam_origin[1], d->cam_origin[2]);
@@ -182,8 +203,7 @@ static void shade_cpu(const lrt_vk_shade_prim *p, uint32_t n,
                         col = add(col, scl(mul(f, srad), NoL));
                     }
                 }
-                v3 albedo = scl(V(m->base_color[0], m->base_color[1], m->base_color[2]), 1.0f - m->metalness);
-                col = add(col, mul(albedo, env_eval(d, N)));
+                col = add(col, ambient_env(d, m, N, wo, rd));
                 accum = add(accum, col);
             }
             accum = scl(accum, 1.0f / (float)spp);

@@ -191,6 +191,30 @@ vec3 diffuse_albedo(uint b) {
     return base * (1.0 - metal);
 }
 
+// Metallic/dielectric F0 (specular reflectance at normal incidence).
+vec3 spec_f0(uint b) {
+    vec3  base  = vec3(prims[b + 8u], prims[b + 9u], prims[b + 10u]);
+    float metal = prims[b + 11u];
+    float ior   = prims[b + 13u];
+    float f0d = (ior - 1.0) / (ior + 1.0);
+    f0d = f0d * f0d;
+    return mix(vec3(f0d), base, metal);
+}
+
+// Ambient environment: diffuse irradiance (1-F weighted) + a Fresnel-weighted
+// specular reflection of the env in the roughness-blurred mirror direction.
+// rd is the incoming view ray direction (into the surface).
+vec3 ambient_env(uint b, vec3 N, vec3 wo, vec3 rd) {
+    float rough = clamp(prims[b + 12u], 0.02, 1.0);
+    vec3 F0 = spec_f0(b);
+    vec3 Fr = fresnel_schlick(max(dot(N, wo), 0.0), F0);
+    vec3 R = reflect(rd, N);
+    vec3 Rb = normalize(mix(R, N, rough));         // crude roughness blur
+    vec3 diff = diffuse_albedo(b) * env_eval(N) * (vec3(1.0) - Fr);
+    vec3 spec = Fr * env_eval(Rb);
+    return diff + spec;
+}
+
 void main() {
     uint gid = gl_GlobalInvocationID.x;
     uint npix = pc.width * pc.height;
@@ -239,8 +263,8 @@ void main() {
                 col += f * srad * NoL;
             }
         }
-        // ambient hemisphere environment (diffuse only)
-        col += diffuse_albedo(b) * env_eval(N);
+        // ambient environment: diffuse irradiance + specular reflection
+        col += ambient_env(b, N, wo, rd);
 
         accum += col;
     }
