@@ -24,7 +24,8 @@ BUILD = build
 
 # our first-party sources (full warnings)
 APP_SRC = main.c pathtrace.c bsdf.c env.c framebuffer.c color.c \
-          gltf_load.c mtlx_xml.c mtlx_doc.c mtlx_eval.c material_bind.c texture.c
+          gltf_load.c mesh_build.c obj_load.c mtlx_xml.c mtlx_doc.c mtlx_eval.c \
+          material_bind.c texture.c
 # third-party sources (compiled quietly with -w)
 TP_SRC  = third_party_impl.c \
           $(LIGHTRT)/lightrt_c_tri.c \

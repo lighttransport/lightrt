@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "gltf_load.h"
+#include "obj_load.h"
 #include "mtlx_doc.h"
 #include "mtlx_eval.h"
 #include "material_bind.h"
@@ -101,7 +102,8 @@ static long cpu_count(void) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s --gltf <file.glb> --mtlx <file.mtlx> [options]\n"
+        "Usage: %s (--gltf <file.glb> | --obj <file.obj>) --mtlx <file.mtlx> [options]\n"
+        "  --obj <file.obj>       load a Wavefront OBJ instead of glTF\n"
         "  --out <file.exr>       output EXR (default chess.exr)\n"
         "  --png <file.png>       also write a tonemapped sRGB PNG\n"
         "  --w <int> --h <int>    image size (default 800x600)\n"
@@ -128,7 +130,7 @@ int main(int argc, char **argv) {
     if (argc >= 4 && !strcmp(argv[1], "--diff"))
         return diff_exr(argv[2], argv[3], argc >= 5 ? (float)atof(argv[4]) : 1e-3f);
 
-    const char *gltf_path = NULL, *mtlx_path = NULL;
+    const char *gltf_path = NULL, *obj_path = NULL, *mtlx_path = NULL;
     const char *out_path = "chess.exr", *png_path = NULL, *env_path = NULL;
     int W = 800, H = 600, spp = 64, bounces = 8, threads = 0, hq = 0, sss_walk = 0, sky = 0;
     float exposure = 1.0f, env_intensity = 1.0f, env_rot = 0.0f;
@@ -141,6 +143,7 @@ int main(int argc, char **argv) {
         const char *a = argv[i];
         #define NEXT (i + 1 < argc ? argv[++i] : "")
         if (!strcmp(a, "--gltf")) gltf_path = NEXT;
+        else if (!strcmp(a, "--obj")) obj_path = NEXT;
         else if (!strcmp(a, "--mtlx")) mtlx_path = NEXT;
         else if (!strcmp(a, "--out")) out_path = NEXT;
         else if (!strcmp(a, "--png")) png_path = NEXT;
@@ -167,11 +170,15 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "unknown option '%s'\n", a); usage(argv[0]); return 1; }
         #undef NEXT
     }
-    if (!gltf_path || !mtlx_path) { usage(argv[0]); return 1; }
+    if ((!gltf_path && !obj_path) || !mtlx_path) { usage(argv[0]); return 1; }
 
-    /* ---- load geometry ---- */
+    /* ---- load geometry (glTF or Wavefront OBJ) ---- */
     Scene scene;
-    if (scene_load_gltf(gltf_path, &scene, hq)) return 1;
+    if (obj_path) {
+        if (scene_load_obj(obj_path, &scene, hq)) return 1;
+    } else {
+        if (scene_load_gltf(gltf_path, &scene, hq)) return 1;
+    }
 
     /* ---- load + bind materials ---- */
     MtlxDoc *doc = mtlx_load(mtlx_path);

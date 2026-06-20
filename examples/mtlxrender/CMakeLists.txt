@@ -18,7 +18,8 @@ file(GLOB TINYEXR_SRC ${TINYEXR}/src/*.c)
 # First-party sources (full warnings).
 set(APP_SRC
     main.c pathtrace.c bsdf.c env.c framebuffer.c color.c
-    gltf_load.c mtlx_xml.c mtlx_doc.c mtlx_eval.c material_bind.c texture.c)
+    gltf_load.c mesh_build.c obj_load.c mtlx_xml.c mtlx_doc.c mtlx_eval.c
+    material_bind.c texture.c)
 # Third-party sources (compiled quietly).
 set(TP_SRC
     third_party_impl.c

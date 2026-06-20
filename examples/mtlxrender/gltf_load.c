@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "mesh_build.h"
 #include "tiny_gltf_v3.h"
 
 /* ---- small double mat4 helpers (column?-agnostic: we use row-major[16]) ---- */
@@ -181,51 +182,6 @@ static uint32_t *read_indices(const tg3_model *m, int32_t ai, uint64_t *out_coun
     return out;
 }
 
-/* ---- growable triangle accumulator ------------------------------------ */
-#define MAX_GEOM 256
-typedef struct {
-    float *verts; float *uv; float *nrm; int32_t *mat; int32_t *geom;
-    size_t ntri, cap;
-    char geom_names[MAX_GEOM][GLTF_MAX_MAT_NAME];
-    int  ngeom;
-} TriBuf;
-
-/* Intern a geometry name; returns its index. */
-static int geom_intern(TriBuf *tb, const char *name, uint32_t len) {
-    char buf[GLTF_MAX_MAT_NAME];
-    uint32_t n = len < GLTF_MAX_MAT_NAME - 1 ? len : GLTF_MAX_MAT_NAME - 1;
-    if (name && n) memcpy(buf, name, n);
-    buf[n] = '\0';
-    for (int i = 0; i < tb->ngeom; i++)
-        if (strcmp(tb->geom_names[i], buf) == 0) return i;
-    if (tb->ngeom >= MAX_GEOM) return tb->ngeom - 1;
-    memcpy(tb->geom_names[tb->ngeom], buf, n + 1);
-    return tb->ngeom++;
-}
-
-static void tribuf_reserve(TriBuf *tb, size_t need) {
-    if (tb->ntri + need <= tb->cap) return;
-    size_t cap = tb->cap ? tb->cap * 2 : 65536;
-    while (cap < tb->ntri + need) cap *= 2;
-    tb->verts = (float *)realloc(tb->verts, cap * 9 * sizeof(float));
-    tb->uv = (float *)realloc(tb->uv, cap * 6 * sizeof(float));
-    tb->nrm = (float *)realloc(tb->nrm, cap * 9 * sizeof(float));
-    tb->mat = (int32_t *)realloc(tb->mat, cap * sizeof(int32_t));
-    tb->geom = (int32_t *)realloc(tb->geom, cap * sizeof(int32_t));
-    tb->cap = cap;
-}
-
-static void emit_tri(TriBuf *tb, const float P[9], const float UV[6], const float N[9],
-                     int32_t mat, int32_t geom) {
-    tribuf_reserve(tb, 1);
-    memcpy(tb->verts + tb->ntri * 9, P, 9 * sizeof(float));
-    memcpy(tb->uv + tb->ntri * 6, UV, 6 * sizeof(float));
-    memcpy(tb->nrm + tb->ntri * 9, N, 9 * sizeof(float));
-    tb->mat[tb->ntri] = mat;
-    tb->geom[tb->ntri] = geom;
-    tb->ntri++;
-}
-
 static void add_primitive(const tg3_model *m, const tg3_primitive *prim,
                           const double world[16], const double nm[9], int32_t geom, TriBuf *tb) {
     int mode = prim->mode < 0 ? TG3_MODE_TRIANGLES : prim->mode;
@@ -274,7 +230,7 @@ static void add_primitive(const tg3_model *m, const tg3_primitive *prim,
                            e1[0] * e2[1] - e1[1] * e2[0]};
             for (int c = 0; c < 3; c++) { N[c * 3] = gn[0]; N[c * 3 + 1] = gn[1]; N[c * 3 + 2] = gn[2]; }
         }
-        emit_tri(tb, P, UV, N, prim->material, geom);
+        tribuf_emit_tri(tb, P, UV, N, prim->material, geom);
     }
 
     free(pos); free(nor); free(uvs); free(idx);
@@ -295,7 +251,7 @@ static void visit_node(const tg3_model *m, int32_t ni, const double parent[16], 
         /* Prefer the node name as the geometry key (matches MaterialX geom),
          * falling back to the mesh name. */
         const tg3_str *gname = (n->name.data && n->name.len) ? &n->name : &mesh->name;
-        int32_t geom = geom_intern(tb, gname->data, gname->len);
+        int32_t geom = tribuf_geom_intern(tb, gname->data, gname->len);
         for (uint32_t p = 0; p < mesh->primitives_count; p++)
             add_primitive(m, &mesh->primitives[p], world, nm, geom, tb);
     }
@@ -349,40 +305,7 @@ int scene_load_gltf(const char *path, Scene *out, int build_quality_hq) {
 
     tg3_model_free(&model);
 
-    if (tb.ntri == 0) { fprintf(stderr, "gltf: no triangles loaded\n"); free(tb.verts); free(tb.uv); free(tb.nrm); free(tb.mat); free(tb.geom); return 1; }
-
-    out->verts = tb.verts;
-    out->tri_uv = tb.uv;
-    out->tri_n = tb.nrm;
-    out->tri_mat = tb.mat;
-    out->tri_geom = tb.geom;
-    out->ntri = tb.ntri;
-
-    out->ngeom = tb.ngeom;
-    if (tb.ngeom > 0) {
-        out->geom_names = malloc(sizeof(char[GLTF_MAX_MAT_NAME]) * (size_t)tb.ngeom);
-        memcpy(out->geom_names, tb.geom_names, sizeof(char[GLTF_MAX_MAT_NAME]) * (size_t)tb.ngeom);
-    }
-
-    /* bounds */
-    out->bmin[0] = out->bmin[1] = out->bmin[2] = 1e30f;
-    out->bmax[0] = out->bmax[1] = out->bmax[2] = -1e30f;
-    for (size_t i = 0; i < tb.ntri * 3; i++) {
-        for (int c = 0; c < 3; c++) {
-            float v = out->verts[i * 3 + c];
-            if (v < out->bmin[c]) out->bmin[c] = v;
-            if (v > out->bmax[c]) out->bmax[c] = v;
-        }
-    }
-
-    /* build BVH */
-    lrt_tri_build_options bopts;
-    memset(&bopts, 0, sizeof(bopts));
-    bopts.quality = build_quality_hq ? LRT_TRI_BUILD_HQ : LRT_TRI_BUILD_DEFAULT;
-    bopts.layout = LRT_TRI_LAYOUT_AUTO;
-    lrt_result err = LRT_RESULT_OK;
-    out->bvh = lrt_tri_scene_build(out->verts, out->ntri, &bopts, &err);
-    if (!out->bvh) { fprintf(stderr, "gltf: BVH build failed (%d)\n", (int)err); return 1; }
+    if (scene_from_tribuf(out, &tb, build_quality_hq)) return 1;
 
     fprintf(stderr, "gltf: %zu triangles, %d materials, kernel=%s\n",
             out->ntri, out->nmat, lrt_tri_kernel_name(out->bvh));
