@@ -23,6 +23,7 @@
 #include "vk/shaders/trace_bvh.spv.h"        /* trace_bvh_spv[]       */
 #include "vk/shaders/build_morton.spv.h"     /* build_morton_spv[]    */
 #include "vk/shaders/trace_ray_query.spv.h"  /* trace_ray_query_spv[] */
+#include "vk/shaders/shade_analytic.spv.h"   /* shade_analytic_spv[]  */
 
 /* Host-read sync flags not declared in lightrt_vkew.h. */
 #ifndef VK_PIPELINE_STAGE_HOST_BIT
@@ -102,6 +103,7 @@ struct lrt_vk_engine {
     vk_pipeline trace_pipes[VK_TRACE_PIPE_CACHE];
     vk_pipeline build_pipe; /* build_morton: no spec constants */
     vk_pipeline rtx_pipe;   /* trace_ray_query: AS + 2 SSBO bindings */
+    vk_pipeline shade_pipe; /* shade_analytic: 3 SSBO bindings + push */
 };
 
 static void vk_set_err(lrt_vk_engine *e, const char *msg) {
@@ -679,6 +681,7 @@ void lrt_vk_engine_destroy(lrt_vk_engine *e) {
             vk_pipeline_destroy(e, &e->trace_pipes[i]);
         vk_pipeline_destroy(e, &e->build_pipe);
         vk_pipeline_destroy(e, &e->rtx_pipe);
+        vk_pipeline_destroy(e, &e->shade_pipe);
         if (e->cmd_pool) vkDestroyCommandPool(e->device, e->cmd_pool, NULL);
         vkDestroyDevice(e->device, NULL);
     }
@@ -990,6 +993,107 @@ fail:
     vk_buffer_destroy(e, &b_morton);
     free(cen);
     free(morton);
+    if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+    return -1;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Analytic-primitive GPU shading (spheres + boxes).                          */
+/* ------------------------------------------------------------------------- */
+typedef struct shade_push {
+    uint32_t width;
+    uint32_t height;
+    uint32_t nprims;
+    uint32_t spp;
+} shade_push;
+
+static vk_pipeline *shade_get_pipeline(lrt_vk_engine *e) {
+    if (e->shade_pipe.valid) return &e->shade_pipe;
+    if (!vk_pipeline_build(e, shade_analytic_spv, sizeof(shade_analytic_spv), 3,
+                           NULL, (uint32_t)sizeof(shade_push), NULL,
+                           &e->shade_pipe))
+        return NULL;
+    return &e->shade_pipe;
+}
+
+/* Pack the public desc into the 32-float "globals" buffer the shader reads. */
+static void shade_pack_globals(const lrt_vk_shade_desc *d, float *g) {
+    float aspect = d->aspect;
+    if (aspect == 0.0f && d->height) aspect = (float)d->width / (float)d->height;
+    memset(g, 0, 32 * sizeof(float));
+    g[0] = d->cam_origin[0];  g[1] = d->cam_origin[1];  g[2] = d->cam_origin[2];
+    g[3] = d->tan_half_fov;
+    g[4] = d->cam_forward[0]; g[5] = d->cam_forward[1]; g[6] = d->cam_forward[2];
+    g[7] = aspect;
+    g[8] = d->cam_right[0];   g[9] = d->cam_right[1];   g[10] = d->cam_right[2];
+    g[12] = d->cam_up[0];     g[13] = d->cam_up[1];     g[14] = d->cam_up[2];
+    g[16] = d->sun_dir[0];    g[17] = d->sun_dir[1];    g[18] = d->sun_dir[2];
+    g[20] = d->sun_radiance[0]; g[21] = d->sun_radiance[1]; g[22] = d->sun_radiance[2];
+    g[24] = d->env_top[0];    g[25] = d->env_top[1];    g[26] = d->env_top[2];
+    g[28] = d->env_bottom[0]; g[29] = d->env_bottom[1]; g[30] = d->env_bottom[2];
+}
+
+int lrt_vk_shade_analytic(lrt_vk_engine *e, const lrt_vk_shade_prim *prims,
+                          uint32_t nprims, const lrt_vk_shade_desc *desc,
+                          float *out_rgba, lrt_result *err) {
+    if (!e || !desc || !out_rgba || (nprims && !prims) ||
+        desc->width == 0 || desc->height == 0) {
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return -1;
+    }
+
+    vk_pipeline *pipe = shade_get_pipeline(e);
+    if (!pipe) {
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return -1;
+    }
+
+    uint32_t npix = desc->width * desc->height;
+    size_t prim_bytes = (size_t)nprims * sizeof(lrt_vk_shade_prim);
+    size_t out_bytes = (size_t)npix * 4u * sizeof(float);
+
+    /* lrt_vk_shade_prim is 16 tightly-packed floats == the shader's stride. */
+    vk_buffer b_prims, b_out, b_glob;
+    int ok = vk_buffer_create(e, prim_bytes, &b_prims) &&
+             vk_buffer_create(e, out_bytes, &b_out) &&
+             vk_buffer_create(e, 32u * sizeof(float), &b_glob);
+    if (!ok) goto fail;
+
+    {
+        float glob[32];
+        shade_pack_globals(desc, glob);
+        if ((prim_bytes && !vk_buffer_write(e, &b_prims, prims, prim_bytes)) ||
+            !vk_buffer_write(e, &b_glob, glob, sizeof(glob)))
+            goto fail;
+
+        vk_buffer set_bufs[3] = {b_prims, b_out, b_glob};
+        VkDescriptorPool pool;
+        VkDescriptorSet set;
+        if (!vk_descriptors_bind(e, pipe->dsl, set_bufs, 3, &pool, &set))
+            goto fail;
+
+        shade_push pc;
+        pc.width = desc->width;
+        pc.height = desc->height;
+        pc.nprims = nprims;
+        pc.spp = desc->spp ? desc->spp : 1u;
+        uint32_t groups = (npix + 63u) / 64u;
+        int run_ok = vk_dispatch(e, pipe, set, &pc, (uint32_t)sizeof(pc), groups);
+        vkDestroyDescriptorPool(e->device, pool, NULL);
+        if (!run_ok) goto fail;
+        if (!vk_buffer_read(e, &b_out, out_rgba, out_bytes)) goto fail;
+    }
+
+    vk_buffer_destroy(e, &b_prims);
+    vk_buffer_destroy(e, &b_out);
+    vk_buffer_destroy(e, &b_glob);
+    if (err) *err = LRT_RESULT_OK;
+    return 0;
+
+fail:
+    vk_buffer_destroy(e, &b_prims);
+    vk_buffer_destroy(e, &b_out);
+    vk_buffer_destroy(e, &b_glob);
     if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
     return -1;
 }

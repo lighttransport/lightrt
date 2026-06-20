@@ -258,6 +258,17 @@ if(LIGHTRT_BUILD_VK)
     if(NOT MSVC)
         target_link_libraries(lightrt_vk PUBLIC m)
     endif()
+
+    # Analytic-primitive GPU shading demo (spheres/boxes) + CPU-reference check.
+    # Links lightrt for the C triangle kernel symbols lightrt_c_vk.c references.
+    add_executable(lightrt_vk_shade examples/vk_shade/vk_shade.c)
+    target_link_libraries(lightrt_vk_shade lightrt_vk lightrt)
+    if(NOT MSVC)
+        target_link_libraries(lightrt_vk_shade m)
+    endif()
+    if(BUILD_TESTING)
+        add_test(NAME lightrt_vk_shade COMMAND lightrt_vk_shade --w 128 --h 96 --spp 2)
+    endif()
 endif()
 
 # Optional: regenerate the checked-in SPIR-V headers (developers with glslang
