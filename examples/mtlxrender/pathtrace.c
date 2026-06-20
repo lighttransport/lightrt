@@ -104,7 +104,7 @@ static int sss_walk(const Scene *s, v3 *P, v3 N, const OpenPBRParams *p, pcg32 *
 
 static v3 trace_path(const Scene *s, const MtlxDoc *doc, const MaterialBinding *bind,
                      TextureCache *tex, const Env *env, const SunLight *sun, lrt_ray ray,
-                     int max_bounces, int sss_walk_enabled, pcg32 *rng,
+                     int max_bounces, int sss_walk_enabled, int hide_env_bg, pcg32 *rng,
                      MtlxValue *memo, char *memo_done) {
     v3 radiance = v3_splat(0.0f);
     v3 throughput = v3_splat(1.0f);
@@ -118,10 +118,14 @@ static v3 trace_path(const Scene *s, const MtlxDoc *doc, const MaterialBinding *
         lrt_hit hit;
         v3 dir = v3_make(ray.dir[0], ray.dir[1], ray.dir[2]);
         if (!lrt_tri_intersect1(s->bvh, &ray, &hit)) {
-            v3 Le = env_eval(env, dir);
-            float w = 1.0f;
-            if (!specular_bounce) { float pe = env_pdf(env, dir); w = mis_power(prev_pdf, pe); }
-            radiance = v3_add(radiance, v3_mul(throughput, v3_scale(Le, w)));
+            /* Hide the env in the background (primary miss) but keep it as a
+             * light for indirect rays -- matches MaterialXView's black bg. */
+            if (!(depth == 0 && hide_env_bg)) {
+                v3 Le = env_eval(env, dir);
+                float w = 1.0f;
+                if (!specular_bounce) { float pe = env_pdf(env, dir); w = mis_power(prev_pdf, pe); }
+                radiance = v3_add(radiance, v3_mul(throughput, v3_scale(Le, w)));
+            }
             break;
         }
 
@@ -235,7 +239,8 @@ static void *worker(void *arg) {
                     float py = (y + pcg32_f(&rng)) / H;
                     lrt_ray r = camera_ray(j->cam, px, py);
                     v3 L = trace_path(j->s, j->doc, j->bind, j->tex, j->env, &j->cfg->sun, r,
-                                      j->cfg->max_bounces, j->cfg->sss_walk, &rng, memo, memo_done);
+                                      j->cfg->max_bounces, j->cfg->sss_walk,
+                                      j->cfg->hide_env_bg, &rng, memo, memo_done);
                     if (v3_is_finite(L)) sum = v3_add(sum, L);
                 }
                 int i = y * W + x;

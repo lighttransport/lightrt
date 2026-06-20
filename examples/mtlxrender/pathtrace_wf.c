@@ -88,6 +88,8 @@ typedef struct {
     TextureCache *tex; const Env *env; const SunLight *sun;
     Path *path; const int *active; const lrt_hit *hits; int M;
     Shadow *shadow; /* sized 2*M; slots [2k],[2k+1] for active k */
+    int depth;          /* current bounce (0 = primary) */
+    int hide_env_bg;    /* primary-ray miss returns black, not the env */
     atomic_int next;
 } ShadeJob;
 
@@ -103,10 +105,14 @@ static void shade_range(ShadeJob *j, int k0, int k1, MtlxValue *memo, char *memo
         v3 dir = v3_make(p->ray.dir[0], p->ray.dir[1], p->ray.dir[2]);
 
         if (hit->prim_id == LRT_TRI_NO_HIT) {
-            v3 Le = env_eval(j->env, dir);
-            float w = 1.0f;
-            if (!p->spec) { float pe = env_pdf(j->env, dir); w = mis_power(p->prev_pdf, pe); }
-            p->rad = v3_add(p->rad, v3_mul(p->thr, v3_scale(Le, w)));
+            /* Hide the env in the background (primary miss) but keep it lighting
+             * indirect rays -- matches MaterialXView's black bg. */
+            if (!(j->depth == 0 && j->hide_env_bg)) {
+                v3 Le = env_eval(j->env, dir);
+                float w = 1.0f;
+                if (!p->spec) { float pe = env_pdf(j->env, dir); w = mis_power(p->prev_pdf, pe); }
+                p->rad = v3_add(p->rad, v3_mul(p->thr, v3_scale(Le, w)));
+            }
             p->alive = 0;
             continue;
         }
@@ -261,6 +267,7 @@ void render_wavefront(const Scene *scene, const MtlxDoc *doc,
             job.env = env; job.sun = &cfg->sun;
             job.path = path; job.active = active; job.hits = hbatch; job.M = M;
             job.shadow = shadow;
+            job.depth = depth; job.hide_env_bg = cfg->hide_env_bg;
             atomic_init(&job.next, 0);
             for (int t = 0; t < nt; t++) {
                 workers[t].job = &job; workers[t].nnode = doc->nnode;

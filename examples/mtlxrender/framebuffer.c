@@ -96,3 +96,23 @@ int fb_write_png(const Framebuffer *fb, const char *path, tonemap_kind tm, float
     fprintf(stderr, "wrote %s (%dx%d sRGB PNG)\n", path, W, H);
     return 0;
 }
+
+/* Plain linear->sRGB encode with an exposure scale, NO filmic/ACES tonemap.
+ * This matches MaterialXView's gamma-encoded framebuffer capture, so the two
+ * PNGs are directly comparable in the same (sRGB) space by the verify harness. */
+int fb_write_png_srgb(const Framebuffer *fb, const char *path, float exposure) {
+    int W = fb->w, H = fb->h;
+    unsigned char *rgb = (unsigned char *)malloc((size_t)W * H * 3);
+    for (int i = 0; i < W * H; i++) {
+        v3 hdr = v3_scale(fb_resolve(fb, i), exposure);
+        v3 s = linear_to_srgb3(hdr); /* sRGB OETF clamps internally below */
+        rgb[i * 3 + 0] = (unsigned char)(clampf(s.x, 0, 1) * 255.0f + 0.5f);
+        rgb[i * 3 + 1] = (unsigned char)(clampf(s.y, 0, 1) * 255.0f + 0.5f);
+        rgb[i * 3 + 2] = (unsigned char)(clampf(s.z, 0, 1) * 255.0f + 0.5f);
+    }
+    int ok = stbi_write_png(path, W, H, 3, rgb, W * 3);
+    free(rgb);
+    if (!ok) { fprintf(stderr, "png: write failed for %s\n", path); return 1; }
+    fprintf(stderr, "wrote %s (%dx%d plain-sRGB PNG)\n", path, W, H);
+    return 0;
+}

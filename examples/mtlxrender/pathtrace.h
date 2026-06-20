@@ -25,6 +25,7 @@ typedef struct {
     int   max_bounces;
     int   nthreads;
     int   sss_walk;     /* enable random-walk subsurface scattering */
+    int   hide_env_bg;  /* primary-ray miss returns black, not the env (env still lights) */
     SunLight sun;       /* optional directional delta light */
     unsigned seed;
 } RenderConfig;

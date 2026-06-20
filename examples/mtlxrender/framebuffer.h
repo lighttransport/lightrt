@@ -27,4 +27,8 @@ int fb_write_exr(const Framebuffer *fb, const char *path);
 /* Write a tonemapped 8-bit sRGB PNG preview. Returns 0 on success. */
 int fb_write_png(const Framebuffer *fb, const char *path, tonemap_kind tm, float exposure);
 
+/* Write a plain linear->sRGB 8-bit PNG with an exposure scale (NO ACES tonemap).
+ * Matches MaterialXView's framebuffer encoding for the verify harness. */
+int fb_write_png_srgb(const Framebuffer *fb, const char *path, float exposure);
+
 #endif /* MTLXRENDER_FRAMEBUFFER_H_ */

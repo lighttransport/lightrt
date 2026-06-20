@@ -1,0 +1,5 @@
+# Generated verification artifacts
+out/
+mtlx_osl_render
+assets/sphere.obj
+*.oso

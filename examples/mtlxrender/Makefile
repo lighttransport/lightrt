@@ -98,4 +98,11 @@ $(BUILD):
 clean:
 	rm -rf build build-vk mtlxrender node_truth mtlxvk
 
-.PHONY: clean test check
+# Cross-renderer verification against the ASF MaterialX reference (GLSL + OSL).
+# Needs the one-time setup in verify/README.md (conda env + reference builds).
+# MODE=glsl|osl|all (default all). Reports verify/out/report.md + contact sheets.
+VERIFY_MODE ?= all
+verify: mtlxrender
+	bash verify/run_verify.sh $(VERIFY_MODE)
+
+.PHONY: clean test check verify

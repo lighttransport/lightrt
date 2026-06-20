@@ -1,0 +1,37 @@
+<!-- testrender scene for the verify harness. Identical to MaterialX's
+     scene_template.xml except the Camera and Sphere are set to lightrt's
+     framing (eye 0,0,5 looking -z, sphere radius 2/sqrt(3)=1.154701, fov_y 45deg
+     in [-1,1] coords -> testrender fov 79.27854) so the OSL sphere projects to
+     the same disk as the lightrt and GLSL renders. The comparison masks to the
+     sphere disk, so the environment background here is irrelevant. -->
+<World>
+   <Camera eye="0, 0, 5" dir="0, 0, -1" fov="79.27854" />
+
+   <!-- Background environment map (provides the IBL lighting). -->
+   <ShaderGroup>
+      %environment_shader_parameter_overrides%
+      shader envmap layer1;
+   </ShaderGroup>
+   <Background resolution="2048" />
+
+   <!-- Background quad with raytype test. Forced to black (instead of
+        %background_color%) so camera-ray misses are black -- matching lightrt's
+        --hide-env render. The Background envmap above still provides the IBL,
+        because it is seen by lighting/reflection rays, not camera rays. -->
+   <ShaderGroup>
+      color Cin 0 0 0;
+      %environment_shader_parameter_overrides%
+      shader raytype_background layer1;
+   </ShaderGroup>
+   <Quad corner="-340, -340, -800" edge_x="680, 0, 0" edge_y="0, 680, 0" />
+
+   <!-- Shader graph routing the generated material into the output layer. -->
+   <ShaderGroup>
+      %input_shader_parameter_overrides%;
+      shader %input_shader_type% inputShader;
+      shader %output_shader_type% outputShader;
+      connect inputShader.%input_shader_output% outputShader.%output_shader_input%;
+   </ShaderGroup>
+
+   <Sphere center="0, 0, 0" radius="1.154701" />
+</World>

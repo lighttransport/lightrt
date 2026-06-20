@@ -107,7 +107,9 @@ static void usage(const char *prog) {
         "Usage: %s (--gltf <file.glb> | --obj <file.obj>) --mtlx <file.mtlx> [options]\n"
         "  --obj <file.obj>       load a Wavefront OBJ instead of glTF\n"
         "  --out <file.exr>       output EXR (default chess.exr)\n"
-        "  --png <file.png>       also write a tonemapped sRGB PNG\n"
+        "  --png <file.png>       also write a tonemapped (ACES) sRGB PNG\n"
+        "  --srgb <file.png>      also write a plain linear->sRGB PNG, no tonemap\n"
+        "                         (for the verify/ harness; --exposure scales it)\n"
         "  --w <int> --h <int>    image size (default 800x600)\n"
         "  --spp <int>            samples per pixel (default 64)\n"
         "  --bounces <int>        max path length (default 8)\n"
@@ -124,6 +126,9 @@ static void usage(const char *prog) {
         "  --sss-walk             enable random-walk subsurface scattering\n"
         "  --hq                   high-quality SBVH build\n"
         "  --cam-yaw <deg> --cam-pitch <deg> --cam-dist <f>   orbit camera\n"
+        "  --cam-eye x,y,z --cam-target x,y,z --cam-fov <deg>  explicit look-at\n"
+        "                         camera (overrides orbit; for the verify harness)\n"
+        "  --hide-env             black background; env still lights the scene\n"
         "  --backend <cpu|vk>     cpu = tiled tracer (default); vk = GPU-traced\n"
         "                         wavefront (needs a VK build + device)\n"
         "  --gpu-validate         render the wavefront on CPU and GPU, report RMSE\n",
@@ -137,9 +142,15 @@ int main(int argc, char **argv) {
 
     const char *gltf_path = NULL, *obj_path = NULL, *mtlx_path = NULL;
     const char *out_path = "chess.exr", *png_path = NULL, *env_path = NULL;
+    const char *srgb_path = NULL; /* plain linear->sRGB PNG (no ACES) for verify harness */
     int W = 800, H = 600, spp = 64, bounces = 8, threads = 0, hq = 0, sss_walk = 0, sky = 0;
+    int hide_env_bg = 0; /* black background, env still lights (for verify harness) */
     float exposure = 1.0f, env_intensity = 1.0f, env_rot = 0.0f;
     float cam_yaw = 35.0f, cam_pitch = 25.0f, cam_dist = 1.6f;
+    /* Explicit look-at camera (overrides the orbit camera when --cam-eye is given). */
+    int cam_explicit = 0;
+    v3 cam_eye = {0, 0, 5}, cam_target = {0, 0, 0};
+    float cam_fov = 45.0f;
     int sun_on = 0;
     float sun_az = 130.0f, sun_el = 45.0f, sun_intensity = 3.0f;
     v3 sun_color = {1.0f, 0.95f, 0.85f};
@@ -173,6 +184,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--cam-yaw")) cam_yaw = (float)atof(NEXT);
         else if (!strcmp(a, "--cam-pitch")) cam_pitch = (float)atof(NEXT);
         else if (!strcmp(a, "--cam-dist")) cam_dist = (float)atof(NEXT);
+        else if (!strcmp(a, "--cam-eye")) {
+            sscanf(NEXT, "%f,%f,%f", &cam_eye.x, &cam_eye.y, &cam_eye.z); cam_explicit = 1;
+        }
+        else if (!strcmp(a, "--cam-target")) {
+            sscanf(NEXT, "%f,%f,%f", &cam_target.x, &cam_target.y, &cam_target.z);
+        }
+        else if (!strcmp(a, "--cam-fov")) cam_fov = (float)atof(NEXT);
+        else if (!strcmp(a, "--srgb")) srgb_path = NEXT;
+        else if (!strcmp(a, "--hide-env")) hide_env_bg = 1;
         else if (!strcmp(a, "--backend")) backend = NEXT;
         else if (!strcmp(a, "--gpu-validate")) gpu_validate = 1;
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
@@ -207,20 +227,26 @@ int main(int argc, char **argv) {
         else env = env_constant(v3_scale(v3_splat(1.0f), env_intensity));
     }
 
-    /* ---- camera: orbit around scene center ---- */
-    v3 center = v3_make(0.5f * (scene.bmin[0] + scene.bmax[0]),
-                        0.5f * (scene.bmin[1] + scene.bmax[1]),
-                        0.5f * (scene.bmin[2] + scene.bmax[2]));
-    float radius = 0.5f * v3_len(v3_make(scene.bmax[0] - scene.bmin[0],
-                                         scene.bmax[1] - scene.bmin[1],
-                                         scene.bmax[2] - scene.bmin[2]));
-    float yaw = cam_yaw * (MTLX_PI / 180.0f), pitch = cam_pitch * (MTLX_PI / 180.0f);
-    float d = radius * 2.0f * cam_dist;
-    v3 eye = v3_add(center, v3_make(d * cosf(pitch) * sinf(yaw),
-                                    d * sinf(pitch),
-                                    d * cosf(pitch) * cosf(yaw)));
-    Camera cam = camera_lookat(eye, center, v3_make(0, 1, 0),
-                               45.0f * (MTLX_PI / 180.0f), (float)W / (float)H);
+    /* ---- camera: explicit look-at (--cam-eye) or orbit around scene center ---- */
+    Camera cam;
+    if (cam_explicit) {
+        cam = camera_lookat(cam_eye, cam_target, v3_make(0, 1, 0),
+                            cam_fov * (MTLX_PI / 180.0f), (float)W / (float)H);
+    } else {
+        v3 center = v3_make(0.5f * (scene.bmin[0] + scene.bmax[0]),
+                            0.5f * (scene.bmin[1] + scene.bmax[1]),
+                            0.5f * (scene.bmin[2] + scene.bmax[2]));
+        float radius = 0.5f * v3_len(v3_make(scene.bmax[0] - scene.bmin[0],
+                                             scene.bmax[1] - scene.bmin[1],
+                                             scene.bmax[2] - scene.bmin[2]));
+        float yaw = cam_yaw * (MTLX_PI / 180.0f), pitch = cam_pitch * (MTLX_PI / 180.0f);
+        float d = radius * 2.0f * cam_dist;
+        v3 eye = v3_add(center, v3_make(d * cosf(pitch) * sinf(yaw),
+                                        d * sinf(pitch),
+                                        d * cosf(pitch) * cosf(yaw)));
+        cam = camera_lookat(eye, center, v3_make(0, 1, 0),
+                            cam_fov * (MTLX_PI / 180.0f), (float)W / (float)H);
+    }
 
     /* ---- render ---- */
     RenderConfig cfg;
@@ -228,6 +254,7 @@ int main(int argc, char **argv) {
     cfg.width = W; cfg.height = H; cfg.spp = spp; cfg.max_bounces = bounces;
     cfg.nthreads = threads > 0 ? threads : (int)cpu_count();
     cfg.sss_walk = sss_walk; cfg.seed = 12345u;
+    cfg.hide_env_bg = hide_env_bg;
 
     /* directional sun from azimuth/elevation (degrees) */
     cfg.sun.enabled = sun_on;
@@ -292,6 +319,7 @@ int main(int argc, char **argv) {
 
     fb_write_exr(&fb, out_path);
     if (png_path) fb_write_png(&fb, png_path, TONEMAP_ACES, exposure);
+    if (srgb_path) fb_write_png_srgb(&fb, srgb_path, exposure);
     fb_free(&fb);
 
 teardown:
