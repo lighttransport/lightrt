@@ -27,6 +27,18 @@ else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti -fno-exceptions")
 endif()
 
+# Detect compiler and apply appropriate warning flags
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(STATUS "Using Clang compiler")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Weverything -Werror")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-c++98-compat -Wno-c++98-compat-pedantic -Wno-padded -Wno-unreachable-code -Wno-implicit-int-float-conversion -Wno-unused-macros -Wno-exit-time-destructors -Wno-unknown-warning-option -Wno-global-constructors -Wno-sign-conversion -Wno-shorthand-array-subscript -Wno-shorten-64-to-32 -Wno-double-promotion -Wno-deprecated-copy-with-dtor -Wno-covered-switch-default -Wno-switch -Wno-switch-default -Wno-unsafe-buffer-usage -Wno-implicit-int-conversion -Wno-unused-function -Wno-unused-template -Wno-unused-member-function -Wno-missing-prototypes -Wno-old-style-cast -Wno-undefined-func-template -Wno-shadow")
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+    message(STATUS "Using GCC compiler")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
+else()
+    message(STATUS "Using ${CMAKE_CXX_COMPILER_ID} compiler")
+endif()
+
 # Optimization flags
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
