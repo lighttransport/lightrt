@@ -53,7 +53,7 @@ typedef struct {
     v3    F0;          /* specular reflectance at normal incidence */
     float alpha;       /* GGX roughness^2 */
     v3    sheen_color; float sheen_alpha, sheen_w;
-    v3    coat_color; float coat_alpha, coat_w, coat_f0;
+    v3    coat_color; float coat_alpha, coat_w, coat_f0, coat_Ri;
     float glass_w, ior;
     /* normalized lobe selection probabilities (glass is delta) */
     float pd, ps, pc, pg;
@@ -84,6 +84,13 @@ static Layers extract(const OpenPBRParams *p) {
     L.coat_alpha = clampf(p->coat_roughness, 0.02f, 1.0f); L.coat_alpha *= L.coat_alpha;
     float c = (p->coat_ior - 1.0f) / (p->coat_ior + 1.0f);
     L.coat_f0 = c * c;
+    /* Internal diffuse Fresnel reflectance of the coat (the fraction of base-
+     * reflected light the coat-air interface bounces back down). Drives coat
+     * darkening: light trapped between coat and base re-illuminates it, which
+     * saturates the apparent base color (a clear coat makes a tinted base look
+     * deeper, not washed out). Egan/Hilgeman polynomial in the coat IOR. */
+    { float n = p->coat_ior;
+      L.coat_Ri = (n > 1.001f) ? (-1.440f / (n * n) + 0.710f / n + 0.668f + 0.0636f * n) : 0.0f; }
 
     L.glass_w = (1.0f - metal) * trans;
 
@@ -114,7 +121,19 @@ static v3 eval_reflection(const Layers *L, v3 N, v3 wo, v3 wi, float *pdf) {
     v3 base_atten = v3_scale(v3_lerp(v3_splat(1.0f), L->coat_color, L->coat_w),
                              1.0f - coat_fr);
 
-    v3 diff = v3_mul(L->diff_color, v3_scale(base_atten, MTLX_INV_PI));
+    /* Coat darkening: the multiple-scattering geometric series for light bounced
+     * between the base (albedo rho) and the coat's internal interface boosts the
+     * effective albedo to rho/(1 - rho*Ri), which raises saturation for tinted
+     * bases (more for high-albedo channels). 1 - rho*Ri*coat_w stays positive
+     * since rho <= 1 and Ri*coat_w < 1. */
+    v3 diff_alb = L->diff_color;
+    if (L->coat_w > 0.0f && L->coat_Ri > 0.0f) {
+        float k = L->coat_Ri * L->coat_w;
+        diff_alb = v3_make(diff_alb.x / (1.0f - diff_alb.x * k),
+                           diff_alb.y / (1.0f - diff_alb.y * k),
+                           diff_alb.z / (1.0f - diff_alb.z * k));
+    }
+    v3 diff = v3_mul(diff_alb, v3_scale(base_atten, MTLX_INV_PI));
 
     float D = ggx_D(NdotH, L->alpha), G = ggx_G(NdotV, NdotL, L->alpha);
     v3 F = fresnel_schlick(VdotH, L->F0);
