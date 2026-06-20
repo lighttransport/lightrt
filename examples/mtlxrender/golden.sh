@@ -33,6 +33,7 @@ MATERIALS=(
     "StandardSurface/standard_surface_velvet.mtlx"
     "StandardSurface/standard_surface_copper.mtlx"
     "StandardSurface/standard_surface_thin_film.mtlx"
+    "StandardSurface/standard_surface_onyx_hextiled.mtlx"
     "OpenPbr/open_pbr_default.mtlx"
     "OpenPbr/open_pbr_pearl.mtlx"
     "OpenPbr/open_pbr_carpaint.mtlx"

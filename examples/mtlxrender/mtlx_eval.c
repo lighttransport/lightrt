@@ -162,7 +162,7 @@ static float cellnoise(v3 p) {
 /* ---- node dispatch ---------------------------------------------------- */
 typedef enum {
     OP_UNKNOWN = 0,
-    OP_IMAGE, OP_NORMALMAP, OP_TEXCOORD, OP_POSITION, OP_NORMAL, OP_TANGENT,
+    OP_IMAGE, OP_HEXTILEDIMAGE, OP_NORMALMAP, OP_TEXCOORD, OP_POSITION, OP_NORMAL, OP_TANGENT,
     OP_BITANGENT, OP_GEOMCOLOR, OP_PLACE2D, OP_CONSTANT,
     OP_ADD, OP_SUBTRACT, OP_MULTIPLY, OP_DIVIDE, OP_MODULO, OP_POWER,
     OP_MIN, OP_MAX, OP_ATAN2,
@@ -179,7 +179,8 @@ typedef enum {
 
 static NodeOp classify(const char *c) {
     /* textures */
-    if (!strcmp(c, "image") || !strcmp(c, "tiledimage") || !strcmp(c, "hextiledimage") ||
+    if (!strcmp(c, "hextiledimage")) return OP_HEXTILEDIMAGE;
+    if (!strcmp(c, "image") || !strcmp(c, "tiledimage") ||
         !strcmp(c, "gltf_image") || !strcmp(c, "gltf_colorimage")) return OP_IMAGE;
     if (!strcmp(c, "normalmap") || !strcmp(c, "gltf_normalmap")) return OP_NORMALMAP;
     /* geometric */
@@ -310,6 +311,105 @@ static MtlxValue eval_image(ShadeContext *ctx, const MtlxNode *n) {
     }
 }
 
+/* ---- hex-tiling (Mikkelsen, Practical Real-Time Hex-Tiling, JCGT 2022) ---
+ * Blend three randomly rotated/scaled/offset lookups of a tiled texture by the
+ * simplex-grid barycentric weights, modulated by per-tap luminance, so the
+ * obvious repetition of a plain tiled texture is hidden. Ported from MaterialX
+ * mx_hextile.glsl / mx_hextiledimage.glsl. Derivatives (textureGrad) are dropped
+ * -- they only affect mip selection, not the blend. */
+static float hex_fract(float x) { return x - floorf(x); }
+static void hex_hash(float px, float py, float *ox, float *oy) {
+    float p3x = hex_fract(px * 0.1031f), p3y = hex_fract(py * 0.1030f), p3z = hex_fract(px * 0.0973f);
+    float d = p3x * (p3y + 33.33f) + p3y * (p3z + 33.33f) + p3z * (p3x + 33.33f);
+    p3x += d; p3y += d; p3z += d;
+    *ox = hex_fract((p3x + p3y) * p3z);
+    *oy = hex_fract((p3x + p3z) * p3y);
+}
+static float hex_schlick_gain(float x, float r) {
+    float rr = clampf(r, 0.001f, 0.999f);
+    float a = (1.0f / rr - 2.0f) * (1.0f - 2.0f * x);
+    return (x < 0.5f) ? x / (a + 1.0f) : (a - x) / (a - 1.0f);
+}
+static float hin_f(ShadeContext *ctx, const MtlxNode *n, const char *nm, float fb) {
+    MtlxValue v = in_or(ctx, n, nm, mv_float(fb));
+    return mv_as_float(&v);
+}
+static MtlxValue eval_hextiledimage(ShadeContext *ctx, const MtlxNode *n) {
+    const MtlxInput *file = find_input(n, "file");
+    int srgb = file ? file->colorspace_srgb : 0;
+    const char *path = (file && file->value.s) ? file->value.s : NULL;
+    int id = path ? texcache_get(ctx->tex, path, srgb) : -1;
+    if (id < 0) return in_or(ctx, n, "default", mv_zero(n->type));
+
+    MtlxValue tv = in_or(ctx, n, "tiling", mv_vec2(1, 1));
+    float tile_x = tv.v[0], tile_y = (tv.v[1] != 0.0f ? tv.v[1] : tv.v[0]);
+    MtlxValue rr = in_or(ctx, n, "rotationrange", mv_vec2(0.0f, 360.0f));
+    MtlxValue sr = in_or(ctx, n, "scalerange", mv_vec2(0.5f, 2.0f));
+    MtlxValue orr = in_or(ctx, n, "offsetrange", mv_vec2(0.0f, 1.0f));
+    float rotation = hin_f(ctx, n, "rotation", 1.0f);
+    float scale = hin_f(ctx, n, "scale", 1.0f);
+    float offset = hin_f(ctx, n, "offset", 1.0f);
+    float falloff = hin_f(ctx, n, "falloff", 0.5f);
+    float fcontrast = hin_f(ctx, n, "falloffcontrast", 0.5f);
+    MtlxValue lv = in_or(ctx, n, "lumacoeffs", mv_color3(v3_make(0.2722287f, 0.6740818f, 0.0536895f)));
+    v3 luma = mv_as_v3(&lv);
+
+    float coord_x = ctx->uv[0] * tile_x, coord_y = ctx->uv[1] * tile_y;
+    const float sqrt3_2 = 3.46410162f;
+    /* skew into the simplex grid: to_skewed * (coord*sqrt3_2) */
+    float stx = coord_x * sqrt3_2, sty = coord_y * sqrt3_2;
+    float skx = stx - 0.57735027f * sty, sky = 1.15470054f * sty;
+    float fracx = hex_fract(skx), fracy = hex_fract(sky);
+    float tz = 1.0f - fracx - fracy;
+    float s = (tz <= 0.0f) ? 1.0f : 0.0f, s2 = 2.0f * s - 1.0f;
+    float w[3];
+    w[0] = -tz * s2; w[1] = s - fracy * s2; w[2] = s - fracx * s2;
+    int basex = (int)floorf(skx), basey = (int)floorf(sky), si = (int)s;
+    int idx[3] = { basex + si, basex + si, basex + (1 - si) };
+    int idy[3] = { basey + si, basey + (1 - si), basey + si };
+    float cx[3], cy[3];
+    for (int i = 0; i < 3; i++) {
+        /* tile center: inv_skewed * (id / sqrt3_2) */
+        float ax = idx[i] / sqrt3_2, ay = idy[i] / sqrt3_2;
+        float ctrx = ax + 0.5f * ay, ctry = 0.866025404f * ay;
+        float rx, ry; hex_hash((float)idx[i] + 0.12345f, (float)idy[i] + 0.12345f, &rx, &ry);
+        float rad0 = rr.v[0] * (float)MTLX_PI / 180.0f, rad1 = rr.v[1] * (float)MTLX_PI / 180.0f;
+        float rot = rad0 + (rad1 - rad0) * (rx * rotation);
+        float sc = 1.0f + ((sr.v[0] + (sr.v[1] - sr.v[0]) * ry) - 1.0f) * scale;
+        float offx = orr.v[0] + (orr.v[1] - orr.v[0]) * (rx * offset);
+        float offy = orr.v[0] + (orr.v[1] - orr.v[0]) * (ry * offset);
+        float dx = coord_x - ctrx, dy = coord_y - ctry;
+        float cr = cosf(rot), srn = sinf(rot);
+        cx[i] = (dx * cr - dy * srn) / sc + ctrx + offx;
+        cy[i] = (dx * srn + dy * cr) / sc + ctry + offy;
+    }
+    float c[3][4];
+    for (int i = 0; i < 3; i++) texcache_sample(ctx->tex, id, cx[i], cy[i], c[i]);
+    /* blend weights: luminance(mix to 1 by contrast) * barycentric^7, normalized */
+    float bw[3], sum = 1e-8f;
+    for (int i = 0; i < 3; i++) {
+        float cwi = c[i][0] * luma.x + c[i][1] * luma.y + c[i][2] * luma.z;
+        cwi = 1.0f + (cwi - 1.0f) * fcontrast;
+        bw[i] = cwi * powf(maxf(w[i], 0.0f), 7.0f);
+        sum += bw[i];
+    }
+    for (int i = 0; i < 3; i++) bw[i] /= sum;
+    if (falloff != 0.5f) {
+        float s3 = 1e-8f;
+        for (int i = 0; i < 3; i++) { bw[i] = hex_schlick_gain(bw[i], falloff); s3 += bw[i]; }
+        for (int i = 0; i < 3; i++) bw[i] /= s3;
+    }
+    float o[4];
+    for (int k = 0; k < 4; k++) o[k] = bw[0] * c[0][k] + bw[1] * c[1][k] + bw[2] * c[2][k];
+    switch (n->type) {
+        case MV_FLOAT: return mv_float(o[0]);
+        case MV_VEC2: return mv_vec2(o[0], o[1]);
+        case MV_VEC3: return mv_vec3(v3_make(o[0], o[1], o[2]));
+        case MV_COLOR4: { MtlxValue r = mv_zero(MV_COLOR4); r.v[0]=o[0];r.v[1]=o[1];r.v[2]=o[2];r.v[3]=o[3]; return r; }
+        default: return mv_color3(v3_make(o[0], o[1], o[2]));
+    }
+}
+
 static MtlxValue eval_normalmap(ShadeContext *ctx, const MtlxNode *n) {
     /* `normalmap` takes an `in` tangent-space vector (usually from an image),
      * but the gltf convenience node `gltf_normalmap` embeds the texture `file`
@@ -349,6 +449,7 @@ static MtlxValue eval_node(ShadeContext *ctx, int node_id) {
     }
     switch (classify(n->category)) {
         case OP_IMAGE: r = eval_image(ctx, n); break;
+        case OP_HEXTILEDIMAGE: r = eval_hextiledimage(ctx, n); break;
         case OP_NORMALMAP: r = eval_normalmap(ctx, n); break;
         case OP_TEXCOORD: r = mv_vec2(ctx->uv[0], ctx->uv[1]); break;
         case OP_POSITION: r = mv_vec3(ctx->P); break;
