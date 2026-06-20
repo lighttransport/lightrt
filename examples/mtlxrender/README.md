@@ -6,6 +6,10 @@ OpenPBR-style layered BSDF. Built to render the MaterialX **Chess set**.
 
 ![chess render](docs/chess.png)
 
+The same scene under a Radiance `.hdr` environment (image-based lighting):
+
+![chess HDRI](docs/chess_hdri.png)
+
 ## What it does
 
 - Loads a (binary) **glTF** mesh via **tinygltf v3** (pure-C `tg3_*` API).
@@ -15,9 +19,23 @@ OpenPBR-style layered BSDF. Built to render the MaterialX **Chess set**.
   the glTF node/mesh name — the chess `.mtlx` has 15 such assignments).
 - Evaluates the node graph with a simple demand-driven **interpreter** (one
   dispatch per node category) producing OpenPBR parameters per shade point.
-  Supported nodes: `image`, `tiledimage`, `normalmap`, `texcoord`, `constant`,
-  `multiply`, `add`, `subtract`, `mix`, `clamp`, `normalize`, `standard_surface`,
-  `open_pbr_surface`, `surfacematerial`.
+  Supported node categories:
+  - **textures**: `image`, `tiledimage`, `hextiledimage`, `gltf_image`,
+    `gltf_colorimage`, `normalmap`, `gltf_normalmap`
+  - **math**: `add` `subtract` `multiply` `divide` `modulo` `power` `min` `max`
+    `atan2` `sin` `cos` `tan` `asin` `acos` `atan` `sqrt` `ln` `exp` `abs`
+    `floor` `ceil` `round` `sign` `normalize` `magnitude` `dotproduct`
+    `crossproduct`
+  - **adjust/compositing**: `mix` `clamp` `smoothstep` `remap` `range`
+    `contrast` `saturate` `luminance` `rgbtohsv` `hsvtorgb` `invert`
+  - **channel**: `separate2/3/4` `combine2/3/4` `extract` `convert` `swizzle`
+  - **procedural**: `constant` `noise3d` `fractal3d` `cellnoise3d` `ramplr`
+    `splitlr`
+  - **geometric**: `texcoord` `position` `normal` `tangent` `bitangent`
+    `geomcolor` `place2d`
+- Supports five surface shader models, all mapped onto the OpenPBR BSDF:
+  `standard_surface`, `open_pbr_surface`, `gltf_pbr`, `UsdPreviewSurface`,
+  `disney_principled`.
 - Path-traces with **NEE + MIS** against an environment light, Russian roulette,
   an OpenPBR-style BSDF (metallic-roughness + dielectric GGX specular + smooth
   glass transmission), and **subsurface scattering** (tinted-diffuse by default,
@@ -58,9 +76,28 @@ GLB=~/work/MaterialX/resources/Geometry/chess_set.glb
 ```
 
 `--sun` adds a directional light (NEE shadow rays) for crisp cast shadows;
-drop it for soft dome-only lighting. Run `./mtlxrender --help` for the full
-option list (camera orbit, environment HDRI via `--env file.exr`, thread
-count, etc.).
+drop it for soft dome-only lighting. `--env` accepts both **Radiance `.hdr`**
+and **`.exr`** lat-long environment maps (importance-sampled). Run
+`./mtlxrender --help` for the full option list (camera orbit, thread count, etc.).
+
+## Golden reference tests
+
+`golden.sh` renders a curated set of example materials (across all five shader
+models) on the MaterialX shaderball, plus the chess scene, under an HDRI, and
+manages them as committed reference images. Renders are deterministic (fixed
+seed; per-pixel RNG independent of thread scheduling), so a matching build
+reproduces them bit-for-bit.
+
+```bash
+./golden.sh gen      # (re)generate references into golden/  (PNG + EXR)
+./golden.sh check    # re-render and diff against golden/*.png (RMSE)
+```
+
+The committed `golden/*.png` are the visual + regression references; `check`
+recomputes each and reports per-material RMSE (PASS within `TOL`, default 0.02).
+`mtlxrender --diff a b [tol]` compares any two EXR/PNG images directly.
+
+![golden contact sheet](docs/golden_contact.png)
 
 ## Dependencies (vendored, under `deps/`, git-ignored)
 

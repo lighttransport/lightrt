@@ -130,6 +130,7 @@ static v3 trace_path(const Scene *s, const MtlxDoc *doc, const MaterialBinding *
         v3 wo = v3_neg(dir);
 
         ctx.uv[0] = hi.uv[0]; ctx.uv[1] = hi.uv[1];
+        ctx.P = hi.P;
         ctx.Ns = hi.Ns; ctx.Ng = hi.Ng; ctx.dpdu = hi.dpdu; ctx.dpdv = v3_cross(hi.Ns, hi.dpdu);
         OpenPBRParams params;
         mtlx_eval_surface(&ctx, hi.surface_node, &params);

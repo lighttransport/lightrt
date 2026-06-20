@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "exr.h"
+#include "stb_image.h"
 
 /* ---- 2D piecewise-constant distribution (pbrt-style) ------------------- */
 typedef struct {
@@ -115,42 +116,73 @@ Env *env_gradient(v3 ground, v3 sky, float intensity) {
 
 static float lum3(const float *p) { return 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]; }
 
+/* Has the path the given (case-insensitive) extension? */
+static int has_ext(const char *path, const char *ext) {
+    size_t lp = strlen(path), le = strlen(ext);
+    if (lp < le) return 0;
+    const char *p = path + lp - le;
+    for (size_t i = 0; i < le; i++) {
+        char a = p[i], b = ext[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+/* Load an equirect HDRI into interleaved float RGB. EXR via tinyexr, everything
+ * else (Radiance .hdr, etc.) via stb_image's float loader. NULL on failure. */
+static float *load_hdri_pixels(const char *path, int *W, int *H) {
+    if (has_ext(path, ".exr")) {
+        exr_image img;
+        memset(&img, 0, sizeof(img));
+        exr_result r = exr_load_from_file(path, NULL, &img);
+        if (!EXR_OK(r) || img.num_parts < 1) {
+            fprintf(stderr, "env: EXR load failed '%s': %s\n", path, exr_result_string(r));
+            return NULL;
+        }
+        exr_part *part = &img.parts[0];
+        int w = part->width, h = part->height;
+        int ci[3] = {-1, -1, -1};
+        for (int c = 0; c < part->header.num_channels; c++) {
+            const char *nm = part->header.channels[c].name;
+            if (!strcmp(nm, "R")) ci[0] = c;
+            else if (!strcmp(nm, "G")) ci[1] = c;
+            else if (!strcmp(nm, "B")) ci[2] = c;
+        }
+        if (ci[0] < 0) ci[0] = 0;
+        if (ci[1] < 0) ci[1] = ci[0];
+        if (ci[2] < 0) ci[2] = ci[0];
+        size_t npx = (size_t)w * h;
+        float *rgb = (float *)malloc(sizeof(float) * npx * 3);
+        float *tmp = (float *)malloc(sizeof(float) * npx);
+        for (int k = 0; k < 3; k++) {
+            exr_pixel_type pt = part->header.channels[ci[k]].pixel_type;
+            exr_convert_pixels(tmp, EXR_PIXEL_FLOAT, part->images[ci[k]], pt, npx, EXR_CONVERT_RAW);
+            for (size_t i = 0; i < npx; i++) rgb[i * 3 + k] = tmp[i];
+        }
+        free(tmp);
+        exr_image_free(&img);
+        *W = w; *H = h;
+        return rgb;
+    }
+    /* Radiance .hdr / other float-capable formats */
+    int w, h, comp;
+    float *px = stbi_loadf(path, &w, &h, &comp, 3);
+    if (!px) { fprintf(stderr, "env: HDRI load failed '%s'\n", path); return NULL; }
+    *W = w; *H = h;
+    return px; /* stb already interleaved RGB (comp forced to 3) */
+}
+
 Env *env_hdri(const char *path, float intensity, float rotation_deg) {
-    exr_image img;
-    memset(&img, 0, sizeof(img));
-    exr_result r = exr_load_from_file(path, NULL, &img);
-    if (!EXR_OK(r) || img.num_parts < 1) {
-        fprintf(stderr, "env: failed to load HDRI '%s': %s\n", path, exr_result_string(r));
-        return NULL;
-    }
-    exr_part *part = &img.parts[0];
-    int W = part->width, H = part->height;
-    int ci_r = -1, ci_g = -1, ci_b = -1;
-    for (int c = 0; c < part->header.num_channels; c++) {
-        const char *nm = part->header.channels[c].name;
-        if (!strcmp(nm, "R")) ci_r = c;
-        else if (!strcmp(nm, "G")) ci_g = c;
-        else if (!strcmp(nm, "B")) ci_b = c;
-    }
-    if (ci_r < 0) ci_r = 0;
-    if (ci_g < 0) ci_g = ci_r;
-    if (ci_b < 0) ci_b = ci_r;
+    int W = 0, H = 0;
+    float *pixels = load_hdri_pixels(path, &W, &H);
+    if (!pixels) return NULL;
 
     Env *e = (Env *)calloc(1, sizeof(Env));
     e->kind = ENV_HDRI; e->w = W; e->h = H; e->intensity = intensity;
     e->rot = rotation_deg * (MTLX_PI / 180.0f);
-    e->pixels = (float *)malloc(sizeof(float) * (size_t)W * H * 3);
-
+    e->pixels = pixels;
     size_t npx = (size_t)W * H;
-    float *tmp = (float *)malloc(sizeof(float) * npx);
-    int chans[3] = {ci_r, ci_g, ci_b};
-    for (int k = 0; k < 3; k++) {
-        exr_pixel_type pt = part->header.channels[chans[k]].pixel_type;
-        exr_convert_pixels(tmp, EXR_PIXEL_FLOAT, part->images[chans[k]], pt, npx, EXR_CONVERT_RAW);
-        for (size_t i = 0; i < npx; i++) e->pixels[i * 3 + k] = tmp[i];
-    }
-    free(tmp);
-    exr_image_free(&img);
 
     /* build importance distribution over luminance * sin(theta) */
     float *func = (float *)malloc(sizeof(float) * npx);

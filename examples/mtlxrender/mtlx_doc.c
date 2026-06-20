@@ -105,9 +105,10 @@ static void node_add_input(MtlxNode *n, const XmlNode *x) {
     const char *nodegraph = xml_attr(x, "nodegraph");
     const char *output = xml_attr(x, "output");
     if (nodename) {
-        size_t L = strlen(nodename) + 3;
+        const char *o = output ? output : "";
+        size_t L = strlen(nodename) + strlen(o) + 4;
         in->src_output = malloc(L);
-        snprintf(in->src_output, L, "N:%s", nodename);
+        snprintf(in->src_output, L, "N:%s\x01%s", nodename, o);
     } else if (nodegraph) {
         const char *o = output ? output : "";
         size_t L = strlen(nodegraph) + strlen(o) + 4;
@@ -234,9 +235,14 @@ MtlxDoc *mtlx_load(const char *path) {
             if (!in->src_output) continue; /* literal or unconnected */
             char *enc = in->src_output;
             if (enc[0] == 'N' && enc[1] == ':') {
+                char *sep = strchr(enc + 2, '\x01');
+                char *sub = NULL;
+                if (sep) { *sep = '\0'; if (sep[1]) sub = sep + 1; }
                 int nid = mtlx_find_node(&b.d, n->graph_id, enc + 2);
                 in->src_node = nid;
-                free(in->src_output); in->src_output = NULL;
+                char *subdup = sub ? strdup(sub) : NULL;
+                free(in->src_output);
+                in->src_output = subdup;
             } else if (enc[0] == 'G' && enc[1] == ':') {
                 char *bar = strchr(enc + 2, '|');
                 char *sub = NULL;

@@ -23,10 +23,20 @@ MaterialBinding material_bind(const Scene *scene, const MtlxDoc *doc) {
     b.ngeom = scene->ngeom;
     b.geom_to_surface = (int *)malloc(sizeof(int) * (size_t)(scene->ngeom > 0 ? scene->ngeom : 1));
 
+    /* Fallback for single-material example files (no <materialassign>): if the
+     * doc has exactly one surface shader, assign it to all geometry. */
+    int only_surface = -1;
+    if (doc->nassign == 0) {
+        int count = 0;
+        for (int m = 0; m < doc->nmat; m++)
+            if (doc->mats[m].surface_node >= 0) { only_surface = doc->mats[m].surface_node; count++; }
+        if (count != 1) only_surface = (doc->nmat > 0 ? doc->mats[0].surface_node : -1);
+    }
+
     int unmatched = 0;
     for (int g = 0; g < scene->ngeom; g++) {
         const char *gname = scene->geom_names[g];
-        int surface = -1;
+        int surface = (doc->nassign == 0) ? only_surface : -1;
 
         /* 1. exact geom -> materialassign -> surfacematerial -> surface node */
         for (int a = 0; a < doc->nassign; a++) {

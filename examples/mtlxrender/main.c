@@ -20,6 +20,66 @@
 #include "framebuffer.h"
 #include "pathtrace.h"
 #include "vecmath.h"
+#include "exr.h"
+#include "stb_image.h"
+
+static int ends_with(const char *s, const char *suf) {
+    size_t ls = strlen(s), lf = strlen(suf);
+    return ls >= lf && strcmp(s + ls - lf, suf) == 0;
+}
+
+/* Load an EXR's R/G/B planes into an interleaved float buffer (malloc'd). */
+static float *load_exr_rgb(const char *path, int *W, int *H) {
+    exr_image img; memset(&img, 0, sizeof(img));
+    if (!EXR_OK(exr_load_from_file(path, NULL, &img)) || img.num_parts < 1) return NULL;
+    exr_part *p = &img.parts[0];
+    int w = p->width, h = p->height, ci[3] = {-1, -1, -1};
+    for (int c = 0; c < p->header.num_channels; c++) {
+        const char *nm = p->header.channels[c].name;
+        if (!strcmp(nm, "R")) ci[0] = c; else if (!strcmp(nm, "G")) ci[1] = c; else if (!strcmp(nm, "B")) ci[2] = c;
+    }
+    if (ci[0] < 0) ci[0] = 0;
+    if (ci[1] < 0) ci[1] = ci[0];
+    if (ci[2] < 0) ci[2] = ci[0];
+    size_t npx = (size_t)w * h;
+    float *rgb = (float *)malloc(sizeof(float) * npx * 3), *tmp = (float *)malloc(sizeof(float) * npx);
+    for (int k = 0; k < 3; k++) {
+        exr_convert_pixels(tmp, EXR_PIXEL_FLOAT, p->images[ci[k]], p->header.channels[ci[k]].pixel_type, npx, EXR_CONVERT_RAW);
+        for (size_t i = 0; i < npx; i++) rgb[i * 3 + k] = tmp[i];
+    }
+    free(tmp); exr_image_free(&img);
+    *W = w; *H = h;
+    return rgb;
+}
+
+/* Load an image (EXR or anything stb reads) as interleaved float RGB. */
+static float *load_image_rgb(const char *path, int *W, int *H) {
+    if (ends_with(path, ".exr")) return load_exr_rgb(path, W, H);
+    int comp;
+    unsigned char *p = stbi_load(path, W, H, &comp, 3);
+    if (!p) return NULL;
+    size_t n = (size_t)(*W) * (*H) * 3;
+    float *f = (float *)malloc(sizeof(float) * n);
+    for (size_t i = 0; i < n; i++) f[i] = p[i] / 255.0f;
+    stbi_image_free(p);
+    return f;
+}
+
+/* Compare two images (EXR or PNG); print RMSE/max, return 0 if within tol. */
+static int diff_exr(const char *a_path, const char *b_path, float tol) {
+    int aw, ah, bw, bh;
+    float *a = load_image_rgb(a_path, &aw, &ah), *b = load_image_rgb(b_path, &bw, &bh);
+    if (!a || !b) { fprintf(stderr, "diff: failed to load EXRs\n"); free(a); free(b); return 2; }
+    if (aw != bw || ah != bh) { fprintf(stderr, "diff: size mismatch %dx%d vs %dx%d\n", aw, ah, bw, bh); free(a); free(b); return 2; }
+    double se = 0.0; float mx = 0.0f;
+    size_t n = (size_t)aw * ah * 3;
+    for (size_t i = 0; i < n; i++) { float d = a[i] - b[i]; se += (double)d * d; float ad = fabsf(d); if (ad > mx) mx = ad; }
+    float rmse = (float)sqrt(se / n);
+    free(a); free(b);
+    int ok = rmse <= tol;
+    fprintf(stderr, "diff: rmse=%.6f max=%.6f tol=%.6f -> %s\n", rmse, mx, tol, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
 
 static void dirname_of(const char *path, char *out, size_t cap) {
     const char *slash = strrchr(path, '/');
@@ -64,6 +124,10 @@ static void usage(const char *prog) {
 }
 
 int main(int argc, char **argv) {
+    /* diff mode: mtlxrender --diff a.exr b.exr [tol] */
+    if (argc >= 4 && !strcmp(argv[1], "--diff"))
+        return diff_exr(argv[2], argv[3], argc >= 5 ? (float)atof(argv[4]) : 1e-3f);
+
     const char *gltf_path = NULL, *mtlx_path = NULL;
     const char *out_path = "chess.exr", *png_path = NULL, *env_path = NULL;
     int W = 800, H = 600, spp = 64, bounces = 8, threads = 0, hq = 0, sss_walk = 0, sky = 0;
