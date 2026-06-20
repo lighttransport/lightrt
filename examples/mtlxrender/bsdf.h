@@ -25,11 +25,18 @@ typedef struct {
 /* Importance-sample the BSDF. Returns 0 if no valid sample. */
 int bsdf_sample(const OpenPBRParams *p, v3 N, v3 wo, pcg32 *rng, BsdfSample *out);
 
-/* Beer-Lambert volume absorption coefficient (per channel) for a transmissive
- * medium: transmission_color is the color seen after transmission_depth units,
- * so sigma_a = -ln(transmission_color)/transmission_depth. Returns 0 (no
- * absorption) when transmission_depth <= 0. */
-v3 transmission_sigma_a(const OpenPBRParams *p);
+/* Homogeneous interior medium of a transmissive material (OpenPBR semantics):
+ *   sigma_t = -ln(transmission_color)/transmission_depth        (extinction)
+ *   sigma_s = min(transmission_scatter/transmission_depth, sigma_t) (scattering)
+ *   sigma_a = sigma_t - sigma_s                                  (absorption)
+ * g is the Henyey-Greenstein anisotropy. All zero when transmission_depth <= 0. */
+typedef struct {
+    v3    sigma_t;   /* extinction coefficient (per channel) */
+    v3    sigma_s;   /* scattering coefficient (per channel) */
+    float g;         /* phase anisotropy */
+} VolumeMedium;
+
+VolumeMedium transmission_medium(const OpenPBRParams *p);
 
 /* Evaluate the non-delta BSDF (diffuse + rough specular) for NEE/MIS.
  * Returns f (rgb); *pdf_out gets the mixture pdf for sampling wi. */

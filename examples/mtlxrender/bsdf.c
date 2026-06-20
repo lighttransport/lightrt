@@ -231,15 +231,23 @@ int bsdf_sample(const OpenPBRParams *p, v3 Ns, v3 wo, pcg32 *rng, BsdfSample *ou
     return 1;
 }
 
-v3 transmission_sigma_a(const OpenPBRParams *p) {
-    if (p->transmission_depth <= 0.0f) return v3_splat(0.0f);
-    /* sigma_a = -ln(clamp(transmission_color)) / depth, per channel. Clamp the
-     * color away from 0 (infinite absorption) and 1 (none) for stability. */
-    v3 c = p->transmission_color;
+VolumeMedium transmission_medium(const OpenPBRParams *p) {
+    VolumeMedium m;
+    m.sigma_t = v3_splat(0.0f); m.sigma_s = v3_splat(0.0f); m.g = 0.0f;
+    if (p->transmission_depth <= 0.0f) return m;
     float inv = 1.0f / p->transmission_depth;
-    return v3_make(-logf(clampf(c.x, 1e-3f, 1.0f)) * inv,
-                   -logf(clampf(c.y, 1e-3f, 1.0f)) * inv,
-                   -logf(clampf(c.z, 1e-3f, 1.0f)) * inv);
+    /* extinction = -ln(clamp(transmission_color))/depth (clamp the color away
+     * from 0 = infinite extinction and 1 = none for stability). */
+    v3 c = p->transmission_color;
+    m.sigma_t = v3_make(-logf(clampf(c.x, 1e-3f, 1.0f)) * inv,
+                        -logf(clampf(c.y, 1e-3f, 1.0f)) * inv,
+                        -logf(clampf(c.z, 1e-3f, 1.0f)) * inv);
+    /* scattering = transmission_scatter/depth, clamped to <= extinction (so the
+     * single-scattering albedo sigma_s/sigma_t stays in [0,1]). */
+    v3 ss = v3_scale(p->transmission_scatter, inv);
+    m.sigma_s = v3_make(minf(ss.x, m.sigma_t.x), minf(ss.y, m.sigma_t.y), minf(ss.z, m.sigma_t.z));
+    m.g = clampf(p->transmission_scatter_anisotropy, -0.95f, 0.95f);
+    return m;
 }
 
 v3 bsdf_eval(const OpenPBRParams *p, v3 Ns, v3 wo, v3 wi, float *pdf_out) {

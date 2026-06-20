@@ -78,7 +78,7 @@ typedef struct {
     float prev_pdf;
     uint8_t alive, spec;
     uint8_t in_medium;   /* inside a transmissive volume (after refraction) */
-    v3 medium_sigma;     /* Beer-Lambert absorption coeff of that volume */
+    VolumeMedium medium; /* extinction/scattering coeffs of that volume */
 } Path;
 
 /* shadow-ray slot (two per shaded hit: env NEE + sun NEE) */
@@ -119,12 +119,14 @@ static void shade_range(ShadeJob *j, int k0, int k1, MtlxValue *memo, char *memo
             continue;
         }
 
-        /* Beer-Lambert: attenuate over the path length just traversed inside a
-         * transmissive medium (entry refraction -> here). */
+        /* Interior medium between the entry refraction and this surface hit:
+         * attenuate by the reduced (absorption-only) coefficient sigma_a =
+         * sigma_t - sigma_s (see trace_path for the rationale). */
         if (p->in_medium) {
-            p->thr = v3_mul(p->thr, v3_make(expf(-p->medium_sigma.x * hit->t),
-                                            expf(-p->medium_sigma.y * hit->t),
-                                            expf(-p->medium_sigma.z * hit->t)));
+            v3 sa = v3_sub(p->medium.sigma_t, p->medium.sigma_s);
+            p->thr = v3_mul(p->thr, v3_make(expf(-maxf(sa.x, 0.0f) * hit->t),
+                                            expf(-maxf(sa.y, 0.0f) * hit->t),
+                                            expf(-maxf(sa.z, 0.0f) * hit->t)));
         }
 
         HitInfo hi;
@@ -187,7 +189,7 @@ static void shade_range(ShadeJob *j, int k0, int k1, MtlxValue *memo, char *memo
         /* A refraction crosses the interface: toggle in/out of the medium and,
          * on entry, capture that material's absorption coefficient. */
         if (bs.crossed) {
-            if (!p->in_medium) { p->in_medium = 1; p->medium_sigma = transmission_sigma_a(&params); }
+            if (!p->in_medium) { p->in_medium = 1; p->medium = transmission_medium(&params); }
             else               { p->in_medium = 0; }
         }
 
@@ -267,7 +269,8 @@ void render_wavefront(const Scene *scene, const MtlxDoc *doc,
                 p->rad = v3_splat(0.0f);
                 p->prev_pdf = 0.0f;
                 p->alive = 1; p->spec = 1;
-                p->in_medium = 0; p->medium_sigma = v3_splat(0.0f);
+                p->in_medium = 0;
+                p->medium.sigma_t = v3_splat(0.0f); p->medium.sigma_s = v3_splat(0.0f); p->medium.g = 0.0f;
             }
         }
 

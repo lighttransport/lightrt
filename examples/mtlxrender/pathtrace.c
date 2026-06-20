@@ -111,7 +111,7 @@ static v3 trace_path(const Scene *s, const MtlxDoc *doc, const MaterialBinding *
     int specular_bounce = 1;
     float prev_pdf = 0.0f;
     int in_medium = 0;            /* inside a transmissive volume (after refraction) */
-    v3 medium_sigma = v3_splat(0.0f); /* Beer-Lambert absorption coeff of that volume */
+    VolumeMedium medium = { v3_splat(0.0f), v3_splat(0.0f), 0.0f };
 
     ShadeContext ctx;
     ctx.doc = doc; ctx.tex = tex; ctx.memo = memo; ctx.memo_done = memo_done;
@@ -131,12 +131,19 @@ static v3 trace_path(const Scene *s, const MtlxDoc *doc, const MaterialBinding *
             break;
         }
 
-        /* Beer-Lambert: attenuate over the path length just traversed inside a
-         * transmissive medium (the segment from the entry refraction to here). */
+        /* Interior medium between the entry refraction and this surface hit.
+         * Attenuate by the reduced (absorption-only) coefficient sigma_a =
+         * sigma_t - sigma_s: the scattering fraction of the extinction
+         * redistributes light forward rather than removing it, so a
+         * similarity-theory reduced extinction approximates the total
+         * transmittance through a scattering medium (e.g. honey) far better than
+         * the full extinction -- and deterministically, without the variance of
+         * stochastic volume sampling. */
         if (in_medium) {
-            throughput = v3_mul(throughput, v3_make(expf(-medium_sigma.x * hit.t),
-                                                    expf(-medium_sigma.y * hit.t),
-                                                    expf(-medium_sigma.z * hit.t)));
+            v3 sa = v3_sub(medium.sigma_t, medium.sigma_s);
+            throughput = v3_mul(throughput, v3_make(expf(-maxf(sa.x, 0.0f) * hit.t),
+                                                    expf(-maxf(sa.y, 0.0f) * hit.t),
+                                                    expf(-maxf(sa.z, 0.0f) * hit.t)));
         }
 
         HitInfo hi;
@@ -213,7 +220,7 @@ static v3 trace_path(const Scene *s, const MtlxDoc *doc, const MaterialBinding *
         /* A refraction crosses the interface: toggle in/out of the medium and,
          * on entry, capture that material's absorption coefficient. */
         if (bs.crossed) {
-            if (!in_medium) { in_medium = 1; medium_sigma = transmission_sigma_a(&params); }
+            if (!in_medium) { in_medium = 1; medium = transmission_medium(&params); }
             else            { in_medium = 0; }
         }
 

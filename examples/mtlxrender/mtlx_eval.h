@@ -27,6 +27,8 @@ typedef struct {
     float transmission;
     v3    transmission_color;
     float transmission_depth; /* Beer-Lambert distance for transmission_color (0 = no absorption) */
+    v3    transmission_scatter;         /* volumetric scattering color (0 = no in-scattering) */
+    float transmission_scatter_anisotropy; /* Henyey-Greenstein g of the interior medium */
     /* subsurface */
     float subsurface;
     v3    subsurface_color;
