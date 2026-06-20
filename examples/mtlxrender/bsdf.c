@@ -140,7 +140,13 @@ static v3 eval_reflection(const Layers *L, v3 N, v3 wo, v3 wi, float *pdf) {
 }
 
 int bsdf_sample(const OpenPBRParams *p, v3 Ns, v3 wo, pcg32 *rng, BsdfSample *out) {
-    v3 N = face_forward(v3_normalize(Ns), wo);
+    v3 Nn = v3_normalize(Ns);
+    /* Sign of the raw (outward) normal vs the view direction tells us which side
+     * of the dielectric interface we are on: entering air->glass (wo on the
+     * outward side) or exiting glass->air (wo on the inward side). This selects
+     * the relative IOR for refraction/Fresnel below. */
+    int entering = v3_dot(Nn, wo) > 0.0f;
+    v3 N = face_forward(Nn, wo);
     Layers L = extract(p);
     v3 T, B; onb(N, &T, &B);
     float u = pcg32_f(rng), u1 = pcg32_f(rng), u2 = pcg32_f(rng);
@@ -151,7 +157,11 @@ int bsdf_sample(const OpenPBRParams *p, v3 Ns, v3 wo, pcg32 *rng, BsdfSample *ou
          * refract about it, giving frosted glass for rough surfaces. */
         v3 m = (L.alpha > 1e-3f) ? v3_normalize(to_world(sample_ggx_h(L.alpha, u1, u2), T, B, N)) : N;
         if (v3_dot(m, wo) < 0.0f) m = v3_neg(m);
-        float eta = 1.0f / L.ior;
+        /* relative IOR n_i/n_t: 1/ior entering air->glass, ior exiting glass->air
+         * (the latter enables total internal reflection past the critical angle,
+         * which the hardcoded 1/ior path silently dropped -- turning the lens
+         * into a washed-out blur). */
+        float eta = entering ? (1.0f / L.ior) : L.ior;
         float cosi = clampf(v3_dot(m, wo), 0.0f, 1.0f);
         float Fr = fresnel_dielectric(cosi, eta);
         v3 wi;
