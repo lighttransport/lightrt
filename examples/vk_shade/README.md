@@ -65,17 +65,21 @@ as the `lightrt_vk_shade` CTest case when `LIGHTRT_BUILD_VK=ON`.
 ### Performance
 
 The demo uses the **resident-scene API** (`lrt_vk_shade_scene_build` /
-`_render` / `_free`): the primitives are uploaded once and the device buffers +
-descriptor set are reused across frames (it times an average of 30 renders, like
-an animation loop). The output lives in `DEVICE_LOCAL` memory — the shader writes
-it at full bandwidth instead of over PCIe to host-coherent memory — and is copied
-to a host-visible staging buffer for readback in the same submission.
+`_render` / `_free`): the primitives are uploaded once and the device buffers,
+descriptor set, **command buffer, fence, and the persistently-mapped staging
+buffer** are all reused across frames (it times an average of 30 renders, like an
+animation loop). The output lives in `DEVICE_LOCAL` memory — the shader writes it
+at full bandwidth instead of over PCIe to host-coherent memory — and is copied to
+a `HOST_CACHED` staging buffer for readback in the same submission (cached CPU
+reads, no per-frame `vkMapMemory`).
 
-On an RTX 5060 Ti this sustains ≈9 Mpix/s, **9–20× the single-threaded CPU
-reference** (the ratio grows with resolution / spp as the CPU cost rises). The
-one-shot `lrt_vk_shade_analytic()` is simpler but re-allocates and uploads every
-buffer per call (host-visible), so it is roughly half as fast for repeated
-rendering — use the resident API in a loop.
+On an RTX 5060 Ti this sustains **~75–135 Mpix/s** (rising with resolution as
+fixed per-submit latency amortizes), **~100–260× the single-threaded CPU
+reference**. Eliminating the per-frame Vulkan object churn (command-buffer
+allocation, fence create/destroy, map/unmap) and the uncached coherent readback
+was worth ~10× over a naive resident loop. The one-shot `lrt_vk_shade_analytic()`
+is simpler but re-allocates and uploads every buffer per call (host-visible), so
+it is far slower for repeated rendering — use the resident API in a loop.
 
 ## Regenerating the shader
 

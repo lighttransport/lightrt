@@ -197,6 +197,58 @@ static int vk_buffer_create(lrt_vk_engine *e, VkDeviceSize size, vk_buffer *out)
                                out);
 }
 
+/* TRANSFER_DST readback buffer preferring HOST_CACHED memory (cached CPU reads
+ * are far faster than reads from write-combined HOST_COHERENT memory) while
+ * keeping HOST_COHERENT too, so no manual vkInvalidateMappedMemoryRanges is
+ * needed (vkew does not expose it). Falls back to plain coherent. */
+static int vk_buffer_create_staging(lrt_vk_engine *e, VkDeviceSize size,
+                                    vk_buffer *out) {
+    memset(out, 0, sizeof(*out));
+    if (size == 0) size = 16;
+    out->size = size;
+    VkBufferCreateInfo bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bi.size = size;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(e->device, &bi, NULL, &out->buf) != VK_SUCCESS) {
+        vk_set_err(e, "vkCreateBuffer(staging)");
+        out->buf = VK_NULL_HANDLE;
+        return 0;
+    }
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(e->device, out->buf, &req);
+    uint32_t mt = vk_find_memory_type(
+        e, req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+            VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (mt == UINT32_MAX)
+        mt = vk_find_memory_type(e, req.memoryTypeBits,
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mt == UINT32_MAX) {
+        vk_set_err(e, "no host-visible memory type for staging");
+        vkDestroyBuffer(e->device, out->buf, NULL);
+        out->buf = VK_NULL_HANDLE;
+        return 0;
+    }
+    VkMemoryAllocateInfo ai;
+    memset(&ai, 0, sizeof(ai));
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = mt;
+    if (vkAllocateMemory(e->device, &ai, NULL, &out->mem) != VK_SUCCESS) {
+        vk_set_err(e, "vkAllocateMemory(staging)");
+        vkDestroyBuffer(e->device, out->buf, NULL);
+        out->buf = VK_NULL_HANDLE;
+        return 0;
+    }
+    vkBindBufferMemory(e->device, out->buf, out->mem, 0);
+    return 1;
+}
+
 static void vk_buffer_destroy(lrt_vk_engine *e, vk_buffer *b) {
     if (b->buf) vkDestroyBuffer(e->device, b->buf, NULL);
     if (b->mem) vkFreeMemory(e->device, b->mem, NULL);
@@ -228,11 +280,6 @@ static int vk_buffer_read(lrt_vk_engine *e, vk_buffer *b, void *dst,
     vkUnmapMemory(e->device, b->mem);
     return 1;
 }
-
-/* One-shot command-buffer helpers (defined later, used by the resident shading
- * path for a dispatch + device->host copy in a single submission). */
-static VkCommandBuffer vk_cmd_begin(lrt_vk_engine *e);
-static int vk_cmd_end_submit(lrt_vk_engine *e, VkCommandBuffer cb);
 
 /* ------------------------------------------------------------------------- */
 /* Compute pipeline construction.                                            */
@@ -1111,12 +1158,16 @@ struct lrt_vk_shade_scene {
     vk_buffer prims;
     vk_buffer glob;
     vk_buffer out;           /* DEVICE_LOCAL: STORAGE | TRANSFER_SRC      */
-    vk_buffer staging;       /* HOST_VISIBLE: TRANSFER_DST (readback)     */
+    vk_buffer staging;       /* HOST_CACHED:  TRANSFER_DST (readback)     */
+    void     *staging_ptr;   /* persistent map of staging (no per-frame map) */
     uint32_t nprims;
     uint32_t out_pixels;     /* current output-buffer capacity, in pixels */
     VkDescriptorPool pool;
     VkDescriptorSet set;
     int bound;
+    VkCommandBuffer cmd;     /* reused across frames (implicit reset on begin) */
+    VkFence fence;           /* reused across frames (reset each submit)       */
+    int have_cmd;
 };
 
 lrt_vk_shade_scene *lrt_vk_shade_scene_build(lrt_vk_engine *e,
@@ -1149,6 +1200,26 @@ lrt_vk_shade_scene *lrt_vk_shade_scene_build(lrt_vk_engine *e,
         if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
         return NULL;
     }
+
+    /* Persistent command buffer + fence, reused every frame. */
+    VkCommandBufferAllocateInfo cbai;
+    memset(&cbai, 0, sizeof(cbai));
+    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbai.commandPool = e->cmd_pool;
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    VkFenceCreateInfo fci;
+    memset(&fci, 0, sizeof(fci));
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if (vkAllocateCommandBuffers(e->device, &cbai, &s->cmd) != VK_SUCCESS ||
+        vkCreateFence(e->device, &fci, NULL, &s->fence) != VK_SUCCESS) {
+        vk_set_err(e, "command buffer / fence allocation failed");
+        lrt_vk_shade_scene_free(e, s);
+        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
+        return NULL;
+    }
+    s->have_cmd = 1;
+
     if (err) *err = LRT_RESULT_OK;
     return s;
 }
@@ -1170,11 +1241,16 @@ int lrt_vk_shade_scene_render(lrt_vk_engine *e, lrt_vk_shade_scene *s,
     uint32_t npix = desc->width * desc->height;
     size_t out_bytes = (size_t)npix * 4u * sizeof(float);
 
-    /* Grow (and rebind) the output buffers only when a larger frame appears. */
+    /* Grow (and rebind) the output buffers only when a larger frame appears.
+     * The host-visible staging buffer is mapped once and kept mapped. */
     if (npix > s->out_pixels) {
         if (s->bound) {
             vkDestroyDescriptorPool(e->device, s->pool, NULL);
             s->bound = 0;
+        }
+        if (s->staging_ptr) {
+            vkUnmapMemory(e->device, s->staging.mem);
+            s->staging_ptr = NULL;
         }
         vk_buffer_destroy(e, &s->out);
         vk_buffer_destroy(e, &s->staging);
@@ -1183,12 +1259,12 @@ int lrt_vk_shade_scene_render(lrt_vk_engine *e, lrt_vk_shade_scene *s,
                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      0, 0, &s->out) &&
-                 vk_buffer_create_ex(e, out_bytes,
-                                     VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1, 0,
-                                     &s->staging);
-        if (!ok) {
+                 vk_buffer_create_staging(e, out_bytes, &s->staging);
+        if (!ok || vkMapMemory(e->device, s->staging.mem, 0, VK_WHOLE_SIZE, 0,
+                               &s->staging_ptr) != VK_SUCCESS) {
             vk_buffer_destroy(e, &s->out);
             vk_buffer_destroy(e, &s->staging);
+            s->staging_ptr = NULL;
             s->out_pixels = 0;
             if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
             return -1;
@@ -1218,11 +1294,17 @@ int lrt_vk_shade_scene_render(lrt_vk_engine *e, lrt_vk_shade_scene *s,
     pc.spp = desc->spp ? desc->spp : 1u;
     uint32_t groups = (npix + 63u) / 64u;
 
-    /* Dispatch into the device-local output, then copy it to the host-visible
-     * staging buffer — all in one submission, with the two barriers the copy
-     * and the host read require. */
-    VkCommandBuffer cb = vk_cmd_begin(e);
-    if (cb == VK_NULL_HANDLE) {
+    /* Record into the reused command buffer (vkBeginCommandBuffer implicitly
+     * resets it; the pool has RESET_COMMAND_BUFFER_BIT): dispatch into the
+     * device-local output, then copy it to the host-cached staging buffer — one
+     * submission, with the two barriers the copy and the host read require. */
+    VkCommandBuffer cb = s->cmd;
+    VkCommandBufferBeginInfo bbi;
+    memset(&bbi, 0, sizeof(bbi));
+    bbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cb, &bbi) != VK_SUCCESS) {
+        vk_set_err(e, "vkBeginCommandBuffer(shade)");
         if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
         return -1;
     }
@@ -1250,21 +1332,34 @@ int lrt_vk_shade_scene_render(lrt_vk_engine *e, lrt_vk_shade_scene *s,
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0,
                          NULL);
-    if (!vk_cmd_end_submit(e, cb)) {
+    vkEndCommandBuffer(cb);
+
+    vkResetFences(e->device, 1, &s->fence);
+    VkSubmitInfo si;
+    memset(&si, 0, sizeof(si));
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cb;
+    if (vkQueueSubmit(e->queue, 1, &si, s->fence) != VK_SUCCESS ||
+        vkWaitForFences(e->device, 1, &s->fence, VK_TRUE, ~0ULL) != VK_SUCCESS) {
         vk_set_err(e, "shade dispatch/copy submission failed");
         if (err) *err = LRT_RESULT_TRAVERSAL_OVERFLOW;
         return -1;
     }
-    if (!vk_buffer_read(e, &s->staging, out_rgba, out_bytes)) {
-        if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
-        return -1;
-    }
+    /* Staging is HOST_COHERENT, so the host read needs no invalidate. */
+    memcpy(out_rgba, s->staging_ptr, out_bytes);
     if (err) *err = LRT_RESULT_OK;
     return 0;
 }
 
 void lrt_vk_shade_scene_free(lrt_vk_engine *e, lrt_vk_shade_scene *s) {
     if (!s) return;
+    if (e->device) vkDeviceWaitIdle(e->device);
+    if (s->have_cmd) {
+        vkFreeCommandBuffers(e->device, e->cmd_pool, 1, &s->cmd);
+        vkDestroyFence(e->device, s->fence, NULL);
+    }
+    if (s->staging_ptr) vkUnmapMemory(e->device, s->staging.mem);
     if (s->bound) vkDestroyDescriptorPool(e->device, s->pool, NULL);
     vk_buffer_destroy(e, &s->prims);
     vk_buffer_destroy(e, &s->glob);
