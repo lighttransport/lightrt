@@ -53,7 +53,7 @@ typedef struct {
     v3    F0;          /* specular reflectance at normal incidence */
     float alpha;       /* GGX roughness^2 */
     v3    sheen_color; float sheen_alpha, sheen_w;
-    float coat_alpha, coat_w, coat_f0;
+    v3    coat_color; float coat_alpha, coat_w, coat_f0;
     float glass_w, ior;
     /* normalized lobe selection probabilities (glass is delta) */
     float pd, ps, pc, pg;
@@ -80,6 +80,7 @@ static Layers extract(const OpenPBRParams *p) {
     L.sheen_alpha = clampf(p->sheen_roughness, 0.05f, 1.0f);
 
     L.coat_w = clampf(p->coat_weight, 0.0f, 1.0f);
+    L.coat_color = p->coat_color;
     L.coat_alpha = clampf(p->coat_roughness, 0.02f, 1.0f); L.coat_alpha *= L.coat_alpha;
     float c = (p->coat_ior - 1.0f) / (p->coat_ior + 1.0f);
     L.coat_f0 = c * c;
@@ -104,19 +105,24 @@ static v3 eval_reflection(const Layers *L, v3 N, v3 wo, v3 wi, float *pdf) {
     v3 H = v3_normalize(v3_add(wo, wi));
     float NdotH = v3_dot(N, H), VdotH = v3_dot(wo, H);
 
-    /* coat attenuates the layers beneath it */
+    /* The coat attenuates the layers beneath it by its Fresnel reflectance and
+     * tints their throughput by coat_color (a clear-coat acts as a colored
+     * filter on everything below; the tint scales with the coat weight). This
+     * colored attenuation is what gives e.g. standard_surface copper its orange
+     * cast -- the copper color lives in coat_color, not base_color. */
     float coat_fr = L->coat_w * fresnel_schlick_s(NdotV, L->coat_f0);
-    float base_atten = 1.0f - coat_fr;
+    v3 base_atten = v3_scale(v3_lerp(v3_splat(1.0f), L->coat_color, L->coat_w),
+                             1.0f - coat_fr);
 
-    v3 diff = v3_scale(L->diff_color, MTLX_INV_PI * base_atten);
+    v3 diff = v3_mul(L->diff_color, v3_scale(base_atten, MTLX_INV_PI));
 
     float D = ggx_D(NdotH, L->alpha), G = ggx_G(NdotV, NdotL, L->alpha);
     v3 F = fresnel_schlick(VdotH, L->F0);
-    v3 spec = v3_scale(F, D * G / (4.0f * NdotV * NdotL) * base_atten);
+    v3 spec = v3_mul(v3_scale(F, D * G / (4.0f * NdotV * NdotL)), base_atten);
 
     v3 sheen = v3_splat(0.0f);
     if (L->sheen_w > 0.0f)
-        sheen = v3_scale(L->sheen_color, L->sheen_w * charlie_D(NdotH, L->sheen_alpha) * sheen_V(NdotV, NdotL) * base_atten);
+        sheen = v3_mul(v3_scale(L->sheen_color, L->sheen_w * charlie_D(NdotH, L->sheen_alpha) * sheen_V(NdotV, NdotL)), base_atten);
 
     v3 coat = v3_splat(0.0f);
     if (L->coat_w > 0.0f) {

@@ -42,6 +42,7 @@ MATERIALS=(
     "ss_plastic|$EXAMPLES/StandardSurface/standard_surface_plastic.mtlx|match"
     "ss_chrome|$EXAMPLES/StandardSurface/standard_surface_chrome.mtlx|match"
     "ss_jade|$EXAMPLES/StandardSurface/standard_surface_jade.mtlx|match"
+    "ss_marble|$EXAMPLES/StandardSurface/standard_surface_marble_solid.mtlx|match"
     "opbr_default|$EXAMPLES/OpenPbr/open_pbr_default.mtlx|match"
     "opbr_carpaint|$EXAMPLES/OpenPbr/open_pbr_carpaint.mtlx|match"
     "ss_glass|$EXAMPLES/StandardSurface/standard_surface_glass.mtlx|divergent"

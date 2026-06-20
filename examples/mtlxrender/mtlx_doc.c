@@ -104,6 +104,7 @@ static void node_add_input(MtlxNode *n, const XmlNode *x) {
     const char *nodename = xml_attr(x, "nodename");
     const char *nodegraph = xml_attr(x, "nodegraph");
     const char *output = xml_attr(x, "output");
+    const char *interfacename = xml_attr(x, "interfacename");
     if (nodename) {
         const char *o = output ? output : "";
         size_t L = strlen(nodename) + strlen(o) + 4;
@@ -114,6 +115,12 @@ static void node_add_input(MtlxNode *n, const XmlNode *x) {
         size_t L = strlen(nodegraph) + strlen(o) + 4;
         in->src_output = malloc(L);
         snprintf(in->src_output, L, "G:%s|%s", nodegraph, o);
+    } else if (interfacename) {
+        /* references an interface input of the owning nodegraph; resolved in
+         * pass B against the synthetic "input"-category node for that name. */
+        size_t L = strlen(interfacename) + 3;
+        in->src_output = malloc(L);
+        snprintf(in->src_output, L, "I:%s", interfacename);
     }
     n->ninput++;
 }
@@ -179,6 +186,12 @@ static MtlxDoc *mtlx_build(XmlNode *root) {
                     const char *sub = xml_attr(c, "output");
                     b.outs[b.nout].sub = sub ? strdup(sub) : NULL;
                     b.nout++;
+                } else if (!strcmp(c->tag, "input")) {
+                    /* nodegraph interface input: a node of category "input"
+                     * whose self-input carries the interface's value (or an
+                     * upstream connection). Referenced via interfacename. */
+                    int nid = add_node(&b, "input", xml_attr(c, "name"), parse_type(xml_attr(c, "type")), gid);
+                    node_add_input(&b.d.nodes[nid], c);
                 } else {
                     int nid = add_node(&b, c->tag, xml_attr(c, "name"), parse_type(xml_attr(c, "type")), gid);
                     for (int k = 0; k < c->nchild; k++)
@@ -242,6 +255,12 @@ static MtlxDoc *mtlx_build(XmlNode *root) {
                 char *subdup = sub ? strdup(sub) : NULL;
                 free(in->src_output);
                 in->src_output = subdup;
+            } else if (enc[0] == 'I' && enc[1] == ':') {
+                /* interface input: bind to the owning graph's "input" node. */
+                int nid = mtlx_find_node(&b.d, n->graph_id, enc + 2);
+                in->src_node = nid;
+                free(in->src_output);
+                in->src_output = NULL;
             } else if (enc[0] == 'G' && enc[1] == ':') {
                 char *bar = strchr(enc + 2, '|');
                 char *sub = NULL;

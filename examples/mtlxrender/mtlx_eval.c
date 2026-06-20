@@ -92,33 +92,72 @@ static v3 hsv_to_rgb(v3 c) {
     }
 }
 
-/* ---- value noise (hash-based gradient-ish) ----------------------------- */
-static float hash3(int x, int y, int z) {
-    uint32_t h = (uint32_t)x * 374761393u + (uint32_t)y * 668265263u + (uint32_t)z * 1274126177u;
-    h = (h ^ (h >> 13)) * 1274126177u;
-    h = h ^ (h >> 16);
-    return (h & 0xFFFFFF) / 16777215.0f; /* [0,1] */
+/* ---- MaterialX-compatible gradient (Perlin) noise ----------------------------
+ * Ported bit-for-bit from MaterialX libraries/stdlib/genglsl/lib/mx_noise.glsl
+ * (itself the OSL oslnoise): Bob Jenkins lookup3 hash + 3D gradient noise with
+ * the 0.9820 normalization. Producing the same values as the reference renderers
+ * is what makes procedural materials (e.g. standard_surface_marble_solid) match. */
+static uint32_t mx_rotl32(uint32_t x, int k) { return (x << k) | (x >> (32 - k)); }
+static uint32_t mx_bjfinal(uint32_t a, uint32_t b, uint32_t c) {
+    c ^= b; c -= mx_rotl32(b, 14);
+    a ^= c; a -= mx_rotl32(c, 11);
+    b ^= a; b -= mx_rotl32(a, 25);
+    c ^= b; c -= mx_rotl32(b, 16);
+    a ^= c; a -= mx_rotl32(c, 4);
+    b ^= a; b -= mx_rotl32(a, 14);
+    c ^= b; c -= mx_rotl32(b, 24);
+    return c;
 }
-static float smooth5(float t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+static uint32_t mx_hash_int3(int x, int y, int z) {
+    uint32_t a, b, c;
+    a = b = c = 0xdeadbeefu + (3u << 2u) + 13u;
+    a += (uint32_t)x; b += (uint32_t)y; c += (uint32_t)z;
+    return mx_bjfinal(a, b, c);
+}
+/* dot product of (x,y,z) with one of 16 edge-of-cube gradient vectors */
+static float mx_gradient(uint32_t hash, float x, float y, float z) {
+    uint32_t h = hash & 15u;
+    float u = (h < 8u) ? x : y;
+    float v = (h < 4u) ? y : (((h == 12u) || (h == 14u)) ? x : z);
+    float r = (h & 1u) ? -u : u;
+    r += (h & 2u) ? -v : v;
+    return r;
+}
+static float mx_fade(float t) { return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f); }
+static int mx_floorfrac(float x, float *f) { int i = (int)floorf(x); *f = x - (float)i; return i; }
+static float mx_trilerp(float v0, float v1, float v2, float v3, float v4, float v5,
+                        float v6, float v7, float s, float t, float r) {
+    float s1 = 1.0f - s, t1 = 1.0f - t, r1 = 1.0f - r;
+    return r1 * (t1 * (v0 * s1 + v1 * s) + t * (v2 * s1 + v3 * s)) +
+           r  * (t1 * (v4 * s1 + v5 * s) + t * (v6 * s1 + v7 * s));
+}
+/* mx_perlin_noise_float(vec3): result in ~[-1,1] */
 static float vnoise(v3 p) {
-    int xi = (int)floorf(p.x), yi = (int)floorf(p.y), zi = (int)floorf(p.z);
-    float fx = smooth5(p.x - xi), fy = smooth5(p.y - yi), fz = smooth5(p.z - zi);
-    float c[8];
-    for (int dz = 0; dz < 2; dz++)
-        for (int dy = 0; dy < 2; dy++)
-            for (int dx = 0; dx < 2; dx++)
-                c[dz * 4 + dy * 2 + dx] = hash3(xi + dx, yi + dy, zi + dz);
-    float x00 = c[0] + fx * (c[1] - c[0]), x10 = c[2] + fx * (c[3] - c[2]);
-    float x01 = c[4] + fx * (c[5] - c[4]), x11 = c[6] + fx * (c[7] - c[6]);
-    float y0 = x00 + fy * (x10 - x00), y1 = x01 + fy * (x11 - x01);
-    return (y0 + fz * (y1 - y0)) * 2.0f - 1.0f; /* [-1,1] */
+    float fx, fy, fz;
+    int X = mx_floorfrac(p.x, &fx), Y = mx_floorfrac(p.y, &fy), Z = mx_floorfrac(p.z, &fz);
+    float u = mx_fade(fx), v = mx_fade(fy), w = mx_fade(fz);
+    float res = mx_trilerp(
+        mx_gradient(mx_hash_int3(X,     Y,     Z    ), fx,        fy,        fz       ),
+        mx_gradient(mx_hash_int3(X + 1, Y,     Z    ), fx - 1.0f, fy,        fz       ),
+        mx_gradient(mx_hash_int3(X,     Y + 1, Z    ), fx,        fy - 1.0f, fz       ),
+        mx_gradient(mx_hash_int3(X + 1, Y + 1, Z    ), fx - 1.0f, fy - 1.0f, fz       ),
+        mx_gradient(mx_hash_int3(X,     Y,     Z + 1), fx,        fy,        fz - 1.0f),
+        mx_gradient(mx_hash_int3(X + 1, Y,     Z + 1), fx - 1.0f, fy,        fz - 1.0f),
+        mx_gradient(mx_hash_int3(X,     Y + 1, Z + 1), fx,        fy - 1.0f, fz - 1.0f),
+        mx_gradient(mx_hash_int3(X + 1, Y + 1, Z + 1), fx - 1.0f, fy - 1.0f, fz - 1.0f),
+        u, v, w);
+    return 0.9820f * res;
 }
 static float fractal(v3 p, int octaves, float lacunarity, float diminish) {
     float sum = 0, amp = 1;
-    for (int o = 0; o < octaves; o++) { sum += vnoise(p) * amp; p = v3_scale(p, lacunarity); amp *= diminish; }
+    for (int o = 0; o < octaves; o++) { sum += amp * vnoise(p); amp *= diminish; p = v3_scale(p, lacunarity); }
     return sum;
 }
-static float cellnoise(v3 p) { return hash3((int)floorf(p.x), (int)floorf(p.y), (int)floorf(p.z)); }
+/* mx_cell_noise_float: hash of the integer lattice cell, mapped to [0,1] */
+static float cellnoise(v3 p) {
+    uint32_t h = mx_hash_int3((int)floorf(p.x), (int)floorf(p.y), (int)floorf(p.z));
+    return (float)h / (float)0xffffffffu;
+}
 
 /* ---- node dispatch ---------------------------------------------------- */
 typedef enum {
@@ -293,6 +332,13 @@ static MtlxValue eval_node(ShadeContext *ctx, int node_id) {
 
     const MtlxNode *n = &ctx->doc->nodes[node_id];
     MtlxValue a, b, r = mv_zero(n->type);
+    /* nodegraph interface input (category "input"): forward its single
+     * self-input (a literal value or an upstream connection). */
+    if (!strcmp(n->category, "input")) {
+        r = (n->ninput > 0) ? eval_input(ctx, &n->inputs[0]) : mv_zero(n->type);
+        ctx->memo[node_id] = r;
+        return r;
+    }
     switch (classify(n->category)) {
         case OP_IMAGE: r = eval_image(ctx, n); break;
         case OP_NORMALMAP: r = eval_normalmap(ctx, n); break;
