@@ -1,6 +1,7 @@
 build/
 cmbuild/
 mtlxrender
+node_truth
 *.o
 *.exr
 *.png
