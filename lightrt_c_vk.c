@@ -1629,9 +1629,20 @@ struct lrt_vk_rtx_scene {
     uint32_t cap;         /* trace-buffer capacity in rays       */
 };
 
-lrt_vk_rtx_scene *lrt_vk_rtx_scene_build(lrt_vk_engine *e, const float *vertices,
-                                         uint32_t ntris, lrt_result *err) {
-    if (!e || !vertices || ntris == 0) {
+/* Shared BLAS+TLAS build behind the soup and indexed entry points. When
+ * `indices` is NULL the BLAS is built from a de-indexed triangle soup
+ * (`vertices` = 9*ntris floats, nverts == 3*ntris, no index buffer). When
+ * `indices` is non-NULL the BLAS uses a real VK_INDEX_TYPE_UINT32 index buffer
+ * (`vertices` = 3*nverts floats of unique positions, `indices` = 3*ntris vertex
+ * ids), so callers with shared vertices need not de-index. Either way the
+ * primitiveIndex is the triangle build order, so lrt_hit.prim_id stays
+ * 0..ntris-1. */
+static lrt_vk_rtx_scene *rtx_scene_build_core(lrt_vk_engine *e,
+                                              const float *vertices,
+                                              uint32_t nverts,
+                                              const uint32_t *indices,
+                                              uint32_t ntris, lrt_result *err) {
+    if (!e || !vertices || ntris == 0 || nverts == 0) {
         if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
         return NULL;
     }
@@ -1652,20 +1663,34 @@ lrt_vk_rtx_scene *lrt_vk_rtx_scene_build(lrt_vk_engine *e, const float *vertices
         return NULL;
     }
 
-    /* The vertex/instance build inputs are only needed during the build — once
-     * vkCmdBuildAccelerationStructures completes, the AS is self-contained, so
-     * they are freed here and the resident scene holds only the BLAS + TLAS. */
-    vk_buffer vbuf = {0}, ibuf = {0};
+    /* The vertex/index/instance build inputs are only needed during the build —
+     * once vkCmdBuildAccelerationStructures completes, the AS is self-contained,
+     * so they are freed here and the resident scene holds only the BLAS + TLAS. */
+    vk_buffer vbuf = {0}, idxbuf = {0}, instbuf = {0};
     int ok = 0;
     do {
+        VkDeviceSize vbytes = (VkDeviceSize)nverts * 3u * sizeof(float);
         if (!vk_buffer_create_ex(
-                e, (VkDeviceSize)ntris * 9u * sizeof(float),
+                e, vbytes,
                 VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
                 1, 1, &vbuf))
             break;
-        if (!vk_buffer_write(e, &vbuf, vertices, (size_t)ntris * 9u * sizeof(float)))
+        if (!vk_buffer_write(e, &vbuf, vertices, (size_t)vbytes))
             break;
         uint64_t vaddr = vk_device_address(e, &vbuf);
+
+        uint64_t idxaddr = 0;
+        if (indices) {
+            VkDeviceSize ibytes = (VkDeviceSize)ntris * 3u * sizeof(uint32_t);
+            if (!vk_buffer_create_ex(
+                    e, ibytes,
+                    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+                    1, 1, &idxbuf))
+                break;
+            if (!vk_buffer_write(e, &idxbuf, indices, (size_t)ibytes))
+                break;
+            idxaddr = vk_device_address(e, &idxbuf);
+        }
 
         VkAccelerationStructureGeometryKHR tgeom;
         memset(&tgeom, 0, sizeof(tgeom));
@@ -1677,8 +1702,13 @@ lrt_vk_rtx_scene *lrt_vk_rtx_scene_build(lrt_vk_engine *e, const float *vertices
         tgeom.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
         tgeom.geometry.triangles.vertexData.deviceAddress = vaddr;
         tgeom.geometry.triangles.vertexStride = 3u * sizeof(float);
-        tgeom.geometry.triangles.maxVertex = ntris * 3u - 1u;
-        tgeom.geometry.triangles.indexType = VK_INDEX_TYPE_NONE_KHR;
+        tgeom.geometry.triangles.maxVertex = nverts - 1u;
+        if (indices) {
+            tgeom.geometry.triangles.indexType = VK_INDEX_TYPE_UINT32;
+            tgeom.geometry.triangles.indexData.deviceAddress = idxaddr;
+        } else {
+            tgeom.geometry.triangles.indexType = VK_INDEX_TYPE_NONE_KHR;
+        }
         if (!vk_build_accel(e, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
                             &tgeom, ntris, &s->blas))
             break;
@@ -1693,10 +1723,10 @@ lrt_vk_rtx_scene *lrt_vk_rtx_scene_build(lrt_vk_engine *e, const float *vertices
         if (!vk_buffer_create_ex(
                 e, sizeof(inst),
                 VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
-                1, 1, &ibuf))
+                1, 1, &instbuf))
             break;
-        if (!vk_buffer_write(e, &ibuf, &inst, sizeof(inst))) break;
-        uint64_t iaddr = vk_device_address(e, &ibuf);
+        if (!vk_buffer_write(e, &instbuf, &inst, sizeof(inst))) break;
+        uint64_t iaddr = vk_device_address(e, &instbuf);
 
         VkAccelerationStructureGeometryKHR igeom;
         memset(&igeom, 0, sizeof(igeom));
@@ -1714,7 +1744,8 @@ lrt_vk_rtx_scene *lrt_vk_rtx_scene_build(lrt_vk_engine *e, const float *vertices
     } while (0);
 
     vk_buffer_destroy(e, &vbuf);
-    vk_buffer_destroy(e, &ibuf);
+    vk_buffer_destroy(e, &idxbuf);
+    vk_buffer_destroy(e, &instbuf);
     if (!ok) {
         vk_accel_destroy(e, &s->tlas);
         vk_accel_destroy(e, &s->blas);
@@ -1724,6 +1755,24 @@ lrt_vk_rtx_scene *lrt_vk_rtx_scene_build(lrt_vk_engine *e, const float *vertices
     }
     if (err) *err = LRT_RESULT_OK;
     return s;
+}
+
+lrt_vk_rtx_scene *lrt_vk_rtx_scene_build(lrt_vk_engine *e, const float *vertices,
+                                         uint32_t ntris, lrt_result *err) {
+    return rtx_scene_build_core(e, vertices, ntris * 3u, NULL, ntris, err);
+}
+
+lrt_vk_rtx_scene *lrt_vk_rtx_scene_build_indexed(lrt_vk_engine *e,
+                                                 const float *vertices,
+                                                 uint32_t nverts,
+                                                 const uint32_t *indices,
+                                                 uint32_t ntris,
+                                                 lrt_result *err) {
+    if (!indices) {
+        if (err) *err = LRT_RESULT_INVALID_ARGUMENT;
+        return NULL;
+    }
+    return rtx_scene_build_core(e, vertices, nverts, indices, ntris, err);
 }
 
 /* Grow the device-local + staging trace buffers to hold at least n rays. */
@@ -1851,11 +1900,29 @@ void lrt_vk_rtx_scene_free(lrt_vk_engine *e, lrt_vk_rtx_scene *s) {
     free(s);
 }
 
-/* One-shot convenience: build a resident scene, trace once, free. */
+/* One-shot convenience: build a resident scene, trace once, free. NOTE: this
+ * rebuilds the whole acceleration structure on every call — fine for a single
+ * batch, but do NOT call it once per ray/pixel in a render loop. For many
+ * batches against the same geometry, build a resident lrt_vk_rtx_scene once and
+ * call lrt_vk_rtx_scene_trace per batch. */
 int lrt_vk_trace_scene_rtx(lrt_vk_engine *e, const float *vertices, uint32_t ntris,
                            const lrt_ray *rays, uint32_t n, lrt_hit *out,
                            lrt_result *err) {
     lrt_vk_rtx_scene *s = lrt_vk_rtx_scene_build(e, vertices, ntris, err);
+    if (!s) return -1;
+    int rc = lrt_vk_rtx_scene_trace(e, s, rays, n, out, err);
+    lrt_vk_rtx_scene_free(e, s);
+    return rc;
+}
+
+/* One-shot convenience for indexed geometry (see lrt_vk_rtx_scene_build_indexed).
+ * Same per-call AS rebuild caveat as lrt_vk_trace_scene_rtx above. */
+int lrt_vk_trace_scene_rtx_indexed(lrt_vk_engine *e, const float *vertices,
+                                   uint32_t nverts, const uint32_t *indices,
+                                   uint32_t ntris, const lrt_ray *rays, uint32_t n,
+                                   lrt_hit *out, lrt_result *err) {
+    lrt_vk_rtx_scene *s =
+        lrt_vk_rtx_scene_build_indexed(e, vertices, nverts, indices, ntris, err);
     if (!s) return -1;
     int rc = lrt_vk_rtx_scene_trace(e, s, rays, n, out, err);
     lrt_vk_rtx_scene_free(e, s);

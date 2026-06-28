@@ -201,6 +201,57 @@ static void test_path_rtx(lrt_vk_engine *e, const float *v, size_t ntris,
     lrt_tri_scene_free(s);
 }
 
+/* Indexed ray-query path: feed the same soup through an explicit index buffer
+ * (identity mapping i->i, nverts == 3*ntris) and check it traces identically to
+ * the CPU reference. Exercises lrt_vk_trace_scene_rtx_indexed /
+ * lrt_vk_rtx_scene_build_indexed (the VK_INDEX_TYPE_UINT32 BLAS path). */
+static void test_path_rtx_indexed(lrt_vk_engine *e, const float *v, size_t ntris,
+                                  size_t nrays, const char *label) {
+    lrt_result err;
+    lrt_tri_build_options o;
+    memset(&o, 0, sizeof(o));
+    o.quality = LRT_TRI_BUILD_DEFAULT;
+    o.layout = LRT_TRI_LAYOUT_BVH8;
+    lrt_tri_scene *s = lrt_tri_scene_build(v, ntris, &o, &err);
+    CHECK(s != NULL, "[%s] CPU build failed", label);
+    if (!s) return;
+
+    uint32_t *idx = (uint32_t *)malloc(ntris * 3 * sizeof(uint32_t));
+    for (size_t i = 0; i < ntris * 3; i++) idx[i] = (uint32_t)i;
+
+    lrt_ray *rays = (lrt_ray *)malloc(nrays * sizeof(lrt_ray));
+    lrt_hit *gh = (lrt_hit *)malloc(nrays * sizeof(lrt_hit));
+    for (size_t i = 0; i < nrays; i++) make_random_ray(&rays[i]);
+
+    int hits = lrt_vk_trace_scene_rtx_indexed(e, v, (uint32_t)(ntris * 3), idx,
+                                              (uint32_t)ntris, rays,
+                                              (uint32_t)nrays, gh, &err);
+    CHECK(hits >= 0, "[%s] indexed ray_query trace failed: %s", label,
+          lrt_vk_engine_last_error(e));
+    if (hits < 0) {
+        free(idx);
+        free(rays);
+        free(gh);
+        lrt_tri_scene_free(s);
+        return;
+    }
+    int mism = 0;
+    for (size_t i = 0; i < nrays; i++) {
+        lrt_hit ch;
+        int ch_hit = lrt_tri_intersect1(s, &rays[i], &ch);
+        int gh_hit = gh[i].prim_id != LRT_TRI_NO_HIT;
+        if (!hit_matches(gh_hit, &gh[i], ch_hit, &ch)) mism++;
+    }
+    CHECK(mism == 0, "[%s] indexed ray_query: %d/%zu rays mismatch HW vs CPU",
+          label, mism, nrays);
+    printf("  [%s] indexed ray_query ok: %d mismatches over %zu rays (%d HW hits)\n",
+           label, mism, nrays, hits);
+    free(idx);
+    free(rays);
+    free(gh);
+    lrt_tri_scene_free(s);
+}
+
 int main(void) {
     lrt_result err;
     lrt_vk_engine_options eo;
@@ -227,6 +278,7 @@ int main(void) {
 
     if (lrt_vk_engine_caps(e) & LRT_VK_CAP_RAY_QUERY) {
         test_path_rtx(e, v, ntris, nrays, "ray_query");
+        test_path_rtx_indexed(e, v, ntris, nrays, "ray_query_indexed");
     } else {
         printf("  ray_query: SKIP (no VK_KHR_ray_query on this device)\n");
     }
