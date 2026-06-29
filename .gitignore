@@ -28,7 +28,12 @@ webgpu/softrt.wasm
 # Build directories
 build/
 build-*/
+build_*/
 cmake-build-*/
+
+# CodeQL analysis artifacts
+_codeql_build_dir/
+_codeql_detected_source_root
 
 # HIP / GPU self-test + benchmark binaries
 lightrt_c_hip_test
