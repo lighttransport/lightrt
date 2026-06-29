@@ -1140,6 +1140,57 @@ cmake --build build_cuda && ctest --test-dir build_cuda -R lightrt_c_cuda_test
 make cuda_test && ./lightrt_c_cuda_test         # Makefile path (opt-in, needs nvcc)
 ```
 
+## A64FX (ARM64 + SVE 1.0) backend for the C11 kernel
+
+`lightrt_c_tri.c` gained ARM SIMD paths alongside the x86 scalar/SSE4/AVX2 ones,
+compile-time selected like the others (`LRT_TRI_HAS_NEON` / `LRT_TRI_HAS_SVE`,
+guarded by `__ARM_NEON` / `__ARM_FEATURE_SVE`). Built for A64FX with the Fujitsu
+compiler in clang mode (the ACLE intrinsics need it): `fcc -Nclang
+-march=armv8.2-a+sve`. A64FX SVE is fixed 512-bit (16 fp32 / 8 fp64 / 64 int8
+lanes). The scalar path is always the correctness oracle; every parity constant
+(`TRI_INVD_MAX`, the relative det epsilon, deferred-tnear cull) is shared.
+
+- **NEON BVH4** (`tri_*_bvh4_neon`, 128-bit / 4 fp32): a 1:1 mirror of the SSE4
+  BVH4 path (same node slab, 4-wide Moller-Trumbore leaf, `perm[octant]`
+  far-to-near push). NEON has no movemask, so a hit mask is `vandq` with
+  `{1,2,4,8}` + `vaddvq`; any-hit uses `vmaxvq`. `kernel_name` = `bvh4/neon`.
+- **SVE BVH8** (`tri_*_bvh8_sve`, A64FX 512-bit): mirrors the AVX2 BVH8 path,
+  processing one BVH8 node/leaf per vector on the low 8 of 16 lanes
+  (`svwhilelt_b32(0,8)`; predicated-off lanes are free per-instruction). Mask
+  extraction stores tnear/tfar to `float[8]` and reuses the scalar
+  insertion-sort, byte-for-byte reproducing the AVX2 traversal order.
+  `kernel_name` = `bvh8/sve`. (BVH16 / `lrt_tri16` to fill all 16 lanes is a
+  documented follow-up.) AUTO layout stays BVH4; pass `LRT_TRI_LAYOUT_BVH8` for
+  the SVE path.
+- **fp64 high-precision (HPC visualization)**: `lrt_tri_intersect1_hp(scene,
+  lrt_ray_hp*, lrt_hit_hp*)` traverses the same fp32 BVH but runs the leaf
+  Moller-Trumbore in double precision — SVE 8-wide fp64 (`svdot`-free
+  `svfloat64`, `svwhilelt_b64`) on A64FX, scalar double elsewhere — so t/u/v keep
+  fp64 resolution along an fp64 ray. The generic fp64 **custom-geometry** path
+  (`lightrt_c.c`, `lrt_scene_*`) additionally gained a NEON node slab
+  (`LRT_HAVE_NEON`); its fp64 leaf is the user callback.
+- **int8/int16 SDOT quantized leaf (experimental, research)**: A64FX is SVE 1.0
+  (no SVE2 `svmullb`; widening is `sunpklo`+`svmul`). `svdot_s32` (int8, 16
+  tris/instr) and `svdot_s64` (int16, 8 tris/instr) were benchmarked for the
+  ray-triangle leaf in `benchmark_c/bench_a64fx_sdot.c`. **Honest verdict
+  (measured on A64FX): neither beats 16-wide fp32 SVE** — int8 ~1.03x, int16
+  ~0.78x, ~3% mean accuracy loss — because fp32 SVE is already 16-wide and SDOT
+  only folds a 3-element dot into one op while the per-lane dequantize erodes it.
+  This matches the project's HIP WMMA finding; the fp32 SVE BVH8 path is the one
+  to use. `LRT_TRI_FORCE_SCALAR` disables all SIMD for the speedup baseline.
+
+### Build / test / benchmark (A64FX)
+```bash
+make c_tri_test CC=fcc && ./lightrt_c_tri_test   # correctness vs scalar oracle
+bash benchmark_c/scripts/build_a64fx.sh          # bench_c, bench_c_scalar, bench_sdot
+bash benchmark_c/scripts/run_a64fx.sh            # scalar vs NEON/SVE + verify + SDOT
+```
+Measured (1 A64FX core, mandelbulb 88k tris, vs the same kernel built scalar):
+NEON BVH4 ~1.95x primary; SVE BVH8 ~2.33x primary / ~2.2-2.3x incoherent+shadow;
+all hits verify 100% against the fp64 oracle. CMake also gained an aarch64
+`-march=armv8.2-a+sve` branch (top-level + `benchmark_c`); for fcc under CMake
+pass `-DCMAKE_C_FLAGS=-Nclang`.
+
 ## Code Conventions
 
 - C++17, no RTTI (`-fno-rtti`), no exceptions (`-fno-exceptions`)

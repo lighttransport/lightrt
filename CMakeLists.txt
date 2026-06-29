@@ -160,7 +160,24 @@ add_library(lightrt STATIC
 # it silently builds scalar kernels (lrt_tri_kernel_name() reports which).
 include(CheckCCompilerFlag)
 set(LIGHTRT_C_TRI_SIMD_FLAGS "")
-if(NOT MSVC)
+if(MSVC)
+    # MSVC: no extra C flags needed here.
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    # ARM64: NEON (BVH4) is baseline; +sve enables the A64FX SVE BVH8 path.
+    # Fujitsu fcc additionally needs -Nclang (clang mode) for the ACLE
+    # intrinsics; pass it via -DCMAKE_C_FLAGS=-Nclang (or use
+    # benchmark_c/scripts/build_a64fx.sh). check_c_compiler_flag verifies the
+    # active compiler accepts the flag, so this stays correct for gcc/clang too.
+    check_c_compiler_flag("-march=armv8.2-a+sve" C_COMPILER_SUPPORTS_SVE)
+    if(C_COMPILER_SUPPORTS_SVE AND NOT LIGHTRT_NO_SVE)
+        list(APPEND LIGHTRT_C_TRI_SIMD_FLAGS -march=armv8.2-a+sve)
+    else()
+        check_c_compiler_flag("-march=armv8-a" C_COMPILER_SUPPORTS_ARMV8)
+        if(C_COMPILER_SUPPORTS_ARMV8)
+            list(APPEND LIGHTRT_C_TRI_SIMD_FLAGS -march=armv8-a)
+        endif()
+    endif()
+else()
     check_c_compiler_flag("-msse4.1" C_COMPILER_SUPPORTS_SSE41)
     if(C_COMPILER_SUPPORTS_SSE41)
         list(APPEND LIGHTRT_C_TRI_SIMD_FLAGS -msse4.1)

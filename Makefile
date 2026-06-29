@@ -36,11 +36,25 @@ ifeq ($(ARCH),x86_64)
 endif
 
 ifeq ($(ARCH),aarch64)
-    # ARM64: Enable NEON (typically available by default)
-    CXXFLAGS += -march=armv8-a
-    # Optional: Enable SVE
-    ifneq ($(NO_SVE),1)
-        CXXFLAGS += -march=armv8-a+sve
+    # ARM64. Detect the Fujitsu compiler (A64FX); fcc/FCC need -Nclang (clang
+    # mode) for the ACLE <arm_sve.h>/<arm_neon.h> intrinsics the C kernel uses.
+    IS_FCC := $(findstring fcc,$(CC))$(findstring FCC,$(CC))$(findstring fccpx,$(CC))
+    ifeq ($(IS_FCC),)
+        # GCC / LLVM clang.
+        CXXFLAGS += -march=armv8-a
+        C_SIMD = -march=armv8.2-a
+        ifneq ($(NO_SVE),1)
+            CXXFLAGS += -march=armv8-a+sve
+            C_SIMD := -march=armv8.2-a+sve
+        endif
+    else
+        # Fujitsu fcc/FCC (A64FX), clang mode for ACLE intrinsics.
+        CFLAGS += -Nclang
+        CXXFLAGS += -Nclang
+        C_SIMD = -march=armv8.2-a
+        ifneq ($(NO_SVE),1)
+            C_SIMD := -march=armv8.2-a+sve
+        endif
     endif
 endif
 
@@ -104,7 +118,7 @@ $(OBJ_BENCH_TARGET): $(OBJ_BENCH_OBJECTS) $(TARGET_LIB)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 %.o: %.c lightrt_c.h
-	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -c $< -o $@
 
 benchmark/%.o: benchmark/%.cc lightrt.hh
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
@@ -131,6 +145,13 @@ info:
 	@echo "LDFLAGS: $(LDFLAGS)"
 
 obj_bench: $(OBJ_BENCH_TARGET)
+
+# ---- C11 fp32 triangle kernel self-test (scalar + SSE4/AVX2 on x86,
+#      NEON/SVE on aarch64). On A64FX: make c_tri_test CC=fcc && ./lightrt_c_tri_test
+C_TRI_TEST_SRC = tests/test_lightrt_c_tri.c lightrt_c_tri.c
+c_tri_test: $(C_TRI_TEST_SRC)
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -o lightrt_c_tri_test $^ -lm -lpthread
+	@echo "Built lightrt_c_tri_test (run: ./lightrt_c_tri_test)"
 
 # ---- Vulkan GPU interop (opt-in; runtime dlopen of libvulkan, no SDK, no -lvulkan) ----
 # Build + run the GPU-interop self-test:  make vk_test && ./lightrt_c_vk_test

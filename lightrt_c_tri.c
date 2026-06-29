@@ -61,6 +61,42 @@
 #include <immintrin.h>
 #endif
 
+/* ARM A64FX: NEON (128-bit, BVH4) mirrors the SSE4 path; SVE (A64FX = 512-bit,
+ * BVH8) mirrors the AVX2 path. Compile-time only, like SSE4/AVX2; the scalar
+ * fallback stays available. Build with fcc -Nclang -march=armv8.2-a+sve (the
+ * ACLE intrinsics need clang mode).
+ *
+ * Define LRT_TRI_FORCE_SCALAR to disable every SIMD path (scalar-only) — used
+ * to measure the NEON/SVE speedup against the same build's scalar kernel. */
+#ifdef LRT_TRI_FORCE_SCALAR
+#undef LRT_TRI_HAS_AVX2
+#undef LRT_TRI_HAS_SSE4
+#define LRT_TRI_HAS_AVX2 0
+#define LRT_TRI_HAS_SSE4 0
+#define LRT_TRI_HAS_NEON 0
+#define LRT_TRI_HAS_SVE 0
+#else
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#define LRT_TRI_HAS_NEON 1
+#include <arm_neon.h>
+#else
+#define LRT_TRI_HAS_NEON 0
+#endif
+#if defined(__ARM_FEATURE_SVE)
+#define LRT_TRI_HAS_SVE 1
+#include <arm_sve.h>
+#else
+#define LRT_TRI_HAS_SVE 0
+#endif
+#endif /* LRT_TRI_FORCE_SCALAR */
+
+/* Portable T0 prefetch (x86 _mm_prefetch vs the GCC/clang builtin on ARM). */
+#if LRT_TRI_HAS_SSE4
+#define TRI_PREFETCH_T0(p) _mm_prefetch((const char *)(p), _MM_HINT_T0)
+#else
+#define TRI_PREFETCH_T0(p) __builtin_prefetch((const void *)(p), 0, 3)
+#endif
+
 /* ------------------------------------------------------------------------- */
 /* Tunables.                                                                 */
 /* ------------------------------------------------------------------------- */
@@ -3027,7 +3063,7 @@ typedef struct tri_stack_entry {
     float tnear;
 } tri_stack_entry;
 
-#if LRT_TRI_HAS_SSE4
+#if LRT_TRI_HAS_SSE4 || LRT_TRI_HAS_NEON || LRT_TRI_HAS_SVE
 /* Prefetch the data a child ref will touch when popped: the bounds planes of
  * an inner node (2 lines for BVH4, 3 for BVH8), or the first triangle block
  * of a leaf. Incoherent rays make these fetches the critical path. */
@@ -3037,29 +3073,29 @@ static inline void tri_prefetch_ref(const lrt_tri_scene *s, uint32_t ref,
     if (TRI_REF_IS_LEAF(ref)) {
         const char *b = (const char *)tri_block_ptr(
             s->blocks, TRI_REF_BLOCK(ref), s->block_stride);
-        _mm_prefetch(b, _MM_HINT_T0);
-        _mm_prefetch(b + 64, _MM_HINT_T0);
+        TRI_PREFETCH_T0(b);
+        TRI_PREFETCH_T0(b + 64);
         return;
     }
     if (s->qnode == 2) {
         const char *p = (const char *)&s->nodes8q4[TRI_REF_NODE(ref)];
-        _mm_prefetch(p, _MM_HINT_T0);
-        _mm_prefetch(p + 64, _MM_HINT_T0);
+        TRI_PREFETCH_T0(p);
+        TRI_PREFETCH_T0(p + 64);
         return;
     }
     if (s->quantized) {
         const char *p = (const char *)&s->nodes8q[TRI_REF_NODE(ref)];
-        _mm_prefetch(p, _MM_HINT_T0);
-        _mm_prefetch(p + 64, _MM_HINT_T0);
+        TRI_PREFETCH_T0(p);
+        TRI_PREFETCH_T0(p + 64);
         return;
     }
     const char *p = (width == 4) ? (const char *)&s->nodes4[TRI_REF_NODE(ref)]
                                  : (const char *)&s->nodes8[TRI_REF_NODE(ref)];
-    _mm_prefetch(p, _MM_HINT_T0);
-    _mm_prefetch(p + 64, _MM_HINT_T0);
+    TRI_PREFETCH_T0(p);
+    TRI_PREFETCH_T0(p + 64);
     if (width == 8) {
-        _mm_prefetch(p + 128, _MM_HINT_T0);
-        _mm_prefetch(p + 192, _MM_HINT_T0); /* child refs */
+        TRI_PREFETCH_T0(p + 128);
+        TRI_PREFETCH_T0(p + 192); /* child refs */
     }
 }
 #endif
@@ -8373,6 +8409,813 @@ static void tri_occluded1N_bvh8_avx2(const lrt_tri_scene *s,
 
 #endif /* LRT_TRI_HAS_AVX2 */
 
+/* ========================================================================= */
+/* ARM NEON BVH4 (128-bit, 4 fp32 lanes). A 1:1 mirror of the SSE4 path:     */
+/* same node slab, same 4-wide Moller-Trumbore leaf, same scalar-driven      */
+/* stack + perm[octant] far-to-near push. The one structural difference is   */
+/* NEON has no movemask, so a hit mask is built by ANDing the compare result */
+/* with {1,2,4,8} and horizontally adding (vaddvq); any-hit uses vmaxvq.     */
+/* Slab uses (bound-org)*invd to match tri_slab_scalar's rounding.           */
+/* ========================================================================= */
+#if LRT_TRI_HAS_NEON && !LRT_TRI_HAS_SSE4
+
+typedef struct tri_neon_ctx {
+    float32x4_t orgx, orgy, orgz;
+    float32x4_t invdx, invdy, invdz;
+    float32x4_t dirx, diry, dirz;
+    float32x4_t tmin;
+} tri_neon_ctx;
+
+static inline void tri_neon_setup(const tri_ray_ctx *rc, tri_neon_ctx *nc) {
+    nc->orgx = vdupq_n_f32(rc->org[0]);
+    nc->orgy = vdupq_n_f32(rc->org[1]);
+    nc->orgz = vdupq_n_f32(rc->org[2]);
+    nc->invdx = vdupq_n_f32(rc->invd[0]);
+    nc->invdy = vdupq_n_f32(rc->invd[1]);
+    nc->invdz = vdupq_n_f32(rc->invd[2]);
+    nc->dirx = vdupq_n_f32(rc->dir[0]);
+    nc->diry = vdupq_n_f32(rc->dir[1]);
+    nc->dirz = vdupq_n_f32(rc->dir[2]);
+    nc->tmin = vdupq_n_f32(rc->tmin);
+}
+
+/* 4-bit movemask emulation: sign/all-ones lanes -> bit i. */
+static inline int tri_neon_movemask(uint32x4_t c) {
+    static const uint32_t lane_bits[4] = {1u, 2u, 4u, 8u};
+    return (int)vaddvq_u32(vandq_u32(c, vld1q_u32(lane_bits)));
+}
+static inline int tri_neon_any(uint32x4_t c) { return vmaxvq_u32(c) != 0u; }
+
+/* Relative parallel-det cull, mirror of tri_isect_det_parallel4. */
+static inline uint32x4_t tri_det_parallel_neon(float32x4_t e1x, float32x4_t e1y,
+                                               float32x4_t e1z, float32x4_t e2x,
+                                               float32x4_t e2y, float32x4_t e2z,
+                                               float32x4_t det) {
+    float32x4_t e1l2 = vaddq_f32(vaddq_f32(vmulq_f32(e1x, e1x), vmulq_f32(e1y, e1y)),
+                                 vmulq_f32(e1z, e1z));
+    float32x4_t e2l2 = vaddq_f32(vaddq_f32(vmulq_f32(e2x, e2x), vmulq_f32(e2y, e2y)),
+                                 vmulq_f32(e2z, e2z));
+    float32x4_t zero = vdupq_n_f32(0.0f);
+    float32x4_t scale = vaddq_f32(vsqrtq_f32(vmaxq_f32(e1l2, zero)),
+                                  vsqrtq_f32(vmaxq_f32(e2l2, zero)));
+    float32x4_t rel = vmulq_f32(vdupq_n_f32(TRI_ISECT_DET_EPS_SCALE),
+                                vmulq_f32(scale, scale));
+    rel = vmaxq_f32(vdupq_n_f32(TRI_ISECT_DET_EPS_MIN), rel);
+    rel = vminq_f32(vdupq_n_f32(TRI_ISECT_DET_EPS_MAX), rel);
+    return vcgtq_f32(vabsq_f32(det), rel);
+}
+
+/* One ray vs the 4 child boxes; returns hit mask, writes per-slot tnear. */
+static inline int tri_bvh4_slab_neon(const lrt_bvh4_node *n,
+                                     const tri_neon_ctx *nc, float32x4_t t_best,
+                                     float *tnear_out) {
+    float32x4_t tlx = vmulq_f32(vsubq_f32(vld1q_f32(n->lo_x), nc->orgx), nc->invdx);
+    float32x4_t thx = vmulq_f32(vsubq_f32(vld1q_f32(n->hi_x), nc->orgx), nc->invdx);
+    float32x4_t tly = vmulq_f32(vsubq_f32(vld1q_f32(n->lo_y), nc->orgy), nc->invdy);
+    float32x4_t thy = vmulq_f32(vsubq_f32(vld1q_f32(n->hi_y), nc->orgy), nc->invdy);
+    float32x4_t tlz = vmulq_f32(vsubq_f32(vld1q_f32(n->lo_z), nc->orgz), nc->invdz);
+    float32x4_t thz = vmulq_f32(vsubq_f32(vld1q_f32(n->hi_z), nc->orgz), nc->invdz);
+    float32x4_t tnear = vmaxq_f32(
+        vmaxq_f32(vminq_f32(tlx, thx), vminq_f32(tly, thy)),
+        vmaxq_f32(vminq_f32(tlz, thz), nc->tmin));
+    float32x4_t tfar = vminq_f32(
+        vminq_f32(vmaxq_f32(tlx, thx), vmaxq_f32(tly, thy)),
+        vminq_f32(vmaxq_f32(tlz, thz), t_best));
+    vst1q_f32(tnear_out, tnear);
+    return tri_neon_movemask(vcleq_f32(tnear, tfar));
+}
+
+/* 4-wide SoA Moller-Trumbore over one block. Updates best hit in place. */
+static inline void tri_block_isect_neon(const lrt_tri4 *blk,
+                                        const tri_neon_ctx *nc, float *best_t,
+                                        float *best_u, float *best_v,
+                                        uint32_t *best_prim) {
+    float32x4_t e1x = vld1q_f32(blk->e1x), e1y = vld1q_f32(blk->e1y),
+                e1z = vld1q_f32(blk->e1z);
+    float32x4_t e2x = vld1q_f32(blk->e2x), e2y = vld1q_f32(blk->e2y),
+                e2z = vld1q_f32(blk->e2z);
+    float32x4_t px = vsubq_f32(vmulq_f32(nc->diry, e2z), vmulq_f32(nc->dirz, e2y));
+    float32x4_t py = vsubq_f32(vmulq_f32(nc->dirz, e2x), vmulq_f32(nc->dirx, e2z));
+    float32x4_t pz = vsubq_f32(vmulq_f32(nc->dirx, e2y), vmulq_f32(nc->diry, e2x));
+    float32x4_t det = vaddq_f32(vaddq_f32(vmulq_f32(e1x, px), vmulq_f32(e1y, py)),
+                                vmulq_f32(e1z, pz));
+    uint32x4_t valid = tri_det_parallel_neon(e1x, e1y, e1z, e2x, e2y, e2z, det);
+    if (!tri_neon_any(valid)) return;
+
+    float32x4_t inv_det = vdivq_f32(vdupq_n_f32(1.0f), det);
+    float32x4_t tvx = vsubq_f32(nc->orgx, vld1q_f32(blk->v0x));
+    float32x4_t tvy = vsubq_f32(nc->orgy, vld1q_f32(blk->v0y));
+    float32x4_t tvz = vsubq_f32(nc->orgz, vld1q_f32(blk->v0z));
+    float32x4_t u = vmulq_f32(
+        vaddq_f32(vaddq_f32(vmulq_f32(tvx, px), vmulq_f32(tvy, py)),
+                  vmulq_f32(tvz, pz)),
+        inv_det);
+    valid = vandq_u32(valid, vcgeq_f32(u, vdupq_n_f32(0.0f)));
+    valid = vandq_u32(valid, vcleq_f32(u, vdupq_n_f32(1.0f)));
+    if (!tri_neon_any(valid)) return;
+
+    float32x4_t qx = vsubq_f32(vmulq_f32(tvy, e1z), vmulq_f32(tvz, e1y));
+    float32x4_t qy = vsubq_f32(vmulq_f32(tvz, e1x), vmulq_f32(tvx, e1z));
+    float32x4_t qz = vsubq_f32(vmulq_f32(tvx, e1y), vmulq_f32(tvy, e1x));
+    float32x4_t v = vmulq_f32(
+        vaddq_f32(vaddq_f32(vmulq_f32(nc->dirx, qx), vmulq_f32(nc->diry, qy)),
+                  vmulq_f32(nc->dirz, qz)),
+        inv_det);
+    valid = vandq_u32(valid, vcgeq_f32(v, vdupq_n_f32(0.0f)));
+    valid = vandq_u32(valid, vcleq_f32(vaddq_f32(u, v), vdupq_n_f32(1.0f)));
+    if (!tri_neon_any(valid)) return;
+
+    float32x4_t t = vmulq_f32(
+        vaddq_f32(vaddq_f32(vmulq_f32(e2x, qx), vmulq_f32(e2y, qy)),
+                  vmulq_f32(e2z, qz)),
+        inv_det);
+    valid = vandq_u32(valid, vcgeq_f32(t, nc->tmin));
+    valid = vandq_u32(valid, vcltq_f32(t, vdupq_n_f32(*best_t)));
+    int mask = tri_neon_movemask(valid);
+    if (!mask) return;
+
+    float ta[4], ua[4], va[4];
+    vst1q_f32(ta, t);
+    vst1q_f32(ua, u);
+    vst1q_f32(va, v);
+    while (mask) {
+        int lane = __builtin_ctz((unsigned)mask);
+        mask &= mask - 1;
+        if (ta[lane] < *best_t) {
+            *best_t = ta[lane];
+            *best_u = ua[lane];
+            *best_v = va[lane];
+            *best_prim = blk->prim_id[lane];
+        }
+    }
+}
+
+static inline int tri_block_occluded_neon(const lrt_tri4 *blk,
+                                          const tri_neon_ctx *nc,
+                                          float32x4_t tmax) {
+    float32x4_t e1x = vld1q_f32(blk->e1x), e1y = vld1q_f32(blk->e1y),
+                e1z = vld1q_f32(blk->e1z);
+    float32x4_t e2x = vld1q_f32(blk->e2x), e2y = vld1q_f32(blk->e2y),
+                e2z = vld1q_f32(blk->e2z);
+    float32x4_t px = vsubq_f32(vmulq_f32(nc->diry, e2z), vmulq_f32(nc->dirz, e2y));
+    float32x4_t py = vsubq_f32(vmulq_f32(nc->dirz, e2x), vmulq_f32(nc->dirx, e2z));
+    float32x4_t pz = vsubq_f32(vmulq_f32(nc->dirx, e2y), vmulq_f32(nc->diry, e2x));
+    float32x4_t det = vaddq_f32(vaddq_f32(vmulq_f32(e1x, px), vmulq_f32(e1y, py)),
+                                vmulq_f32(e1z, pz));
+    uint32x4_t valid = tri_det_parallel_neon(e1x, e1y, e1z, e2x, e2y, e2z, det);
+    if (!tri_neon_any(valid)) return 0;
+    float32x4_t inv_det = vdivq_f32(vdupq_n_f32(1.0f), det);
+    float32x4_t tvx = vsubq_f32(nc->orgx, vld1q_f32(blk->v0x));
+    float32x4_t tvy = vsubq_f32(nc->orgy, vld1q_f32(blk->v0y));
+    float32x4_t tvz = vsubq_f32(nc->orgz, vld1q_f32(blk->v0z));
+    float32x4_t u = vmulq_f32(
+        vaddq_f32(vaddq_f32(vmulq_f32(tvx, px), vmulq_f32(tvy, py)),
+                  vmulq_f32(tvz, pz)),
+        inv_det);
+    valid = vandq_u32(valid, vcgeq_f32(u, vdupq_n_f32(0.0f)));
+    valid = vandq_u32(valid, vcleq_f32(u, vdupq_n_f32(1.0f)));
+    if (!tri_neon_any(valid)) return 0;
+    float32x4_t qx = vsubq_f32(vmulq_f32(tvy, e1z), vmulq_f32(tvz, e1y));
+    float32x4_t qy = vsubq_f32(vmulq_f32(tvz, e1x), vmulq_f32(tvx, e1z));
+    float32x4_t qz = vsubq_f32(vmulq_f32(tvx, e1y), vmulq_f32(tvy, e1x));
+    float32x4_t v = vmulq_f32(
+        vaddq_f32(vaddq_f32(vmulq_f32(nc->dirx, qx), vmulq_f32(nc->diry, qy)),
+                  vmulq_f32(nc->dirz, qz)),
+        inv_det);
+    valid = vandq_u32(valid, vcgeq_f32(v, vdupq_n_f32(0.0f)));
+    valid = vandq_u32(valid, vcleq_f32(vaddq_f32(u, v), vdupq_n_f32(1.0f)));
+    if (!tri_neon_any(valid)) return 0;
+    float32x4_t t = vmulq_f32(
+        vaddq_f32(vaddq_f32(vmulq_f32(e2x, qx), vmulq_f32(e2y, qy)),
+                  vmulq_f32(e2z, qz)),
+        inv_det);
+    valid = vandq_u32(valid, vcgeq_f32(t, nc->tmin));
+    valid = vandq_u32(valid, vcleq_f32(t, tmax));
+    return tri_neon_any(valid);
+}
+
+static int tri_intersect_bvh4_neon(const lrt_tri_scene *s, const lrt_ray *ray,
+                                   lrt_hit *hit) {
+    tri_ray_ctx rc;
+    tri_ray_setup(ray, &rc);
+    tri_neon_ctx nc;
+    tri_neon_setup(&rc, &nc);
+
+    float best_t = ray->tmax;
+    float best_u = 0.0f, best_v = 0.0f;
+    uint32_t best_prim = LRT_TRI_NO_HIT;
+
+    tri_stack_entry stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp].ref = s->root;
+    stack[sp].tnear = rc.tmin;
+    sp++;
+
+    while (sp > 0) {
+        tri_stack_entry e = stack[--sp];
+        if (e.tnear >= best_t) continue;
+        if (TRI_REF_IS_LEAF(e.ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(e.ref);
+            uint32_t nblk = TRI_REF_NBLOCKS(e.ref);
+            const lrt_tri4 *blocks = (const lrt_tri4 *)s->blocks;
+            for (uint32_t b = 0; b < nblk; b++) {
+                tri_block_isect_neon(&blocks[blk0 + b], &nc, &best_t, &best_u,
+                                     &best_v, &best_prim);
+            }
+            continue;
+        }
+        const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(e.ref)];
+        _Alignas(16) float tnear[4];
+        int mask = tri_bvh4_slab_neon(n, &nc, vdupq_n_f32(best_t), tnear);
+        mask &= (1 << n->nchildren) - 1;
+        uint8_t perm = n->perm[rc.octant];
+        for (int p = 3; p >= 0; p--) {
+            int slot = (perm >> (2 * p)) & 3;
+            if (!(mask & (1 << slot))) continue;
+            tri_prefetch_ref(s, n->child[slot], 4);
+            stack[sp].ref = n->child[slot];
+            stack[sp].tnear = tnear[slot];
+            sp++;
+        }
+    }
+
+    if (hit) {
+        hit->t = best_prim != LRT_TRI_NO_HIT ? best_t : 0.0f;
+        hit->u = best_u;
+        hit->v = best_v;
+        hit->prim_id = best_prim;
+    }
+    return best_prim != LRT_TRI_NO_HIT;
+}
+
+static int tri_occluded_bvh4_neon(const lrt_tri_scene *s, const lrt_ray *ray) {
+    tri_ray_ctx rc;
+    tri_ray_setup(ray, &rc);
+    tri_neon_ctx nc;
+    tri_neon_setup(&rc, &nc);
+    float32x4_t tmax4 = vdupq_n_f32(ray->tmax);
+
+    uint32_t stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp++] = s->root;
+
+    while (sp > 0) {
+        uint32_t ref = stack[--sp];
+        if (TRI_REF_IS_LEAF(ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(ref);
+            uint32_t nblk = TRI_REF_NBLOCKS(ref);
+            const lrt_tri4 *blocks = (const lrt_tri4 *)s->blocks;
+            for (uint32_t b = 0; b < nblk; b++) {
+                if (tri_block_occluded_neon(&blocks[blk0 + b], &nc, tmax4))
+                    return 1;
+            }
+            continue;
+        }
+        const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(ref)];
+        _Alignas(16) float tnear[4];
+        int mask = tri_bvh4_slab_neon(n, &nc, tmax4, tnear);
+        mask &= (1 << n->nchildren) - 1;
+        while (mask) {
+            int i = __builtin_ctz((unsigned)mask);
+            mask &= mask - 1;
+            tri_prefetch_ref(s, n->child[i], 4);
+            stack[sp++] = n->child[i];
+        }
+    }
+    return 0;
+}
+
+#endif /* LRT_TRI_HAS_NEON && !LRT_TRI_HAS_SSE4 */
+
+/* ========================================================================= */
+/* ARM SVE BVH8 (A64FX = 512-bit). A mirror of the AVX2 BVH8 path. Each      */
+/* node/leaf uses the low 8 of 16 fp32 lanes (svwhilelt_b32(0,8)); on A64FX  */
+/* a predicated-off lane is free per-instruction, so 8-of-16 costs the same  */
+/* as a hypothetical narrow vector while keeping the existing BVH8 layout.   */
+/* SVE sizeless vector types can't be struct members, so the ray context is  */
+/* broadcast (svdup) inside each call rather than cached in a struct. The     */
+/* slab uses (bound-org)*invd to match tri_slab_scalar; the hit list is       */
+/* materialized to float[8] and the existing scalar insertion-sort drives the */
+/* nearest-first push, byte-for-byte reproducing the AVX2 traversal order.   */
+/* ========================================================================= */
+#if LRT_TRI_HAS_SVE && !LRT_TRI_HAS_SSE4
+
+#define TRI_SVE_P8() svwhilelt_b32((uint32_t)0, (uint32_t)8)
+
+/* Relative parallel-det cull (8 lanes), mirror of tri_isect_det_parallel8. */
+static inline svbool_t tri_det_parallel_sve(svbool_t pg, svfloat32_t e1x,
+                                            svfloat32_t e1y, svfloat32_t e1z,
+                                            svfloat32_t e2x, svfloat32_t e2y,
+                                            svfloat32_t e2z, svfloat32_t det) {
+    svfloat32_t e1l2 = svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e1x, e1x),
+                                                    e1y, e1y),
+                                   e1z, e1z);
+    svfloat32_t e2l2 = svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e2x, e2x),
+                                                    e2y, e2y),
+                                   e2z, e2z);
+    svfloat32_t zero = svdup_f32(0.0f);
+    svfloat32_t scale = svadd_f32_x(pg, svsqrt_f32_x(pg, svmax_f32_x(pg, e1l2, zero)),
+                                    svsqrt_f32_x(pg, svmax_f32_x(pg, e2l2, zero)));
+    svfloat32_t rel = svmul_f32_x(pg, svdup_f32(TRI_ISECT_DET_EPS_SCALE),
+                                  svmul_f32_x(pg, scale, scale));
+    rel = svmax_f32_x(pg, svdup_f32(TRI_ISECT_DET_EPS_MIN), rel);
+    rel = svmin_f32_x(pg, svdup_f32(TRI_ISECT_DET_EPS_MAX), rel);
+    return svcmpgt_f32(pg, svabs_f32_x(pg, det), rel);
+}
+
+/* 8-wide SoA Moller-Trumbore over one lrt_tri8 block. Updates best in place. */
+static inline void tri_block_isect_sve(const lrt_tri8 *blk,
+                                       const tri_ray_ctx *rc, float *best_t,
+                                       float *best_u, float *best_v,
+                                       uint32_t *best_prim) {
+    svbool_t pg = TRI_SVE_P8();
+    svfloat32_t dirx = svdup_f32(rc->dir[0]), diry = svdup_f32(rc->dir[1]),
+                dirz = svdup_f32(rc->dir[2]);
+    svfloat32_t e1x = svld1_f32(pg, blk->e1x), e1y = svld1_f32(pg, blk->e1y),
+                e1z = svld1_f32(pg, blk->e1z);
+    svfloat32_t e2x = svld1_f32(pg, blk->e2x), e2y = svld1_f32(pg, blk->e2y),
+                e2z = svld1_f32(pg, blk->e2z);
+    svfloat32_t px = svmls_f32_x(pg, svmul_f32_x(pg, diry, e2z), dirz, e2y);
+    svfloat32_t py = svmls_f32_x(pg, svmul_f32_x(pg, dirz, e2x), dirx, e2z);
+    svfloat32_t pz = svmls_f32_x(pg, svmul_f32_x(pg, dirx, e2y), diry, e2x);
+    svfloat32_t det = svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e1x, px),
+                                                  e1y, py),
+                                  e1z, pz);
+    svbool_t valid = tri_det_parallel_sve(pg, e1x, e1y, e1z, e2x, e2y, e2z, det);
+    if (!svptest_any(pg, valid)) return;
+
+    svfloat32_t inv_det = svdiv_f32_x(pg, svdup_f32(1.0f), det);
+    svfloat32_t tvx = svsub_f32_x(pg, svdup_f32(rc->org[0]), svld1_f32(pg, blk->v0x));
+    svfloat32_t tvy = svsub_f32_x(pg, svdup_f32(rc->org[1]), svld1_f32(pg, blk->v0y));
+    svfloat32_t tvz = svsub_f32_x(pg, svdup_f32(rc->org[2]), svld1_f32(pg, blk->v0z));
+    svfloat32_t u = svmul_f32_x(
+        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, tvx, px), tvy, py),
+                        tvz, pz),
+        inv_det);
+    valid = svand_b_z(pg, valid, svcmpge_f32(pg, u, svdup_f32(0.0f)));
+    valid = svand_b_z(pg, valid, svcmple_f32(pg, u, svdup_f32(1.0f)));
+    if (!svptest_any(pg, valid)) return;
+
+    svfloat32_t qx = svmls_f32_x(pg, svmul_f32_x(pg, tvy, e1z), tvz, e1y);
+    svfloat32_t qy = svmls_f32_x(pg, svmul_f32_x(pg, tvz, e1x), tvx, e1z);
+    svfloat32_t qz = svmls_f32_x(pg, svmul_f32_x(pg, tvx, e1y), tvy, e1x);
+    svfloat32_t v = svmul_f32_x(
+        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, dirx, qx), diry, qy),
+                        dirz, qz),
+        inv_det);
+    valid = svand_b_z(pg, valid, svcmpge_f32(pg, v, svdup_f32(0.0f)));
+    valid = svand_b_z(pg, valid,
+                      svcmple_f32(pg, svadd_f32_x(pg, u, v), svdup_f32(1.0f)));
+    if (!svptest_any(pg, valid)) return;
+
+    svfloat32_t t = svmul_f32_x(
+        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e2x, qx), e2y, qy),
+                        e2z, qz),
+        inv_det);
+    valid = svand_b_z(pg, valid, svcmpge_f32(pg, t, svdup_f32(rc->tmin)));
+    valid = svand_b_z(pg, valid, svcmplt_f32(pg, t, svdup_f32(*best_t)));
+    if (!svptest_any(pg, valid)) return;
+
+    /* Materialize: invalid lanes get +INF so the scalar winner loop skips
+     * them (no movemask needed). */
+    _Alignas(64) float ta[8], ua[8], va[8];
+    svst1_f32(pg, ta, svsel_f32(valid, t, svdup_f32(TRI_INF_F)));
+    svst1_f32(pg, ua, u);
+    svst1_f32(pg, va, v);
+    for (int lane = 0; lane < 8; lane++) {
+        if (ta[lane] < *best_t) {
+            *best_t = ta[lane];
+            *best_u = ua[lane];
+            *best_v = va[lane];
+            *best_prim = blk->prim_id[lane];
+        }
+    }
+}
+
+static inline int tri_block_occluded_sve(const lrt_tri8 *blk,
+                                         const tri_ray_ctx *rc, float tmax) {
+    svbool_t pg = TRI_SVE_P8();
+    svfloat32_t dirx = svdup_f32(rc->dir[0]), diry = svdup_f32(rc->dir[1]),
+                dirz = svdup_f32(rc->dir[2]);
+    svfloat32_t e1x = svld1_f32(pg, blk->e1x), e1y = svld1_f32(pg, blk->e1y),
+                e1z = svld1_f32(pg, blk->e1z);
+    svfloat32_t e2x = svld1_f32(pg, blk->e2x), e2y = svld1_f32(pg, blk->e2y),
+                e2z = svld1_f32(pg, blk->e2z);
+    svfloat32_t px = svmls_f32_x(pg, svmul_f32_x(pg, diry, e2z), dirz, e2y);
+    svfloat32_t py = svmls_f32_x(pg, svmul_f32_x(pg, dirz, e2x), dirx, e2z);
+    svfloat32_t pz = svmls_f32_x(pg, svmul_f32_x(pg, dirx, e2y), diry, e2x);
+    svfloat32_t det = svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e1x, px),
+                                                  e1y, py),
+                                  e1z, pz);
+    svbool_t valid = tri_det_parallel_sve(pg, e1x, e1y, e1z, e2x, e2y, e2z, det);
+    if (!svptest_any(pg, valid)) return 0;
+    svfloat32_t inv_det = svdiv_f32_x(pg, svdup_f32(1.0f), det);
+    svfloat32_t tvx = svsub_f32_x(pg, svdup_f32(rc->org[0]), svld1_f32(pg, blk->v0x));
+    svfloat32_t tvy = svsub_f32_x(pg, svdup_f32(rc->org[1]), svld1_f32(pg, blk->v0y));
+    svfloat32_t tvz = svsub_f32_x(pg, svdup_f32(rc->org[2]), svld1_f32(pg, blk->v0z));
+    svfloat32_t u = svmul_f32_x(
+        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, tvx, px), tvy, py),
+                        tvz, pz),
+        inv_det);
+    valid = svand_b_z(pg, valid, svcmpge_f32(pg, u, svdup_f32(0.0f)));
+    valid = svand_b_z(pg, valid, svcmple_f32(pg, u, svdup_f32(1.0f)));
+    if (!svptest_any(pg, valid)) return 0;
+    svfloat32_t qx = svmls_f32_x(pg, svmul_f32_x(pg, tvy, e1z), tvz, e1y);
+    svfloat32_t qy = svmls_f32_x(pg, svmul_f32_x(pg, tvz, e1x), tvx, e1z);
+    svfloat32_t qz = svmls_f32_x(pg, svmul_f32_x(pg, tvx, e1y), tvy, e1x);
+    svfloat32_t v = svmul_f32_x(
+        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, dirx, qx), diry, qy),
+                        dirz, qz),
+        inv_det);
+    valid = svand_b_z(pg, valid, svcmpge_f32(pg, v, svdup_f32(0.0f)));
+    valid = svand_b_z(pg, valid,
+                      svcmple_f32(pg, svadd_f32_x(pg, u, v), svdup_f32(1.0f)));
+    if (!svptest_any(pg, valid)) return 0;
+    svfloat32_t t = svmul_f32_x(
+        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e2x, qx), e2y, qy),
+                        e2z, qz),
+        inv_det);
+    valid = svand_b_z(pg, valid, svcmpge_f32(pg, t, svdup_f32(rc->tmin)));
+    valid = svand_b_z(pg, valid, svcmple_f32(pg, t, svdup_f32(tmax)));
+    return svptest_any(pg, valid);
+}
+
+/* One ray vs the 8 child boxes; writes per-slot tnear and tfar to float[8]. */
+static inline void tri_bvh8_slab_sve(const lrt_bvh8_node *n,
+                                     const tri_ray_ctx *rc, float best_t,
+                                     float *tnear_out, float *tfar_out) {
+    svbool_t pg = TRI_SVE_P8();
+    svfloat32_t orgx = svdup_f32(rc->org[0]), orgy = svdup_f32(rc->org[1]),
+                orgz = svdup_f32(rc->org[2]);
+    svfloat32_t invdx = svdup_f32(rc->invd[0]), invdy = svdup_f32(rc->invd[1]),
+                invdz = svdup_f32(rc->invd[2]);
+    svfloat32_t tlx = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->lo_x), orgx), invdx);
+    svfloat32_t thx = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->hi_x), orgx), invdx);
+    svfloat32_t tly = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->lo_y), orgy), invdy);
+    svfloat32_t thy = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->hi_y), orgy), invdy);
+    svfloat32_t tlz = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->lo_z), orgz), invdz);
+    svfloat32_t thz = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->hi_z), orgz), invdz);
+    svfloat32_t tnear = svmax_f32_x(
+        pg, svmax_f32_x(pg, svmin_f32_x(pg, tlx, thx), svmin_f32_x(pg, tly, thy)),
+        svmax_f32_x(pg, svmin_f32_x(pg, tlz, thz), svdup_f32(rc->tmin)));
+    svfloat32_t tfar = svmin_f32_x(
+        pg, svmin_f32_x(pg, svmax_f32_x(pg, tlx, thx), svmax_f32_x(pg, tly, thy)),
+        svmin_f32_x(pg, svmax_f32_x(pg, tlz, thz), svdup_f32(best_t)));
+    svst1_f32(pg, tnear_out, tnear);
+    svst1_f32(pg, tfar_out, tfar);
+}
+
+static int tri_intersect_bvh8_sve(const lrt_tri_scene *s, const lrt_ray *ray,
+                                  lrt_hit *hit) {
+    tri_ray_ctx rc;
+    tri_ray_setup(ray, &rc);
+
+    float best_t = ray->tmax;
+    float best_u = 0.0f, best_v = 0.0f;
+    uint32_t best_prim = LRT_TRI_NO_HIT;
+
+    tri_stack_entry stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp].ref = s->root;
+    stack[sp].tnear = rc.tmin;
+    sp++;
+
+    while (sp > 0) {
+        tri_stack_entry e = stack[--sp];
+        if (e.tnear >= best_t) continue;
+        if (TRI_REF_IS_LEAF(e.ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(e.ref);
+            uint32_t nblk = TRI_REF_NBLOCKS(e.ref);
+            const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
+            for (uint32_t b = 0; b < nblk; b++) {
+                tri_block_isect_sve(&blocks[blk0 + b], &rc, &best_t, &best_u,
+                                    &best_v, &best_prim);
+            }
+            continue;
+        }
+
+        const lrt_bvh8_node *n = &s->nodes8[TRI_REF_NODE(e.ref)];
+        _Alignas(64) float tnear[8], tfar[8];
+        tri_bvh8_slab_sve(n, &rc, best_t, tnear, tfar);
+        int nch = (int)n->nchildren;
+        uint32_t hit_ref[8];
+        float hit_tn[8];
+        int nhit = 0;
+        for (int i = 0; i < nch; i++) {
+            if (!(tnear[i] <= tfar[i])) continue;
+            tri_prefetch_ref(s, n->child[i], 8);
+            int j = nhit++;
+            while (j > 0 && hit_tn[j - 1] > tnear[i]) {
+                hit_tn[j] = hit_tn[j - 1];
+                hit_ref[j] = hit_ref[j - 1];
+                j--;
+            }
+            hit_tn[j] = tnear[i];
+            hit_ref[j] = n->child[i];
+        }
+        for (int i = nhit - 1; i >= 0; i--) {
+            stack[sp].ref = hit_ref[i];
+            stack[sp].tnear = hit_tn[i];
+            sp++;
+        }
+    }
+
+    if (hit) {
+        hit->t = best_prim != LRT_TRI_NO_HIT ? best_t : 0.0f;
+        hit->u = best_u;
+        hit->v = best_v;
+        hit->prim_id = best_prim;
+    }
+    return best_prim != LRT_TRI_NO_HIT;
+}
+
+static int tri_occluded_bvh8_sve(const lrt_tri_scene *s, const lrt_ray *ray) {
+    tri_ray_ctx rc;
+    tri_ray_setup(ray, &rc);
+    float tmax = ray->tmax;
+
+    uint32_t stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp++] = s->root;
+
+    while (sp > 0) {
+        uint32_t ref = stack[--sp];
+        if (TRI_REF_IS_LEAF(ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(ref);
+            uint32_t nblk = TRI_REF_NBLOCKS(ref);
+            const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
+            for (uint32_t b = 0; b < nblk; b++) {
+                if (tri_block_occluded_sve(&blocks[blk0 + b], &rc, tmax)) return 1;
+            }
+            continue;
+        }
+        const lrt_bvh8_node *n = &s->nodes8[TRI_REF_NODE(ref)];
+        _Alignas(64) float tnear[8], tfar[8];
+        tri_bvh8_slab_sve(n, &rc, tmax, tnear, tfar);
+        int nch = (int)n->nchildren;
+        for (int i = 0; i < nch; i++) {
+            if (tnear[i] <= tfar[i]) {
+                tri_prefetch_ref(s, n->child[i], 8);
+                stack[sp++] = n->child[i];
+            }
+        }
+    }
+    return 0;
+}
+
+#endif /* LRT_TRI_HAS_SVE && !LRT_TRI_HAS_SSE4 */
+
+/* ========================================================================= */
+/* fp64 high-precision triangle query (HPC visualization).                   */
+/* Traverses the existing fp32 BVH (bounds promoted to double for a fully     */
+/* fp64-arithmetic slab) and runs the leaf Moller-Trumbore in double         */
+/* precision so t/u/v keep fp64 resolution along an fp64 ray. The leaf is     */
+/* SVE 8-wide fp64 on A64FX (svfloat64, svwhilelt_b64 over the block width),  */
+/* scalar double elsewhere. Triangle vertices are the build's fp32 values.    */
+/* ========================================================================= */
+typedef struct tri_ray_ctx_hp {
+    double org[3], dir[3], invd[3], tmin;
+} tri_ray_ctx_hp;
+
+#define TRI_INVD_MAX_HP 1e300
+
+static inline void tri_ray_setup_hp(const lrt_ray_hp *ray, tri_ray_ctx_hp *rc) {
+    for (int k = 0; k < 3; k++) {
+        rc->org[k] = ray->org[k];
+        rc->dir[k] = ray->dir[k];
+        double inv = ray->dir[k] != 0.0 ? 1.0 / ray->dir[k] : TRI_INVD_MAX_HP;
+        if (!(inv >= -TRI_INVD_MAX_HP && inv <= TRI_INVD_MAX_HP))
+            inv = copysign(TRI_INVD_MAX_HP, ray->dir[k] == 0.0 ? 1.0 : ray->dir[k]);
+        rc->invd[k] = inv;
+    }
+    rc->tmin = ray->tmin;
+}
+
+static inline double tri_mind(double a, double b) { return a < b ? a : b; }
+static inline double tri_maxd(double a, double b) { return a > b ? a : b; }
+
+/* fp64 slab for child slot i of SoA float bounds (promoted to double). */
+static inline int tri_slab_hp(const float *lo_x, const float *lo_y,
+                              const float *lo_z, const float *hi_x,
+                              const float *hi_y, const float *hi_z, int i,
+                              const tri_ray_ctx_hp *rc, double t_best,
+                              double *tnear_out) {
+    double tlx = ((double)lo_x[i] - rc->org[0]) * rc->invd[0];
+    double thx = ((double)hi_x[i] - rc->org[0]) * rc->invd[0];
+    double tly = ((double)lo_y[i] - rc->org[1]) * rc->invd[1];
+    double thy = ((double)hi_y[i] - rc->org[1]) * rc->invd[1];
+    double tlz = ((double)lo_z[i] - rc->org[2]) * rc->invd[2];
+    double thz = ((double)hi_z[i] - rc->org[2]) * rc->invd[2];
+    double tnear = tri_maxd(tri_maxd(tri_mind(tlx, thx), tri_mind(tly, thy)),
+                            tri_maxd(tri_mind(tlz, thz), rc->tmin));
+    double tfar = tri_mind(tri_mind(tri_maxd(tlx, thx), tri_maxd(tly, thy)),
+                           tri_mind(tri_maxd(tlz, thz), t_best));
+    *tnear_out = tnear;
+    return tnear <= tfar;
+}
+
+/* fp64 leaf Moller-Trumbore over a generic-width block (f = 9 float arrays of
+ * `bw` lanes), arithmetic in double. Updates best in place. */
+static inline void tri_block_isect_hp(const float *f, int bw,
+                                      const tri_ray_ctx_hp *rc, double *best_t,
+                                      double *best_u, double *best_v,
+                                      uint32_t *best_prim, const uint32_t *prim) {
+    /* Promote the block lanes to double scratch (bw <= 8). */
+    double v0x[8], v0y[8], v0z[8], e1x[8], e1y[8], e1z[8], e2x[8], e2y[8], e2z[8];
+    for (int l = 0; l < bw; l++) {
+        v0x[l] = f[0 * bw + l]; v0y[l] = f[1 * bw + l]; v0z[l] = f[2 * bw + l];
+        e1x[l] = f[3 * bw + l]; e1y[l] = f[4 * bw + l]; e1z[l] = f[5 * bw + l];
+        e2x[l] = f[6 * bw + l]; e2y[l] = f[7 * bw + l]; e2z[l] = f[8 * bw + l];
+    }
+    double ta[8], ua[8], va[8];
+#if LRT_TRI_HAS_SVE && !LRT_TRI_HAS_SSE4
+    svbool_t pg = svwhilelt_b64((uint64_t)0, (uint64_t)bw);
+    svfloat64_t dx = svdup_f64(rc->dir[0]), dy = svdup_f64(rc->dir[1]),
+                dz = svdup_f64(rc->dir[2]);
+    svfloat64_t E1x = svld1_f64(pg, e1x), E1y = svld1_f64(pg, e1y),
+                E1z = svld1_f64(pg, e1z);
+    svfloat64_t E2x = svld1_f64(pg, e2x), E2y = svld1_f64(pg, e2y),
+                E2z = svld1_f64(pg, e2z);
+    svfloat64_t px = svmls_f64_x(pg, svmul_f64_x(pg, dy, E2z), dz, E2y);
+    svfloat64_t py = svmls_f64_x(pg, svmul_f64_x(pg, dz, E2x), dx, E2z);
+    svfloat64_t pz = svmls_f64_x(pg, svmul_f64_x(pg, dx, E2y), dy, E2x);
+    svfloat64_t det = svmla_f64_x(pg, svmla_f64_x(pg, svmul_f64_x(pg, E1x, px),
+                                                  E1y, py),
+                                  E1z, pz);
+    /* relative parallel-det cull (double) */
+    svfloat64_t e1l2 = svmla_f64_x(pg, svmla_f64_x(pg, svmul_f64_x(pg, E1x, E1x),
+                                                   E1y, E1y),
+                                   E1z, E1z);
+    svfloat64_t e2l2 = svmla_f64_x(pg, svmla_f64_x(pg, svmul_f64_x(pg, E2x, E2x),
+                                                   E2y, E2y),
+                                   E2z, E2z);
+    svfloat64_t z0 = svdup_f64(0.0);
+    svfloat64_t scl = svadd_f64_x(pg, svsqrt_f64_x(pg, svmax_f64_x(pg, e1l2, z0)),
+                                  svsqrt_f64_x(pg, svmax_f64_x(pg, e2l2, z0)));
+    svfloat64_t rel = svmul_f64_x(pg, svdup_f64((double)TRI_ISECT_DET_EPS_SCALE),
+                                  svmul_f64_x(pg, scl, scl));
+    rel = svmax_f64_x(pg, svdup_f64((double)TRI_ISECT_DET_EPS_MIN), rel);
+    rel = svmin_f64_x(pg, svdup_f64((double)TRI_ISECT_DET_EPS_MAX), rel);
+    svbool_t valid = svcmpgt_f64(pg, svabs_f64_x(pg, det), rel);
+    svfloat64_t inv = svdiv_f64_x(pg, svdup_f64(1.0), det);
+    svfloat64_t tvx = svsub_f64_x(pg, svdup_f64(rc->org[0]), svld1_f64(pg, v0x));
+    svfloat64_t tvy = svsub_f64_x(pg, svdup_f64(rc->org[1]), svld1_f64(pg, v0y));
+    svfloat64_t tvz = svsub_f64_x(pg, svdup_f64(rc->org[2]), svld1_f64(pg, v0z));
+    svfloat64_t U = svmul_f64_x(
+        pg, svmla_f64_x(pg, svmla_f64_x(pg, svmul_f64_x(pg, tvx, px), tvy, py),
+                        tvz, pz),
+        inv);
+    valid = svand_b_z(pg, valid, svcmpge_f64(pg, U, svdup_f64(0.0)));
+    valid = svand_b_z(pg, valid, svcmple_f64(pg, U, svdup_f64(1.0)));
+    svfloat64_t qx = svmls_f64_x(pg, svmul_f64_x(pg, tvy, E1z), tvz, E1y);
+    svfloat64_t qy = svmls_f64_x(pg, svmul_f64_x(pg, tvz, E1x), tvx, E1z);
+    svfloat64_t qz = svmls_f64_x(pg, svmul_f64_x(pg, tvx, E1y), tvy, E1x);
+    svfloat64_t V = svmul_f64_x(
+        pg, svmla_f64_x(pg, svmla_f64_x(pg, svmul_f64_x(pg, dx, qx), dy, qy),
+                        dz, qz),
+        inv);
+    valid = svand_b_z(pg, valid, svcmpge_f64(pg, V, svdup_f64(0.0)));
+    valid = svand_b_z(pg, valid,
+                      svcmple_f64(pg, svadd_f64_x(pg, U, V), svdup_f64(1.0)));
+    svfloat64_t T = svmul_f64_x(
+        pg, svmla_f64_x(pg, svmla_f64_x(pg, svmul_f64_x(pg, E2x, qx), E2y, qy),
+                        E2z, qz),
+        inv);
+    valid = svand_b_z(pg, valid, svcmpge_f64(pg, T, svdup_f64(rc->tmin)));
+    svst1_f64(pg, ta, svsel_f64(valid, T, svdup_f64((double)TRI_INF_F)));
+    svst1_f64(pg, ua, U);
+    svst1_f64(pg, va, V);
+#else
+    for (int l = 0; l < bw; l++) {
+        double px = rc->dir[1] * e2z[l] - rc->dir[2] * e2y[l];
+        double py = rc->dir[2] * e2x[l] - rc->dir[0] * e2z[l];
+        double pz = rc->dir[0] * e2y[l] - rc->dir[1] * e2x[l];
+        double det = e1x[l] * px + e1y[l] * py + e1z[l] * pz;
+        double e1l = sqrt(e1x[l] * e1x[l] + e1y[l] * e1y[l] + e1z[l] * e1z[l]);
+        double e2l = sqrt(e2x[l] * e2x[l] + e2y[l] * e2y[l] + e2z[l] * e2z[l]);
+        double scl = e1l + e2l;
+        double rel = (double)TRI_ISECT_DET_EPS_SCALE * scl * scl;
+        rel = tri_maxd((double)TRI_ISECT_DET_EPS_MIN, rel);
+        rel = tri_mind((double)TRI_ISECT_DET_EPS_MAX, rel);
+        ta[l] = (double)TRI_INF_F;
+        if (!(fabs(det) > rel)) continue;
+        double inv = 1.0 / det;
+        double tvx = rc->org[0] - v0x[l], tvy = rc->org[1] - v0y[l],
+               tvz = rc->org[2] - v0z[l];
+        double uu = (tvx * px + tvy * py + tvz * pz) * inv;
+        if (uu < 0.0 || uu > 1.0) continue;
+        double qx = tvy * e1z[l] - tvz * e1y[l];
+        double qy = tvz * e1x[l] - tvx * e1z[l];
+        double qz = tvx * e1y[l] - tvy * e1x[l];
+        double vv = (rc->dir[0] * qx + rc->dir[1] * qy + rc->dir[2] * qz) * inv;
+        if (vv < 0.0 || uu + vv > 1.0) continue;
+        double tt = (e2x[l] * qx + e2y[l] * qy + e2z[l] * qz) * inv;
+        if (tt < rc->tmin) continue;
+        ta[l] = tt;
+        ua[l] = uu;
+        va[l] = vv;
+    }
+#endif
+    for (int l = 0; l < bw; l++) {
+        if (ta[l] < *best_t) {
+            *best_t = ta[l];
+            *best_u = ua[l];
+            *best_v = va[l];
+            *best_prim = prim[l];
+        }
+    }
+}
+
+static int tri_intersect_hp(const lrt_tri_scene *s, const lrt_ray_hp *ray,
+                            lrt_hit_hp *hit) {
+    tri_ray_ctx_hp rc;
+    tri_ray_setup_hp(ray, &rc);
+    int bw = s->layout; /* 4 or 8 */
+    double best_t = ray->tmax, best_u = 0.0, best_v = 0.0;
+    uint32_t best_prim = LRT_TRI_NO_HIT;
+
+    tri_stack_entry stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp].ref = s->root;
+    stack[sp].tnear = (float)rc.tmin;
+    sp++;
+
+    while (sp > 0) {
+        tri_stack_entry e = stack[--sp];
+        if ((double)e.tnear >= best_t) continue;
+        if (TRI_REF_IS_LEAF(e.ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(e.ref), nblk = TRI_REF_NBLOCKS(e.ref);
+            for (uint32_t b = 0; b < nblk; b++) {
+                const float *f =
+                    tri_block_floats(s->blocks, blk0 + b, bw);
+                const uint32_t *prim = (const uint32_t *)(f + 9 * bw);
+                tri_block_isect_hp(f, bw, &rc, &best_t, &best_u, &best_v,
+                                   &best_prim, prim);
+            }
+            continue;
+        }
+        if (bw == 8) {
+            const lrt_bvh8_node *n = &s->nodes8[TRI_REF_NODE(e.ref)];
+            int nch = (int)n->nchildren;
+            uint32_t hit_ref[8];
+            double hit_tn[8];
+            int nhit = 0;
+            for (int i = 0; i < nch; i++) {
+                double tnear;
+                if (tri_slab_hp(n->lo_x, n->lo_y, n->lo_z, n->hi_x, n->hi_y,
+                                n->hi_z, i, &rc, best_t, &tnear)) {
+                    int j = nhit++;
+                    while (j > 0 && hit_tn[j - 1] > tnear) {
+                        hit_tn[j] = hit_tn[j - 1];
+                        hit_ref[j] = hit_ref[j - 1];
+                        j--;
+                    }
+                    hit_tn[j] = tnear;
+                    hit_ref[j] = n->child[i];
+                }
+            }
+            for (int i = nhit - 1; i >= 0; i--) {
+                stack[sp].ref = hit_ref[i];
+                stack[sp].tnear = (float)hit_tn[i];
+                sp++;
+            }
+        } else {
+            const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(e.ref)];
+            int nch = (int)n->nchildren;
+            uint32_t hit_ref[4];
+            double hit_tn[4];
+            int nhit = 0;
+            for (int i = 0; i < nch; i++) {
+                double tnear;
+                if (tri_slab_hp(n->lo_x, n->lo_y, n->lo_z, n->hi_x, n->hi_y,
+                                n->hi_z, i, &rc, best_t, &tnear)) {
+                    int j = nhit++;
+                    while (j > 0 && hit_tn[j - 1] > tnear) {
+                        hit_tn[j] = hit_tn[j - 1];
+                        hit_ref[j] = hit_ref[j - 1];
+                        j--;
+                    }
+                    hit_tn[j] = tnear;
+                    hit_ref[j] = n->child[i];
+                }
+            }
+            for (int i = nhit - 1; i >= 0; i--) {
+                stack[sp].ref = hit_ref[i];
+                stack[sp].tnear = (float)hit_tn[i];
+                sp++;
+            }
+        }
+    }
+
+    if (hit) {
+        hit->t = best_prim != LRT_TRI_NO_HIT ? best_t : 0.0;
+        hit->u = best_u;
+        hit->v = best_v;
+        hit->prim_id = best_prim;
+    }
+    return best_prim != LRT_TRI_NO_HIT;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Public API.                                                               */
 /* ------------------------------------------------------------------------- */
@@ -8517,7 +9360,9 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
          * 256-bit ops execute as 2x128-bit there, so the wider node test
          * gains nothing while 256-byte nodes cost more bandwidth. Pass
          * LRT_TRI_LAYOUT_BVH8 explicitly on CPUs with a native 256-bit
-         * datapath. */
+         * datapath (incl. A64FX/SVE, which has a native 512-bit datapath and a
+         * tri_intersect_bvh8_sve path). AUTO stays BVH4 (the NEON leaf) for a
+         * conservative, predictable default; benchmarks select BVH8 directly. */
         layout = 4;
     }
 #if !LRT_TRI_HAS_AVX2
@@ -8736,6 +9581,14 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
     s->kernel_name = layout == 4    ? "bvh4/sse4"
                      : quantized    ? "bvh8q/scalar"
                                     : "bvh8/scalar";
+#elif LRT_TRI_HAS_SVE
+    s->kernel_name = layout == 4    ? "bvh4/neon"
+                     : quantized    ? "bvh8q/scalar"
+                                    : "bvh8/sve";
+#elif LRT_TRI_HAS_NEON
+    s->kernel_name = layout == 4    ? "bvh4/neon"
+                     : quantized    ? "bvh8q/scalar"
+                                    : "bvh8/scalar";
 #else
     s->kernel_name = layout == 4    ? "bvh4/scalar"
                      : quantized    ? "bvh8q/scalar"
@@ -8849,7 +9702,37 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
 #if LRT_TRI_HAS_SSE4
     if (s->layout == 4) return tri_intersect_bvh4_sse(s, ray, hit);
 #endif
+#if LRT_TRI_HAS_SVE && !LRT_TRI_HAS_SSE4
+    /* Plain-triangle BVH8 -> SVE. Quantized-node BVH8 (qnode/quantized) has no
+     * SVE slab yet and falls through to scalar. */
+    if (s->layout == 8 && s->prim_kind == TRI_PRIM_TRI && !s->curve &&
+        !s->quantized)
+        return tri_intersect_bvh8_sve(s, ray, hit);
+#endif
+#if LRT_TRI_HAS_NEON && !LRT_TRI_HAS_SSE4
+    /* Only plain-triangle BVH4 has a NEON leaf; curve/point/sphere/user/etc.
+     * (the SSE4-guarded branches above on x86) fall through to the scalar
+     * switch, which handles every prim_kind. */
+    if (s->layout == 4 && s->prim_kind == TRI_PRIM_TRI && !s->curve)
+        return tri_intersect_bvh4_neon(s, ray, hit);
+#endif
     return tri_intersect_scalar(s, ray, hit);
+}
+
+int lrt_tri_intersect1_hp(const lrt_tri_scene *s, const lrt_ray_hp *ray,
+                          lrt_hit_hp *hit) {
+    if (!s || !ray) {
+        if (hit) hit->prim_id = LRT_TRI_NO_HIT;
+        return 0;
+    }
+    /* Plain-triangle scenes only (the fp64 leaf assumes the lrt_tri4/lrt_tri8
+     * block layout). Other prim_kinds report a miss. */
+    if (s->prim_kind != TRI_PRIM_TRI || s->curve || s->quantized ||
+        (s->layout != 4 && s->layout != 8)) {
+        if (hit) hit->prim_id = LRT_TRI_NO_HIT;
+        return 0;
+    }
+    return tri_intersect_hp(s, ray, hit);
 }
 
 int lrt_tri_occluded1(const lrt_tri_scene *s, const lrt_ray *ray) {
@@ -8889,6 +9772,15 @@ int lrt_tri_occluded1(const lrt_tri_scene *s, const lrt_ray *ray) {
 #endif
 #if LRT_TRI_HAS_SSE4
     if (s->layout == 4) return tri_occluded_bvh4_sse(s, ray);
+#endif
+#if LRT_TRI_HAS_SVE && !LRT_TRI_HAS_SSE4
+    if (s->layout == 8 && s->prim_kind == TRI_PRIM_TRI && !s->curve &&
+        !s->quantized)
+        return tri_occluded_bvh8_sve(s, ray);
+#endif
+#if LRT_TRI_HAS_NEON && !LRT_TRI_HAS_SSE4
+    if (s->layout == 4 && s->prim_kind == TRI_PRIM_TRI && !s->curve)
+        return tri_occluded_bvh4_neon(s, ray);
 #endif
     return tri_occluded_scalar(s, ray);
 }
