@@ -1150,10 +1150,22 @@ compiler in clang mode (the ACLE intrinsics need it): `fcc -Nclang
 lanes). The scalar path is always the correctness oracle; every parity constant
 (`TRI_INVD_MAX`, the relative det epsilon, deferred-tnear cull) is shared.
 
-- **NEON BVH4** (`tri_*_bvh4_neon`, 128-bit / 4 fp32): a 1:1 mirror of the SSE4
-  BVH4 path (same node slab, 4-wide Moller-Trumbore leaf, `perm[octant]`
-  far-to-near push). NEON has no movemask, so a hit mask is `vandq` with
-  `{1,2,4,8}` + `vaddvq`; any-hit uses `vmaxvq`. `kernel_name` = `bvh4/neon`.
+- **NEON BVH4 via an SSE→NEON shim** (`lightrt_sse2neon_min.h`): on ARM NEON the
+  kernel sets `LRT_TRI_HAS_SSE4 = 1` and runs the existing 4-wide SSE BVH4 code
+  (triangle, curve, point, sphere, quad, qtri, and the patch-traversal drivers)
+  through a minimal shim mapping the ~39 `_mm_*` intrinsics the kernel uses to
+  NEON — so one shim vectorizes all the BVH4 leaves instead of hand-duplicating
+  them. `LRT_TRI_NEON_SHIM` marks the mode; `kernel_name` = `bvh4/neon`. The shim
+  maps comparisons to float-domain masks (`vreinterpretq_f32_u32(vcXXq)`),
+  `_mm_movemask_ps`→`vshrq`+`vaddvq`, `_mm_blendv_ps`→`vbslq` (kernel only feeds
+  it compare masks). **Curve leaves vectorize well — flat ~2.3×, cubic-Bézier
+  ~3.1×, sphere ~1.4× over scalar (48-thread A64FX) — except round-linear**,
+  whose blendv/movemask-heavy Embree CSG leaf is measured *slower* as NEON than
+  scalar, so `TRI_PRIM_RLCURVE` is routed to the scalar path on ARM.
+  **Parametric surfaces (bilinear / bicubic-Bézier / NURBS) stay scalar**: they
+  are dispatched to `tri_intersect_scalar` (per-patch Newton + adaptive
+  subdivision — divergent, not 4-wide-SIMD-friendly); SVE-vectorizing the
+  intra-patch eval is future work.
 - **SVE BVH8** (`tri_*_bvh8_sve`, A64FX 512-bit): mirrors the AVX2 BVH8 path,
   processing one BVH8 node/leaf per vector on the low 8 of 16 lanes
   (`svwhilelt_b32(0,8)`; predicated-off lanes are free per-instruction). Mask

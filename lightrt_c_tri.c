@@ -75,6 +75,7 @@
 #define LRT_TRI_HAS_SSE4 0
 #define LRT_TRI_HAS_NEON 0
 #define LRT_TRI_HAS_SVE 0
+#define LRT_TRI_NEON_SHIM 0
 #else
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #define LRT_TRI_HAS_NEON 1
@@ -88,6 +89,20 @@
 #else
 #define LRT_TRI_HAS_SVE 0
 #endif
+/* On ARM NEON (no x86 SSE), run the kernel's 4-wide SSE BVH4 code through a
+ * minimal SSE->NEON shim: set LRT_TRI_HAS_SSE4 = 1 so all the SSE-written
+ * leaf/node/traversal code (triangle, curve, point, sphere, quad, bilinear,
+ * qtri, and the parametric-patch traversal drivers) compiles + runs as NEON
+ * 4-wide. SVE (BVH8 + fp64) is a separate, native path keyed on
+ * LRT_TRI_HAS_SVE. LRT_TRI_NEON_SHIM marks this mode (e.g. for kernel names). */
+#if LRT_TRI_HAS_NEON && !LRT_TRI_HAS_SSE4
+#define LRT_TRI_NEON_SHIM 1
+#include "lightrt_sse2neon_min.h"
+#undef LRT_TRI_HAS_SSE4
+#define LRT_TRI_HAS_SSE4 1
+#else
+#define LRT_TRI_NEON_SHIM 0
+#endif
 #endif /* LRT_TRI_FORCE_SCALAR */
 
 /* Portable T0 prefetch (x86 _mm_prefetch vs the GCC/clang builtin on ARM). */
@@ -95,6 +110,15 @@
 #define TRI_PREFETCH_T0(p) _mm_prefetch((const char *)(p), _MM_HINT_T0)
 #else
 #define TRI_PREFETCH_T0(p) __builtin_prefetch((const void *)(p), 0, 3)
+#endif
+
+/* Tag for the 4-wide BVH4 SIMD path in kernel_name strings: "neon" when the
+ * SSE-written leaves run through the ARM shim, else "sse4". Used only inside
+ * #if LRT_TRI_HAS_SSE4 branches (the scalar case keeps its own "scalar"). */
+#if LRT_TRI_NEON_SHIM
+#define LRT_SIMD4_SUFFIX "neon"
+#else
+#define LRT_SIMD4_SUFFIX "sse4"
 #endif
 
 /* ------------------------------------------------------------------------- */
@@ -8410,284 +8434,6 @@ static void tri_occluded1N_bvh8_avx2(const lrt_tri_scene *s,
 #endif /* LRT_TRI_HAS_AVX2 */
 
 /* ========================================================================= */
-/* ARM NEON BVH4 (128-bit, 4 fp32 lanes). A 1:1 mirror of the SSE4 path:     */
-/* same node slab, same 4-wide Moller-Trumbore leaf, same scalar-driven      */
-/* stack + perm[octant] far-to-near push. The one structural difference is   */
-/* NEON has no movemask, so a hit mask is built by ANDing the compare result */
-/* with {1,2,4,8} and horizontally adding (vaddvq); any-hit uses vmaxvq.     */
-/* Slab uses (bound-org)*invd to match tri_slab_scalar's rounding.           */
-/* ========================================================================= */
-#if LRT_TRI_HAS_NEON && !LRT_TRI_HAS_SSE4
-
-typedef struct tri_neon_ctx {
-    float32x4_t orgx, orgy, orgz;
-    float32x4_t invdx, invdy, invdz;
-    float32x4_t dirx, diry, dirz;
-    float32x4_t tmin;
-} tri_neon_ctx;
-
-static inline void tri_neon_setup(const tri_ray_ctx *rc, tri_neon_ctx *nc) {
-    nc->orgx = vdupq_n_f32(rc->org[0]);
-    nc->orgy = vdupq_n_f32(rc->org[1]);
-    nc->orgz = vdupq_n_f32(rc->org[2]);
-    nc->invdx = vdupq_n_f32(rc->invd[0]);
-    nc->invdy = vdupq_n_f32(rc->invd[1]);
-    nc->invdz = vdupq_n_f32(rc->invd[2]);
-    nc->dirx = vdupq_n_f32(rc->dir[0]);
-    nc->diry = vdupq_n_f32(rc->dir[1]);
-    nc->dirz = vdupq_n_f32(rc->dir[2]);
-    nc->tmin = vdupq_n_f32(rc->tmin);
-}
-
-/* 4-bit movemask emulation: sign/all-ones lanes -> bit i. */
-static inline int tri_neon_movemask(uint32x4_t c) {
-    static const uint32_t lane_bits[4] = {1u, 2u, 4u, 8u};
-    return (int)vaddvq_u32(vandq_u32(c, vld1q_u32(lane_bits)));
-}
-static inline int tri_neon_any(uint32x4_t c) { return vmaxvq_u32(c) != 0u; }
-
-/* Relative parallel-det cull, mirror of tri_isect_det_parallel4. */
-static inline uint32x4_t tri_det_parallel_neon(float32x4_t e1x, float32x4_t e1y,
-                                               float32x4_t e1z, float32x4_t e2x,
-                                               float32x4_t e2y, float32x4_t e2z,
-                                               float32x4_t det) {
-    float32x4_t e1l2 = vaddq_f32(vaddq_f32(vmulq_f32(e1x, e1x), vmulq_f32(e1y, e1y)),
-                                 vmulq_f32(e1z, e1z));
-    float32x4_t e2l2 = vaddq_f32(vaddq_f32(vmulq_f32(e2x, e2x), vmulq_f32(e2y, e2y)),
-                                 vmulq_f32(e2z, e2z));
-    float32x4_t zero = vdupq_n_f32(0.0f);
-    float32x4_t scale = vaddq_f32(vsqrtq_f32(vmaxq_f32(e1l2, zero)),
-                                  vsqrtq_f32(vmaxq_f32(e2l2, zero)));
-    float32x4_t rel = vmulq_f32(vdupq_n_f32(TRI_ISECT_DET_EPS_SCALE),
-                                vmulq_f32(scale, scale));
-    rel = vmaxq_f32(vdupq_n_f32(TRI_ISECT_DET_EPS_MIN), rel);
-    rel = vminq_f32(vdupq_n_f32(TRI_ISECT_DET_EPS_MAX), rel);
-    return vcgtq_f32(vabsq_f32(det), rel);
-}
-
-/* One ray vs the 4 child boxes; returns hit mask, writes per-slot tnear. */
-static inline int tri_bvh4_slab_neon(const lrt_bvh4_node *n,
-                                     const tri_neon_ctx *nc, float32x4_t t_best,
-                                     float *tnear_out) {
-    float32x4_t tlx = vmulq_f32(vsubq_f32(vld1q_f32(n->lo_x), nc->orgx), nc->invdx);
-    float32x4_t thx = vmulq_f32(vsubq_f32(vld1q_f32(n->hi_x), nc->orgx), nc->invdx);
-    float32x4_t tly = vmulq_f32(vsubq_f32(vld1q_f32(n->lo_y), nc->orgy), nc->invdy);
-    float32x4_t thy = vmulq_f32(vsubq_f32(vld1q_f32(n->hi_y), nc->orgy), nc->invdy);
-    float32x4_t tlz = vmulq_f32(vsubq_f32(vld1q_f32(n->lo_z), nc->orgz), nc->invdz);
-    float32x4_t thz = vmulq_f32(vsubq_f32(vld1q_f32(n->hi_z), nc->orgz), nc->invdz);
-    float32x4_t tnear = vmaxq_f32(
-        vmaxq_f32(vminq_f32(tlx, thx), vminq_f32(tly, thy)),
-        vmaxq_f32(vminq_f32(tlz, thz), nc->tmin));
-    float32x4_t tfar = vminq_f32(
-        vminq_f32(vmaxq_f32(tlx, thx), vmaxq_f32(tly, thy)),
-        vminq_f32(vmaxq_f32(tlz, thz), t_best));
-    vst1q_f32(tnear_out, tnear);
-    return tri_neon_movemask(vcleq_f32(tnear, tfar));
-}
-
-/* 4-wide SoA Moller-Trumbore over one block. Updates best hit in place. */
-static inline void tri_block_isect_neon(const lrt_tri4 *blk,
-                                        const tri_neon_ctx *nc, float *best_t,
-                                        float *best_u, float *best_v,
-                                        uint32_t *best_prim) {
-    float32x4_t e1x = vld1q_f32(blk->e1x), e1y = vld1q_f32(blk->e1y),
-                e1z = vld1q_f32(blk->e1z);
-    float32x4_t e2x = vld1q_f32(blk->e2x), e2y = vld1q_f32(blk->e2y),
-                e2z = vld1q_f32(blk->e2z);
-    float32x4_t px = vsubq_f32(vmulq_f32(nc->diry, e2z), vmulq_f32(nc->dirz, e2y));
-    float32x4_t py = vsubq_f32(vmulq_f32(nc->dirz, e2x), vmulq_f32(nc->dirx, e2z));
-    float32x4_t pz = vsubq_f32(vmulq_f32(nc->dirx, e2y), vmulq_f32(nc->diry, e2x));
-    float32x4_t det = vaddq_f32(vaddq_f32(vmulq_f32(e1x, px), vmulq_f32(e1y, py)),
-                                vmulq_f32(e1z, pz));
-    uint32x4_t valid = tri_det_parallel_neon(e1x, e1y, e1z, e2x, e2y, e2z, det);
-    if (!tri_neon_any(valid)) return;
-
-    float32x4_t inv_det = vdivq_f32(vdupq_n_f32(1.0f), det);
-    float32x4_t tvx = vsubq_f32(nc->orgx, vld1q_f32(blk->v0x));
-    float32x4_t tvy = vsubq_f32(nc->orgy, vld1q_f32(blk->v0y));
-    float32x4_t tvz = vsubq_f32(nc->orgz, vld1q_f32(blk->v0z));
-    float32x4_t u = vmulq_f32(
-        vaddq_f32(vaddq_f32(vmulq_f32(tvx, px), vmulq_f32(tvy, py)),
-                  vmulq_f32(tvz, pz)),
-        inv_det);
-    valid = vandq_u32(valid, vcgeq_f32(u, vdupq_n_f32(0.0f)));
-    valid = vandq_u32(valid, vcleq_f32(u, vdupq_n_f32(1.0f)));
-    if (!tri_neon_any(valid)) return;
-
-    float32x4_t qx = vsubq_f32(vmulq_f32(tvy, e1z), vmulq_f32(tvz, e1y));
-    float32x4_t qy = vsubq_f32(vmulq_f32(tvz, e1x), vmulq_f32(tvx, e1z));
-    float32x4_t qz = vsubq_f32(vmulq_f32(tvx, e1y), vmulq_f32(tvy, e1x));
-    float32x4_t v = vmulq_f32(
-        vaddq_f32(vaddq_f32(vmulq_f32(nc->dirx, qx), vmulq_f32(nc->diry, qy)),
-                  vmulq_f32(nc->dirz, qz)),
-        inv_det);
-    valid = vandq_u32(valid, vcgeq_f32(v, vdupq_n_f32(0.0f)));
-    valid = vandq_u32(valid, vcleq_f32(vaddq_f32(u, v), vdupq_n_f32(1.0f)));
-    if (!tri_neon_any(valid)) return;
-
-    float32x4_t t = vmulq_f32(
-        vaddq_f32(vaddq_f32(vmulq_f32(e2x, qx), vmulq_f32(e2y, qy)),
-                  vmulq_f32(e2z, qz)),
-        inv_det);
-    valid = vandq_u32(valid, vcgeq_f32(t, nc->tmin));
-    valid = vandq_u32(valid, vcltq_f32(t, vdupq_n_f32(*best_t)));
-    int mask = tri_neon_movemask(valid);
-    if (!mask) return;
-
-    float ta[4], ua[4], va[4];
-    vst1q_f32(ta, t);
-    vst1q_f32(ua, u);
-    vst1q_f32(va, v);
-    while (mask) {
-        int lane = __builtin_ctz((unsigned)mask);
-        mask &= mask - 1;
-        if (ta[lane] < *best_t) {
-            *best_t = ta[lane];
-            *best_u = ua[lane];
-            *best_v = va[lane];
-            *best_prim = blk->prim_id[lane];
-        }
-    }
-}
-
-static inline int tri_block_occluded_neon(const lrt_tri4 *blk,
-                                          const tri_neon_ctx *nc,
-                                          float32x4_t tmax) {
-    float32x4_t e1x = vld1q_f32(blk->e1x), e1y = vld1q_f32(blk->e1y),
-                e1z = vld1q_f32(blk->e1z);
-    float32x4_t e2x = vld1q_f32(blk->e2x), e2y = vld1q_f32(blk->e2y),
-                e2z = vld1q_f32(blk->e2z);
-    float32x4_t px = vsubq_f32(vmulq_f32(nc->diry, e2z), vmulq_f32(nc->dirz, e2y));
-    float32x4_t py = vsubq_f32(vmulq_f32(nc->dirz, e2x), vmulq_f32(nc->dirx, e2z));
-    float32x4_t pz = vsubq_f32(vmulq_f32(nc->dirx, e2y), vmulq_f32(nc->diry, e2x));
-    float32x4_t det = vaddq_f32(vaddq_f32(vmulq_f32(e1x, px), vmulq_f32(e1y, py)),
-                                vmulq_f32(e1z, pz));
-    uint32x4_t valid = tri_det_parallel_neon(e1x, e1y, e1z, e2x, e2y, e2z, det);
-    if (!tri_neon_any(valid)) return 0;
-    float32x4_t inv_det = vdivq_f32(vdupq_n_f32(1.0f), det);
-    float32x4_t tvx = vsubq_f32(nc->orgx, vld1q_f32(blk->v0x));
-    float32x4_t tvy = vsubq_f32(nc->orgy, vld1q_f32(blk->v0y));
-    float32x4_t tvz = vsubq_f32(nc->orgz, vld1q_f32(blk->v0z));
-    float32x4_t u = vmulq_f32(
-        vaddq_f32(vaddq_f32(vmulq_f32(tvx, px), vmulq_f32(tvy, py)),
-                  vmulq_f32(tvz, pz)),
-        inv_det);
-    valid = vandq_u32(valid, vcgeq_f32(u, vdupq_n_f32(0.0f)));
-    valid = vandq_u32(valid, vcleq_f32(u, vdupq_n_f32(1.0f)));
-    if (!tri_neon_any(valid)) return 0;
-    float32x4_t qx = vsubq_f32(vmulq_f32(tvy, e1z), vmulq_f32(tvz, e1y));
-    float32x4_t qy = vsubq_f32(vmulq_f32(tvz, e1x), vmulq_f32(tvx, e1z));
-    float32x4_t qz = vsubq_f32(vmulq_f32(tvx, e1y), vmulq_f32(tvy, e1x));
-    float32x4_t v = vmulq_f32(
-        vaddq_f32(vaddq_f32(vmulq_f32(nc->dirx, qx), vmulq_f32(nc->diry, qy)),
-                  vmulq_f32(nc->dirz, qz)),
-        inv_det);
-    valid = vandq_u32(valid, vcgeq_f32(v, vdupq_n_f32(0.0f)));
-    valid = vandq_u32(valid, vcleq_f32(vaddq_f32(u, v), vdupq_n_f32(1.0f)));
-    if (!tri_neon_any(valid)) return 0;
-    float32x4_t t = vmulq_f32(
-        vaddq_f32(vaddq_f32(vmulq_f32(e2x, qx), vmulq_f32(e2y, qy)),
-                  vmulq_f32(e2z, qz)),
-        inv_det);
-    valid = vandq_u32(valid, vcgeq_f32(t, nc->tmin));
-    valid = vandq_u32(valid, vcleq_f32(t, tmax));
-    return tri_neon_any(valid);
-}
-
-static int tri_intersect_bvh4_neon(const lrt_tri_scene *s, const lrt_ray *ray,
-                                   lrt_hit *hit) {
-    tri_ray_ctx rc;
-    tri_ray_setup(ray, &rc);
-    tri_neon_ctx nc;
-    tri_neon_setup(&rc, &nc);
-
-    float best_t = ray->tmax;
-    float best_u = 0.0f, best_v = 0.0f;
-    uint32_t best_prim = LRT_TRI_NO_HIT;
-
-    tri_stack_entry stack[TRI_STACK_SIZE];
-    int sp = 0;
-    stack[sp].ref = s->root;
-    stack[sp].tnear = rc.tmin;
-    sp++;
-
-    while (sp > 0) {
-        tri_stack_entry e = stack[--sp];
-        if (e.tnear >= best_t) continue;
-        if (TRI_REF_IS_LEAF(e.ref)) {
-            uint32_t blk0 = TRI_REF_BLOCK(e.ref);
-            uint32_t nblk = TRI_REF_NBLOCKS(e.ref);
-            const lrt_tri4 *blocks = (const lrt_tri4 *)s->blocks;
-            for (uint32_t b = 0; b < nblk; b++) {
-                tri_block_isect_neon(&blocks[blk0 + b], &nc, &best_t, &best_u,
-                                     &best_v, &best_prim);
-            }
-            continue;
-        }
-        const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(e.ref)];
-        _Alignas(16) float tnear[4];
-        int mask = tri_bvh4_slab_neon(n, &nc, vdupq_n_f32(best_t), tnear);
-        mask &= (1 << n->nchildren) - 1;
-        uint8_t perm = n->perm[rc.octant];
-        for (int p = 3; p >= 0; p--) {
-            int slot = (perm >> (2 * p)) & 3;
-            if (!(mask & (1 << slot))) continue;
-            tri_prefetch_ref(s, n->child[slot], 4);
-            stack[sp].ref = n->child[slot];
-            stack[sp].tnear = tnear[slot];
-            sp++;
-        }
-    }
-
-    if (hit) {
-        hit->t = best_prim != LRT_TRI_NO_HIT ? best_t : 0.0f;
-        hit->u = best_u;
-        hit->v = best_v;
-        hit->prim_id = best_prim;
-    }
-    return best_prim != LRT_TRI_NO_HIT;
-}
-
-static int tri_occluded_bvh4_neon(const lrt_tri_scene *s, const lrt_ray *ray) {
-    tri_ray_ctx rc;
-    tri_ray_setup(ray, &rc);
-    tri_neon_ctx nc;
-    tri_neon_setup(&rc, &nc);
-    float32x4_t tmax4 = vdupq_n_f32(ray->tmax);
-
-    uint32_t stack[TRI_STACK_SIZE];
-    int sp = 0;
-    stack[sp++] = s->root;
-
-    while (sp > 0) {
-        uint32_t ref = stack[--sp];
-        if (TRI_REF_IS_LEAF(ref)) {
-            uint32_t blk0 = TRI_REF_BLOCK(ref);
-            uint32_t nblk = TRI_REF_NBLOCKS(ref);
-            const lrt_tri4 *blocks = (const lrt_tri4 *)s->blocks;
-            for (uint32_t b = 0; b < nblk; b++) {
-                if (tri_block_occluded_neon(&blocks[blk0 + b], &nc, tmax4))
-                    return 1;
-            }
-            continue;
-        }
-        const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(ref)];
-        _Alignas(16) float tnear[4];
-        int mask = tri_bvh4_slab_neon(n, &nc, tmax4, tnear);
-        mask &= (1 << n->nchildren) - 1;
-        while (mask) {
-            int i = __builtin_ctz((unsigned)mask);
-            mask &= mask - 1;
-            tri_prefetch_ref(s, n->child[i], 4);
-            stack[sp++] = n->child[i];
-        }
-    }
-    return 0;
-}
-
-#endif /* LRT_TRI_HAS_NEON && !LRT_TRI_HAS_SSE4 */
-
-/* ========================================================================= */
 /* ARM SVE BVH8 (A64FX = 512-bit). A mirror of the AVX2 BVH8 path. Each      */
 /* node/leaf uses the low 8 of 16 fp32 lanes (svwhilelt_b32(0,8)); on A64FX  */
 /* a predicated-off lane is free per-instruction, so 8-of-16 costs the same  */
@@ -8698,7 +8444,7 @@ static int tri_occluded_bvh4_neon(const lrt_tri_scene *s, const lrt_ray *ray) {
 /* materialized to float[8] and the existing scalar insertion-sort drives the */
 /* nearest-first push, byte-for-byte reproducing the AVX2 traversal order.   */
 /* ========================================================================= */
-#if LRT_TRI_HAS_SVE && !LRT_TRI_HAS_SSE4
+#if LRT_TRI_HAS_SVE
 
 #define TRI_SVE_P8() svwhilelt_b32((uint32_t)0, (uint32_t)8)
 
@@ -8963,7 +8709,7 @@ static int tri_occluded_bvh8_sve(const lrt_tri_scene *s, const lrt_ray *ray) {
     return 0;
 }
 
-#endif /* LRT_TRI_HAS_SVE && !LRT_TRI_HAS_SSE4 */
+#endif /* LRT_TRI_HAS_SVE */
 
 /* ========================================================================= */
 /* fp64 high-precision triangle query (HPC visualization).                   */
@@ -9028,7 +8774,7 @@ static inline void tri_block_isect_hp(const float *f, int bw,
         e2x[l] = f[6 * bw + l]; e2y[l] = f[7 * bw + l]; e2z[l] = f[8 * bw + l];
     }
     double ta[8], ua[8], va[8];
-#if LRT_TRI_HAS_SVE && !LRT_TRI_HAS_SSE4
+#if LRT_TRI_HAS_SVE
     svbool_t pg = svwhilelt_b64((uint64_t)0, (uint64_t)bw);
     svfloat64_t dx = svdup_f64(rc->dir[0]), dy = svdup_f64(rc->dir[1]),
                 dz = svdup_f64(rc->dir[2]);
@@ -9577,16 +9323,13 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
     s->kernel_name = layout == 4    ? "bvh4/sse4"
                      : quantized    ? "bvh8q/avx2"
                                     : "bvh8/avx2";
+#elif LRT_TRI_NEON_SHIM
+    /* ARM: BVH4 via the SSE->NEON shim, BVH8 via the native SVE path. */
+    s->kernel_name = layout == 4 ? "bvh4/neon"
+                     : quantized ? "bvh8q/scalar"
+                                 : (LRT_TRI_HAS_SVE ? "bvh8/sve" : "bvh8/scalar");
 #elif LRT_TRI_HAS_SSE4
     s->kernel_name = layout == 4    ? "bvh4/sse4"
-                     : quantized    ? "bvh8q/scalar"
-                                    : "bvh8/scalar";
-#elif LRT_TRI_HAS_SVE
-    s->kernel_name = layout == 4    ? "bvh4/neon"
-                     : quantized    ? "bvh8q/scalar"
-                                    : "bvh8/sve";
-#elif LRT_TRI_HAS_NEON
-    s->kernel_name = layout == 4    ? "bvh4/neon"
                      : quantized    ? "bvh8q/scalar"
                                     : "bvh8/scalar";
 #else
@@ -9676,6 +9419,12 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
         s->prim_kind == TRI_PRIM_BEZPATCH || s->prim_kind == TRI_PRIM_RBEZPATCH ||
         s->prim_kind == TRI_PRIM_TRIMNURBS)
         return tri_intersect_scalar(s, ray, hit);
+#if LRT_TRI_NEON_SHIM
+    /* The round-linear curve leaf (Embree CSG port, blendv/movemask-heavy) is
+     * measured slower as NEON than scalar on A64FX, so use the scalar path. */
+    if (s->prim_kind == TRI_PRIM_RLCURVE)
+        return tri_intersect_scalar(s, ray, hit);
+#endif
 #if LRT_TRI_HAS_SSE4
     if (s->curve) return tri_curve_intersect_bvh4(s, ray, hit);
     if (s->prim_kind == TRI_PRIM_RLCURVE)
@@ -9702,19 +9451,12 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
 #if LRT_TRI_HAS_SSE4
     if (s->layout == 4) return tri_intersect_bvh4_sse(s, ray, hit);
 #endif
-#if LRT_TRI_HAS_SVE && !LRT_TRI_HAS_SSE4
+#if LRT_TRI_HAS_SVE
     /* Plain-triangle BVH8 -> SVE. Quantized-node BVH8 (qnode/quantized) has no
      * SVE slab yet and falls through to scalar. */
     if (s->layout == 8 && s->prim_kind == TRI_PRIM_TRI && !s->curve &&
         !s->quantized)
         return tri_intersect_bvh8_sve(s, ray, hit);
-#endif
-#if LRT_TRI_HAS_NEON && !LRT_TRI_HAS_SSE4
-    /* Only plain-triangle BVH4 has a NEON leaf; curve/point/sphere/user/etc.
-     * (the SSE4-guarded branches above on x86) fall through to the scalar
-     * switch, which handles every prim_kind. */
-    if (s->layout == 4 && s->prim_kind == TRI_PRIM_TRI && !s->curve)
-        return tri_intersect_bvh4_neon(s, ray, hit);
 #endif
     return tri_intersect_scalar(s, ray, hit);
 }
@@ -9749,6 +9491,9 @@ int lrt_tri_occluded1(const lrt_tri_scene *s, const lrt_ray *ray) {
         s->prim_kind == TRI_PRIM_BEZPATCH || s->prim_kind == TRI_PRIM_RBEZPATCH ||
         s->prim_kind == TRI_PRIM_TRIMNURBS)
         return tri_occluded_scalar(s, ray);
+#if LRT_TRI_NEON_SHIM
+    if (s->prim_kind == TRI_PRIM_RLCURVE) return tri_occluded_scalar(s, ray);
+#endif
 #if LRT_TRI_HAS_SSE4
     if (s->curve) return tri_curve_occluded_bvh4(s, ray);
     if (s->prim_kind == TRI_PRIM_RLCURVE)
@@ -9773,14 +9518,10 @@ int lrt_tri_occluded1(const lrt_tri_scene *s, const lrt_ray *ray) {
 #if LRT_TRI_HAS_SSE4
     if (s->layout == 4) return tri_occluded_bvh4_sse(s, ray);
 #endif
-#if LRT_TRI_HAS_SVE && !LRT_TRI_HAS_SSE4
+#if LRT_TRI_HAS_SVE
     if (s->layout == 8 && s->prim_kind == TRI_PRIM_TRI && !s->curve &&
         !s->quantized)
         return tri_occluded_bvh8_sve(s, ray);
-#endif
-#if LRT_TRI_HAS_NEON && !LRT_TRI_HAS_SSE4
-    if (s->layout == 4 && s->prim_kind == TRI_PRIM_TRI && !s->curve)
-        return tri_occluded_bvh4_neon(s, ray);
 #endif
     return tri_occluded_scalar(s, ray);
 }
@@ -10553,7 +10294,7 @@ lrt_tri_scene *lrt_curve_scene_build(const float *segments, const float *radii,
     }
 
 #if LRT_TRI_HAS_SSE4
-    s->kernel_name = "curve-bvh4/sse4";
+    s->kernel_name = "curve-bvh4/" LRT_SIMD4_SUFFIX;
 #else
     s->kernel_name = "curve-bvh4/scalar";
 #endif
@@ -10779,8 +10520,10 @@ lrt_tri_scene *lrt_roundcurve_scene_build(const lrt_hair_strands *strands,
     }
     tri_build_shade_data(s); /* per-segment p0/r0/p1/r1 from the rlc leaves */
 
-#if LRT_TRI_HAS_SSE4
-    s->kernel_name = "rlcurve-bvh4/sse4";
+#if LRT_TRI_NEON_SHIM
+    s->kernel_name = "rlcurve-bvh4/scalar"; /* NEON leaf slower here; uses scalar */
+#elif LRT_TRI_HAS_SSE4
+    s->kernel_name = "rlcurve-bvh4/" LRT_SIMD4_SUFFIX;
 #else
     s->kernel_name = "rlcurve-bvh4/scalar";
 #endif
@@ -10933,7 +10676,7 @@ lrt_tri_scene *lrt_flatcurve_scene_build(const lrt_hair_strands *strands,
     }
     tri_build_shade_data(s); /* per-segment p0/r0/p1/r1 from the flat leaves */
 #if LRT_TRI_HAS_SSE4
-    s->kernel_name = "flatcurve-bvh4/sse4";
+    s->kernel_name = "flatcurve-bvh4/" LRT_SIMD4_SUFFIX;
 #else
     s->kernel_name = "flatcurve-bvh4/scalar";
 #endif
@@ -11055,7 +10798,7 @@ lrt_tri_scene *lrt_bezcurve_scene_build(const float *cps, size_t nseg,
      * segment parameter cannot be reconstructed -> lrt_tri_curve_frame rejects
      * BEZCURVE scenes. */
 #if LRT_TRI_HAS_SSE4
-    s->kernel_name = "bezcurve-bvh4/sse4";
+    s->kernel_name = "bezcurve-bvh4/" LRT_SIMD4_SUFFIX;
 #else
     s->kernel_name = "bezcurve-bvh4/scalar";
 #endif
@@ -11115,7 +10858,7 @@ static lrt_tri_scene *tri_finish_aabb_build(tri_build_ctx *bc, size_t nprims,
     }
 #if LRT_TRI_HAS_SSE4
     s->kernel_name =
-        prim_kind == TRI_PRIM_SPHERE ? "sphere-bvh4/sse4" : "user-bvh4/sse4";
+        prim_kind == TRI_PRIM_SPHERE ? "sphere-bvh4/" LRT_SIMD4_SUFFIX : "user-bvh4/" LRT_SIMD4_SUFFIX;
 #else
     s->kernel_name = prim_kind == TRI_PRIM_SPHERE ? "sphere-bvh4/scalar"
                                                   : "user-bvh4/scalar";
@@ -12505,7 +12248,7 @@ lrt_tri_scene *lrt_points_scene_build(const float *centers, const float *radii,
     if (s) {
         s->point_type = point_type;
 #if LRT_TRI_HAS_SSE4
-        s->kernel_name = "point-bvh4/sse4";
+        s->kernel_name = "point-bvh4/" LRT_SIMD4_SUFFIX;
 #else
         s->kernel_name = "point-bvh4/scalar";
 #endif
@@ -13042,7 +12785,7 @@ static const void *tri_scene_nodes_ptr(const lrt_tri_scene *s) {
 static void tri_set_kernel_name(lrt_tri_scene *s) {
     if (s->prim_kind == TRI_PRIM_CURVE) {
 #if LRT_TRI_HAS_SSE4
-        s->kernel_name = "curve-bvh4/sse4";
+        s->kernel_name = "curve-bvh4/" LRT_SIMD4_SUFFIX;
 #else
         s->kernel_name = "curve-bvh4/scalar";
 #endif
@@ -13052,6 +12795,10 @@ static void tri_set_kernel_name(lrt_tri_scene *s) {
     s->kernel_name = s->layout == 4 ? "bvh4/sse4"
                      : s->quantized ? "bvh8q/avx2"
                                     : "bvh8/avx2";
+#elif LRT_TRI_NEON_SHIM
+    s->kernel_name = s->layout == 4 ? "bvh4/neon"
+                     : s->quantized ? "bvh8q/scalar"
+                                    : (LRT_TRI_HAS_SVE ? "bvh8/sve" : "bvh8/scalar");
 #elif LRT_TRI_HAS_SSE4
     s->kernel_name = s->layout == 4 ? "bvh4/sse4"
                      : s->quantized ? "bvh8q/scalar"
