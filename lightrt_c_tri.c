@@ -121,6 +121,18 @@
 #define LRT_SIMD4_SUFFIX "sse4"
 #endif
 
+/* SVE 16-lane Bernstein evaluation of the bicubic Bézier / NURBS patch Newton
+ * leaf. Implemented and measured on A64FX, but it is NEUTRAL-to-slightly-slower
+ * than the scalar eval (the 9-12 horizontal svaddv reductions per eval cost
+ * about as much as the 18 scalar 1D cubic evals, and the eval is not the
+ * dominant cost — adaptive subdivision + AABB cull + Newton control flow are).
+ * So it is OFF by default; build with -DLRT_TRI_SVE_PATCH_EVAL to use it. */
+#if LRT_TRI_HAS_SVE && defined(LRT_TRI_SVE_PATCH_EVAL)
+#define LRT_TRI_PATCH_EVAL_SVE 1
+#else
+#define LRT_TRI_PATCH_EVAL_SVE 0
+#endif
+
 /* ------------------------------------------------------------------------- */
 /* Tunables.                                                                 */
 /* ------------------------------------------------------------------------- */
@@ -4271,6 +4283,64 @@ static inline void tri_bezpatch_eval(const float cp[48], float u, float v,
     }
 }
 
+#if LRT_TRI_PATCH_EVAL_SVE
+/* SVE bicubic-patch evaluation: instead of 18 scalar 1D cubic evals, weight all
+ * 16 control points at once on A64FX's 16-lane fp32 vector. The Bernstein basis
+ * for (u,v) gives a 16-lane weight w[k] = Bu[k%4]*Bv[k>>2] (k = v*4+u, matching
+ * the cp point order j*4+i); the surface point / partials are then per-axis
+ * horizontal sums svaddv(w * cp_axis). Control points must be supplied as SoA
+ * (one contiguous array per axis), transposed once per patch by the caller. */
+static inline void tri_bern3(float u, float B[4], float dB[4]) {
+    float u1 = 1.0f - u;
+    B[0] = u1 * u1 * u1; B[1] = 3.0f * u1 * u1 * u;
+    B[2] = 3.0f * u1 * u * u; B[3] = u * u * u;
+    dB[0] = -3.0f * u1 * u1; dB[1] = 3.0f * u1 * u1 - 6.0f * u1 * u;
+    dB[2] = 6.0f * u1 * u - 3.0f * u * u; dB[3] = 3.0f * u * u;
+}
+/* Build the three 16-lane weight vectors w (value), wu (d/du), wv (d/dv). */
+static inline void tri_bicubic_weights_sve(float u, float v, svfloat32_t *w,
+                                           svfloat32_t *wu, svfloat32_t *wv) {
+    float Bu[4], dBu[4], Bv[4], dBv[4];
+    tri_bern3(u, Bu, dBu);
+    tri_bern3(v, Bv, dBv);
+    svbool_t pg = svptrue_b32();
+    svfloat32_t Bur = svld1rq_f32(pg, Bu);   /* lane k: Bu[k%4] (quad replicate) */
+    svfloat32_t dBur = svld1rq_f32(pg, dBu);
+    svfloat32_t Bvq = svld1rq_f32(pg, Bv);
+    svfloat32_t dBvq = svld1rq_f32(pg, dBv);
+    svuint32_t idx = svlsr_n_u32_x(pg, svindex_u32(0, 1), 2); /* k>>2 */
+    svfloat32_t Bve = svtbl_f32(Bvq, idx);   /* lane k: Bv[k>>2] */
+    svfloat32_t dBve = svtbl_f32(dBvq, idx);
+    *w = svmul_f32_x(pg, Bur, Bve);
+    *wu = svmul_f32_x(pg, dBur, Bve);
+    *wv = svmul_f32_x(pg, Bur, dBve);
+}
+static inline void tri_bezpatch_eval_sve(const float *cpx, const float *cpy,
+                                         const float *cpz, float u, float v,
+                                         float S[3], float dSdu[3],
+                                         float dSdv[3]) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t w, wu, wv;
+    tri_bicubic_weights_sve(u, v, &w, &wu, &wv);
+    svfloat32_t X = svld1_f32(pg, cpx), Y = svld1_f32(pg, cpy),
+                Z = svld1_f32(pg, cpz);
+    S[0] = svaddv_f32(pg, svmul_f32_x(pg, w, X));
+    S[1] = svaddv_f32(pg, svmul_f32_x(pg, w, Y));
+    S[2] = svaddv_f32(pg, svmul_f32_x(pg, w, Z));
+    dSdu[0] = svaddv_f32(pg, svmul_f32_x(pg, wu, X));
+    dSdu[1] = svaddv_f32(pg, svmul_f32_x(pg, wu, Y));
+    dSdu[2] = svaddv_f32(pg, svmul_f32_x(pg, wu, Z));
+    dSdv[0] = svaddv_f32(pg, svmul_f32_x(pg, wv, X));
+    dSdv[1] = svaddv_f32(pg, svmul_f32_x(pg, wv, Y));
+    dSdv[2] = svaddv_f32(pg, svmul_f32_x(pg, wv, Z));
+}
+#define TRI_BEZ_EVAL(cp, cx, cy, cz, u, v, S, du, dv) \
+    tri_bezpatch_eval_sve(cx, cy, cz, u, v, S, du, dv)
+#else
+#define TRI_BEZ_EVAL(cp, cx, cy, cz, u, v, S, du, dv) \
+    tri_bezpatch_eval(cp, u, v, S, du, dv)
+#endif
+
 /* de Casteljau split/restrict of a cubic over 4 points × 3 floats. */
 static void tri_bez_split3(const float c[12], float t, float L[12],
                            float R[12]) {
@@ -4326,13 +4396,19 @@ static inline float tri_det3(const float a[3], const float b[3],
 }
 
 /* Newton on (u,v,t): S(u,v) - (org + t*dir) = 0. */
-static int tri_bezpatch_newton(const float cp[48], const float *org,
-                               const float *dir, float u, float v, float t,
-                               float tmin, float best, float *t_out,
-                               float *u_out, float *v_out) {
+static int tri_bezpatch_newton(const float cp[48], const float *cpx,
+                               const float *cpy, const float *cpz,
+                               const float *org, const float *dir, float u,
+                               float v, float t, float tmin, float best,
+                               float *t_out, float *u_out, float *v_out) {
+#if LRT_TRI_PATCH_EVAL_SVE
+    (void)cp;
+#else
+    (void)cpx; (void)cpy; (void)cpz;
+#endif
     for (int it = 0; it < 8; it++) {
         float S[3], du[3], dv[3];
-        tri_bezpatch_eval(cp, u, v, S, du, dv);
+        TRI_BEZ_EVAL(cp, cpx, cpy, cpz, u, v, S, du, dv);
         float R[3] = {S[0] - org[0] - t * dir[0], S[1] - org[1] - t * dir[1],
                       S[2] - org[2] - t * dir[2]};
         float ndir[3] = {-dir[0], -dir[1], -dir[2]};
@@ -4375,6 +4451,16 @@ static int tri_bezpatch_isect_one(const float cp[48], const tri_ray_ctx *rc,
     sp++;
     float best = best_t;
     int hit = 0;
+    /* SoA control points for the SVE eval (transpose once per patch; all eval
+     * calls below reuse the full patch cp with global (u,v)). */
+    const float *cpx = NULL, *cpy = NULL, *cpz = NULL;
+#if LRT_TRI_PATCH_EVAL_SVE
+    float cx[16], cy[16], cz[16];
+    for (int k = 0; k < 16; k++) {
+        cx[k] = cp[k * 3 + 0]; cy[k] = cp[k * 3 + 1]; cz[k] = cp[k * 3 + 2];
+    }
+    cpx = cx; cpy = cy; cpz = cz;
+#endif
     while (sp > 0) {
         sp--;
         float u0 = stk[sp].u0, u1 = stk[sp].u1, v0 = stk[sp].v0, v1 = stk[sp].v1;
@@ -4404,7 +4490,7 @@ static int tri_bezpatch_isect_one(const float cp[48], const tri_ray_ctx *rc,
         if (depth >= BEZPATCH_MAXDEPTH) {
             float uc = 0.5f * (u0 + u1), vc = 0.5f * (v0 + v1);
             float S[3], du[3], dv[3];
-            tri_bezpatch_eval(cp, uc, vc, S, du, dv);
+            TRI_BEZ_EVAL(cp, cpx, cpy, cpz, uc, vc, S, du, dv);
             float ddot = rc->dir[0] * rc->dir[0] + rc->dir[1] * rc->dir[1] +
                          rc->dir[2] * rc->dir[2];
             float t0 = ((S[0] - rc->org[0]) * rc->dir[0] +
@@ -4412,8 +4498,8 @@ static int tri_bezpatch_isect_one(const float cp[48], const tri_ray_ctx *rc,
                         (S[2] - rc->org[2]) * rc->dir[2]) /
                        (ddot > 1e-20f ? ddot : 1e-20f);
             float th, uh, vh;
-            if (tri_bezpatch_newton(cp, rc->org, rc->dir, uc, vc, t0, rc->tmin,
-                                    best, &th, &uh, &vh)) {
+            if (tri_bezpatch_newton(cp, cpx, cpy, cpz, rc->org, rc->dir, uc, vc,
+                                    t0, rc->tmin, best, &th, &uh, &vh)) {
                 best = th;
                 *t_out = th;
                 *u_out = uh;
@@ -4526,13 +4612,60 @@ static inline void tri_rbezpatch_eval(const float cp[64], float u, float v,
     }
 }
 
-static int tri_rbezpatch_newton(const float cp[64], const float *org,
+#if LRT_TRI_PATCH_EVAL_SVE
+/* SVE rational bicubic eval: 16-lane Bernstein weights (as bezpatch) over the
+ * 4 homogeneous components (x,y,z,w in SoA), then the perspective divide +
+ * quotient-rule partials in scalar. */
+static inline void tri_rbezpatch_eval_sve(const float *cx, const float *cy,
+                                          const float *cz, const float *cw,
+                                          float u, float v, float S[3],
+                                          float dSdu[3], float dSdv[3]) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t w, wu, wv;
+    tri_bicubic_weights_sve(u, v, &w, &wu, &wv);
+    svfloat32_t X = svld1_f32(pg, cx), Y = svld1_f32(pg, cy),
+                Z = svld1_f32(pg, cz), W = svld1_f32(pg, cw);
+    float N[4], Nu[4], Nv[4];
+    N[0] = svaddv_f32(pg, svmul_f32_x(pg, w, X));
+    N[1] = svaddv_f32(pg, svmul_f32_x(pg, w, Y));
+    N[2] = svaddv_f32(pg, svmul_f32_x(pg, w, Z));
+    N[3] = svaddv_f32(pg, svmul_f32_x(pg, w, W));
+    Nu[0] = svaddv_f32(pg, svmul_f32_x(pg, wu, X));
+    Nu[1] = svaddv_f32(pg, svmul_f32_x(pg, wu, Y));
+    Nu[2] = svaddv_f32(pg, svmul_f32_x(pg, wu, Z));
+    Nu[3] = svaddv_f32(pg, svmul_f32_x(pg, wu, W));
+    Nv[0] = svaddv_f32(pg, svmul_f32_x(pg, wv, X));
+    Nv[1] = svaddv_f32(pg, svmul_f32_x(pg, wv, Y));
+    Nv[2] = svaddv_f32(pg, svmul_f32_x(pg, wv, Z));
+    Nv[3] = svaddv_f32(pg, svmul_f32_x(pg, wv, W));
+    float ww = N[3], iw = 1.0f / ww, iw2 = iw * iw;
+    for (int k = 0; k < 3; k++) {
+        S[k] = N[k] * iw;
+        dSdu[k] = (Nu[k] * ww - N[k] * Nu[3]) * iw2;
+        dSdv[k] = (Nv[k] * ww - N[k] * Nv[3]) * iw2;
+    }
+}
+#define TRI_RBEZ_EVAL(cp, cx, cy, cz, cw, u, v, S, du, dv) \
+    tri_rbezpatch_eval_sve(cx, cy, cz, cw, u, v, S, du, dv)
+#else
+#define TRI_RBEZ_EVAL(cp, cx, cy, cz, cw, u, v, S, du, dv) \
+    tri_rbezpatch_eval(cp, u, v, S, du, dv)
+#endif
+
+static int tri_rbezpatch_newton(const float cp[64], const float *cx,
+                                const float *cy, const float *cz,
+                                const float *cw, const float *org,
                                 const float *dir, float u, float v, float t,
                                 float tmin, float best, float *t_out,
                                 float *u_out, float *v_out) {
+#if LRT_TRI_PATCH_EVAL_SVE
+    (void)cp;
+#else
+    (void)cx; (void)cy; (void)cz; (void)cw;
+#endif
     for (int it = 0; it < 8; it++) {
         float S[3], du[3], dv[3];
-        tri_rbezpatch_eval(cp, u, v, S, du, dv);
+        TRI_RBEZ_EVAL(cp, cx, cy, cz, cw, u, v, S, du, dv);
         float R[3] = {S[0] - org[0] - t * dir[0], S[1] - org[1] - t * dir[1],
                       S[2] - org[2] - t * dir[2]};
         float ndir[3] = {-dir[0], -dir[1], -dir[2]};
@@ -4594,6 +4727,16 @@ static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
     sp++;
     float best = best_t;
     int hit = 0;
+    /* SoA homogeneous control points for the SVE eval (transpose once). */
+    const float *cx = NULL, *cy = NULL, *cz = NULL, *cw = NULL;
+#if LRT_TRI_PATCH_EVAL_SVE
+    float cxa[16], cya[16], cza[16], cwa[16];
+    for (int k = 0; k < 16; k++) {
+        cxa[k] = cp[k * 4 + 0]; cya[k] = cp[k * 4 + 1];
+        cza[k] = cp[k * 4 + 2]; cwa[k] = cp[k * 4 + 3];
+    }
+    cx = cxa; cy = cya; cz = cza; cw = cwa;
+#endif
     while (sp > 0) {
         sp--;
         float u0 = stk[sp].u0, u1 = stk[sp].u1, v0 = stk[sp].v0, v1 = stk[sp].v1;
@@ -4627,7 +4770,7 @@ static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
         if (depth >= RBEZ_MAXDEPTH) {
             float uc = 0.5f * (u0 + u1), vc = 0.5f * (v0 + v1);
             float S[3], du[3], dv[3];
-            tri_rbezpatch_eval(cp, uc, vc, S, du, dv);
+            TRI_RBEZ_EVAL(cp, cx, cy, cz, cw, uc, vc, S, du, dv);
             float ddot = rc->dir[0] * rc->dir[0] + rc->dir[1] * rc->dir[1] +
                          rc->dir[2] * rc->dir[2];
             float t0 = ((S[0] - rc->org[0]) * rc->dir[0] +
@@ -4635,8 +4778,8 @@ static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
                         (S[2] - rc->org[2]) * rc->dir[2]) /
                        (ddot > 1e-20f ? ddot : 1e-20f);
             float th, uh, vh;
-            if (tri_rbezpatch_newton(cp, rc->org, rc->dir, uc, vc, t0, rc->tmin,
-                                     best, &th, &uh, &vh)) {
+            if (tri_rbezpatch_newton(cp, cx, cy, cz, cw, rc->org, rc->dir, uc, vc,
+                                     t0, rc->tmin, best, &th, &uh, &vh)) {
                 float gu = dom[0] + uh * (dom[1] - dom[0]); /* local -> global */
                 float gv = dom[2] + vh * (dom[3] - dom[2]);
                 /* trimmed hits are rejected; keep searching for the nearest

@@ -1162,10 +1162,19 @@ lanes). The scalar path is always the correctness oracle; every parity constant
   ~3.1×, sphere ~1.4× over scalar (48-thread A64FX) — except round-linear**,
   whose blendv/movemask-heavy Embree CSG leaf is measured *slower* as NEON than
   scalar, so `TRI_PRIM_RLCURVE` is routed to the scalar path on ARM.
-  **Parametric surfaces (bilinear / bicubic-Bézier / NURBS) stay scalar**: they
-  are dispatched to `tri_intersect_scalar` (per-patch Newton + adaptive
-  subdivision — divergent, not 4-wide-SIMD-friendly); SVE-vectorizing the
-  intra-patch eval is future work.
+  **Parametric surfaces (bilinear / bicubic-Bézier / NURBS) stay scalar** by
+  default: they are dispatched to `tri_intersect_scalar` (per-patch Newton +
+  adaptive subdivision — divergent control flow, not 4-wide-SIMD-friendly).
+- **SVE patch Newton eval (experimental, off by default)**: the bicubic
+  Bézier / NURBS patch eval can be done as a 16-lane Bernstein-weighted sum over
+  all 16 control points (`tri_bezpatch_eval_sve` / `tri_rbezpatch_eval_sve`,
+  weights `w[k]=Bu[k%4]*Bv[k>>2]` via `svld1rq`+`svtbl`, per-axis `svaddv`).
+  Build with `-DLRT_TRI_SVE_PATCH_EVAL`. **Honest verdict (measured on A64FX):
+  neutral-to-slightly-slower than scalar** (bezpatch ~0.98×, NURBS ~0.97×) — the
+  9-12 horizontal `svaddv` reductions per eval cost ~as much as the 18 scalar 1D
+  cubic evals, and the eval is not the dominant cost (subdivision + AABB cull +
+  Newton control flow are). So it ships OFF (`LRT_TRI_PATCH_EVAL_SVE`), like the
+  SDOT result; the scalar patch eval is the default.
 - **SVE BVH8** (`tri_*_bvh8_sve`, A64FX 512-bit): mirrors the AVX2 BVH8 path,
   processing one BVH8 node/leaf per vector on the low 8 of 16 lanes
   (`svwhilelt_b32(0,8)`; predicated-off lanes are free per-instruction). Mask
