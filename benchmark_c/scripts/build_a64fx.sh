@@ -63,3 +63,19 @@ echo "Built $out/bench_c_scalar"
 echo "CC  bench_a64fx_sdot.c"
 $FCC_C $COMMON -std=gnu11 "$here/bench_a64fx_sdot.c" -o "$out/bench_sdot" -lm
 echo "Built $out/bench_sdot"
+
+# Parametric-surface (subd) and dense-grid volume-raymarch benches. Both reuse
+# rays.c; subd also needs the kernel (c11) for the patch intersectors. rays.c is
+# compiled gnu11 (POSIX clock); the kernel object is the c11 one built above.
+echo "CC  rays.c [gnu11 for subd/volume]"
+$FCC_C $COMMON -std=gnu11 -c "$here/rays.c" -o "$out/rays_g.o"
+echo "CC  bench_a64fx_subd.c"
+$FCC_C $COMMON -std=gnu11 -c "$here/bench_a64fx_subd.c" -o "$out/subd.o"
+$FCC_C -Nclang $ARCH -O3 -o "$out/bench_subd" "$out/subd.o" "$out/rays_g.o" \
+    "$out/lightrt_c_tri.o" -lpthread -lm
+echo "Built $out/bench_subd"
+echo "CC  bench_a64fx_volume.c"
+$FCC_C $COMMON -std=gnu11 -c "$here/bench_a64fx_volume.c" -o "$out/vol.o"
+$FCC_C -Nclang $ARCH -O3 -o "$out/bench_volume" "$out/vol.o" "$out/rays_g.o" \
+    -lpthread -lm
+echo "Built $out/bench_volume"
