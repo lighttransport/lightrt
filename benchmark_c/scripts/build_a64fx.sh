@@ -16,7 +16,10 @@ mkdir -p "$out"
 FCC_C=${FCC_C:-fcc}
 FCC_CXX=${FCC_CXX:-FCC}
 ARCH="-march=armv8.2-a+sve"
-COMMON="-Nclang $ARCH -O3 -D_POSIX_C_SOURCE=200809L -I$here -I$root"
+# -DLRT_TRI_SVE_PACKET enables the 16-ray coherent SVE packet (fast primary
+# rays; not bit-identical to single-ray, so it's opt-in and off in the default
+# library / unit tests). FORCE_SCALAR builds ignore it (no SVE).
+COMMON="-Nclang $ARCH -O3 -DLRT_TRI_SVE_PACKET -D_POSIX_C_SOURCE=200809L -I$here -I$root"
 
 # Benchmark glue + backends (gnu11: strict c11 hides clock_gettime/pthreads).
 cglue=(bench_main rays scene_mandelbulb scene_thinspan \

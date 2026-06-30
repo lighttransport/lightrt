@@ -133,6 +133,18 @@
 #define LRT_TRI_PATCH_EVAL_SVE 0
 #endif
 
+/* SVE 16-ray coherent packet for lrt_tri_intersect1N(COHERENT). A big win on
+ * primary/coherent rays (~3.9x BVH4), but its results are not bit-identical to
+ * the single-ray kernel (different FMA + traversal order -> ULP-level t and
+ * tie-break prim_id differences; still matches the fp64 oracle within
+ * tolerance). The default intersect1N keeps the bit-exact Ray4 path so
+ * batch==single holds; build with -DLRT_TRI_SVE_PACKET to use the fast packet. */
+#if LRT_TRI_HAS_SVE && defined(LRT_TRI_SVE_PACKET)
+#define LRT_TRI_PACKET_SVE 1
+#else
+#define LRT_TRI_PACKET_SVE 0
+#endif
+
 /* ------------------------------------------------------------------------- */
 /* Tunables.                                                                 */
 /* ------------------------------------------------------------------------- */
@@ -8612,6 +8624,16 @@ static void tri_occluded1N_bvh8_avx2(const lrt_tri_scene *s,
 
 #endif /* LRT_TRI_HAS_AVX2 */
 
+/* Generic per-layout node view + decode (full definition below); forward
+ * declared here so the SVE ray packet can walk any layout. */
+typedef struct tri_node_view {
+    const float *lo_x, *lo_y, *lo_z, *hi_x, *hi_y, *hi_z;
+    const uint32_t *child;
+    int n;
+} tri_node_view;
+static inline void tri_node_load(const lrt_tri_scene *s, uint32_t node_ref,
+                                 float *dec, tri_node_view *v);
+
 /* ========================================================================= */
 /* ARM SVE BVH8 (A64FX = 512-bit). A mirror of the AVX2 BVH8 path. Each      */
 /* node/leaf uses the low 8 of 16 fp32 lanes (svwhilelt_b32(0,8)); on A64FX  */
@@ -9198,6 +9220,130 @@ static int tri_intersect_bvh8q_sve(const lrt_tri_scene *s, const lrt_ray *ray,
     }
     return best_prim != LRT_TRI_NO_HIT;
 }
+
+/* ===== SVE coherent ray packet: 16 rays vs 1 box/triangle (ray-parallel) =====
+ * For coherent batches (e.g. primary camera rays): the packet amortizes node +
+ * leaf fetches over 16 rays sharing the traversal. Works for any plain-triangle
+ * layout (BVH4/8/8q/16) via tri_node_load. Closest-hit is order-independent, so
+ * children are pushed if ANY active ray's interval enters them (within that
+ * ray's current best_t). nr in [1,16]; the tail uses a predicate. */
+#if LRT_TRI_PACKET_SVE
+static void tri_intersect16_sve(const lrt_tri_scene *s, const lrt_ray *rays,
+                                lrt_hit *hits, int nr) {
+    svbool_t pg = svwhilelt_b32((uint32_t)0, (uint32_t)nr);
+    float ox[16], oy[16], oz[16], dx[16], dy[16], dz[16];
+    float ix[16], iy[16], iz[16], tmn[16], tmx[16];
+    for (int r = 0; r < nr; r++) {
+        const lrt_ray *ray = &rays[r];
+        ox[r] = ray->org[0]; oy[r] = ray->org[1]; oz[r] = ray->org[2];
+        dx[r] = ray->dir[0]; dy[r] = ray->dir[1]; dz[r] = ray->dir[2];
+        for (int k = 0; k < 3; k++) {
+            float d = ray->dir[k];
+            float inv = d != 0.0f ? 1.0f / d : TRI_INVD_MAX;
+            if (!(inv >= -TRI_INVD_MAX && inv <= TRI_INVD_MAX))
+                inv = copysignf(TRI_INVD_MAX, d == 0.0f ? 1.0f : d);
+            (k == 0 ? ix : k == 1 ? iy : iz)[r] = inv;
+        }
+        tmn[r] = ray->tmin; tmx[r] = ray->tmax;
+    }
+    svfloat32_t orgx = svld1_f32(pg, ox), orgy = svld1_f32(pg, oy),
+                orgz = svld1_f32(pg, oz);
+    svfloat32_t dirx = svld1_f32(pg, dx), diry = svld1_f32(pg, dy),
+                dirz = svld1_f32(pg, dz);
+    svfloat32_t invdx = svld1_f32(pg, ix), invdy = svld1_f32(pg, iy),
+                invdz = svld1_f32(pg, iz);
+    svfloat32_t tmin = svld1_f32(pg, tmn);
+    svfloat32_t best_t = svld1_f32(pg, tmx);
+    svfloat32_t best_u = svdup_f32(0.0f), best_v = svdup_f32(0.0f);
+    uint32_t best_prim[16];
+    for (int r = 0; r < 16; r++) best_prim[r] = LRT_TRI_NO_HIT;
+    const int width = s->layout;
+
+    uint32_t stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp++] = s->root;
+    while (sp > 0) {
+        uint32_t ref = stack[--sp];
+        if (TRI_REF_IS_LEAF(ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(ref), nblk = TRI_REF_NBLOCKS(ref);
+            for (uint32_t b = 0; b < nblk; b++) {
+                const float *f = tri_block_floats(s->blocks, blk0 + b, width);
+                const uint32_t *ids = (const uint32_t *)(f + 9 * width);
+                for (int lane = 0; lane < width; lane++) {
+                    if (ids[lane] == LRT_TRI_NO_HIT) continue;
+                    float e1x = f[3 * width + lane], e1y = f[4 * width + lane],
+                          e1z = f[5 * width + lane];
+                    float e2x = f[6 * width + lane], e2y = f[7 * width + lane],
+                          e2z = f[8 * width + lane];
+                    float e1l = sqrtf(e1x * e1x + e1y * e1y + e1z * e1z);
+                    float e2l = sqrtf(e2x * e2x + e2y * e2y + e2z * e2z);
+                    float sc = e1l + e2l;
+                    float rel = TRI_ISECT_DET_EPS_SCALE * sc * sc;
+                    rel = rel < TRI_ISECT_DET_EPS_MIN ? TRI_ISECT_DET_EPS_MIN : rel;
+                    rel = rel > TRI_ISECT_DET_EPS_MAX ? TRI_ISECT_DET_EPS_MAX : rel;
+                    svfloat32_t px = svmls_f32_x(pg, svmul_f32_x(pg, diry, svdup_f32(e2z)), dirz, svdup_f32(e2y));
+                    svfloat32_t py = svmls_f32_x(pg, svmul_f32_x(pg, dirz, svdup_f32(e2x)), dirx, svdup_f32(e2z));
+                    svfloat32_t pz = svmls_f32_x(pg, svmul_f32_x(pg, dirx, svdup_f32(e2y)), diry, svdup_f32(e2x));
+                    svfloat32_t det = svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, px, svdup_f32(e1x)), py, svdup_f32(e1y)), pz, svdup_f32(e1z));
+                    svbool_t valid = svcmpgt_f32(pg, svabs_f32_x(pg, det), svdup_f32(rel));
+                    if (!svptest_any(pg, valid)) continue;
+                    svfloat32_t inv = svdiv_f32_x(pg, svdup_f32(1.0f), det);
+                    svfloat32_t tvx = svsub_f32_x(pg, orgx, svdup_f32(f[0 * width + lane]));
+                    svfloat32_t tvy = svsub_f32_x(pg, orgy, svdup_f32(f[1 * width + lane]));
+                    svfloat32_t tvz = svsub_f32_x(pg, orgz, svdup_f32(f[2 * width + lane]));
+                    svfloat32_t u = svmul_f32_x(pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, tvx, px), tvy, py), tvz, pz), inv);
+                    valid = svand_b_z(pg, valid, svcmpge_f32(pg, u, svdup_f32(0.0f)));
+                    valid = svand_b_z(pg, valid, svcmple_f32(pg, u, svdup_f32(1.0f)));
+                    if (!svptest_any(pg, valid)) continue;
+                    svfloat32_t qx = svmls_f32_x(pg, svmul_f32_x(pg, tvy, svdup_f32(e1z)), tvz, svdup_f32(e1y));
+                    svfloat32_t qy = svmls_f32_x(pg, svmul_f32_x(pg, tvz, svdup_f32(e1x)), tvx, svdup_f32(e1z));
+                    svfloat32_t qz = svmls_f32_x(pg, svmul_f32_x(pg, tvx, svdup_f32(e1y)), tvy, svdup_f32(e1x));
+                    svfloat32_t vv = svmul_f32_x(pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, dirx, qx), diry, qy), dirz, qz), inv);
+                    valid = svand_b_z(pg, valid, svcmpge_f32(pg, vv, svdup_f32(0.0f)));
+                    valid = svand_b_z(pg, valid, svcmple_f32(pg, svadd_f32_x(pg, u, vv), svdup_f32(1.0f)));
+                    if (!svptest_any(pg, valid)) continue;
+                    svfloat32_t t = svmul_f32_x(pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, svdup_f32(e2x), qx), svdup_f32(e2y), qy), svdup_f32(e2z), qz), inv);
+                    valid = svand_b_z(pg, valid, svcmpge_f32(pg, t, tmin));
+                    svbool_t closer = svand_b_z(pg, valid, svcmplt_f32(pg, t, best_t));
+                    if (!svptest_any(pg, closer)) continue;
+                    best_t = svsel_f32(closer, t, best_t);
+                    best_u = svsel_f32(closer, u, best_u);
+                    best_v = svsel_f32(closer, vv, best_v);
+                    /* scatter prim id to the lanes that improved */
+                    uint32_t cm[16];
+                    svst1_u32(pg, cm, svsel_u32(closer, svdup_u32(1), svdup_u32(0)));
+                    for (int r = 0; r < nr; r++) if (cm[r]) best_prim[r] = ids[lane];
+                }
+            }
+            continue;
+        }
+        float dec[48];
+        tri_node_view nv;
+        tri_node_load(s, ref, dec, &nv);
+        for (int i = 0; i < nv.n && sp < TRI_STACK_SIZE; i++) {
+            svfloat32_t tlx = svmul_f32_x(pg, svsub_f32_x(pg, svdup_f32(nv.lo_x[i]), orgx), invdx);
+            svfloat32_t thx = svmul_f32_x(pg, svsub_f32_x(pg, svdup_f32(nv.hi_x[i]), orgx), invdx);
+            svfloat32_t tly = svmul_f32_x(pg, svsub_f32_x(pg, svdup_f32(nv.lo_y[i]), orgy), invdy);
+            svfloat32_t thy = svmul_f32_x(pg, svsub_f32_x(pg, svdup_f32(nv.hi_y[i]), orgy), invdy);
+            svfloat32_t tlz = svmul_f32_x(pg, svsub_f32_x(pg, svdup_f32(nv.lo_z[i]), orgz), invdz);
+            svfloat32_t thz = svmul_f32_x(pg, svsub_f32_x(pg, svdup_f32(nv.hi_z[i]), orgz), invdz);
+            svfloat32_t tnear = svmax_f32_x(pg, svmax_f32_x(pg, svmin_f32_x(pg, tlx, thx), svmin_f32_x(pg, tly, thy)), svmax_f32_x(pg, svmin_f32_x(pg, tlz, thz), tmin));
+            svfloat32_t tfar = svmin_f32_x(pg, svmin_f32_x(pg, svmax_f32_x(pg, tlx, thx), svmax_f32_x(pg, tly, thy)), svmin_f32_x(pg, svmax_f32_x(pg, tlz, thz), best_t));
+            if (svptest_any(pg, svcmple_f32(pg, tnear, tfar))) stack[sp++] = nv.child[i];
+        }
+    }
+    float ta[16], ua[16], va[16];
+    svst1_f32(pg, ta, best_t);
+    svst1_f32(pg, ua, best_u);
+    svst1_f32(pg, va, best_v);
+    for (int r = 0; r < nr; r++) {
+        hits[r].u = ua[r];
+        hits[r].v = va[r];
+        hits[r].prim_id = best_prim[r];
+        hits[r].t = best_prim[r] != LRT_TRI_NO_HIT ? ta[r] : 0.0f;
+    }
+}
+#endif /* LRT_TRI_PACKET_SVE */
 
 static int tri_occluded_bvh8q_sve(const lrt_tri_scene *s, const lrt_ray *ray) {
     tri_ray_ctx rc;
@@ -10238,6 +10384,18 @@ void lrt_tri_intersect1N(const lrt_tri_scene *s, const lrt_ray *rays,
         for (size_t i = 0; i < n; i++) lrt_tri_intersect1(s, &rays[i], &hits[i]);
         return;
     }
+#if LRT_TRI_PACKET_SVE
+    /* A64FX: coherent closest-hit via a 16-ray SVE packet (16 rays vs 1 box),
+     * amortizing node/leaf fetches over the packet. Works for any plain-triangle
+     * layout (BVH4/8/8q/16) via tri_node_load. Opt-in (-DLRT_TRI_SVE_PACKET):
+     * not bit-identical to the single-ray kernel (ULP-t / tie prim_id). */
+    if (hint == LRT_TRI_BATCH_COHERENT) {
+        size_t i = 0;
+        for (; i + 16 <= n; i += 16) tri_intersect16_sve(s, &rays[i], &hits[i], 16);
+        if (i < n) tri_intersect16_sve(s, &rays[i], &hits[i], (int)(n - i));
+        return;
+    }
+#endif
 #if LRT_TRI_HAS_SSE4
     if (hint == LRT_TRI_BATCH_COHERENT && s->layout == 4) {
         /* Coherent closest-hit: the Ray4 packet amortizes node and leaf fetches
@@ -10336,13 +10494,7 @@ const char *lrt_tri_kernel_name(const lrt_tri_scene *s) {
 /* ------------------------------------------------------------------------- */
 
 /* Unified view of a wide node's child bounds + refs (quantized nodes decoded
- * into the caller's float[48] scratch). */
-typedef struct tri_node_view {
-    const float *lo_x, *lo_y, *lo_z, *hi_x, *hi_y, *hi_z;
-    const uint32_t *child;
-    int n;
-} tri_node_view;
-
+ * into the caller's float[48] scratch). (tri_node_view declared above.) */
 static inline void tri_node_load(const lrt_tri_scene *s, uint32_t node_ref,
                                  float *dec, tri_node_view *v) {
     if (s->layout == 4) {
@@ -10356,6 +10508,11 @@ static inline void tri_node_load(const lrt_tri_scene *s, uint32_t node_ref,
                          dec + 40);
         v->lo_x = dec; v->lo_y = dec + 8; v->lo_z = dec + 16;
         v->hi_x = dec + 24; v->hi_y = dec + 32; v->hi_z = dec + 40;
+        v->child = n->child; v->n = (int)n->nchildren;
+    } else if (s->layout == 16) {
+        const lrt_bvh16_node *n = &s->nodes16[TRI_REF_NODE(node_ref)];
+        v->lo_x = n->lo_x; v->lo_y = n->lo_y; v->lo_z = n->lo_z;
+        v->hi_x = n->hi_x; v->hi_y = n->hi_y; v->hi_z = n->hi_z;
         v->child = n->child; v->n = (int)n->nchildren;
     } else {
         const lrt_bvh8_node *n = &s->nodes8[TRI_REF_NODE(node_ref)];

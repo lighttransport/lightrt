@@ -1189,6 +1189,20 @@ lanes). The scalar path is always the correctness oracle; every parity constant
   `kernel_name` = `bvh8q/sve`. ~**2.5× over scalar** (48-thread A64FX, 31.6/22.4
   vs 12.8/9.7 Mray/s primary/incoherent) and ≈ BVH8/SVE at half the node bytes.
   qnode (fp8/q4) node formats remain AVX2-only.
+- **SVE coherent ray packet** (`tri_intersect16_sve`, opt-in
+  `-DLRT_TRI_SVE_PACKET`): routes `lrt_tri_intersect1N(LRT_TRI_BATCH_COHERENT)`
+  through a **16 rays vs one box/triangle** traversal (ray-parallel SoA, full
+  16-lane SVE), walking any plain-triangle layout (BVH4/8/8q/16) via
+  `tri_node_load`. Closest-hit is order-independent so a child is pushed if any
+  active ray's interval enters it (within that ray's best_t). **Big win on
+  coherent/primary rays** (48-thread A64FX, mandelbulb 127k, 100% fp64-oracle
+  match): BVH4 primary **30.6 → 120.7 Mray/s (~3.9×)**, BVH8 **32.3 → 77.4
+  (~2.4×)** — BVH4 wins under the packet (4 boxes/node vs 8; coherent rays don't
+  need the wider node). It is **off by default**: the packet's FMA/traversal
+  order isn't bit-identical to the single-ray kernel (ULP-level t, tie-break
+  prim_id), and the default `intersect1N` keeps the bit-exact Ray4 path so the
+  `batch == single` unit-test contract holds; `benchmark_c/scripts/build_a64fx.sh`
+  enables it. Any-hit (`occluded1N`) stays per-ray by design.
 - **BVH16 (`LRT_TRI_LAYOUT_BVH16`, `lrt_bvh16_node`/`lrt_tri16`, opt-in):** a
   16-wide node + 16-wide leaf that fills all 16 SVE fp32 lanes with no predicate
   waste (`tri_*_bvh16_sve`, `svptrue_b32`). SVE-only (no scalar nodes16 path —
