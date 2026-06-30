@@ -9879,14 +9879,161 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
     return tri_intersect_scalar(s, ray, hit);
 }
 
+/* ===== fp64 high-precision parametric-surface (Bézier/NURBS) intersection =====
+ * For HPC visualization: an fp64 closest hit on bicubic Bézier / NURBS patches.
+ * The coarse find (which patch + an approximate (u,v) seed) reuses the fp32
+ * adaptive-subdivision intersector; the hit is then refined by an fp64 Newton on
+ * (u,v,t) using the fp64 ray and the patch control points (promoted to double),
+ * so t/u/v carry full fp64 resolution. The eval is scalar double: the fp32 SVE
+ * Bernstein eval was already neutral (svaddv-bound), and fp64 halves the lane
+ * count (16 CPs span two 8-lane vectors), so SVE does not help the fp64 eval —
+ * the precision, not throughput, is the point here. */
+static inline void tri_bez_cubic1_hp(double p0, double p1, double p2, double p3,
+                                     double u, double *val, double *der) {
+    double u1 = 1.0 - u;
+    *val = u1 * u1 * u1 * p0 + 3.0 * u1 * u1 * u * p1 + 3.0 * u1 * u * u * p2 +
+           u * u * u * p3;
+    *der = 3.0 * (u1 * u1 * (p1 - p0) + 2.0 * u1 * u * (p2 - p1) +
+                  u * u * (p3 - p2));
+}
+/* fp64 bicubic eval from fp32 control points (cp[48], point k=j*4+i). */
+static inline void tri_bezpatch_eval_hp(const float cp[48], double u, double v,
+                                        double S[3], double dSdu[3],
+                                        double dSdv[3]) {
+    for (int a = 0; a < 3; a++) {
+        double R[4], dR[4];
+        for (int j = 0; j < 4; j++)
+            tri_bez_cubic1_hp(cp[(j * 4 + 0) * 3 + a], cp[(j * 4 + 1) * 3 + a],
+                              cp[(j * 4 + 2) * 3 + a], cp[(j * 4 + 3) * 3 + a], u,
+                              &R[j], &dR[j]);
+        double sv, dsv, su, tmp;
+        tri_bez_cubic1_hp(R[0], R[1], R[2], R[3], v, &sv, &dsv);
+        tri_bez_cubic1_hp(dR[0], dR[1], dR[2], dR[3], v, &su, &tmp);
+        S[a] = sv; dSdv[a] = dsv; dSdu[a] = su;
+    }
+}
+/* fp64 rational bicubic eval from fp32 homogeneous control points (cp[64]). */
+static inline void tri_rbezpatch_eval_hp(const float cp[64], double u, double v,
+                                         double S[3], double dSdu[3],
+                                         double dSdv[3]) {
+    double N[4], Nu[4], Nv[4];
+    for (int a = 0; a < 4; a++) {
+        double R[4], dR[4];
+        for (int j = 0; j < 4; j++)
+            tri_bez_cubic1_hp(cp[(j * 4 + 0) * 4 + a], cp[(j * 4 + 1) * 4 + a],
+                              cp[(j * 4 + 2) * 4 + a], cp[(j * 4 + 3) * 4 + a], u,
+                              &R[j], &dR[j]);
+        double sv, dsv, su, tmp;
+        tri_bez_cubic1_hp(R[0], R[1], R[2], R[3], v, &sv, &dsv);
+        tri_bez_cubic1_hp(dR[0], dR[1], dR[2], dR[3], v, &su, &tmp);
+        N[a] = sv; Nv[a] = dsv; Nu[a] = su;
+    }
+    double w = N[3], iw = 1.0 / w, iw2 = iw * iw;
+    for (int a = 0; a < 3; a++) {
+        S[a] = N[a] * iw;
+        dSdu[a] = (Nu[a] * w - N[a] * Nu[3]) * iw2;
+        dSdv[a] = (Nv[a] * w - N[a] * Nv[3]) * iw2;
+    }
+}
+static inline double tri_det3_hp(const double a[3], const double b[3],
+                                 const double c[3]) {
+    return a[0] * (b[1] * c[2] - b[2] * c[1]) -
+           a[1] * (b[0] * c[2] - b[2] * c[0]) +
+           a[2] * (b[0] * c[1] - b[1] * c[0]);
+}
+/* fp64 Newton on (u,v,t) for a bicubic patch; rational==1 uses the NURBS eval.
+ * (u,v) are LOCAL [0,1]^2. Returns 1 + refined (t,u,v) on convergence. */
+static int tri_patch_newton_hp(const float *cp, int rational, const double org[3],
+                               const double dir[3], double u, double v, double t,
+                               double tmin, double best, double *t_out,
+                               double *u_out, double *v_out) {
+    for (int it = 0; it < 10; it++) {
+        double S[3], du[3], dv[3];
+        if (rational) tri_rbezpatch_eval_hp(cp, u, v, S, du, dv);
+        else tri_bezpatch_eval_hp(cp, u, v, S, du, dv);
+        double R[3] = {S[0] - org[0] - t * dir[0], S[1] - org[1] - t * dir[1],
+                       S[2] - org[2] - t * dir[2]};
+        double nd[3] = {-dir[0], -dir[1], -dir[2]};
+        double det = tri_det3_hp(du, dv, nd);
+        if (det > -1e-300 && det < 1e-300) return 0;
+        double inv = 1.0 / det;
+        u -= tri_det3_hp(R, dv, nd) * inv;
+        v -= tri_det3_hp(du, R, nd) * inv;
+        t -= tri_det3_hp(du, dv, R) * inv;
+        double rr = sqrt(R[0] * R[0] + R[1] * R[1] + R[2] * R[2]);
+        double sl = sqrt(S[0] * S[0] + S[1] * S[1] + S[2] * S[2]);
+        if (rr < 1e-12 * (1.0 + sl)) {
+            if (u >= -1e-6 && u <= 1.0 + 1e-6 && v >= -1e-6 && v <= 1.0 + 1e-6 &&
+                t >= tmin && t < best) {
+                *t_out = t; *u_out = u; *v_out = v;
+                return 1;
+            }
+            return 0;
+        }
+    }
+    return 0;
+}
+/* fp64 patch closest hit: fp32 coarse find + fp64 Newton polish. */
+static int tri_patch_intersect_hp(const lrt_tri_scene *s, const lrt_ray_hp *ray,
+                                  lrt_hit_hp *hit) {
+    lrt_ray r32;
+    for (int k = 0; k < 3; k++) {
+        r32.org[k] = (float)ray->org[k];
+        r32.dir[k] = (float)ray->dir[k];
+    }
+    r32.tmin = (float)ray->tmin;
+    r32.tmax = (float)ray->tmax;
+    lrt_hit h32;
+    if (!lrt_tri_intersect1(s, &r32, &h32)) {
+        if (hit) hit->prim_id = LRT_TRI_NO_HIT;
+        return 0;
+    }
+    double t = h32.t, u = h32.u, v = h32.v; /* fp32-cast fallback */
+    uint32_t prim = h32.prim_id;
+    int k = s->prim_kind;
+    if (s->shade_cps && prim < s->shade_nprims &&
+        (k == TRI_PRIM_BEZPATCH || k == TRI_PRIM_RBEZPATCH ||
+         k == TRI_PRIM_TRIMNURBS)) {
+        const float *cp = &s->shade_cps[(size_t)prim * s->shade_stride];
+        double org[3] = {ray->org[0], ray->org[1], ray->org[2]};
+        double dir[3] = {ray->dir[0], ray->dir[1], ray->dir[2]};
+        double to, uo, vo;
+        if (k == TRI_PRIM_BEZPATCH) {
+            if (tri_patch_newton_hp(cp, 0, org, dir, u, v, t, ray->tmin,
+                                    ray->tmax, &to, &uo, &vo)) {
+                t = to; u = uo; v = vo;
+            }
+        } else { /* NURBS: (u,v) global -> local, refine, map back */
+            const float *dom = &s->shade_dom[(size_t)prim * 4];
+            double du = (double)dom[1] - dom[0], dv = (double)dom[3] - dom[2];
+            double lu = du != 0.0 ? (u - dom[0]) / du : 0.0;
+            double lv = dv != 0.0 ? (v - dom[2]) / dv : 0.0;
+            lu = lu < 0.0 ? 0.0 : (lu > 1.0 ? 1.0 : lu);
+            lv = lv < 0.0 ? 0.0 : (lv > 1.0 ? 1.0 : lv);
+            if (tri_patch_newton_hp(cp, 1, org, dir, lu, lv, t, ray->tmin,
+                                    ray->tmax, &to, &uo, &vo)) {
+                t = to; u = dom[0] + uo * du; v = dom[2] + vo * dv;
+            }
+        }
+    }
+    if (hit) {
+        hit->t = t; hit->u = u; hit->v = v; hit->prim_id = prim;
+    }
+    return 1;
+}
+
 int lrt_tri_intersect1_hp(const lrt_tri_scene *s, const lrt_ray_hp *ray,
                           lrt_hit_hp *hit) {
     if (!s || !ray) {
         if (hit) hit->prim_id = LRT_TRI_NO_HIT;
         return 0;
     }
-    /* Plain-triangle scenes only (the fp64 leaf assumes the lrt_tri4/lrt_tri8
-     * block layout). Other prim_kinds report a miss. */
+    /* fp64 Bézier / NURBS surfaces: fp32 find + fp64 Newton polish. */
+    if (s->prim_kind == TRI_PRIM_BEZPATCH || s->prim_kind == TRI_PRIM_RBEZPATCH ||
+        s->prim_kind == TRI_PRIM_TRIMNURBS)
+        return tri_patch_intersect_hp(s, ray, hit);
+    /* Plain-triangle scenes (the fp64 leaf assumes the lrt_tri4/lrt_tri8 block
+     * layout). Other prim_kinds report a miss. */
     if (s->prim_kind != TRI_PRIM_TRI || s->curve || s->quantized ||
         (s->layout != 4 && s->layout != 8)) {
         if (hit) hit->prim_id = LRT_TRI_NO_HIT;

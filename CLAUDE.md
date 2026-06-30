@@ -1198,7 +1198,15 @@ lanes). The scalar path is always the correctness oracle; every parity constant
   `svfloat64`, `svwhilelt_b64`) on A64FX, scalar double elsewhere — so t/u/v keep
   fp64 resolution along an fp64 ray. The generic fp64 **custom-geometry** path
   (`lightrt_c.c`, `lrt_scene_*`) additionally gained a NEON node slab
-  (`LRT_HAVE_NEON`); its fp64 leaf is the user callback.
+  (`LRT_HAVE_NEON`); its fp64 leaf is the user callback. `lrt_tri_intersect1_hp`
+  also covers **bicubic Bézier and NURBS surfaces**: the fp32 adaptive-subdiv
+  intersector does the coarse find (which patch + (u,v) seed), then an fp64
+  Newton on (u,v,t) — using the patch control points promoted to double and the
+  fp64 ray — refines to full fp64 t/u/v (NURBS (u,v) mapped global<->local via
+  the patch domain). 100% hit agreement with the fp32 path; the fp64 eval is
+  scalar double (an SVE fp64 eval doesn't help — the fp32 SVE Bernstein eval was
+  already neutral and fp64 halves the lane count, 16 CPs over two 8-lane
+  vectors; precision, not throughput, is the point of the fp64 path).
 - **int8/int16 SDOT quantized leaf (experimental, research)**: A64FX is SVE 1.0
   (no SVE2 `svmullb`; widening is `sunpklo`+`svmul`). `svdot_s32` (int8, 16
   tris/instr) and `svdot_s64` (int16, 8 tris/instr) were benchmarked for the
