@@ -49,6 +49,7 @@ typedef struct bench_backend {
 const bench_backend *backend_lightrt_cb(void);    /* lightrt_c.h callback API */
 const bench_backend *backend_lightrt_bvh4(void);  /* lightrt_c_tri.h, BVH4/SAH */
 const bench_backend *backend_lightrt_bvh8(void);  /* lightrt_c_tri.h, BVH8/SAH */
+const bench_backend *backend_lightrt_bvh16(void); /* BVH16/SAH (A64FX SVE 16-wide) */
 const bench_backend *backend_lightrt_lbvh4(void); /* BVH4, Morton fast build */
 const bench_backend *backend_lightrt_lbvh8(void); /* BVH8, Morton fast build */
 const bench_backend *backend_lightrt_bvh8q(void); /* BVH8, quantized nodes */

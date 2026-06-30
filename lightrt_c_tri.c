@@ -188,6 +188,16 @@ typedef struct lrt_bvh8_node {
     uint32_t _pad[7];
 } lrt_bvh8_node;
 
+/* 16-wide node (A64FX SVE fills all 16 fp32 lanes): SoA child bounds, 512 bytes
+ * = 8 cache lines. No perm table (traversal insertion-sorts hits like BVH8). */
+typedef struct lrt_bvh16_node {
+    float lo_x[16], lo_y[16], lo_z[16];
+    float hi_x[16], hi_y[16], hi_z[16];
+    uint32_t child[16];
+    uint32_t nchildren;
+    uint32_t _pad[15];
+} lrt_bvh16_node;
+
 /* Quantized 8-wide node: child bounds as 8-bit offsets on a node-local grid
  * (org + q * scale, quantization rounded outward so decoded boxes always
  * contain the true ones). 128 bytes = 2 cache lines. */
@@ -234,6 +244,15 @@ typedef struct lrt_tri8 {
     float e2x[8], e2y[8], e2z[8];
     uint32_t prim_id[8];
 } lrt_tri8;
+
+/* 16-wide triangle leaf block (A64FX SVE): 640 bytes. Same generic float
+ * layout (9 arrays of `width` floats + `width` prim ids) as lrt_tri4/8. */
+typedef struct lrt_tri16 {
+    float v0x[16], v0y[16], v0z[16];
+    float e1x[16], e1y[16], e1z[16];
+    float e2x[16], e2y[16], e2z[16];
+    uint32_t prim_id[16];
+} lrt_tri16;
 
 /* Capsule (hair sub-segment) leaf block: same 160-byte footprint as lrt_tri4,
  * so curve scenes reuse the triangle block allocator and leaf-ref encoding.
@@ -476,6 +495,7 @@ struct lrt_tri_scene {
     lrt_bvh8_node *nodes8;
     lrt_bvh8q_node *nodes8q;
     lrt_bvh8q4_node *nodes8q4;
+    lrt_bvh16_node *nodes16; /* layout == 16 (A64FX SVE) */
     int qnode; /* node-bound quant: 0=linear8(BVH8Q), 1=fp8(E4M3), 2=q4 */
     uint32_t node_count;
     void *blocks; /* lrt_tri4[] when layout==4, lrt_tri8[] when layout==8 */
@@ -513,7 +533,8 @@ struct lrt_tri_scene {
 };
 
 static inline size_t tri_block_size(int width) {
-    return width == 4 ? sizeof(lrt_tri4) : sizeof(lrt_tri8);
+    return width == 4 ? sizeof(lrt_tri4)
+                      : width == 16 ? sizeof(lrt_tri16) : sizeof(lrt_tri8);
 }
 
 /* Rebuild per-prim post-hit shade data from leaf blocks (defined below; used by
@@ -2892,7 +2913,7 @@ static uint32_t tri_collapse(tri_collapse_ctx *cc, uint32_t b_idx,
 
     /* Gather up to `width` binary children by repeatedly expanding the inner
      * member with the largest surface area. */
-    uint32_t set[8];
+    uint32_t set[16]; /* up to BVH16 width */
     int n = 0;
     set[n++] = bn->a;
     set[n++] = bn->b;
@@ -3035,6 +3056,21 @@ static uint32_t tri_collapse(tri_collapse_ctx *cc, uint32_t b_idx,
             }
             uint32_t ref = tri_collapse(cc, set[i], depth + 1);
             s->nodes8q[node_idx].child[i] = ref;
+        }
+    } else if (width == 16) {
+        lrt_bvh16_node *w = &s->nodes16[node_idx];
+        memset(w, 0, sizeof(*w));
+        for (int i = 0; i < 16; i++) {
+            w->lo_x[i] = w->lo_y[i] = w->lo_z[i] = TRI_INF_F;
+            w->hi_x[i] = w->hi_y[i] = w->hi_z[i] = TRI_INF_F;
+        }
+        w->nchildren = (uint32_t)n;
+        for (int i = 0; i < n; i++) {
+            tri_fill_slot(cc, set[i], depth + 1, s->nodes16[node_idx].lo_x,
+                          s->nodes16[node_idx].lo_y, s->nodes16[node_idx].lo_z,
+                          s->nodes16[node_idx].hi_x, s->nodes16[node_idx].hi_y,
+                          s->nodes16[node_idx].hi_z, s->nodes16[node_idx].child,
+                          i);
         }
     } else {
         lrt_bvh8_node *w = &s->nodes8[node_idx];
@@ -8852,6 +8888,227 @@ static int tri_occluded_bvh8_sve(const lrt_tri_scene *s, const lrt_ray *ray) {
     return 0;
 }
 
+/* ===== SVE BVH16: 16-wide node + leaf, filling all 16 A64FX fp32 lanes ===== */
+
+/* 16-wide Moller-Trumbore over one lrt_tri16 block (full svptrue_b32). */
+static inline void tri_block_isect_sve16(const lrt_tri16 *blk,
+                                         const tri_ray_ctx *rc, float *best_t,
+                                         float *best_u, float *best_v,
+                                         uint32_t *best_prim) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t dirx = svdup_f32(rc->dir[0]), diry = svdup_f32(rc->dir[1]),
+                dirz = svdup_f32(rc->dir[2]);
+    svfloat32_t e1x = svld1_f32(pg, blk->e1x), e1y = svld1_f32(pg, blk->e1y),
+                e1z = svld1_f32(pg, blk->e1z);
+    svfloat32_t e2x = svld1_f32(pg, blk->e2x), e2y = svld1_f32(pg, blk->e2y),
+                e2z = svld1_f32(pg, blk->e2z);
+    svfloat32_t px = svmls_f32_x(pg, svmul_f32_x(pg, diry, e2z), dirz, e2y);
+    svfloat32_t py = svmls_f32_x(pg, svmul_f32_x(pg, dirz, e2x), dirx, e2z);
+    svfloat32_t pz = svmls_f32_x(pg, svmul_f32_x(pg, dirx, e2y), diry, e2x);
+    svfloat32_t det = svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e1x, px),
+                                                  e1y, py),
+                                  e1z, pz);
+    svbool_t valid = tri_det_parallel_sve(pg, e1x, e1y, e1z, e2x, e2y, e2z, det);
+    if (!svptest_any(pg, valid)) return;
+    svfloat32_t inv_det = svdiv_f32_x(pg, svdup_f32(1.0f), det);
+    svfloat32_t tvx = svsub_f32_x(pg, svdup_f32(rc->org[0]), svld1_f32(pg, blk->v0x));
+    svfloat32_t tvy = svsub_f32_x(pg, svdup_f32(rc->org[1]), svld1_f32(pg, blk->v0y));
+    svfloat32_t tvz = svsub_f32_x(pg, svdup_f32(rc->org[2]), svld1_f32(pg, blk->v0z));
+    svfloat32_t u = svmul_f32_x(
+        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, tvx, px), tvy, py),
+                        tvz, pz),
+        inv_det);
+    valid = svand_b_z(pg, valid, svcmpge_f32(pg, u, svdup_f32(0.0f)));
+    valid = svand_b_z(pg, valid, svcmple_f32(pg, u, svdup_f32(1.0f)));
+    if (!svptest_any(pg, valid)) return;
+    svfloat32_t qx = svmls_f32_x(pg, svmul_f32_x(pg, tvy, e1z), tvz, e1y);
+    svfloat32_t qy = svmls_f32_x(pg, svmul_f32_x(pg, tvz, e1x), tvx, e1z);
+    svfloat32_t qz = svmls_f32_x(pg, svmul_f32_x(pg, tvx, e1y), tvy, e1x);
+    svfloat32_t v = svmul_f32_x(
+        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, dirx, qx), diry, qy),
+                        dirz, qz),
+        inv_det);
+    valid = svand_b_z(pg, valid, svcmpge_f32(pg, v, svdup_f32(0.0f)));
+    valid = svand_b_z(pg, valid,
+                      svcmple_f32(pg, svadd_f32_x(pg, u, v), svdup_f32(1.0f)));
+    if (!svptest_any(pg, valid)) return;
+    svfloat32_t t = svmul_f32_x(
+        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e2x, qx), e2y, qy),
+                        e2z, qz),
+        inv_det);
+    valid = svand_b_z(pg, valid, svcmpge_f32(pg, t, svdup_f32(rc->tmin)));
+    valid = svand_b_z(pg, valid, svcmplt_f32(pg, t, svdup_f32(*best_t)));
+    if (!svptest_any(pg, valid)) return;
+    _Alignas(64) float ta[16], ua[16], va[16];
+    svst1_f32(pg, ta, svsel_f32(valid, t, svdup_f32(TRI_INF_F)));
+    svst1_f32(pg, ua, u);
+    svst1_f32(pg, va, v);
+    for (int lane = 0; lane < 16; lane++) {
+        if (ta[lane] < *best_t) {
+            *best_t = ta[lane]; *best_u = ua[lane]; *best_v = va[lane];
+            *best_prim = blk->prim_id[lane];
+        }
+    }
+}
+
+static inline int tri_block_occluded_sve16(const lrt_tri16 *blk,
+                                           const tri_ray_ctx *rc, float tmax) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t dirx = svdup_f32(rc->dir[0]), diry = svdup_f32(rc->dir[1]),
+                dirz = svdup_f32(rc->dir[2]);
+    svfloat32_t e1x = svld1_f32(pg, blk->e1x), e1y = svld1_f32(pg, blk->e1y),
+                e1z = svld1_f32(pg, blk->e1z);
+    svfloat32_t e2x = svld1_f32(pg, blk->e2x), e2y = svld1_f32(pg, blk->e2y),
+                e2z = svld1_f32(pg, blk->e2z);
+    svfloat32_t px = svmls_f32_x(pg, svmul_f32_x(pg, diry, e2z), dirz, e2y);
+    svfloat32_t py = svmls_f32_x(pg, svmul_f32_x(pg, dirz, e2x), dirx, e2z);
+    svfloat32_t pz = svmls_f32_x(pg, svmul_f32_x(pg, dirx, e2y), diry, e2x);
+    svfloat32_t det = svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e1x, px),
+                                                  e1y, py),
+                                  e1z, pz);
+    svbool_t valid = tri_det_parallel_sve(pg, e1x, e1y, e1z, e2x, e2y, e2z, det);
+    if (!svptest_any(pg, valid)) return 0;
+    svfloat32_t inv_det = svdiv_f32_x(pg, svdup_f32(1.0f), det);
+    svfloat32_t tvx = svsub_f32_x(pg, svdup_f32(rc->org[0]), svld1_f32(pg, blk->v0x));
+    svfloat32_t tvy = svsub_f32_x(pg, svdup_f32(rc->org[1]), svld1_f32(pg, blk->v0y));
+    svfloat32_t tvz = svsub_f32_x(pg, svdup_f32(rc->org[2]), svld1_f32(pg, blk->v0z));
+    svfloat32_t u = svmul_f32_x(
+        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, tvx, px), tvy, py),
+                        tvz, pz),
+        inv_det);
+    valid = svand_b_z(pg, valid, svcmpge_f32(pg, u, svdup_f32(0.0f)));
+    valid = svand_b_z(pg, valid, svcmple_f32(pg, u, svdup_f32(1.0f)));
+    if (!svptest_any(pg, valid)) return 0;
+    svfloat32_t qx = svmls_f32_x(pg, svmul_f32_x(pg, tvy, e1z), tvz, e1y);
+    svfloat32_t qy = svmls_f32_x(pg, svmul_f32_x(pg, tvz, e1x), tvx, e1z);
+    svfloat32_t qz = svmls_f32_x(pg, svmul_f32_x(pg, tvx, e1y), tvy, e1x);
+    svfloat32_t v = svmul_f32_x(
+        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, dirx, qx), diry, qy),
+                        dirz, qz),
+        inv_det);
+    valid = svand_b_z(pg, valid, svcmpge_f32(pg, v, svdup_f32(0.0f)));
+    valid = svand_b_z(pg, valid,
+                      svcmple_f32(pg, svadd_f32_x(pg, u, v), svdup_f32(1.0f)));
+    if (!svptest_any(pg, valid)) return 0;
+    svfloat32_t t = svmul_f32_x(
+        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e2x, qx), e2y, qy),
+                        e2z, qz),
+        inv_det);
+    valid = svand_b_z(pg, valid, svcmpge_f32(pg, t, svdup_f32(rc->tmin)));
+    valid = svand_b_z(pg, valid, svcmple_f32(pg, t, svdup_f32(tmax)));
+    return svptest_any(pg, valid);
+}
+
+/* One ray vs the 16 child boxes; writes per-slot tnear/tfar to float[16]. */
+static inline void tri_bvh16_slab_sve(const lrt_bvh16_node *n,
+                                      const tri_ray_ctx *rc, float best_t,
+                                      float *tnear_out, float *tfar_out) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t orgx = svdup_f32(rc->org[0]), orgy = svdup_f32(rc->org[1]),
+                orgz = svdup_f32(rc->org[2]);
+    svfloat32_t invdx = svdup_f32(rc->invd[0]), invdy = svdup_f32(rc->invd[1]),
+                invdz = svdup_f32(rc->invd[2]);
+    svfloat32_t tlx = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->lo_x), orgx), invdx);
+    svfloat32_t thx = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->hi_x), orgx), invdx);
+    svfloat32_t tly = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->lo_y), orgy), invdy);
+    svfloat32_t thy = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->hi_y), orgy), invdy);
+    svfloat32_t tlz = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->lo_z), orgz), invdz);
+    svfloat32_t thz = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->hi_z), orgz), invdz);
+    svfloat32_t tnear = svmax_f32_x(
+        pg, svmax_f32_x(pg, svmin_f32_x(pg, tlx, thx), svmin_f32_x(pg, tly, thy)),
+        svmax_f32_x(pg, svmin_f32_x(pg, tlz, thz), svdup_f32(rc->tmin)));
+    svfloat32_t tfar = svmin_f32_x(
+        pg, svmin_f32_x(pg, svmax_f32_x(pg, tlx, thx), svmax_f32_x(pg, tly, thy)),
+        svmin_f32_x(pg, svmax_f32_x(pg, tlz, thz), svdup_f32(best_t)));
+    svst1_f32(pg, tnear_out, tnear);
+    svst1_f32(pg, tfar_out, tfar);
+}
+
+static int tri_intersect_bvh16_sve(const lrt_tri_scene *s, const lrt_ray *ray,
+                                   lrt_hit *hit) {
+    tri_ray_ctx rc;
+    tri_ray_setup(ray, &rc);
+    float best_t = ray->tmax, best_u = 0.0f, best_v = 0.0f;
+    uint32_t best_prim = LRT_TRI_NO_HIT;
+    tri_stack_entry stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp].ref = s->root;
+    stack[sp].tnear = rc.tmin;
+    sp++;
+    while (sp > 0) {
+        tri_stack_entry e = stack[--sp];
+        if (e.tnear >= best_t) continue;
+        if (TRI_REF_IS_LEAF(e.ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(e.ref), nblk = TRI_REF_NBLOCKS(e.ref);
+            const lrt_tri16 *blocks = (const lrt_tri16 *)s->blocks;
+            for (uint32_t b = 0; b < nblk; b++)
+                tri_block_isect_sve16(&blocks[blk0 + b], &rc, &best_t, &best_u,
+                                      &best_v, &best_prim);
+            continue;
+        }
+        const lrt_bvh16_node *n = &s->nodes16[TRI_REF_NODE(e.ref)];
+        _Alignas(64) float tnear[16], tfar[16];
+        tri_bvh16_slab_sve(n, &rc, best_t, tnear, tfar);
+        int nch = (int)n->nchildren;
+        uint32_t hit_ref[16];
+        float hit_tn[16];
+        int nhit = 0;
+        for (int i = 0; i < nch; i++) {
+            if (!(tnear[i] <= tfar[i])) continue;
+            tri_prefetch_ref(s, n->child[i], 8);
+            int j = nhit++;
+            while (j > 0 && hit_tn[j - 1] > tnear[i]) {
+                hit_tn[j] = hit_tn[j - 1];
+                hit_ref[j] = hit_ref[j - 1];
+                j--;
+            }
+            hit_tn[j] = tnear[i];
+            hit_ref[j] = n->child[i];
+        }
+        for (int i = nhit - 1; i >= 0; i--) {
+            stack[sp].ref = hit_ref[i];
+            stack[sp].tnear = hit_tn[i];
+            sp++;
+        }
+    }
+    if (hit) {
+        hit->t = best_prim != LRT_TRI_NO_HIT ? best_t : 0.0f;
+        hit->u = best_u;
+        hit->v = best_v;
+        hit->prim_id = best_prim;
+    }
+    return best_prim != LRT_TRI_NO_HIT;
+}
+
+static int tri_occluded_bvh16_sve(const lrt_tri_scene *s, const lrt_ray *ray) {
+    tri_ray_ctx rc;
+    tri_ray_setup(ray, &rc);
+    float tmax = ray->tmax;
+    uint32_t stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp++] = s->root;
+    while (sp > 0) {
+        uint32_t ref = stack[--sp];
+        if (TRI_REF_IS_LEAF(ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(ref), nblk = TRI_REF_NBLOCKS(ref);
+            const lrt_tri16 *blocks = (const lrt_tri16 *)s->blocks;
+            for (uint32_t b = 0; b < nblk; b++)
+                if (tri_block_occluded_sve16(&blocks[blk0 + b], &rc, tmax)) return 1;
+            continue;
+        }
+        const lrt_bvh16_node *n = &s->nodes16[TRI_REF_NODE(ref)];
+        _Alignas(64) float tnear[16], tfar[16];
+        tri_bvh16_slab_sve(n, &rc, tmax, tnear, tfar);
+        int nch = (int)n->nchildren;
+        for (int i = 0; i < nch; i++)
+            if (tnear[i] <= tfar[i]) {
+                tri_prefetch_ref(s, n->child[i], 8);
+                stack[sp++] = n->child[i];
+            }
+    }
+    return 0;
+}
+
 #endif /* LRT_TRI_HAS_SVE */
 
 /* ========================================================================= */
@@ -9126,7 +9383,7 @@ static void tri_collapse_count(const tri_build_ctx *bc, int width,
         *blocks += (bn->count + (uint32_t)width - 1u) / (uint32_t)width;
         return;
     }
-    uint32_t set[8];
+    uint32_t set[16]; /* up to BVH16 width */
     int n = 0;
     set[n++] = bn->a;
     set[n++] = bn->b;
@@ -9196,6 +9453,7 @@ static int tri_collapse_into(lrt_tri_scene *s, tri_build_ctx *bc,
     s->stats.leaf_count = cc.leaf_count;
     s->stats.max_depth = cc.max_depth;
     size_t node_size = s->layout == 4    ? sizeof(lrt_bvh4_node)
+                       : s->layout == 16 ? sizeof(lrt_bvh16_node)
                        : s->quantized    ? sizeof(lrt_bvh8q_node)
                                          : sizeof(lrt_bvh8_node);
     s->stats.memory_bytes = (size_t)s->node_count * node_size +
@@ -9243,6 +9501,8 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
         layout = 8;
         quantized = 1;
         qnode = 2; /* 4-bit node bounds */
+    } else if (o.layout == LRT_TRI_LAYOUT_BVH16) {
+        layout = 16; /* A64FX SVE: fills all 16 fp32 lanes */
     } else {
         /* AUTO: BVH4. Measured on Zen 1 (mandelbulb, 128k tris, primary and
          * incoherent rays, 1 and 16 threads), BVH4 matches or beats BVH8:
@@ -9260,6 +9520,12 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
         return NULL;
     }
 #endif
+#if !LRT_TRI_HAS_SVE
+    if (layout == 16) { /* BVH16 has no scalar traversal; needs SVE */
+        tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
+        return NULL;
+    }
+#endif
 
     uint32_t max_leaf = o.max_leaf_size ? o.max_leaf_size : TRI_DEFAULT_LEAF;
     if (max_leaf > TRI_MAX_LEAF) max_leaf = TRI_MAX_LEAF;
@@ -9270,7 +9536,7 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
     bc.verts = vertices;
     bc.ntris = ntris;
     bc.max_leaf = max_leaf;
-    bc.block_shift = layout == 8 ? 3u : 2u;
+    bc.block_shift = layout == 16 ? 4u : layout == 8 ? 3u : 2u;
     bc.quality = o.quality;
 
     size_t n3 = ntris * 3;
@@ -9390,6 +9656,9 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
         if (layout == 4) {
             s->nodes4 = (lrt_bvh4_node *)tri_aligned_alloc(
                 64, (size_t)node_cap * sizeof(lrt_bvh4_node));
+        } else if (layout == 16) {
+            s->nodes16 = (lrt_bvh16_node *)tri_aligned_alloc(
+                64, (size_t)node_cap * sizeof(lrt_bvh16_node));
         } else if (qnode == 2) {
             s->nodes8q4 = (lrt_bvh8q4_node *)tri_aligned_alloc(
                 64, (size_t)node_cap * sizeof(lrt_bvh8q4_node));
@@ -9402,7 +9671,8 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
         }
         s->blocks = tri_aligned_alloc(
             64, (size_t)block_cap * s->block_stride);
-        if ((!s->nodes4 && !s->nodes8 && !s->nodes8q && !s->nodes8q4) ||
+        if ((!s->nodes4 && !s->nodes8 && !s->nodes8q && !s->nodes8q4 &&
+             !s->nodes16) ||
             !s->blocks) {
             bc.failed = 1;
         } else {
@@ -9469,6 +9739,7 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
 #elif LRT_TRI_NEON_SHIM
     /* ARM: BVH4 via the SSE->NEON shim, BVH8 via the native SVE path. */
     s->kernel_name = layout == 4 ? "bvh4/neon"
+                     : layout == 16 ? "bvh16/sve"
                      : quantized ? "bvh8q/scalar"
                                  : (LRT_TRI_HAS_SVE ? "bvh8/sve" : "bvh8/scalar");
 #elif LRT_TRI_HAS_SSE4
@@ -9535,6 +9806,7 @@ void lrt_tri_scene_free(lrt_tri_scene *s) {
         tri_aligned_free(s->nodes8);
         tri_aligned_free(s->nodes8q);
         tri_aligned_free(s->nodes8q4);
+        tri_aligned_free(s->nodes16);
         tri_aligned_free(s->blocks);
     }
     free(s->owned_user);
@@ -9595,8 +9867,11 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
     if (s->layout == 4) return tri_intersect_bvh4_sse(s, ray, hit);
 #endif
 #if LRT_TRI_HAS_SVE
-    /* Plain-triangle BVH8 -> SVE. Quantized-node BVH8 (qnode/quantized) has no
-     * SVE slab yet and falls through to scalar. */
+    /* Plain-triangle BVH8 / BVH16 -> SVE. Quantized-node BVH8 (qnode/quantized)
+     * has no SVE slab yet and falls through to scalar. */
+    if (s->layout == 16 && s->prim_kind == TRI_PRIM_TRI && !s->curve &&
+        !s->quantized)
+        return tri_intersect_bvh16_sve(s, ray, hit);
     if (s->layout == 8 && s->prim_kind == TRI_PRIM_TRI && !s->curve &&
         !s->quantized)
         return tri_intersect_bvh8_sve(s, ray, hit);
@@ -9662,6 +9937,9 @@ int lrt_tri_occluded1(const lrt_tri_scene *s, const lrt_ray *ray) {
     if (s->layout == 4) return tri_occluded_bvh4_sse(s, ray);
 #endif
 #if LRT_TRI_HAS_SVE
+    if (s->layout == 16 && s->prim_kind == TRI_PRIM_TRI && !s->curve &&
+        !s->quantized)
+        return tri_occluded_bvh16_sve(s, ray);
     if (s->layout == 8 && s->prim_kind == TRI_PRIM_TRI && !s->curve &&
         !s->quantized)
         return tri_occluded_bvh8_sve(s, ray);
@@ -12825,6 +13103,7 @@ static size_t tri_align_up(size_t x, size_t a) {
 
 static size_t tri_node_stride(int layout, int quantized) {
     return layout == 4    ? sizeof(lrt_bvh4_node)
+           : layout == 16 ? sizeof(lrt_bvh16_node)
            : quantized    ? sizeof(lrt_bvh8q_node)
                           : sizeof(lrt_bvh8_node);
 }
@@ -12940,6 +13219,7 @@ static void tri_set_kernel_name(lrt_tri_scene *s) {
                                     : "bvh8/avx2";
 #elif LRT_TRI_NEON_SHIM
     s->kernel_name = s->layout == 4 ? "bvh4/neon"
+                     : s->layout == 16 ? "bvh16/sve"
                      : s->quantized ? "bvh8q/scalar"
                                     : (LRT_TRI_HAS_SVE ? "bvh8/sve" : "bvh8/scalar");
 #elif LRT_TRI_HAS_SSE4
@@ -12995,6 +13275,8 @@ lrt_result lrt_tri_scene_save_to_memory(const lrt_tri_scene *s, void **buf,
         return LRT_RESULT_INVALID_ARGUMENT; /* callbacks/qtri can't serialize */
     if (s->qnode != 0)
         return LRT_RESULT_INVALID_ARGUMENT; /* qnode format not in the v1 header */
+    if (s->layout == 16)
+        return LRT_RESULT_INVALID_ARGUMENT; /* BVH16 not in the serialization format */
     size_t nstride = tri_node_stride(s->layout, s->quantized);
     size_t bstride = s->block_stride;
     size_t node_off =
@@ -13418,6 +13700,7 @@ lrt_result lrt_tri_scene_refit(lrt_tri_scene *s, const float *vertices,
                                size_t ntris) {
     if (!s || !vertices || ntris == 0) return LRT_RESULT_INVALID_ARGUMENT;
     if (s->mem_mapped) return LRT_RESULT_INVALID_ARGUMENT; /* read-only */
+    if (s->layout == 16) return LRT_RESULT_INVALID_ARGUMENT; /* BVH16: no refit */
     if (s->prim_kind != TRI_PRIM_TRI) return LRT_RESULT_INVALID_ARGUMENT;
     /* Validate: ntris must match the original triangle count. */
     if ((size_t)s->original_ntris != ntris)

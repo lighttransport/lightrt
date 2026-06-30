@@ -1180,9 +1180,18 @@ lanes). The scalar path is always the correctness oracle; every parity constant
   (`svwhilelt_b32(0,8)`; predicated-off lanes are free per-instruction). Mask
   extraction stores tnear/tfar to `float[8]` and reuses the scalar
   insertion-sort, byte-for-byte reproducing the AVX2 traversal order.
-  `kernel_name` = `bvh8/sve`. (BVH16 / `lrt_tri16` to fill all 16 lanes is a
-  documented follow-up.) AUTO layout stays BVH4; pass `LRT_TRI_LAYOUT_BVH8` for
-  the SVE path.
+  `kernel_name` = `bvh8/sve`. AUTO layout stays BVH4; pass `LRT_TRI_LAYOUT_BVH8`
+  for the SVE path.
+- **BVH16 (`LRT_TRI_LAYOUT_BVH16`, `lrt_bvh16_node`/`lrt_tri16`, opt-in):** a
+  16-wide node + 16-wide leaf that fills all 16 SVE fp32 lanes with no predicate
+  waste (`tri_*_bvh16_sve`, `svptrue_b32`). SVE-only (no scalar nodes16 path —
+  the build rejects it without SVE; no serialization/refit/mmap). 100% correct
+  vs the BVH8/scalar oracle. **Honest verdict (48-thread A64FX, mandelbulb 127k):
+  ~0.55× of BVH8** (primary 17.8 vs 32.3 Mray/s) — the 512-byte nodes (8 cache
+  lines) cost too much bandwidth and the wider nodes cull worse, outweighing the
+  full-lane utilization (build is faster and memory slightly lower, but the trace
+  tanks). So **BVH8's 8-of-16 is the SVE sweet spot**; BVH16 ships as a measured
+  negative result, like the SDOT/patch-eval experiments.
 - **fp64 high-precision (HPC visualization)**: `lrt_tri_intersect1_hp(scene,
   lrt_ray_hp*, lrt_hit_hp*)` traverses the same fp32 BVH but runs the leaf
   Moller-Trumbore in double precision — SVE 8-wide fp64 (`svdot`-free

@@ -284,6 +284,7 @@ int main(int argc, char **argv) {
             {"c11-cb", backend_lightrt_cb, 0},
             {"c11-bvh4", backend_lightrt_bvh4, 0},
             {"c11-bvh8", backend_lightrt_bvh8, 0},
+            {"c11-bvh16", backend_lightrt_bvh16, 1},
             {"c11-lbvh4", backend_lightrt_lbvh4, 0},
             {"c11-lbvh8", backend_lightrt_lbvh8, 0},
             {"c11-bvh8q", backend_lightrt_bvh8q, 0},

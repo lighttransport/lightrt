@@ -87,7 +87,11 @@ typedef enum lrt_tri_layout {
     LRT_TRI_LAYOUT_BVH8_Q4 = 10,
     /* 8-wide with 8-bit-FLOAT (E4M3) child bounds (128-byte nodes, same size as
      * BVH8Q): a tighter bound fit for skewed extents, not a memory win. */
-    LRT_TRI_LAYOUT_BVH8_QF8 = 11
+    LRT_TRI_LAYOUT_BVH8_QF8 = 11,
+    /* 16-wide nodes + 16-wide leaves to fill all 16 A64FX SVE fp32 lanes (no
+     * predicate waste). 512-byte nodes; plain-triangle scenes only; needs SVE
+     * (falls back to scalar otherwise). No serialization / refit / mmap. */
+    LRT_TRI_LAYOUT_BVH16 = 16
 } lrt_tri_layout;
 
 typedef struct lrt_tri_build_options {
