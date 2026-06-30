@@ -9109,6 +9109,125 @@ static int tri_occluded_bvh16_sve(const lrt_tri_scene *s, const lrt_ray *ray) {
     return 0;
 }
 
+/* ===== SVE BVH8Q: 8-bit quantized node bounds (memory-efficient layout) =====
+ * Node bounds are 8-bit offsets on a node-local grid (org + q*scale); decode
+ * on the fly to fp32 and run the same slab. Leaves are full-precision lrt_tri8
+ * (reuse tri_block_isect_sve / tri_block_occluded_sve). Plane = q*scale*invd +
+ * (org_node-org_ray)*invd, mirroring tri_bvh8q_slab_avx. 8-of-16 lanes. */
+static inline void tri_bvh8q_slab_sve(const lrt_bvh8q_node *n,
+                                      const tri_ray_ctx *rc, float best_t,
+                                      float *tnear_out, float *tfar_out) {
+    svbool_t pg = TRI_SVE_P8();
+    svfloat32_t sx = svdup_f32(n->scale[0] * rc->invd[0]);
+    svfloat32_t sy = svdup_f32(n->scale[1] * rc->invd[1]);
+    svfloat32_t sz = svdup_f32(n->scale[2] * rc->invd[2]);
+    svfloat32_t bx = svdup_f32((n->org[0] - rc->org[0]) * rc->invd[0]);
+    svfloat32_t by = svdup_f32((n->org[1] - rc->org[1]) * rc->invd[1]);
+    svfloat32_t bz = svdup_f32((n->org[2] - rc->org[2]) * rc->invd[2]);
+#define TRI_Q8_SVE(arr, s, b) \
+    svmla_f32_x(pg, (b), svcvt_f32_u32_x(pg, svld1ub_u32(pg, (arr))), (s))
+    svfloat32_t tlx = TRI_Q8_SVE(n->qlo_x, sx, bx);
+    svfloat32_t thx = TRI_Q8_SVE(n->qhi_x, sx, bx);
+    svfloat32_t tly = TRI_Q8_SVE(n->qlo_y, sy, by);
+    svfloat32_t thy = TRI_Q8_SVE(n->qhi_y, sy, by);
+    svfloat32_t tlz = TRI_Q8_SVE(n->qlo_z, sz, bz);
+    svfloat32_t thz = TRI_Q8_SVE(n->qhi_z, sz, bz);
+#undef TRI_Q8_SVE
+    svfloat32_t tnear = svmax_f32_x(
+        pg, svmax_f32_x(pg, svmin_f32_x(pg, tlx, thx), svmin_f32_x(pg, tly, thy)),
+        svmax_f32_x(pg, svmin_f32_x(pg, tlz, thz), svdup_f32(rc->tmin)));
+    svfloat32_t tfar = svmin_f32_x(
+        pg, svmin_f32_x(pg, svmax_f32_x(pg, tlx, thx), svmax_f32_x(pg, tly, thy)),
+        svmin_f32_x(pg, svmax_f32_x(pg, tlz, thz), svdup_f32(best_t)));
+    svst1_f32(pg, tnear_out, tnear);
+    svst1_f32(pg, tfar_out, tfar);
+}
+
+static int tri_intersect_bvh8q_sve(const lrt_tri_scene *s, const lrt_ray *ray,
+                                   lrt_hit *hit) {
+    tri_ray_ctx rc;
+    tri_ray_setup(ray, &rc);
+    float best_t = ray->tmax, best_u = 0.0f, best_v = 0.0f;
+    uint32_t best_prim = LRT_TRI_NO_HIT;
+    tri_stack_entry stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp].ref = s->root;
+    stack[sp].tnear = rc.tmin;
+    sp++;
+    while (sp > 0) {
+        tri_stack_entry e = stack[--sp];
+        if (e.tnear >= best_t) continue;
+        if (TRI_REF_IS_LEAF(e.ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(e.ref), nblk = TRI_REF_NBLOCKS(e.ref);
+            const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
+            for (uint32_t b = 0; b < nblk; b++)
+                tri_block_isect_sve(&blocks[blk0 + b], &rc, &best_t, &best_u,
+                                    &best_v, &best_prim);
+            continue;
+        }
+        const lrt_bvh8q_node *n = &s->nodes8q[TRI_REF_NODE(e.ref)];
+        _Alignas(64) float tnear[8], tfar[8];
+        tri_bvh8q_slab_sve(n, &rc, best_t, tnear, tfar);
+        int nch = (int)n->nchildren;
+        uint32_t hit_ref[8];
+        float hit_tn[8];
+        int nhit = 0;
+        for (int i = 0; i < nch; i++) {
+            if (!(tnear[i] <= tfar[i])) continue;
+            tri_prefetch_ref(s, n->child[i], 8);
+            int j = nhit++;
+            while (j > 0 && hit_tn[j - 1] > tnear[i]) {
+                hit_tn[j] = hit_tn[j - 1];
+                hit_ref[j] = hit_ref[j - 1];
+                j--;
+            }
+            hit_tn[j] = tnear[i];
+            hit_ref[j] = n->child[i];
+        }
+        for (int i = nhit - 1; i >= 0; i--) {
+            stack[sp].ref = hit_ref[i];
+            stack[sp].tnear = hit_tn[i];
+            sp++;
+        }
+    }
+    if (hit) {
+        hit->t = best_prim != LRT_TRI_NO_HIT ? best_t : 0.0f;
+        hit->u = best_u;
+        hit->v = best_v;
+        hit->prim_id = best_prim;
+    }
+    return best_prim != LRT_TRI_NO_HIT;
+}
+
+static int tri_occluded_bvh8q_sve(const lrt_tri_scene *s, const lrt_ray *ray) {
+    tri_ray_ctx rc;
+    tri_ray_setup(ray, &rc);
+    float tmax = ray->tmax;
+    uint32_t stack[TRI_STACK_SIZE];
+    int sp = 0;
+    stack[sp++] = s->root;
+    while (sp > 0) {
+        uint32_t ref = stack[--sp];
+        if (TRI_REF_IS_LEAF(ref)) {
+            uint32_t blk0 = TRI_REF_BLOCK(ref), nblk = TRI_REF_NBLOCKS(ref);
+            const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
+            for (uint32_t b = 0; b < nblk; b++)
+                if (tri_block_occluded_sve(&blocks[blk0 + b], &rc, tmax)) return 1;
+            continue;
+        }
+        const lrt_bvh8q_node *n = &s->nodes8q[TRI_REF_NODE(ref)];
+        _Alignas(64) float tnear[8], tfar[8];
+        tri_bvh8q_slab_sve(n, &rc, tmax, tnear, tfar);
+        int nch = (int)n->nchildren;
+        for (int i = 0; i < nch; i++)
+            if (tnear[i] <= tfar[i]) {
+                tri_prefetch_ref(s, n->child[i], 8);
+                stack[sp++] = n->child[i];
+            }
+    }
+    return 0;
+}
+
 #endif /* LRT_TRI_HAS_SVE */
 
 /* ========================================================================= */
@@ -9740,7 +9859,7 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
     /* ARM: BVH4 via the SSE->NEON shim, BVH8 via the native SVE path. */
     s->kernel_name = layout == 4 ? "bvh4/neon"
                      : layout == 16 ? "bvh16/sve"
-                     : quantized ? "bvh8q/scalar"
+                     : quantized ? (LRT_TRI_HAS_SVE ? "bvh8q/sve" : "bvh8q/scalar")
                                  : (LRT_TRI_HAS_SVE ? "bvh8/sve" : "bvh8/scalar");
 #elif LRT_TRI_HAS_SSE4
     s->kernel_name = layout == 4    ? "bvh4/sse4"
@@ -9872,6 +9991,9 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
     if (s->layout == 16 && s->prim_kind == TRI_PRIM_TRI && !s->curve &&
         !s->quantized)
         return tri_intersect_bvh16_sve(s, ray, hit);
+    if (s->layout == 8 && s->prim_kind == TRI_PRIM_TRI && !s->curve &&
+        s->quantized && s->qnode == 0)
+        return tri_intersect_bvh8q_sve(s, ray, hit);
     if (s->layout == 8 && s->prim_kind == TRI_PRIM_TRI && !s->curve &&
         !s->quantized)
         return tri_intersect_bvh8_sve(s, ray, hit);
@@ -10087,6 +10209,9 @@ int lrt_tri_occluded1(const lrt_tri_scene *s, const lrt_ray *ray) {
     if (s->layout == 16 && s->prim_kind == TRI_PRIM_TRI && !s->curve &&
         !s->quantized)
         return tri_occluded_bvh16_sve(s, ray);
+    if (s->layout == 8 && s->prim_kind == TRI_PRIM_TRI && !s->curve &&
+        s->quantized && s->qnode == 0)
+        return tri_occluded_bvh8q_sve(s, ray);
     if (s->layout == 8 && s->prim_kind == TRI_PRIM_TRI && !s->curve &&
         !s->quantized)
         return tri_occluded_bvh8_sve(s, ray);
@@ -13367,7 +13492,7 @@ static void tri_set_kernel_name(lrt_tri_scene *s) {
 #elif LRT_TRI_NEON_SHIM
     s->kernel_name = s->layout == 4 ? "bvh4/neon"
                      : s->layout == 16 ? "bvh16/sve"
-                     : s->quantized ? "bvh8q/scalar"
+                     : s->quantized ? (LRT_TRI_HAS_SVE ? "bvh8q/sve" : "bvh8q/scalar")
                                     : (LRT_TRI_HAS_SVE ? "bvh8/sve" : "bvh8/scalar");
 #elif LRT_TRI_HAS_SSE4
     s->kernel_name = s->layout == 4 ? "bvh4/sse4"

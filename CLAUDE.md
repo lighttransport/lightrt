@@ -1182,6 +1182,13 @@ lanes). The scalar path is always the correctness oracle; every parity constant
   insertion-sort, byte-for-byte reproducing the AVX2 traversal order.
   `kernel_name` = `bvh8/sve`. AUTO layout stays BVH4; pass `LRT_TRI_LAYOUT_BVH8`
   for the SVE path.
+- **SVE BVH8Q** (`tri_*_bvh8q_sve`, `LRT_TRI_LAYOUT_BVH8Q`): the memory-efficient
+  8-bit-quantized-node layout (128-byte nodes vs 256) ran scalar on A64FX; now
+  the decode+slab is SVE (`svld1ub_u32`+`svcvt_f32_u32`, plane `q*scale*invd +
+  (org-org)*invd` via `svmla`, full-precision `lrt_tri8` leaves reused).
+  `kernel_name` = `bvh8q/sve`. ~**2.5× over scalar** (48-thread A64FX, 31.6/22.4
+  vs 12.8/9.7 Mray/s primary/incoherent) and ≈ BVH8/SVE at half the node bytes.
+  qnode (fp8/q4) node formats remain AVX2-only.
 - **BVH16 (`LRT_TRI_LAYOUT_BVH16`, `lrt_bvh16_node`/`lrt_tri16`, opt-in):** a
   16-wide node + 16-wide leaf that fills all 16 SVE fp32 lanes with no predicate
   waste (`tri_*_bvh16_sve`, `svptrue_b32`). SVE-only (no scalar nodes16 path —
