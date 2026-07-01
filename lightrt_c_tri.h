@@ -88,6 +88,32 @@ lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
                                    const lrt_tri_build_options *opts,
                                    lrt_result *err);
 
+/* Indexed build: `vertices` is `nverts` unique vertices (3 floats each) and
+ * `indices` is 3*ntris vertex ids (3 per triangle). Equivalent to de-indexing
+ * into a 9*ntris soup and calling lrt_tri_scene_build -- byte-identical result --
+ * but the caller avoids materializing the soup (the build gathers each
+ * triangle's vertices through `indices`). prim_id stays 0..ntris-1 (the triangle
+ * index), so lrt_tri_get_verts and per-triangle caller data are unchanged.
+ * Returns NULL on failure (err set when non-NULL). */
+lrt_tri_scene *lrt_tri_scene_build_indexed(const float *vertices, size_t nverts,
+                                           const uint32_t *indices, size_t ntris,
+                                           const lrt_tri_build_options *opts,
+                                           lrt_result *err);
+
+/* Build `n` independent scenes at once, parallelizing ACROSS scenes (each scene
+ * is built single-threaded; workers steal scenes one at a time). This is the
+ * efficient path for two-level/TLAS builds with many small BLAS, where the
+ * per-scene intra-build threading (engaged only at >=4096 tris) would leave a
+ * fleet of small prototype scenes building serially. vertices[i]/ntris[i]
+ * describe scene i exactly as for lrt_tri_scene_build; a NULL vertices[i] or
+ * zero ntris[i] yields out_scenes[i]=NULL (a permitted empty slot — see
+ * lrt_tlas_build). opts->num_threads bounds the worker count. out_scenes must
+ * have room for n entries; errs (optional) receives the n per-scene results. */
+void lrt_tri_scene_build_batch(const float *const *vertices,
+                               const size_t *ntris, size_t n,
+                               const lrt_tri_build_options *opts,
+                               lrt_tri_scene **out_scenes, lrt_result *errs);
+
 void lrt_tri_scene_free(lrt_tri_scene *s);
 
 /* Closest hit. Returns 1 and fills *hit on a hit; returns 0 on miss (hit, if
@@ -178,6 +204,22 @@ void lrt_tri_scene_stats(const lrt_tri_scene *s, lrt_tri_stats *out);
  * "bvh4/scalar". Useful to detect a scalar fallback caused by missing
  * compiler SIMD flags. */
 const char *lrt_tri_kernel_name(const lrt_tri_scene *s);
+
+/* Recover a triangle's object-space vertices from the built BVH leaves, so a
+ * caller need not retain its own (9-float-per-triangle) vertex copy. Available
+ * only for plain triangle scenes (lrt_tri_scene_has_verts() != 0); returns 1 and
+ * fills v0/v1/v2 on success, 0 otherwise. The result is byte-exact with the input
+ * soup for typical mesh coordinates (leaves store v0 + edges; v0+edge round-trips
+ * exactly when |vk-v0| < 2|v0|, i.e. adjacent vertices, by Sterbenz's lemma). */
+int lrt_tri_scene_has_verts(const lrt_tri_scene *s);
+int lrt_tri_get_verts(const lrt_tri_scene *s, uint32_t prim_id, float v0[3],
+                      float v1[3], float v2[3]);
+
+/* Leaf slot for a triangle (BVH leaf-emission order), or LRT_TRI_NO_HIT, and the
+ * total slot count. Lets a caller reorder per-triangle shading into slot order
+ * for cache-coherent hit-time reads. Plain triangle scenes only (prim2slot). */
+uint32_t lrt_tri_get_slot(const lrt_tri_scene *s, uint32_t prim_id);
+uint32_t lrt_tri_slot_count(const lrt_tri_scene *s);
 
 /* --- Hair / curve scenes ---------------------------------------------------
  *
@@ -825,7 +867,10 @@ typedef struct lrt_tlas_hit {
     uint32_t inst_id; /* instance_id of the hit instance */
 } lrt_tlas_hit;
 
-/* Build a TLAS. Instances with a (near-)singular transform are skipped. */
+/* Build a TLAS. Instances with a (near-)singular transform are skipped.
+ * Entries of blas[] may be NULL as long as no instance references that index,
+ * so a sparse BLAS array (e.g. with empty prototype slots) can be passed without
+ * compacting + remapping it. */
 lrt_tlas *lrt_tlas_build(lrt_tri_scene *const *blas, size_t nblas,
                          const lrt_instance *insts, size_t ninsts,
                          const lrt_tri_build_options *opts, lrt_result *err);

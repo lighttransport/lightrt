@@ -43,6 +43,42 @@
 #define LRT_TRI_HAS_MMAP 0
 #endif
 
+#if defined(_WIN32)
+#include <malloc.h> /* _aligned_malloc / _aligned_free */
+#endif
+
+/* C11 <threads.h> is optional in practice: some toolchains (notably llvm-mingw)
+ * do not ship the header even though they leave __STDC_NO_THREADS__ undefined.
+ * Gate the parallel build/traversal paths on the header actually being present;
+ * otherwise fall back to the serial path (functionally identical, slower). */
+#if !defined(__STDC_NO_THREADS__) && \
+    (!defined(__has_include) || __has_include(<threads.h>))
+#define LRT_TRI_HAS_THREADS 1
+#else
+#define LRT_TRI_HAS_THREADS 0
+#endif
+
+/* Count-leading/trailing-zeros: GCC/Clang have __builtin_clzll/__builtin_ctz;
+ * MSVC exposes the equivalents via <intrin.h> bit-scan intrinsics. Both the
+ * builtins and the intrinsics are undefined for a zero input, so behaviour
+ * parity is preserved (call sites never pass zero). */
+#if defined(_MSC_VER)
+#include <intrin.h>
+static inline int lrt_clzll(unsigned long long x) {
+    unsigned long idx;
+    _BitScanReverse64(&idx, x);
+    return 63 - (int)idx;
+}
+static inline int lrt_ctz(unsigned int x) {
+    unsigned long idx;
+    _BitScanForward(&idx, x);
+    return (int)idx;
+}
+#else
+static inline int lrt_clzll(unsigned long long x) { return __builtin_clzll(x); }
+static inline int lrt_ctz(unsigned int x) { return __builtin_ctz(x); }
+#endif
+
 /* ------------------------------------------------------------------------- */
 /* SIMD detection (compile-time; scalar fallback always available).          */
 /* ------------------------------------------------------------------------- */
@@ -408,6 +444,11 @@ struct lrt_tri_scene {
     uint32_t node_count;
     void *blocks; /* lrt_tri4[] when layout==4, lrt_tri8[] when layout==8 */
     uint32_t block_count;
+    /* Optional prim_id -> (block*width + lane) map so callers can recover a
+     * triangle's object-space vertices from the swizzled leaves (lrt_tri_get_verts)
+     * and drop their own vertex copy. Built only for plain TRI_PRIM_TRI scenes;
+     * NULL otherwise. */
+    uint32_t *prim2slot;
     uint32_t block_stride; /* bytes per leaf block (varies for quantized leaves) */
     lrt_tri_stats stats;
     const char *kernel_name;
@@ -455,6 +496,73 @@ static inline const float *tri_block_floats(const void *blocks, uint32_t idx,
                            (size_t)idx * tri_block_size(width));
 }
 
+/* Build the prim_id -> leaf-slot map for a plain triangle scene, so
+ * lrt_tri_get_verts can recover object-space vertices from the swizzled leaves.
+ * Cheap O(ntris) pass over the leaf blocks; leaves s->prim2slot NULL on any
+ * unsupported layout or OOM (caller then keeps its own vertex copy). */
+static void tri_build_prim2slot(lrt_tri_scene *s) {
+    if (!s || s->prim_kind != TRI_PRIM_TRI || s->quantized || s->curve) return;
+    const int w = s->layout; /* 4 or 8 */
+    const uint32_t nt = s->original_ntris;
+    if (nt == 0) return;
+    uint32_t *p2s = (uint32_t *)malloc((size_t)nt * sizeof(uint32_t));
+    if (!p2s) return;
+    for (uint32_t i = 0; i < nt; i++) p2s[i] = LRT_TRI_NO_HIT;
+    for (uint32_t blk = 0; blk < s->block_count; blk++) {
+        const float *f = tri_block_floats(s->blocks, blk, w);
+        const uint32_t *ids = (const uint32_t *)(const void *)(f + 9 * (size_t)w);
+        for (int lane = 0; lane < w; lane++) {
+            const uint32_t prim = ids[lane];
+            if (prim < nt) p2s[prim] = blk * (uint32_t)w + (uint32_t)lane;
+        }
+    }
+    s->prim2slot = p2s;
+}
+
+int lrt_tri_scene_has_verts(const lrt_tri_scene *s) {
+    return (s && s->prim2slot) ? 1 : 0;
+}
+
+int lrt_tri_get_verts(const lrt_tri_scene *s, uint32_t prim_id, float v0[3],
+                      float v1[3], float v2[3]) {
+    if (!s || !s->prim2slot || prim_id >= s->original_ntris) return 0;
+    const uint32_t slot = s->prim2slot[prim_id];
+    if (slot == LRT_TRI_NO_HIT) return 0;
+    const int w = s->layout;
+    const uint32_t blk = slot / (uint32_t)w;
+    const uint32_t lane = slot % (uint32_t)w;
+    const float *f = tri_block_floats(s->blocks, blk, w);
+    /* Leaves store v0 and the precomputed edges e1=v1-v0, e2=v2-v0 (see
+     * tri_emit_leaf); v0 + e is byte-exact for adjacent mesh coords (Sterbenz). */
+    const float v0x = f[0 * w + lane], v0y = f[1 * w + lane], v0z = f[2 * w + lane];
+    v0[0] = v0x;
+    v0[1] = v0y;
+    v0[2] = v0z;
+    v1[0] = v0x + f[3 * w + lane];
+    v1[1] = v0y + f[4 * w + lane];
+    v1[2] = v0z + f[5 * w + lane];
+    v2[0] = v0x + f[6 * w + lane];
+    v2[1] = v0y + f[7 * w + lane];
+    v2[2] = v0z + f[8 * w + lane];
+    return 1;
+}
+
+/* Leaf slot (block*width + lane) for a triangle, or LRT_TRI_NO_HIT. Slots run in
+ * BVH leaf-emission order, so a caller can lay per-triangle shading out in slot
+ * order for cache-coherent hit-time access (adjacent leaf triangles -> adjacent
+ * slots). Same lookup lrt_tri_get_verts does internally. */
+uint32_t lrt_tri_get_slot(const lrt_tri_scene *s, uint32_t prim_id) {
+    if (!s || !s->prim2slot || prim_id >= s->original_ntris) return LRT_TRI_NO_HIT;
+    return s->prim2slot[prim_id];
+}
+
+/* Number of leaf slots (block_count * width): the size a slot-indexed array must
+ * have. Includes padding lanes (their prim_id is LRT_TRI_NO_HIT). */
+uint32_t lrt_tri_slot_count(const lrt_tri_scene *s) {
+    if (!s) return 0;
+    return s->block_count * (uint32_t)s->layout;
+}
+
 /* Binary build node (arena, freed after collapse). */
 typedef struct tri_bnode {
     float lo[3], hi[3];
@@ -466,7 +574,11 @@ typedef struct tri_bnode {
  * [node_next, node_end) slice of the shared bnodes arena and a disjoint range
  * of the shared indices array, so no synchronization is needed. */
 typedef struct tri_build_ctx {
-    const float *verts; /* caller soup, 9*ntris (NULL for curve scenes) */
+    const float *verts; /* caller soup, 9*ntris (NULL for curve scenes), OR
+                         * when vidx != NULL: a unique-vertex array (3*nverts)
+                         * gathered through vidx (indexed build, see tri_fetch9). */
+    const uint32_t *vidx; /* NULL = flat soup; else 3*ntris vertex indices into
+                           * `verts` (3 floats/vertex) for indexed triangle input */
     const tri_subseg *subsegs; /* curve sub-segments (NULL for triangles) */
     const tri_rlcseg *rlcsegs; /* round-linear curve segs (TRI_PRIM_RLCURVE) */
     size_t ntris;
@@ -537,7 +649,9 @@ static void *tri_aligned_alloc(size_t align, size_t size) {
     }
 #endif
     size = (size + align - 1u) & ~(align - 1u);
-#if defined(_MSC_VER)
+#if defined(_WIN32)
+    /* mingw (incl. llvm-mingw UCRT) has no C11 aligned_alloc; use the Win32
+     * _aligned_malloc/_aligned_free pair (declared in <malloc.h>). */
     return _aligned_malloc(size, align);
 #else
     return aligned_alloc(align, size);
@@ -545,7 +659,7 @@ static void *tri_aligned_alloc(size_t align, size_t size) {
 }
 
 static void tri_aligned_free(void *p) {
-#if defined(_MSC_VER)
+#if defined(_WIN32)
     _aligned_free(p);
 #else
     free(p);
@@ -596,7 +710,7 @@ typedef struct tri_bin {
 /* ------------------------------------------------------------------------- */
 /* Parallel-for helper (C11 threads).                                        */
 /* ------------------------------------------------------------------------- */
-#if !defined(__STDC_NO_THREADS__)
+#if LRT_TRI_HAS_THREADS
 #include <threads.h>
 
 #define TRI_PAR_NODE_MIN (1u << 16) /* intra-node parallelism above this */
@@ -650,7 +764,7 @@ static void tri_parallel_for(uint32_t n, unsigned threads,
 /* Binary SAH build.                                                         */
 /* ------------------------------------------------------------------------- */
 
-#if !defined(__STDC_NO_THREADS__)
+#if LRT_TRI_HAS_THREADS
 /* Parallel 3-axis binning over indices[first+begin, first+end) per chunk. */
 typedef struct tri_bin_job {
     const tri_build_ctx *c;
@@ -740,6 +854,22 @@ static void tri_part_copyback(void *arg, unsigned chunk, uint32_t begin,
 
 /* Per-triangle AABB + centroid precompute. Returns non-zero on non-finite
  * input. Parallelized by chunks when threads > 1. */
+/* Return a pointer to triangle `i`'s 9 object-space floats (v0 v1 v2). For a
+ * flat soup (vidx == NULL) this is a zero-copy view into `verts`; for indexed
+ * input it gathers the three vertices through vidx into `buf` (byte-identical
+ * floats, just relocated from the caller's de-index into the build). */
+static inline const float *tri_fetch9(const float *verts, const uint32_t *vidx,
+                                      size_t i, float buf[9]) {
+    if (!vidx) return &verts[i * 9];
+    const uint32_t a = vidx[i * 3 + 0];
+    const uint32_t b = vidx[i * 3 + 1];
+    const uint32_t c = vidx[i * 3 + 2];
+    memcpy(&buf[0], &verts[(size_t)a * 3], 3 * sizeof(float));
+    memcpy(&buf[3], &verts[(size_t)b * 3], 3 * sizeof(float));
+    memcpy(&buf[6], &verts[(size_t)c * 3], 3 * sizeof(float));
+    return buf;
+}
+
 typedef struct tri_precompute_job {
     tri_build_ctx *c;
     atomic_int bad;
@@ -749,7 +879,8 @@ static void tri_precompute_chunk_impl(tri_build_ctx *c, uint32_t begin,
                                       uint32_t end, int *bad_out) {
     int bad = 0;
     for (uint32_t i = begin; i < end; i++) {
-        const float *v = &c->verts[(size_t)i * 9];
+        float vbuf[9];
+        const float *v = tri_fetch9(c->verts, c->vidx, i, vbuf);
         for (int a = 0; a < 3; a++) {
             /* check the vertices, not min/max results: minf/maxf comparisons
              * are false for NaN and would swallow it */
@@ -767,7 +898,7 @@ static void tri_precompute_chunk_impl(tri_build_ctx *c, uint32_t begin,
     if (bad) *bad_out = 1;
 }
 
-#if !defined(__STDC_NO_THREADS__)
+#if LRT_TRI_HAS_THREADS
 static void tri_precompute_chunk(void *arg, unsigned chunk, uint32_t begin,
                                  uint32_t end) {
     (void)chunk;
@@ -779,7 +910,7 @@ static void tri_precompute_chunk(void *arg, unsigned chunk, uint32_t begin,
 #endif
 
 static int tri_precompute(tri_build_ctx *c, unsigned threads) {
-#if !defined(__STDC_NO_THREADS__)
+#if LRT_TRI_HAS_THREADS
     if (threads > 1 && c->ntris >= TRI_PAR_NODE_MIN) {
         tri_precompute_job j;
         j.c = c;
@@ -799,7 +930,7 @@ static int tri_precompute(tri_build_ctx *c, unsigned threads) {
  * left-side count. Uses the parallel path for large nodes when enabled. */
 static uint32_t tri_partition(tri_build_ctx *c, uint32_t first, uint32_t num,
                               int axis, float pos) {
-#if !defined(__STDC_NO_THREADS__)
+#if LRT_TRI_HAS_THREADS
     if (c->par_threads > 1 && c->par_scratch && num >= TRI_PAR_NODE_MIN) {
         tri_part_job j;
         j.c = c;
@@ -909,7 +1040,7 @@ static uint32_t tri_build_node(tri_build_ctx *c, uint32_t first, uint32_t num,
             }
         }
 
-#if !defined(__STDC_NO_THREADS__)
+#if LRT_TRI_HAS_THREADS
         if (c->par_threads > 1 && num >= TRI_PAR_NODE_MIN) {
             unsigned threads = c->par_threads;
             if (threads > TRI_PAR_NODE_THREADS) threads = TRI_PAR_NODE_THREADS;
@@ -1103,7 +1234,7 @@ static uint32_t tri_lbvh_find_split(const uint64_t *keys, uint32_t first,
     uint64_t kl = keys[first + num - 1] >> 32;
     uint64_t x = kf ^ kl;
     if (x == 0) return num / 2; /* identical codes: median */
-    int bit = 63 - __builtin_clzll(x);
+    int bit = 63 - lrt_clzll(x);
     /* sorted: a prefix has the bit clear, the suffix has it set */
     uint32_t lo = 0, hi = num - 1;
     while (hi - lo > 1) {
@@ -1191,7 +1322,7 @@ static void tri_morton_chunk_impl(const tri_morton_job *j, uint32_t begin,
     }
 }
 
-#if !defined(__STDC_NO_THREADS__)
+#if LRT_TRI_HAS_THREADS
 static void tri_morton_chunk(void *arg, unsigned chunk, uint32_t begin,
                              uint32_t end) {
     (void)chunk;
@@ -1219,7 +1350,7 @@ static void tri_morton_encode(const tri_build_ctx *c, uint64_t *keys,
         j.base[a] = clo[a];
         j.scale[a] = ext > 0.0f ? 1024.0f / ext : 0.0f;
     }
-#if !defined(__STDC_NO_THREADS__)
+#if LRT_TRI_HAS_THREADS
     if (threads > 1 && c->ntris >= TRI_PAR_NODE_MIN) {
         tri_parallel_for((uint32_t)c->ntris, threads, tri_morton_chunk, &j);
         return;
@@ -1243,7 +1374,7 @@ typedef struct tri_build_task {
     uint32_t *parent_slot; /* &bnodes[parent].a or .b (unique per task) */
 } tri_build_task;
 
-#if !defined(__STDC_NO_THREADS__)
+#if LRT_TRI_HAS_THREADS
 typedef struct tri_build_pool {
     const tri_build_ctx *proto;
     tri_build_task *tasks;
@@ -1286,7 +1417,7 @@ static int tri_build_worker(void *arg) {
 /* Build the binary tree over all primitives, using up to num_threads workers.
  * Returns the root node index, or fails via c->failed. */
 static uint32_t tri_build_binary(tri_build_ctx *c, unsigned num_threads) {
-#if !defined(__STDC_NO_THREADS__)
+#if LRT_TRI_HAS_THREADS
     if (num_threads > 1 && c->ntris >= 4096) {
         /* Serial frontier expansion: always expand the largest task. */
         enum { MAX_TASKS = 256 };
@@ -1407,7 +1538,7 @@ static uint32_t tri_build_binary(tri_build_ctx *c, unsigned num_threads) {
  * bounds are filled in afterwards from their children (reverse creation
  * order: children are always created after their parent). */
 static uint32_t tri_build_lbvh(tri_build_ctx *c, unsigned num_threads) {
-#if !defined(__STDC_NO_THREADS__)
+#if LRT_TRI_HAS_THREADS
     if (num_threads > 1 && c->ntris >= 4096) {
         enum { MAX_TASKS = 256 };
         tri_build_task tasks[MAX_TASKS];
@@ -2700,7 +2831,9 @@ static uint32_t tri_emit_leaf(tri_collapse_ctx *cc, const tri_bnode *bn) {
                 if (k < count) {
                     uint32_t prim = bc->indices[bn->a + k];
                     prims[lane] = prim;
-                    memcpy(vtx[lane], &bc->verts[(size_t)prim * 9],
+                    float vbuf[9];
+                    memcpy(vtx[lane],
+                           tri_fetch9(bc->verts, bc->vidx, prim, vbuf),
                            9 * sizeof(float));
                 } else {
                     prims[lane] = LRT_TRI_NO_HIT;
@@ -2724,7 +2857,8 @@ static uint32_t tri_emit_leaf(tri_collapse_ctx *cc, const tri_bnode *bn) {
             uint32_t k = b * bw + lane;
             if (k < count) {
                 uint32_t prim = bc->indices[bn->a + k];
-                const float *v = &bc->verts[(size_t)prim * 9];
+                float vbuf[9];
+                const float *v = tri_fetch9(bc->verts, bc->vidx, prim, vbuf);
                 f[0 * bw + lane] = v[0];
                 f[1 * bw + lane] = v[1];
                 f[2 * bw + lane] = v[2];
@@ -5452,7 +5586,7 @@ static inline void tri_block_isect_sse(const lrt_tri4 *blk,
     _mm_storeu_ps(ua, u);
     _mm_storeu_ps(va, v);
     while (mask) {
-        int lane = __builtin_ctz((unsigned)mask);
+        int lane = lrt_ctz((unsigned)mask);
         mask &= mask - 1;
         if (ta[lane] < *best_t) {
             *best_t = ta[lane];
@@ -5535,7 +5669,7 @@ static inline void tri_mt4_decoded_sse(__m128 v0x, __m128 v0y, __m128 v0z,
     _mm_storeu_ps(ua, u);
     _mm_storeu_ps(va, v);
     while (mask) {
-        int lane = __builtin_ctz((unsigned)mask);
+        int lane = lrt_ctz((unsigned)mask);
         mask &= mask - 1;
         if (ta[lane] < *best_t) {
             *best_t = ta[lane];
@@ -5715,7 +5849,7 @@ static int tri_occluded_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray) {
         /* Unordered pushes: measured faster for any-hit than tnear-sorted,
          * octant-ordered, and eager-leaf variants on this workload. */
         while (mask) {
-            int i = __builtin_ctz((unsigned)mask);
+            int i = lrt_ctz((unsigned)mask);
             mask &= mask - 1;
             tri_prefetch_ref(s, n->child[i], 4);
             stack[sp++] = n->child[i];
@@ -5811,7 +5945,7 @@ static int tri_curve_occluded_bvh4(const lrt_tri_scene *s, const lrt_ray *ray) {
         int mask = tri_bvh4_slab_sse(n, &sc, tmax4, tnear);
         mask &= (1 << n->nchildren) - 1;
         while (mask) {
-            int i = __builtin_ctz((unsigned)mask);
+            int i = lrt_ctz((unsigned)mask);
             mask &= mask - 1;
             tri_prefetch_ref(s, n->child[i], 4);
             stack[sp++] = n->child[i];
@@ -6050,7 +6184,7 @@ static inline void tri_rlc4_isect_sse(const lrt_rlc4 *blk,
     _mm_store_ps(ua, u);
     _mm_store_si128((__m128i *)(void *)pa, primi);
     while (mask) {
-        int lane = __builtin_ctz((unsigned)mask);
+        int lane = lrt_ctz((unsigned)mask);
         mask &= mask - 1;
         if (ta[lane] < *best_t) {
             *best_t = ta[lane];
@@ -6147,7 +6281,7 @@ static int tri_rlcurve_occluded_bvh4(const lrt_tri_scene *s, const lrt_ray *ray)
         int mask = tri_bvh4_slab_sse(n, &sc, tmax4, tnear);
         mask &= (1 << n->nchildren) - 1;
         while (mask) {
-            int i = __builtin_ctz((unsigned)mask);
+            int i = lrt_ctz((unsigned)mask);
             mask &= mask - 1;
             tri_prefetch_ref(s, n->child[i], 4);
             stack[sp++] = n->child[i];
@@ -6227,7 +6361,7 @@ static inline void tri_point4_isect_sse(const lrt_point4 *blk,
     _mm_store_ps(ta, tcand);
     _mm_store_si128((__m128i *)(void *)pa, primi);
     while (mask) {
-        int lane = __builtin_ctz((unsigned)mask);
+        int lane = lrt_ctz((unsigned)mask);
         mask &= mask - 1;
         if (ta[lane] < *best_t) {
             *best_t = ta[lane];
@@ -6330,7 +6464,7 @@ static inline void tri_flat4_isect_sse(const lrt_flat4 *blk,
     _mm_store_ps(ua, uu);
     _mm_store_si128((__m128i *)(void *)pa, primi);
     while (mask) {
-        int lane = __builtin_ctz((unsigned)mask);
+        int lane = lrt_ctz((unsigned)mask);
         mask &= mask - 1;
         if (ta[lane] < *best_t) {
             *best_t = ta[lane];
@@ -6419,7 +6553,7 @@ static int tri_point_occluded_bvh4(const lrt_tri_scene *s, const lrt_ray *ray) {
         int mask = tri_bvh4_slab_sse(n, &sc, tmax4, tnear);
         mask &= (1 << n->nchildren) - 1;
         while (mask) {
-            int i = __builtin_ctz((unsigned)mask);
+            int i = lrt_ctz((unsigned)mask);
             mask &= mask - 1;
             tri_prefetch_ref(s, n->child[i], 4);
             stack[sp++] = n->child[i];
@@ -6505,7 +6639,7 @@ static int tri_flatcurve_occluded_bvh4(const lrt_tri_scene *s,
         int mask = tri_bvh4_slab_sse(n, &sc, tmax4, tnear);
         mask &= (1 << n->nchildren) - 1;
         while (mask) {
-            int i = __builtin_ctz((unsigned)mask);
+            int i = lrt_ctz((unsigned)mask);
             mask &= mask - 1;
             tri_prefetch_ref(s, n->child[i], 4);
             stack[sp++] = n->child[i];
@@ -6649,7 +6783,7 @@ static int tri_bez_sweep_sse(const float cp_world[16], const tri_ray_ctx *rc,
         _mm_store_ps(r2a, r2w);
         int leaf = (depth + 1 >= BEZ_SIMD_DEPTH);
         while (mask) {
-            int L = __builtin_ctz((unsigned)mask);
+            int L = lrt_ctz((unsigned)mask);
             mask &= mask - 1;
             if (leaf) {
                 float u0 = usa[L], u1 = uea[L], hL = u1 - u0;
@@ -6810,7 +6944,7 @@ static inline void tri_bez4_isect_sse(const lrt_bez4 *blk, const tri_ray_ctx *rc
                             blk->b2x, blk->b2y, blk->b2z, blk->b2r,
                             blk->b3x, blk->b3y, blk->b3z, blk->b3r};
     while (mask) {
-        int lane = __builtin_ctz((unsigned)mask);
+        int lane = lrt_ctz((unsigned)mask);
         mask &= mask - 1;
         float cp[16];
         for (int k = 0; k < 16; k++) cp[k] = src[k][lane];
@@ -6901,7 +7035,7 @@ static int tri_bezcurve_occluded_bvh4(const lrt_tri_scene *s,
         int mask = tri_bvh4_slab_sse(n, &sc, tmax4, tnear);
         mask &= (1 << n->nchildren) - 1;
         while (mask) {
-            int i = __builtin_ctz((unsigned)mask);
+            int i = lrt_ctz((unsigned)mask);
             mask &= mask - 1;
             tri_prefetch_ref(s, n->child[i], 4);
             stack[sp++] = n->child[i];
@@ -6954,7 +7088,7 @@ static inline void tri_block_isect_sph_sse(const lrt_sph4 *blk,
     _mm_storeu_ps(ta, tsel);
     int mask = _mm_movemask_ps(_mm_cmplt_ps(tsel, bt));
     while (mask) {
-        int lane = __builtin_ctz((unsigned)mask);
+        int lane = lrt_ctz((unsigned)mask);
         mask &= mask - 1;
         if (ta[lane] < *best_t) {
             *best_t = ta[lane];
@@ -7075,7 +7209,7 @@ static int tri_sphere_occluded_bvh4(const lrt_tri_scene *s, const lrt_ray *ray) 
         int mask = tri_bvh4_slab_sse(n, &sc, tmax4, tnear);
         mask &= (1 << n->nchildren) - 1;
         while (mask) {
-            int i = __builtin_ctz((unsigned)mask);
+            int i = lrt_ctz((unsigned)mask);
             mask &= mask - 1;
             tri_prefetch_ref(s, n->child[i], 4);
             stack[sp++] = n->child[i];
@@ -7144,7 +7278,7 @@ static int tri_user_intersect_bvh4(const lrt_tri_scene *s, const lrt_ray *ray,
                 const lrt_user4 *blk = &blocks[blk0 + b];
                 int m = tri_user_box_mask_sse(blk, &sc, _mm_set1_ps(best_t));
                 while (m) {
-                    int lane = __builtin_ctz((unsigned)m);
+                    int lane = lrt_ctz((unsigned)m);
                     m &= m - 1;
                     uint32_t pid = blk->prim[lane];
                     if (pid == LRT_TRI_NO_HIT) continue;
@@ -7207,7 +7341,7 @@ static int tri_user_occluded_bvh4(const lrt_tri_scene *s, const lrt_ray *ray) {
                 const lrt_user4 *blk = &blocks[blk0 + b];
                 int m = tri_user_box_mask_sse(blk, &sc, tmax4);
                 while (m) {
-                    int lane = __builtin_ctz((unsigned)m);
+                    int lane = lrt_ctz((unsigned)m);
                     m &= m - 1;
                     uint32_t pid = blk->prim[lane];
                     if (pid == LRT_TRI_NO_HIT) continue;
@@ -7232,7 +7366,7 @@ static int tri_user_occluded_bvh4(const lrt_tri_scene *s, const lrt_ray *ray) {
         int mask = tri_bvh4_slab_sse(n, &sc, tmax4, tnear);
         mask &= (1 << n->nchildren) - 1;
         while (mask) {
-            int i = __builtin_ctz((unsigned)mask);
+            int i = lrt_ctz((unsigned)mask);
             mask &= mask - 1;
             tri_prefetch_ref(s, n->child[i], 4);
             stack[sp++] = n->child[i];
@@ -7329,7 +7463,7 @@ static int tri_qtri_occluded_bvh4(const lrt_tri_scene *s, const lrt_ray *ray) {
         int mask = tri_bvh4_slab_sse(n, &sc, tmax4, tnear);
         mask &= (1 << n->nchildren) - 1;
         while (mask) {
-            int i = __builtin_ctz((unsigned)mask);
+            int i = lrt_ctz((unsigned)mask);
             mask &= mask - 1;
             tri_prefetch_ref(s, n->child[i], 4);
             stack[sp++] = n->child[i];
@@ -7405,7 +7539,7 @@ static inline int tri_pipe4_step(const lrt_tri_scene *s, tri_pipe4_state *st) {
         float hit_tn[4];
         int nhit = 0;
         while (mask) {
-            int i = __builtin_ctz((unsigned)mask);
+            int i = lrt_ctz((unsigned)mask);
             mask &= mask - 1;
             tri_prefetch_ref(s, n->child[i], 4);
             int j = nhit++;
@@ -7514,7 +7648,7 @@ static inline int tri_pipeocc4_step(const lrt_tri_scene *s,
     int mask = tri_bvh4_slab_sse(n, &st->sc, st->tmax4, tnear);
     mask &= (1 << n->nchildren) - 1;
     while (mask) {
-        int i = __builtin_ctz((unsigned)mask);
+        int i = lrt_ctz((unsigned)mask);
         mask &= mask - 1;
         tri_prefetch_ref(s, n->child[i], 4);
         st->stack[st->sp++] = n->child[i];
@@ -7644,7 +7778,7 @@ static inline void tri_block_isect_avx(const lrt_tri8 *blk,
     _mm256_store_ps(ua, u);
     _mm256_store_ps(va, v);
     while (mask) {
-        int lane = __builtin_ctz((unsigned)mask);
+        int lane = lrt_ctz((unsigned)mask);
         mask &= mask - 1;
         if (ta[lane] < *best_t) {
             *best_t = ta[lane];
@@ -7756,7 +7890,7 @@ static int tri_intersect_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray,
         float hit_tn[8];
         int nhit = 0;
         while (mask) {
-            int i = __builtin_ctz((unsigned)mask);
+            int i = lrt_ctz((unsigned)mask);
             mask &= mask - 1;
             tri_prefetch_ref(s, n->child[i], 8);
             int j = nhit++;
@@ -7813,7 +7947,7 @@ static int tri_occluded_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray) {
         int mask = tri_bvh8_slab_avx(n, &ac, tmax8, tnear);
         mask &= (1 << n->nchildren) - 1;
         while (mask) {
-            int i = __builtin_ctz((unsigned)mask);
+            int i = lrt_ctz((unsigned)mask);
             mask &= mask - 1;
             tri_prefetch_ref(s, n->child[i], 8);
             stack[sp++] = n->child[i];
@@ -7897,7 +8031,7 @@ static int tri_intersect_bvh8q_avx2(const lrt_tri_scene *s, const lrt_ray *ray,
         float hit_tn[8];
         int nhit = 0;
         while (mask) {
-            int i = __builtin_ctz((unsigned)mask);
+            int i = lrt_ctz((unsigned)mask);
             mask &= mask - 1;
             tri_prefetch_ref(s, n->child[i], 8);
             int j = nhit++;
@@ -7954,7 +8088,7 @@ static int tri_occluded_bvh8q_avx2(const lrt_tri_scene *s, const lrt_ray *ray) {
         int mask = tri_bvh8q_slab_avx(n, &rc, ac.tmin, tmax8, tnear);
         mask &= (1 << n->nchildren) - 1;
         while (mask) {
-            int i = __builtin_ctz((unsigned)mask);
+            int i = lrt_ctz((unsigned)mask);
             mask &= mask - 1;
             tri_prefetch_ref(s, n->child[i], 8);
             stack[sp++] = n->child[i];
@@ -8077,7 +8211,7 @@ static inline int tri_bvh8q4_slab_avx(const lrt_bvh8q4_node *n,
             float hit_tn[8];                                                  \
             int nhit = 0;                                                      \
             while (mask) {                                                     \
-                int i = __builtin_ctz((unsigned)mask);                        \
+                int i = lrt_ctz((unsigned)mask);                        \
                 mask &= mask - 1;                                             \
                 tri_prefetch_ref(s, n->child[i], 8);                         \
                 int j = nhit++;                                              \
@@ -8128,7 +8262,7 @@ static inline int tri_bvh8q4_slab_avx(const lrt_bvh8q4_node *n,
             int mask = SLAB(n, &rc, ac.tmin, tmax8, tnear);                  \
             mask &= (1 << n->nchildren) - 1;                                  \
             while (mask) {                                                     \
-                int i = __builtin_ctz((unsigned)mask);                        \
+                int i = lrt_ctz((unsigned)mask);                        \
                 mask &= mask - 1;                                             \
                 tri_prefetch_ref(s, n->child[i], 8);                         \
                 if (sp < TRI_STACK_SIZE) stack[sp++] = n->child[i];          \
@@ -8208,7 +8342,7 @@ static inline int tri_pipe8_step(const lrt_tri_scene *s, tri_pipe8_state *st) {
         float hit_tn[8];
         int nhit = 0;
         while (mask) {
-            int i = __builtin_ctz((unsigned)mask);
+            int i = lrt_ctz((unsigned)mask);
             mask &= mask - 1;
             tri_prefetch_ref(s, child[i], 8);
             int j = nhit++;
@@ -8329,7 +8463,7 @@ static inline int tri_pipeocc8_step(const lrt_tri_scene *s,
         child = n->child;
     }
     while (mask) {
-        int i = __builtin_ctz((unsigned)mask);
+        int i = lrt_ctz((unsigned)mask);
         mask &= mask - 1;
         tri_prefetch_ref(s, child[i], 8);
         st->stack[st->sp++] = child[i];
@@ -8476,6 +8610,7 @@ static int tri_collapse_into(lrt_tri_scene *s, tri_build_ctx *bc,
 static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
                                            const lrt_tri_build_options *opts,
                                            const uint32_t *morton_override,
+                                           const uint32_t *vidx,
                                            lrt_result *err) {
     tri_set_err(err, LRT_RESULT_OK);
     if (!vertices || ntris == 0 || ntris > 0x07FFFFFFu) {
@@ -8534,6 +8669,7 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
     tri_build_ctx bc;
     memset(&bc, 0, sizeof(bc));
     bc.verts = vertices;
+    bc.vidx = vidx; /* NULL => flat soup; else indexed gather (tri_fetch9) */
     bc.ntris = ntris;
     bc.max_leaf = max_leaf;
     bc.block_shift = layout == 8 ? 3u : 2u;
@@ -8567,7 +8703,7 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
     }
 
     unsigned num_threads = o.num_threads ? o.num_threads : 1u;
-#if !defined(__STDC_NO_THREADS__)
+#if LRT_TRI_HAS_THREADS
     if (num_threads > 1 && ntris >= 4096) {
         bc.par_threads = num_threads;
         bc.par_scratch = (uint32_t *)malloc(ntris * sizeof(uint32_t));
@@ -8741,13 +8877,117 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
                      : quantized    ? "bvh8q/scalar"
                                     : "bvh8/scalar";
 #endif
+    tri_build_prim2slot(s);
     return s;
 }
 
 lrt_tri_scene *lrt_tri_scene_build(const float *vertices, size_t ntris,
                                    const lrt_tri_build_options *opts,
                                    lrt_result *err) {
-    return tri_scene_build_impl(vertices, ntris, opts, NULL, err);
+    return tri_scene_build_impl(vertices, ntris, opts, NULL, NULL, err);
+}
+
+/* Indexed build: `vertices` is a unique-vertex array (3 floats each, nverts of
+ * them) and `indices` is 3*ntris vertex ids. Byte-identical to passing the
+ * de-indexed soup to lrt_tri_scene_build -- the build gathers each triangle's 3
+ * vertices through `indices` (tri_fetch9) instead of reading a pre-expanded
+ * soup, so the caller need not materialize 9*ntris floats. prim_id in the BVH is
+ * still the triangle index 0..ntris-1, so per-triangle caller data (color,
+ * material, face map) indexes unchanged. The de-indexed leaf is identical, so
+ * lrt_tri_get_verts works the same. */
+lrt_tri_scene *lrt_tri_scene_build_indexed(const float *vertices, size_t nverts,
+                                           const uint32_t *indices, size_t ntris,
+                                           const lrt_tri_build_options *opts,
+                                           lrt_result *err) {
+    if (!vertices || !indices || ntris == 0) {
+        tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
+        return NULL;
+    }
+    (void)nverts; /* bounds are the caller's contract; gather trusts indices */
+    return tri_scene_build_impl(vertices, ntris, opts, NULL, indices, err);
+}
+
+/* Batch build: build many independent scenes, parallelizing ACROSS scenes. This
+ * is the efficient path for two-level (TLAS) builds with many small BLAS — the
+ * intra-build parallel path only engages at >=4096 tris, so a fleet of small
+ * prototype BLAS would otherwise build one-at-a-time. Each scene is built
+ * single-threaded; the workers steal scenes one at a time (nchunks == n) so an
+ * uneven mix of prototype sizes still balances. out_scenes[i] is the built
+ * scene or NULL (empty input, i.e. vertices[i]==NULL or ntris[i]==0, or a build
+ * failure); errs[i] (optional) receives the per-scene result. */
+typedef struct lrt_batch_build_job {
+    const float *const *verts;
+    const size_t *ntris;
+    const lrt_tri_build_options *opts;
+    lrt_tri_scene **out;
+    lrt_result *errs;
+} lrt_batch_build_job;
+
+static void lrt_batch_build_one(void *arg, unsigned chunk, uint32_t begin,
+                                uint32_t end) {
+    lrt_batch_build_job *j = (lrt_batch_build_job *)arg;
+    uint32_t i;
+    (void)chunk;
+    for (i = begin; i < end; i++) {
+        lrt_result e = LRT_RESULT_OK;
+        lrt_tri_scene *s = NULL;
+        if (j->verts[i] && j->ntris[i] > 0) {
+            lrt_tri_build_options o;
+            if (j->opts)
+                o = *j->opts;
+            else
+                memset(&o, 0, sizeof(o));
+            o.num_threads = 1u; /* parallelism is across scenes, not within */
+            s = lrt_tri_scene_build(j->verts[i], j->ntris[i], &o, &e);
+        }
+        j->out[i] = s;
+        if (j->errs) j->errs[i] = e;
+    }
+}
+
+void lrt_tri_scene_build_batch(const float *const *vertices,
+                               const size_t *ntris, size_t n,
+                               const lrt_tri_build_options *opts,
+                               lrt_tri_scene **out_scenes, lrt_result *errs) {
+    size_t i;
+    lrt_batch_build_job job;
+    unsigned threads;
+    if (!out_scenes) return;
+    for (i = 0; i < n; i++) out_scenes[i] = NULL;
+    if (!vertices || !ntris || n == 0) return;
+
+    job.verts = vertices;
+    job.ntris = ntris;
+    job.opts = opts;
+    job.out = out_scenes;
+    job.errs = errs;
+    threads = (opts && opts->num_threads) ? opts->num_threads : 1u;
+
+#if LRT_TRI_HAS_THREADS
+    if (threads > 1u && n > 1u && n <= 0xFFFFFFFFu) {
+        /* One chunk per scene -> the worker loop steals scenes atomically. */
+        tri_pfor_job pjob;
+        thrd_t tids[TRI_PAR_MAX_THREADS];
+        unsigned spawned = 0u, k, nw = threads;
+        if (nw > TRI_PAR_MAX_THREADS) nw = TRI_PAR_MAX_THREADS;
+        if ((size_t)nw > n) nw = (unsigned)n;
+        pjob.fn = lrt_batch_build_one;
+        pjob.arg = &job;
+        pjob.n = (uint32_t)n;
+        pjob.nchunks = (uint32_t)n;
+        atomic_init(&pjob.next, 0u);
+        for (k = 0; k + 1u < nw; k++) {
+            if (thrd_create(&tids[k], tri_pfor_worker, &pjob) != thrd_success)
+                break;
+            spawned++;
+        }
+        tri_pfor_worker(&pjob); /* the calling thread participates */
+        for (k = 0; k < spawned; k++) thrd_join(tids[k], NULL);
+        return;
+    }
+#endif
+    (void)threads;
+    lrt_batch_build_one(&job, 0u, 0u, (uint32_t)n);
 }
 
 /* GPU-assisted build hook used by lightrt_c_vk.c (declared extern there; not in
@@ -8771,7 +9011,7 @@ lrt_tri_scene *lrt_tri_scene_build_lbvh_morton(const float *vertices,
     o.layout = layout;
     o.max_leaf_size = max_leaf_size;
     o.num_threads = 1;
-    return tri_scene_build_impl(vertices, ntris, &o, morton, err);
+    return tri_scene_build_impl(vertices, ntris, &o, morton, NULL, err);
 }
 
 /* Release a memory-mapped scene's backing store. The mmap path is implemented
@@ -8798,6 +9038,7 @@ void lrt_tri_scene_free(lrt_tri_scene *s) {
         tri_aligned_free(s->nodes8q4);
         tri_aligned_free(s->blocks);
     }
+    free(s->prim2slot); /* always heap, even for mmap'd scenes (NULL if absent) */
     free(s->owned_user);
     free(s->trim_loop_off);
     free(s->trim_pts);
@@ -9584,7 +9825,7 @@ lrt_tri_scene *lrt_curve_scene_build(const float *segments, const float *radii,
         }
     }
 
-#if !defined(__STDC_NO_THREADS__)
+#if LRT_TRI_HAS_THREADS
     if (num_threads > 1 && nsub >= 4096) {
         bc.par_threads = num_threads;
         bc.par_scratch = (uint32_t *)malloc(nsub * sizeof(uint32_t));
@@ -9725,7 +9966,14 @@ lrt_tri_scene *lrt_roundcurve_scene_build(const lrt_hair_strands *strands,
     bc.ntris = nseg;
     bc.max_leaf = max_leaf;
     bc.block_shift = 2u; /* round-linear blocks are 4-wide */
-    bc.quality = LRT_TRI_BUILD_DEFAULT;
+    /* Honor the caller's quality. FAST routes through the parallel Morton LBVH
+     * below (same path the mesh FAST build uses) instead of the recursive,
+     * serial-top-level binned SAH -- the SAH build dominated curve-heavy scenes
+     * (Island isIronwoodA1: 3M hair segments, ~2s, barely scaling past ~2 cores)
+     * and its 2*nseg bnode arena drove peak RSS. LBVH is fully parallel and uses
+     * a much smaller frontier. Same closest hits, so renders are byte-identical. */
+    bc.quality = (o.quality == LRT_TRI_BUILD_FAST) ? LRT_TRI_BUILD_FAST
+                                                   : LRT_TRI_BUILD_DEFAULT;
     bc.emit_kind = TRI_PRIM_RLCURVE;
     bc.plo = (float *)malloc(nseg * 3 * sizeof(float));
     bc.phi = (float *)malloc(nseg * 3 * sizeof(float));
@@ -9810,7 +10058,7 @@ lrt_tri_scene *lrt_roundcurve_scene_build(const lrt_hair_strands *strands,
         return NULL;
     }
 
-#if !defined(__STDC_NO_THREADS__)
+#if LRT_TRI_HAS_THREADS
     if (num_threads > 1 && nseg >= 4096) {
         bc.par_threads = num_threads;
         bc.par_scratch = (uint32_t *)malloc(nseg * sizeof(uint32_t));
@@ -9818,7 +10066,44 @@ lrt_tri_scene *lrt_roundcurve_scene_build(const lrt_hair_strands *strands,
     }
 #endif
 
-    uint32_t b_root = tri_build_binary(&bc, num_threads);
+    /* LBVH preprocessing (Morton sort) for the FAST path -- mirrors
+     * tri_scene_build_impl. Centroids (bc.cen) are already filled above. */
+    uint64_t *lbvh_keys = NULL, *lbvh_tmp = NULL;
+    if (bc.quality == LRT_TRI_BUILD_FAST) {
+        lbvh_keys = (uint64_t *)malloc(nseg * sizeof(uint64_t));
+        lbvh_tmp = (uint64_t *)malloc(nseg * sizeof(uint64_t));
+        if (!lbvh_keys || !lbvh_tmp) {
+            free(lbvh_keys);
+            free(lbvh_tmp);
+            free(segs);
+            free(bc.plo);
+            free(bc.phi);
+            free(bc.cen);
+            free(bc.indices);
+            free(bc.bnodes);
+            free(bc.par_scratch);
+            tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+            return NULL;
+        }
+        tri_morton_encode(&bc, lbvh_keys, num_threads);
+        const uint64_t *sorted = tri_radix_sort_keys(lbvh_keys, lbvh_tmp, nseg);
+        for (size_t i = 0; i < nseg; i++) bc.indices[i] = (uint32_t)sorted[i];
+        bc.lbvh_keys = sorted;
+        uint32_t bw = 1u << bc.block_shift;
+        bc.lbvh_leaf = 2u * bw;
+        if (bc.lbvh_leaf > max_leaf) bc.lbvh_leaf = max_leaf;
+        /* Centroids are only needed for the Morton encode (the LBVH build uses
+         * plo/phi + the sorted order); free them now to offset the Morton-key
+         * buffers (the SAH path keeps cen for binning, so free only here). */
+        free(bc.cen);
+        bc.cen = NULL;
+    }
+
+    uint32_t b_root = (bc.quality == LRT_TRI_BUILD_FAST)
+                          ? tri_build_lbvh(&bc, num_threads)
+                          : tri_build_binary(&bc, num_threads);
+    free(lbvh_keys);
+    free(lbvh_tmp);
 
     lrt_tri_scene *s = NULL;
     if (!bc.failed) {
@@ -10004,7 +10289,7 @@ lrt_tri_scene *lrt_flatcurve_scene_build(const lrt_hair_strands *strands,
     lrt_tri_scene *s = NULL;
     {
         /* like tri_finish_aabb_build but with the flat block stride */
-#if !defined(__STDC_NO_THREADS__)
+#if LRT_TRI_HAS_THREADS
         if (num_threads > 1 && nseg >= 4096) {
             bc.par_threads = num_threads;
             bc.par_scratch = (uint32_t *)malloc(nseg * sizeof(uint32_t));
@@ -10126,7 +10411,7 @@ lrt_tri_scene *lrt_bezcurve_scene_build(const float *cps, size_t nseg,
     }
 
     lrt_tri_scene *s = NULL;
-#if !defined(__STDC_NO_THREADS__)
+#if LRT_TRI_HAS_THREADS
     if (num_threads > 1 && nsub >= 4096) {
         bc.par_threads = num_threads;
         bc.par_scratch = (uint32_t *)malloc(nsub * sizeof(uint32_t));
@@ -10184,7 +10469,7 @@ lrt_tri_scene *lrt_bezcurve_scene_build(const float *cps, size_t nseg,
 static lrt_tri_scene *tri_finish_aabb_build(tri_build_ctx *bc, size_t nprims,
                                             int prim_kind, unsigned num_threads,
                                             lrt_result *err) {
-#if !defined(__STDC_NO_THREADS__)
+#if LRT_TRI_HAS_THREADS
     if (num_threads > 1 && nprims >= 4096) {
         bc->par_threads = num_threads;
         bc->par_scratch = (uint32_t *)malloc(nprims * sizeof(uint32_t));
@@ -13122,16 +13407,12 @@ static uint32_t tlas_collapse(tlas_collapse_ctx *cc, uint32_t b_idx) {
 
 /* (Re)build the TLAS BVH over the instances' current world AABBs. Frees any
  * existing nodes/inst_refs first. Returns 0 on success. */
-static int tlas_rebuild(lrt_tlas *t, unsigned num_threads) {
-    size_t ninsts = t->ninsts;
-    tri_build_ctx bc;
-    memset(&bc, 0, sizeof(bc));
-    bc.ntris = ninsts;
-    bc.max_leaf = 4u;
-    bc.block_shift = 2u;
-    bc.quality = LRT_TRI_BUILD_DEFAULT;
-    if (tri_alloc_aabb_scratch(&bc, ninsts)) return 1;
-    for (size_t i = 0; i < ninsts; i++) {
+/* Compute world-space AABBs for instances [begin, end) into bc->plo/phi/cen.
+ * Each instance writes only its own [i*3, i*3+3) slots, so chunks are
+ * independent. */
+static void tlas_bounds_chunk(const lrt_tlas *t, tri_build_ctx *bc,
+                              uint32_t begin, uint32_t end) {
+    for (uint32_t i = begin; i < end; i++) {
         const lrt_instance_int *in = &t->insts[i];
         float wlo[3], whi[3];
         const lrt_tri_scene *bl = t->blas[in->blas_id];
@@ -13146,13 +13427,49 @@ static int tlas_rebuild(lrt_tlas *t, unsigned num_threads) {
             tlas_transform_aabb(in->obj2world, bl->root_lo, bl->root_hi, wlo, whi);
         }
         for (int a = 0; a < 3; a++) {
-            bc.plo[i * 3 + a] = wlo[a];
-            bc.phi[i * 3 + a] = whi[a];
-            bc.cen[i * 3 + a] = 0.5f * (wlo[a] + whi[a]);
+            bc->plo[(size_t)i * 3 + a] = wlo[a];
+            bc->phi[(size_t)i * 3 + a] = whi[a];
+            bc->cen[(size_t)i * 3 + a] = 0.5f * (wlo[a] + whi[a]);
         }
-        bc.indices[i] = (uint32_t)i;
+        bc->indices[i] = i;
     }
-#if !defined(__STDC_NO_THREADS__)
+}
+
+#if LRT_TRI_HAS_THREADS
+typedef struct tlas_bounds_job {
+    const lrt_tlas *t;
+    tri_build_ctx *bc;
+} tlas_bounds_job;
+
+static void tlas_bounds_pfor(void *arg, unsigned chunk, uint32_t begin,
+                             uint32_t end) {
+    (void)chunk;
+    tlas_bounds_job *j = (tlas_bounds_job *)arg;
+    tlas_bounds_chunk(j->t, j->bc, begin, end);
+}
+#endif
+
+static int tlas_rebuild(lrt_tlas *t, unsigned num_threads) {
+    size_t ninsts = t->ninsts;
+    tri_build_ctx bc;
+    memset(&bc, 0, sizeof(bc));
+    bc.ntris = ninsts;
+    bc.max_leaf = 4u;
+    bc.block_shift = 2u;
+    bc.quality = LRT_TRI_BUILD_DEFAULT;
+    if (tri_alloc_aabb_scratch(&bc, ninsts)) return 1;
+#if LRT_TRI_HAS_THREADS
+    if (num_threads > 1 && ninsts >= 4096) {
+        tlas_bounds_job j;
+        j.t = t;
+        j.bc = &bc;
+        tri_parallel_for((uint32_t)ninsts, num_threads, tlas_bounds_pfor, &j);
+    } else
+#endif
+    {
+        tlas_bounds_chunk(t, &bc, 0u, (uint32_t)ninsts);
+    }
+#if LRT_TRI_HAS_THREADS
     if (num_threads > 1 && ninsts >= 4096) {
         bc.par_threads = num_threads;
         bc.par_scratch = (uint32_t *)malloc(ninsts * sizeof(uint32_t));
@@ -13195,18 +13512,63 @@ static int tlas_rebuild(lrt_tlas *t, unsigned num_threads) {
     return failed;
 }
 
-static int tlas_fill_instances(lrt_tlas *t, const lrt_instance *insts,
-                               size_t ninsts) {
-    for (size_t i = 0; i < ninsts; i++) {
+/* Fill t->insts[begin, end) from insts[]; returns 1 if any instance references
+ * a missing (out-of-range or NULL) BLAS. Per-instance work (a 3x4 affine copy +
+ * matrix inversion) is independent and indexed by i, so chunks never collide. */
+static int tlas_fill_chunk(lrt_tlas *t, const lrt_instance *insts,
+                           uint32_t begin, uint32_t end) {
+    int bad = 0;
+    for (uint32_t i = begin; i < end; i++) {
         lrt_instance_int *in = &t->insts[i];
-        if (insts[i].blas_id >= t->nblas) return 1;
+        /* Reject an instance that references a missing (out-of-range or NULL)
+         * BLAS. NULL entries that no instance references are allowed: the build
+         * and traversal only ever touch t->blas[in->blas_id] for live
+         * instances, so callers may pass a sparse blas[] array (e.g. with empty
+         * prototype slots) without compacting + remapping it first. */
+        if (insts[i].blas_id >= t->nblas || !t->blas[insts[i].blas_id]) {
+            bad = 1;
+            continue;
+        }
         memcpy(in->obj2world, insts[i].obj2world, sizeof(in->obj2world));
         in->blas_id = insts[i].blas_id;
         in->instance_id = insts[i].instance_id;
         in->mask = insts[i].mask;
         in->degenerate = tlas_affine_invert(in->obj2world, in->world2obj) ? 0u : 1u;
     }
-    return 0;
+    return bad;
+}
+
+#if LRT_TRI_HAS_THREADS
+typedef struct tlas_fill_job {
+    lrt_tlas *t;
+    const lrt_instance *insts;
+    atomic_int bad;
+} tlas_fill_job;
+
+static void tlas_fill_pfor(void *arg, unsigned chunk, uint32_t begin,
+                           uint32_t end) {
+    (void)chunk;
+    tlas_fill_job *j = (tlas_fill_job *)arg;
+    if (tlas_fill_chunk(j->t, j->insts, begin, end))
+        atomic_store_explicit(&j->bad, 1, memory_order_relaxed);
+}
+#endif
+
+static int tlas_fill_instances(lrt_tlas *t, const lrt_instance *insts,
+                               size_t ninsts, unsigned num_threads) {
+#if LRT_TRI_HAS_THREADS
+    if (num_threads > 1 && ninsts >= 4096) {
+        tlas_fill_job j;
+        j.t = t;
+        j.insts = insts;
+        atomic_init(&j.bad, 0);
+        tri_parallel_for((uint32_t)ninsts, num_threads, tlas_fill_pfor, &j);
+        return atomic_load(&j.bad);
+    }
+#else
+    (void)num_threads;
+#endif
+    return tlas_fill_chunk(t, insts, 0u, (uint32_t)ninsts);
 }
 
 lrt_tlas *lrt_tlas_build(lrt_tri_scene *const *blas, size_t nblas,
@@ -13217,16 +13579,9 @@ lrt_tlas *lrt_tlas_build(lrt_tri_scene *const *blas, size_t nblas,
         tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
         return NULL;
     }
-    /* Validate BLAS pointers are non-NULL. */
-    {
-        size_t i;
-        for (i = 0; i < nblas; i++) {
-            if (!blas[i]) {
-                tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
-                return NULL;
-            }
-        }
-    }
+    /* Individual blas[] entries may be NULL as long as no instance references
+     * them (validated per-instance in tlas_fill_instances). This lets callers
+     * pass a sparse BLAS array without compacting it. */
     unsigned num_threads = (opts && opts->num_threads) ? opts->num_threads : 1u;
     lrt_tlas *t = (lrt_tlas *)calloc(1, sizeof(lrt_tlas));
     if (!t) {
@@ -13245,7 +13600,7 @@ lrt_tlas *lrt_tlas_build(lrt_tri_scene *const *blas, size_t nblas,
         return NULL;
     }
     memcpy(t->blas, blas, nblas * sizeof(lrt_tri_scene *));
-    if (tlas_fill_instances(t, insts, ninsts)) {
+    if (tlas_fill_instances(t, insts, ninsts, num_threads)) {
         free(t->insts);
         free(t);
         tri_set_err(err, LRT_RESULT_INVALID_ARGUMENT);
@@ -13271,7 +13626,7 @@ void lrt_tlas_free(lrt_tlas *t) {
 lrt_result lrt_tlas_refit(lrt_tlas *t, const lrt_instance *insts,
                           size_t ninsts) {
     if (!t || !insts || ninsts != t->ninsts) return LRT_RESULT_INVALID_ARGUMENT;
-    if (tlas_fill_instances(t, insts, ninsts)) return LRT_RESULT_INVALID_ARGUMENT;
+    if (tlas_fill_instances(t, insts, ninsts, 1u)) return LRT_RESULT_INVALID_ARGUMENT;
     return tlas_rebuild(t, 1u) ? LRT_RESULT_OUT_OF_MEMORY : LRT_RESULT_OK;
 }
 
@@ -13571,7 +13926,7 @@ static void tri_intersect4_sse(const lrt_tri_scene *s, const lrt_ray4 *r,
                         best_u = _mm_blendv_ps(best_u, uu, closer);
                         best_v = _mm_blendv_ps(best_v, vv, closer);
                         while (cm) {
-                            int l = __builtin_ctz((unsigned)cm);
+                            int l = lrt_ctz((unsigned)cm);
                             cm &= cm - 1;
                             best_prim[l] = ids[lane];
                         }
