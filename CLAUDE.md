@@ -1140,6 +1140,116 @@ cmake --build build_cuda && ctest --test-dir build_cuda -R lightrt_c_cuda_test
 make cuda_test && ./lightrt_c_cuda_test         # Makefile path (opt-in, needs nvcc)
 ```
 
+## A64FX (ARM64 + SVE 1.0) backend for the C11 kernel
+
+`lightrt_c_tri.c` gained ARM SIMD paths alongside the x86 scalar/SSE4/AVX2 ones,
+compile-time selected like the others (`LRT_TRI_HAS_NEON` / `LRT_TRI_HAS_SVE`,
+guarded by `__ARM_NEON` / `__ARM_FEATURE_SVE`). Built for A64FX with the Fujitsu
+compiler in clang mode (the ACLE intrinsics need it): `fcc -Nclang
+-march=armv8.2-a+sve`. A64FX SVE is fixed 512-bit (16 fp32 / 8 fp64 / 64 int8
+lanes). The scalar path is always the correctness oracle; every parity constant
+(`TRI_INVD_MAX`, the relative det epsilon, deferred-tnear cull) is shared.
+
+- **NEON BVH4 via an SSE→NEON shim** (`lightrt_sse2neon_min.h`): on ARM NEON the
+  kernel sets `LRT_TRI_HAS_SSE4 = 1` and runs the existing 4-wide SSE BVH4 code
+  (triangle, curve, point, sphere, quad, qtri, and the patch-traversal drivers)
+  through a minimal shim mapping the ~39 `_mm_*` intrinsics the kernel uses to
+  NEON — so one shim vectorizes all the BVH4 leaves instead of hand-duplicating
+  them. `LRT_TRI_NEON_SHIM` marks the mode; `kernel_name` = `bvh4/neon`. The shim
+  maps comparisons to float-domain masks (`vreinterpretq_f32_u32(vcXXq)`),
+  `_mm_movemask_ps`→`vshrq`+`vaddvq`, `_mm_blendv_ps`→`vbslq` (kernel only feeds
+  it compare masks). **Curve leaves vectorize well — flat ~2.3×, cubic-Bézier
+  ~3.1×, sphere ~1.4× over scalar (48-thread A64FX) — except round-linear**,
+  whose blendv/movemask-heavy Embree CSG leaf is measured *slower* as NEON than
+  scalar, so `TRI_PRIM_RLCURVE` is routed to the scalar path on ARM.
+  **Parametric surfaces (bilinear / bicubic-Bézier / NURBS) stay scalar** by
+  default: they are dispatched to `tri_intersect_scalar` (per-patch Newton +
+  adaptive subdivision — divergent control flow, not 4-wide-SIMD-friendly).
+- **SVE patch Newton eval (experimental, off by default)**: the bicubic
+  Bézier / NURBS patch eval can be done as a 16-lane Bernstein-weighted sum over
+  all 16 control points (`tri_bezpatch_eval_sve` / `tri_rbezpatch_eval_sve`,
+  weights `w[k]=Bu[k%4]*Bv[k>>2]` via `svld1rq`+`svtbl`, per-axis `svaddv`).
+  Build with `-DLRT_TRI_SVE_PATCH_EVAL`. **Honest verdict (measured on A64FX):
+  neutral-to-slightly-slower than scalar** (bezpatch ~0.98×, NURBS ~0.97×) — the
+  9-12 horizontal `svaddv` reductions per eval cost ~as much as the 18 scalar 1D
+  cubic evals, and the eval is not the dominant cost (subdivision + AABB cull +
+  Newton control flow are). So it ships OFF (`LRT_TRI_PATCH_EVAL_SVE`), like the
+  SDOT result; the scalar patch eval is the default.
+- **SVE BVH8** (`tri_*_bvh8_sve`, A64FX 512-bit): mirrors the AVX2 BVH8 path,
+  processing one BVH8 node/leaf per vector on the low 8 of 16 lanes
+  (`svwhilelt_b32(0,8)`; predicated-off lanes are free per-instruction). Mask
+  extraction stores tnear/tfar to `float[8]` and reuses the scalar
+  insertion-sort, byte-for-byte reproducing the AVX2 traversal order.
+  `kernel_name` = `bvh8/sve`. AUTO layout stays BVH4; pass `LRT_TRI_LAYOUT_BVH8`
+  for the SVE path.
+- **SVE BVH8Q** (`tri_*_bvh8q_sve`, `LRT_TRI_LAYOUT_BVH8Q`): the memory-efficient
+  8-bit-quantized-node layout (128-byte nodes vs 256) ran scalar on A64FX; now
+  the decode+slab is SVE (`svld1ub_u32`+`svcvt_f32_u32`, plane `q*scale*invd +
+  (org-org)*invd` via `svmla`, full-precision `lrt_tri8` leaves reused).
+  `kernel_name` = `bvh8q/sve`. ~**2.5× over scalar** (48-thread A64FX, 31.6/22.4
+  vs 12.8/9.7 Mray/s primary/incoherent) and ≈ BVH8/SVE at half the node bytes.
+  qnode (fp8/q4) node formats remain AVX2-only.
+- **SVE coherent ray packet** (`tri_intersect16_sve`, opt-in
+  `-DLRT_TRI_SVE_PACKET`): routes `lrt_tri_intersect1N(LRT_TRI_BATCH_COHERENT)`
+  through a **16 rays vs one box/triangle** traversal (ray-parallel SoA, full
+  16-lane SVE), walking any plain-triangle layout (BVH4/8/8q/16) via
+  `tri_node_load`. Closest-hit is order-independent so a child is pushed if any
+  active ray's interval enters it (within that ray's best_t). **Big win on
+  coherent/primary rays** (48-thread A64FX, mandelbulb 127k, 100% fp64-oracle
+  match): BVH4 primary **30.6 → 120.7 Mray/s (~3.9×)**, BVH8 **32.3 → 77.4
+  (~2.4×)** — BVH4 wins under the packet (4 boxes/node vs 8; coherent rays don't
+  need the wider node). It is **off by default**: the packet's FMA/traversal
+  order isn't bit-identical to the single-ray kernel (ULP-level t, tie-break
+  prim_id), and the default `intersect1N` keeps the bit-exact Ray4 path so the
+  `batch == single` unit-test contract holds; `benchmark_c/scripts/build_a64fx.sh`
+  enables it. Any-hit (`occluded1N`) stays per-ray by design.
+- **BVH16 (`LRT_TRI_LAYOUT_BVH16`, `lrt_bvh16_node`/`lrt_tri16`, opt-in):** a
+  16-wide node + 16-wide leaf that fills all 16 SVE fp32 lanes with no predicate
+  waste (`tri_*_bvh16_sve`, `svptrue_b32`). SVE-only (no scalar nodes16 path —
+  the build rejects it without SVE; no serialization/refit/mmap). 100% correct
+  vs the BVH8/scalar oracle. **Honest verdict (48-thread A64FX, mandelbulb 127k):
+  ~0.55× of BVH8** (primary 17.8 vs 32.3 Mray/s) — the 512-byte nodes (8 cache
+  lines) cost too much bandwidth and the wider nodes cull worse, outweighing the
+  full-lane utilization (build is faster and memory slightly lower, but the trace
+  tanks). So **BVH8's 8-of-16 is the SVE sweet spot**; BVH16 ships as a measured
+  negative result, like the SDOT/patch-eval experiments.
+- **fp64 high-precision (HPC visualization)**: `lrt_tri_intersect1_hp(scene,
+  lrt_ray_hp*, lrt_hit_hp*)` traverses the same fp32 BVH but runs the leaf
+  Moller-Trumbore in double precision — SVE 8-wide fp64 (`svdot`-free
+  `svfloat64`, `svwhilelt_b64`) on A64FX, scalar double elsewhere — so t/u/v keep
+  fp64 resolution along an fp64 ray. The generic fp64 **custom-geometry** path
+  (`lightrt_c.c`, `lrt_scene_*`) additionally gained a NEON node slab
+  (`LRT_HAVE_NEON`); its fp64 leaf is the user callback. `lrt_tri_intersect1_hp`
+  also covers **bicubic Bézier and NURBS surfaces**: the fp32 adaptive-subdiv
+  intersector does the coarse find (which patch + (u,v) seed), then an fp64
+  Newton on (u,v,t) — using the patch control points promoted to double and the
+  fp64 ray — refines to full fp64 t/u/v (NURBS (u,v) mapped global<->local via
+  the patch domain). 100% hit agreement with the fp32 path; the fp64 eval is
+  scalar double (an SVE fp64 eval doesn't help — the fp32 SVE Bernstein eval was
+  already neutral and fp64 halves the lane count, 16 CPs over two 8-lane
+  vectors; precision, not throughput, is the point of the fp64 path).
+- **int8/int16 SDOT quantized leaf (experimental, research)**: A64FX is SVE 1.0
+  (no SVE2 `svmullb`; widening is `sunpklo`+`svmul`). `svdot_s32` (int8, 16
+  tris/instr) and `svdot_s64` (int16, 8 tris/instr) were benchmarked for the
+  ray-triangle leaf in `benchmark_c/bench_a64fx_sdot.c`. **Honest verdict
+  (measured on A64FX): neither beats 16-wide fp32 SVE** — int8 ~1.03x, int16
+  ~0.78x, ~3% mean accuracy loss — because fp32 SVE is already 16-wide and SDOT
+  only folds a 3-element dot into one op while the per-lane dequantize erodes it.
+  This matches the project's HIP WMMA finding; the fp32 SVE BVH8 path is the one
+  to use. `LRT_TRI_FORCE_SCALAR` disables all SIMD for the speedup baseline.
+
+### Build / test / benchmark (A64FX)
+```bash
+make c_tri_test CC=fcc && ./lightrt_c_tri_test   # correctness vs scalar oracle
+bash benchmark_c/scripts/build_a64fx.sh          # bench_c, bench_c_scalar, bench_sdot
+bash benchmark_c/scripts/run_a64fx.sh            # scalar vs NEON/SVE + verify + SDOT
+```
+Measured (1 A64FX core, mandelbulb 88k tris, vs the same kernel built scalar):
+NEON BVH4 ~1.95x primary; SVE BVH8 ~2.33x primary / ~2.2-2.3x incoherent+shadow;
+all hits verify 100% against the fp64 oracle. CMake also gained an aarch64
+`-march=armv8.2-a+sve` branch (top-level + `benchmark_c`); for fcc under CMake
+pass `-DCMAKE_C_FLAGS=-Nclang`.
+
 ## Code Conventions
 
 - C++17, no RTTI (`-fno-rtti`), no exceptions (`-fno-exceptions`)

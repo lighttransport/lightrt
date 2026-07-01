@@ -772,6 +772,20 @@ static int user_tri_cb(const lrt_ray *ray, uint32_t prim, void *user, float *t,
     return ref_isect(&c->verts[prim * 9], ray, t, u, v);
 }
 
+/* File-scope user callbacks (hoisted out of test bodies so the file builds with
+ * compilers that lack GNU nested functions, e.g. Fujitsu fcc in clang mode). */
+static int user_always_hit_cb(const lrt_ray *r, uint32_t p, void *u, float *t,
+                              float *u2, float *v) {
+    (void)r; (void)p; (void)u; (void)u2; (void)v;
+    *t = 5.0f;
+    return 1;
+}
+static int user_always_miss_cb(const lrt_ray *r, uint32_t p, void *u, float *t,
+                               float *u2, float *v) {
+    (void)r; (void)p; (void)u; (void)t; (void)u2; (void)v;
+    return 0;
+}
+
 static void test_user_geometry(void) {
     lrt_result err = LRT_RESULT_OK;
 
@@ -2996,11 +3010,16 @@ static void test_tri_build_edge_cases(void) {
     {
         float tri[9] = {-1, -1, 5, 1, -1, 5, 0, 1, 5};
         lrt_tri_layout layouts[] = {
-            LRT_TRI_LAYOUT_BVH4, LRT_TRI_LAYOUT_BVH8,
-            LRT_TRI_LAYOUT_BVH8Q, LRT_TRI_LAYOUT_BVH8_Q4, LRT_TRI_LAYOUT_BVH8_QF8};
+            LRT_TRI_LAYOUT_BVH4, LRT_TRI_LAYOUT_BVH8, LRT_TRI_LAYOUT_BVH8Q,
+            /* q4/fp8 node-quantized layouts are AVX2-only (see kernel). */
+#if defined(__AVX2__) && defined(__FMA__)
+            LRT_TRI_LAYOUT_BVH8_Q4, LRT_TRI_LAYOUT_BVH8_QF8
+#endif
+        };
+        const unsigned nlayouts = (unsigned)(sizeof(layouts) / sizeof(layouts[0]));
         lrt_tri_quality qualities[] = {
             LRT_TRI_BUILD_FAST, LRT_TRI_BUILD_DEFAULT, LRT_TRI_BUILD_HQ};
-        for (unsigned l = 0; l < 5; l++) {
+        for (unsigned l = 0; l < nlayouts; l++) {
             for (unsigned q = 0; q < 3; q++) {
                 lrt_tri_build_options o = {
                     .quality = qualities[q], .layout = layouts[l],
@@ -3254,7 +3273,9 @@ static void test_tri_build_edge_cases(void) {
     }
 
     /* (15) BVH8_Q4 on SBVH (HQ): exercises the 4-bit quantized node path with
-     * spatial splits. */
+     * spatial splits. The q4/fp8 node-quantized kernels are AVX2-only; on other
+     * targets the build returns INVALID_ARGUMENT, so this is x86-AVX2 only. */
+#if defined(__AVX2__) && defined(__FMA__)
     {
         g_rng = 0x88888888ull;
         float *verts = make_random_soup(300, 0.5f);
@@ -3277,6 +3298,7 @@ static void test_tri_build_edge_cases(void) {
             free(verts);
         }
     }
+#endif
 
     /* (16) Parallel LBVH build: exercises the parallel Morton sort + radix sort
      * path. */
@@ -4501,8 +4523,9 @@ static void test_kernel_name(void) {
 #if defined(__AVX2__) && defined(__FMA__)
         if (n8q) CHECK(strstr(n8q, "/avx2") != NULL, "kernel-name: BVH8Q reports avx2");
 #else
-        if (n8) CHECK((strstr(n8, "/sse4") || strstr(n8, "/scalar")) != NULL,
-                      "kernel-name: BVH8 reports sse4/scalar");
+        if (n8) CHECK((strstr(n8, "/sse4") || strstr(n8, "/scalar") ||
+                       strstr(n8, "/sve") || strstr(n8, "/neon")) != NULL,
+                      "kernel-name: BVH8 reports a known backend");
 #endif
         if (s8qf8 && s8q4) {
             const char *n8qf8 = lrt_tri_kernel_name(s8qf8);
@@ -4543,19 +4566,9 @@ static void test_user_geometry_edge_cases(void) {
         float nan_aabb[6];
         memset(nan_aabb, 0, sizeof(nan_aabb));
         nan_aabb[0] = NAN;
-        int always_hit(const lrt_ray *r, uint32_t p, void *u, float *t, float *u2,
-                       float *v) {
-            (void)r;
-            (void)p;
-            (void)u;
-            (void)u2;
-            (void)v;
-            *t = 5.0f;
-            return 1;
-        }
         err = LRT_RESULT_OK;
         lrt_tri_scene *s =
-            lrt_user_scene_build(nan_aabb, 1, always_hit, NULL, NULL, NULL, &err);
+            lrt_user_scene_build(nan_aabb, 1, user_always_hit_cb, NULL, NULL, NULL, &err);
         CHECK(s == NULL && err == LRT_RESULT_INVALID_BOUNDS,
               "user build NaN AABB rejected (err=%d)", (int)err);
     }
@@ -4563,19 +4576,9 @@ static void test_user_geometry_edge_cases(void) {
     /* Inverted AABB (lo > hi): should build (user owns AABB validity). */
     {
         float inv_aabb[6] = {1, 1, 1, -1, -1, -1};
-        int always_hit(const lrt_ray *r, uint32_t p, void *u, float *t, float *u2,
-                       float *v) {
-            (void)r;
-            (void)p;
-            (void)u;
-            (void)u2;
-            (void)v;
-            *t = 5.0f;
-            return 1;
-        }
         err = LRT_RESULT_OK;
         lrt_tri_scene *s =
-            lrt_user_scene_build(inv_aabb, 1, always_hit, NULL, NULL, NULL, &err);
+            lrt_user_scene_build(inv_aabb, 1, user_always_hit_cb, NULL, NULL, NULL, &err);
         CHECK(s != NULL, "user build inverted AABB builds (err=%d)", (int)err);
         if (s) {
             lrt_hit h;
@@ -4589,18 +4592,8 @@ static void test_user_geometry_edge_cases(void) {
     /* User callback that always returns hit: all rays should hit. */
     {
         float aabb[6] = {-10, -10, -10, 10, 10, 10};
-        int always_hit_cb(const lrt_ray *r, uint32_t p, void *u, float *t, float *u2,
-                          float *v) {
-            (void)r;
-            (void)p;
-            (void)u;
-            (void)u2;
-            (void)v;
-            *t = 5.0f;
-            return 1;
-        }
         lrt_tri_scene *s =
-            lrt_user_scene_build(aabb, 1, always_hit_cb, NULL, NULL, NULL, &err);
+            lrt_user_scene_build(aabb, 1, user_always_hit_cb, NULL, NULL, NULL, &err);
         CHECK(s != NULL, "user build always-hit cb");
         if (s) {
             lrt_hit h;
@@ -4614,18 +4607,8 @@ static void test_user_geometry_edge_cases(void) {
     /* User callback that always returns miss: no rays should hit. */
     {
         float aabb[6] = {-10, -10, -10, 10, 10, 10};
-        int always_miss_cb(const lrt_ray *r, uint32_t p, void *u, float *t, float *u2,
-                           float *v) {
-            (void)r;
-            (void)p;
-            (void)u;
-            (void)t;
-            (void)u2;
-            (void)v;
-            return 0;
-        }
         lrt_tri_scene *s =
-            lrt_user_scene_build(aabb, 1, always_miss_cb, NULL, NULL, NULL, &err);
+            lrt_user_scene_build(aabb, 1, user_always_miss_cb, NULL, NULL, NULL, &err);
         CHECK(s != NULL, "user build always-miss cb");
         if (s) {
             lrt_hit h;
@@ -6040,6 +6023,7 @@ refit_pzn_done:
     }
 
 refit_dn_done:
+    ; /* empty statement: a label must be followed by a statement (pre-C23) */
 }
 
 /* --- section 6: SDF edge-case tests ----------------------------------------------- */
