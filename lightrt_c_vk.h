@@ -64,6 +64,12 @@ uint32_t lrt_vk_engine_caps(const lrt_vk_engine *e);
 /* Selected physical-device name (e.g. "NVIDIA GeForce RTX 3070"). */
 const char *lrt_vk_engine_device_name(const lrt_vk_engine *e);
 
+/* Largest DEVICE_LOCAL memory heap (VRAM) in bytes, queried with a throwaway
+ * Vulkan instance (no engine needed). prefer_discrete!=0 favors a discrete GPU.
+ * Returns 0 if Vulkan or a suitable device is unavailable. Lets callers size GPU
+ * memory budgets before building anything. */
+uint64_t lrt_vk_device_local_bytes(int prefer_discrete);
+
 /* Human-readable message for the last failed call on this engine. */
 const char *lrt_vk_engine_last_error(const lrt_vk_engine *e);
 
@@ -151,11 +157,96 @@ lrt_vk_rtx_scene *lrt_vk_rtx_scene_build_indexed(lrt_vk_engine *e,
                                                  const uint32_t *indices,
                                                  uint32_t ntris, lrt_result *err);
 
+/* --- True two-level (instanced) scene -------------------------------------
+ *
+ * Build a genuine two-level acceleration structure: one BLAS per PROTOTYPE
+ * (geometry stored on the device ONCE) and one TLAS instance per PLACEMENT (the
+ * same prototype BLAS referenced under a per-instance transform). This is the
+ * memory-sharing path the flat builders above cannot express — N copies of a
+ * prototype cost one BLAS, not N. It reuses the SAME trace pipeline/shader as
+ * the flat builders (no shader change): the shader already recovers the hit id
+ * as instanceId*tri_chunk + primitiveIndex, so here tri_chunk is set to the max
+ * prototype triangle count and the returned lrt_hit.prim_id decodes as:
+ *     instance       = prim_id / (*out_tri_stride)
+ *     prototypeLocalTri = prim_id % (*out_tri_stride)
+ * The caller maps `instance` -> prototype (via its own instance list) and shades
+ * the prototype-local triangle, transforming object-space attributes by that
+ * instance's transform.
+ *
+ * Each prototype builds as a SINGLE BLAS (this API does no chunk splitting), so a
+ * prototype larger than the device's one-BLAS build limit must be pre-split by the
+ * caller into several smaller prototypes (each a triangle slice) sharing the same
+ * per-instance transform — the encoding is unaffected. Fails (returns NULL,
+ * LRT_RESULT_INVALID_ARGUMENT) if ninsts*maxPrototypeTris would overflow the 32-bit
+ * prim_id encoding — the caller should fall back to the flat builder. */
+typedef struct lrt_vk_proto {
+    const float *vertices;   /* 3*nverts floats of unique positions             */
+    uint32_t nverts;
+    const uint32_t *indices; /* 3*ntris vertex ids (uint32), prototype-local    */
+    uint32_t ntris;
+} lrt_vk_proto;
+
+typedef struct lrt_vk_instance {
+    float transform[12]; /* object->world 3x4 row-major (world = M*[p;1])        */
+    uint32_t proto;      /* index into the protos[] array                        */
+} lrt_vk_instance;
+
+lrt_vk_rtx_scene *lrt_vk_rtx_scene_build_instanced(
+    lrt_vk_engine *e, const lrt_vk_proto *protos, uint32_t nprotos,
+    const lrt_vk_instance *insts, uint32_t ninsts, uint32_t *out_tri_stride,
+    lrt_result *err);
+
+/* Wide-id instanced build: same inputs as lrt_vk_rtx_scene_build_instanced, but
+ * the hit id is NOT packed into a single 32-bit prim_id. Instead the trace stores
+ * the TLAS instanceId and the prototype-local triangle index in SEPARATE 32-bit
+ * words (lrt_hit_wide below), so there is no ninsts*maxPrototypeTris product to
+ * overflow -- the only remaining ceiling is the device TLAS maxInstanceCount
+ * (commonly 2^24). Use this for instanced scenes the narrow builder rejects
+ * (Moana-island scale). A scene built this way MUST be traced with
+ * lrt_vk_rtx_scene_trace_wide (the narrow trace returns -1 on it). */
+lrt_vk_rtx_scene *lrt_vk_rtx_scene_build_instanced_wide(
+    lrt_vk_engine *e, const lrt_vk_proto *protos, uint32_t nprotos,
+    const lrt_vk_instance *insts, uint32_t ninsts, lrt_result *err);
+
+/* Multi-TLAS wide instanced build: as lrt_vk_rtx_scene_build_instanced_wide, but
+ * splits the instances into ceil(ninsts / ~16M) TLAS slices, each its own TLAS
+ * over the SAME shared BLAS set, so a scene with MORE than the device TLAS
+ * maxInstanceCount (2^24) instances renders IN FULL (Moana island's ~42.8M
+ * instances -> 3 TLASes). Trace with lrt_vk_rtx_scene_trace_wide: it traces the
+ * slices sequentially and merges the nearest hit on the host, reporting GLOBAL
+ * instanceIds (0..ninsts-1). Costs K sequential dispatches per trace + K TLAS
+ * instance buffers of VRAM; the BLAS is stored once regardless of K. */
+lrt_vk_rtx_scene *lrt_vk_rtx_scene_build_instanced_multi(
+    lrt_vk_engine *e, const lrt_vk_proto *protos, uint32_t nprotos,
+    const lrt_vk_instance *insts, uint32_t ninsts, lrt_result *err);
+
 /* Trace n rays against the resident AS. Returns #rays that hit, or -1 on error.
- * Trace buffers are reused/grown across calls. */
+ * Trace buffers are reused/grown across calls. Rejects (-1) a scene built with
+ * the wide builder -- use lrt_vk_rtx_scene_trace_wide for those. */
 int lrt_vk_rtx_scene_trace(lrt_vk_engine *e, lrt_vk_rtx_scene *s,
                            const lrt_ray *rays, uint32_t n, lrt_hit *out,
                            lrt_result *err);
+
+/* Wide-id hit: like lrt_hit but the single 32-bit prim_id is replaced by the two
+ * fields the wide trace stores separately. `inst` is the TLAS instance (placement)
+ * id 0..ninsts-1; `local` is the prototype-local triangle index. A miss sets
+ * inst == LRT_TRI_NO_HIT (as lrt_hit.prim_id does). The caller maps inst ->
+ * prototype via its own instance list and shades prototype triangle `local`. */
+typedef struct lrt_hit_wide {
+    float t, u, v;
+    uint32_t inst;
+    uint32_t local;
+} lrt_hit_wide;
+
+/* As lrt_vk_rtx_scene_trace, for a scene built with lrt_vk_rtx_scene_build_instanced_wide.
+ * Writes n lrt_hit_wide. Rejects (-1) a narrow scene. */
+int lrt_vk_rtx_scene_trace_wide(lrt_vk_engine *e, lrt_vk_rtx_scene *s,
+                                const lrt_ray *rays, uint32_t n, lrt_hit_wide *out,
+                                lrt_result *err);
+
+/* Number of TLAS slices the scene was built with (1 for a single-TLAS scene, >1
+ * for a multi-TLAS scene). 0 if s is NULL. Informational (logging / tests). */
+uint32_t lrt_vk_rtx_scene_ntlas(const lrt_vk_rtx_scene *s);
 
 void lrt_vk_rtx_scene_free(lrt_vk_engine *e, lrt_vk_rtx_scene *s);
 
