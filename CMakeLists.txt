@@ -440,6 +440,24 @@ if(LIGHTRT_BUILD_CUDA)
     install(FILES lightrt_c_cuda.h DESTINATION include)
 endif()
 
+option(LIGHTRT_BUILD_D3D11 "Build the Direct3D 11 compute backend (Windows only)" OFF)
+if(LIGHTRT_BUILD_D3D11)
+    if(NOT WIN32)
+        message(WARNING "LIGHTRT_BUILD_D3D11 is Windows-only; lightrt_c_d3d11.cpp is "
+                        "an empty translation unit elsewhere. Skipping the target.")
+    else()
+        # Static library exposing the D3D11 compute trace backend. Mirrors the
+        # Vulkan "Path A" (CPU build -> GPU trace) on a D3D11 compute shader
+        # (d3d/shaders/trace_bvh.hlsl, decompiled from the trace_bvh SPIR-V) and
+        # walks the same serialized BVH4/BVH8 scene. d3d11 + d3dcompiler + dxgi
+        # ship with the OS, so no SDK is required.
+        add_library(lightrt_d3d11 STATIC lightrt_c_d3d11.cpp)
+        target_include_directories(lightrt_d3d11 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+        target_link_libraries(lightrt_d3d11 PUBLIC d3d11 d3dcompiler dxgi)
+        install(FILES lightrt_c_d3d11.h DESTINATION include)
+    endif()
+endif()
+
 # Optional: regenerate the checked-in SPIR-V headers (developers with glslang
 # only; never part of the default build / ALL target).
 find_program(LIGHTRT_GLSLANG glslangValidator)
