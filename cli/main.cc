@@ -36,6 +36,7 @@ struct Options {
   bool fallback_camera = false;
   uint32_t mblur_samples = 1;
   uint32_t spp = 1;
+  uint32_t curve_segments = 8;
   bool geometry_only = false;
   bool compose = false;
   bool load_only = false;
@@ -57,13 +58,23 @@ static void enableCompositionMode() {
 #endif
 }
 
+static void setCurveSegments(uint32_t segments) {
+  char value[16];
+  std::snprintf(value, sizeof(value), "%u", segments);
+#if defined(_WIN32)
+  _putenv_s("LIGHTRT_USD_CURVE_SEGMENTS", value);
+#else
+  setenv("LIGHTRT_USD_CURVE_SEGMENTS", value, 1);
+#endif
+}
+
 static bool parseArgs(int argc, char** argv, Options& opts) {
   if (argc < 2) {
     fprintf(stderr,
       "Usage: %s input.usd [-o output.png] [-w 800] [-h 600]\n"
       "       [-t timecode] [--time-range start end step]\n"
       "       [--camera name_or_index] [--mblur-samples N] [--spp N]\n"
-      "       [--compose] [--geometry-only] [--load-only]\n",
+      "       [--compose] [--curve-segments N] [--geometry-only] [--load-only]\n",
       argv[0]);
     return false;
   }
@@ -107,6 +118,13 @@ static bool parseArgs(int argc, char** argv, Options& opts) {
       opts.geometry_only = true;
     } else if (strcmp(argv[i], "--compose") == 0) {
       opts.compose = true;
+    } else if (strcmp(argv[i], "--curve-segments") == 0 && i + 1 < argc) {
+      const int requested = atoi(argv[++i]);
+      if (requested < 1 || requested > 64) {
+        fprintf(stderr, "Curve segments must be between 1 and 64\n");
+        return false;
+      }
+      opts.curve_segments = static_cast<uint32_t>(requested);
     } else if (strcmp(argv[i], "--load-only") == 0) {
       opts.load_only = true;
     } else {
@@ -160,6 +178,7 @@ int main(int argc, char** argv) {
   if (!parseArgs(argc, argv, opts)) return 1;
   if (opts.geometry_only) enableGeometryOnlyMode();
   if (opts.compose) enableCompositionMode();
+  setCurveSegments(opts.curve_segments);
 
   auto renderOneFrame = [&](double timecode, const std::string& outpath) -> bool {
     scene::Scene scene;
@@ -188,7 +207,8 @@ int main(int argc, char** argv) {
     }
 
     // Apply motion blur if a camera has shutter interval
-    double shutter_offset = 0.0;
+    double shutter_open = 0.0;
+    double shutter_close = 0.0;
     if (!scene.cameras.empty()) {
       int cam_idx = 0;
       if (opts.camera_index >= 0 && opts.camera_index < static_cast<int>(scene.cameras.size()))
@@ -198,10 +218,12 @@ int main(int argc, char** argv) {
           if (scene.cameras[i].name == opts.camera_name) { cam_idx = static_cast<int>(i); break; }
         }
       }
-      shutter_offset = scene.cameras[cam_idx].shutter_close - scene.cameras[cam_idx].shutter_open;
+      shutter_open = scene.cameras[cam_idx].shutter_open;
+      shutter_close = scene.cameras[cam_idx].shutter_close;
     }
-    if (opts.mblur_samples > 1 && shutter_offset > 0.0) {
-      lightrt_common::applyMotionBlur(opts.input_file, timecode, shutter_offset, scene);
+    if (opts.mblur_samples > 1 && shutter_close > shutter_open) {
+      lightrt_common::applyMotionBlur(opts.input_file, timecode,
+                                     shutter_open, shutter_close, scene);
     }
 
     // Setup camera

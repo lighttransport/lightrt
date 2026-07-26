@@ -49,23 +49,143 @@ struct MeshBLAS {
 struct CurveBLAS {
   std::vector<lightrt::Curve> curves;
   std::vector<lightrt::AABB> curve_aabbs;
+  std::vector<lightrt::AABB> segment_aabbs;
+  std::vector<uint32_t> segment_curve_ids;
+  std::vector<uint32_t> segment_local_ids;
   lightrt::BVH bvh;
+  lightrt::BVHBuildConfig build_config;
   lightrt::AABB local_bounds;
   int32_t default_material_id = -1;
   std::vector<int32_t> curve_material_ids;
 
-  void build(const std::vector<lightrt::Curve>& input_curves,
+  void build(std::vector<lightrt::Curve> input_curves,
              const lightrt::BVHBuildConfig& cfg = lightrt::BVHBuildConfig()) {
-    curves = input_curves;
+    build_config = cfg;
+    curves = std::move(input_curves);
     curve_aabbs.resize(curves.size());
+    segment_aabbs.clear();
+    segment_curve_ids.clear();
+    segment_local_ids.clear();
+    size_t segment_count = 0;
+    for (const auto& curve : curves) {
+      if (curve.control_points.size() >= 2)
+        segment_count += curve.control_points.size() - 1;
+    }
+    segment_aabbs.reserve(segment_count);
+    segment_curve_ids.reserve(segment_count);
+    segment_local_ids.reserve(segment_count);
     local_bounds = lightrt::AABB();
     for (size_t i = 0; i < curves.size(); i++) {
       curve_aabbs[i] = curves[i].bounds();
       local_bounds.expand(curve_aabbs[i].min);
       local_bounds.expand(curve_aabbs[i].max);
+      for (uint32_t segment = 0;
+           segment + 1u < curves[i].control_points.size(); ++segment) {
+        lightrt::AABB bounds;
+        auto expand_endpoint = [&](const lightrt::Vec3& p,
+                                   float radius) {
+          const float r = std::max(0.0f, radius);
+          const lightrt::Vec3 rv(r, r, r);
+          bounds.expand(p - rv);
+          bounds.expand(p + rv);
+        };
+        const float r0 = segment < curves[i].radii.size()
+                             ? curves[i].radii[segment] : 0.01f;
+        const float r1 = segment + 1u < curves[i].radii.size()
+                             ? curves[i].radii[segment + 1u] : r0;
+        expand_endpoint(curves[i].control_points[segment], r0);
+        expand_endpoint(curves[i].control_points[segment + 1u], r1);
+        if (curves[i].hasMotionSamples()) {
+          const float close_r0 =
+              curves[i].radii_close.size() == curves[i].radii.size()
+                  ? curves[i].radii_close[segment] : r0;
+          const float close_r1 =
+              curves[i].radii_close.size() == curves[i].radii.size()
+                  ? curves[i].radii_close[segment + 1u] : r1;
+          expand_endpoint(curves[i].control_points_close[segment], close_r0);
+          expand_endpoint(curves[i].control_points_close[segment + 1u],
+                          close_r1);
+        }
+        segment_aabbs.push_back(bounds);
+        segment_curve_ids.push_back(static_cast<uint32_t>(i));
+        segment_local_ids.push_back(segment);
+      }
     }
-    bvh.build(curve_aabbs, cfg);
+    bvh.build(segment_aabbs, cfg);
     curve_material_ids.assign(curves.size(), -1);
+  }
+
+  bool hasCompatibleMotionTopology(const CurveBLAS& sample) const {
+    if (curves.size() != sample.curves.size()) return false;
+    for (size_t i = 0; i < curves.size(); ++i) {
+      if (curves[i].control_points.size() !=
+          sample.curves[i].control_points.size())
+        return false;
+    }
+    return true;
+  }
+
+  bool replaceOpenSamples(const CurveBLAS& sample) {
+    if (!hasCompatibleMotionTopology(sample)) return false;
+
+    std::vector<lightrt::Curve> sampled_curves = sample.curves;
+    for (auto& curve : sampled_curves) {
+      curve.control_points_close.clear();
+      curve.radii_close.clear();
+      curve.colors_close.clear();
+    }
+    const int32_t saved_default_material = default_material_id;
+    std::vector<int32_t> saved_materials = std::move(curve_material_ids);
+    const lightrt::BVHBuildConfig saved_config = build_config;
+    build(std::move(sampled_curves), saved_config);
+    default_material_id = saved_default_material;
+    curve_material_ids = std::move(saved_materials);
+    return true;
+  }
+
+  bool setMotionSamples(const CurveBLAS& close) {
+    if (!hasCompatibleMotionTopology(close)) return false;
+    bool changed = false;
+    auto vec3_different = [](const std::vector<lightrt::Vec3>& a,
+                             const std::vector<lightrt::Vec3>& b) {
+      if (a.size() != b.size()) return true;
+      for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].x != b[i].x || a[i].y != b[i].y || a[i].z != b[i].z)
+          return true;
+      }
+      return false;
+    };
+    auto float_different = [](const std::vector<float>& a,
+                              const std::vector<float>& b) {
+      return a != b;
+    };
+
+    for (size_t i = 0; i < curves.size(); ++i) {
+      const bool geometry_changed = vec3_different(
+          curves[i].control_points, close.curves[i].control_points);
+      const bool radius_changed = float_different(
+          curves[i].radii, close.curves[i].radii);
+      const bool color_changed = vec3_different(
+          curves[i].colors, close.curves[i].colors);
+      if (geometry_changed || radius_changed) {
+        curves[i].control_points_close = close.curves[i].control_points;
+        curves[i].radii_close = close.curves[i].radii;
+        changed = true;
+      }
+      if (color_changed && curves[i].colors.size() == close.curves[i].colors.size()) {
+        curves[i].colors_close = close.curves[i].colors;
+        changed = true;
+      }
+    }
+    if (!changed) return false;
+
+    const int32_t saved_default_material = default_material_id;
+    std::vector<int32_t> saved_materials = std::move(curve_material_ids);
+    const lightrt::BVHBuildConfig saved_config = build_config;
+    build(std::move(curves), saved_config);
+    default_material_id = saved_default_material;
+    curve_material_ids = std::move(saved_materials);
+    return true;
   }
 };
 
@@ -252,10 +372,14 @@ inline HitInfo traceScene(const Scene& scene, const lightrt::Ray& ray, float ray
         inst.curve_mesh_id < static_cast<uint32_t>(scene.curve_meshes.size())) {
       const CurveBLAS& cb = scene.curve_meshes[inst.curve_mesh_id];
       cb.bvh.queryRay(local_ray, best.t * dir_len, primitive_candidates);
-      for (uint32_t curve_idx : primitive_candidates) {
+      for (uint32_t segment_idx : primitive_candidates) {
+        if (segment_idx >= cb.segment_curve_ids.size()) continue;
+        const uint32_t curve_idx = cb.segment_curve_ids[segment_idx];
+        const uint32_t local_idx = cb.segment_local_ids[segment_idx];
         if (curve_idx >= static_cast<uint32_t>(cb.curves.size())) continue;
         float ct, cu;
-        if (cb.curves[curve_idx].intersect(local_ray, ct, cu)) {
+        if (cb.curves[curve_idx].intersectSegment(local_ray, local_idx,
+                                                  ct, cu, ray_time)) {
           float world_t = ct * inv_dir_len;
           if (world_t < best.t) {
             best.instance_id = i;
@@ -458,11 +582,16 @@ inline bool traceSceneAnyHit(const Scene& scene, const lightrt::Ray& ray,
         inst.curve_mesh_id < static_cast<uint32_t>(scene.curve_meshes.size())) {
       const CurveBLAS& cb = scene.curve_meshes[inst.curve_mesh_id];
       cb.bvh.queryRay(local_ray, local_ray.tmax, primitive_candidates);
-      for (uint32_t cidx : primitive_candidates) {
+      for (uint32_t segment_idx : primitive_candidates) {
+        if (segment_idx >= cb.segment_curve_ids.size()) continue;
+        const uint32_t cidx = cb.segment_curve_ids[segment_idx];
+        const uint32_t local_idx = cb.segment_local_ids[segment_idx];
         if (cidx >= static_cast<uint32_t>(cb.curves.size())) continue;
         if (i == exclude_instance && cidx == exclude_prim) continue;
         float ct, cu;
-        if (cb.curves[cidx].intersect(local_ray, ct, cu)) return true;
+        if (cb.curves[cidx].intersectSegment(local_ray, local_idx, ct, cu,
+                                              ray_time))
+          return true;
       }
     }
 

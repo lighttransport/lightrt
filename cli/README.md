@@ -7,7 +7,8 @@ then renders an image. Direct single-layer loading is the low-memory default;
 ## Setup and build
 
 Dependencies are ordinary clones under `dep/`; no Git submodules are added.
-When `$HOME/work/lightusd-c` exists, the setup script clones that local worktree.
+When `$HOME/work/lightusd_c` exists, the setup script clones that local worktree
+(the hyphenated `$HOME/work/lightusd-c` spelling is also accepted).
 
 ```bash
 ./scripts/setup_deps.sh
@@ -39,6 +40,7 @@ build_usd_cpu/lightrt_cli scene.usdc --camera fallback -w 256 -h 256
 | `--spp <N>` | Samples per pixel |
 | `--envmap <file>` | Environment map |
 | `--compose` | Resolve sublayers, references, payloads, variants, inherits, and specializes through lightusd PCP |
+| `--curve-segments <N>` | Curve tessellation samples per cubic/NURBS/Hermite span, from 1 to 64 (default 8) |
 | `--geometry-only` | Skip materials, textures, UVs, and shading normals to reduce large-scene memory |
 | `--load-only` | Load the layer and build acceleration structures without rendering |
 
@@ -50,15 +52,21 @@ Set `LIGHTRT_USD_VERBOSE=1` for per-primitive loader diagnostics.
 - `BasisCurves` with linear, Bezier, Catmull-Rom, or B-spline bases
 - Rational `NurbsCurves`, including orders, knots, ranges, and point weights
 - `HermiteCurves`, including authored tangent evaluation
+- Constant, uniform, varying, and vertex `primvars:displayColor` on curve schemas
+- Time-sampled points, widths, display colors, topology counts, Hermite
+  tangents, and rational NURBS order/knot/range/weight data
+- Authored shutter-open/close sampling with transform, width, color, and
+  deformation motion blur for tessellated curves
 - `Points`, represented by analytic sphere primitives using authored widths
 - `ParticleField3DGaussianSplat`, including anisotropic scale, quaternion
   orientation, opacity, and view-dependent spherical harmonics through degree 3
 - `Sphere`, represented analytically, and `Cube`
 
 Meshes, curves, points, and Gaussian fields each build local acceleration
-structures. Instances are placed in a top-level BVH, so rays do not linearly
-scan large scene graphs. Gaussian fields use front-to-back density compositing
-in the CPU reference renderer.
+structures. Curves use a per-segment BLAS with tapered capsule intersection;
+instances are placed in a top-level BVH, so rays do not linearly scan large
+scene graphs or long tessellated strands. Gaussian fields use front-to-back
+density compositing in the CPU reference renderer.
 
 Composition serializes the resolved stage to an adopted in-memory USDC layer.
 This avoids a second copy, but a very large composed scene still temporarily

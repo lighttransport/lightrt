@@ -211,7 +211,12 @@ void renderFrame(const scene::Scene& scene,
         lightrt::Vec3 dir = (camera.direction + camera.right * u + camera.up * v).normalize();
         lightrt::Ray ray(camera.position, dir);
 
-        float ray_time = (settings.mblur_samples > 1) ? dist01(rng) : 0.0f;
+        float ray_time = 0.0f;
+        if (settings.mblur_samples > 1) {
+          const uint32_t temporal_sample = s % settings.mblur_samples;
+          ray_time = (static_cast<float>(temporal_sample) + dist01(rng)) /
+                     static_cast<float>(settings.mblur_samples);
+        }
 
         scene::HitInfo hit = scene::traceScene(scene, ray, ray_time);
 
@@ -265,10 +270,18 @@ void renderFrame(const scene::Scene& scene,
             // Curve hit — compute normal + tangent from the fiber
             const scene::CurveBLAS& cb = scene.curve_meshes[inst.curve_mesh_id];
             const lightrt::Curve& curve = cb.curves[hit.curve_id];
+            float curve_transform[12];
+            const float* active_transform = inst.transform;
+            if (inst.has_motion && ray_time > 0.0f) {
+              scene::lerp3x4(inst.transform, inst.transform_close,
+                             std::min(1.0f, ray_time), curve_transform);
+              active_transform = curve_transform;
+            }
             lightrt::Vec3 pos = scene::transformPoint(
-                inst.transform, curve.evaluate(hit.curve_u));
+                active_transform, curve.evaluate(hit.curve_u, ray_time));
             fiber_T = scene::transformDir(
-                inst.transform, curve.evaluateTangent(hit.curve_u)).normalize();
+                active_transform,
+                curve.evaluateTangent(hit.curve_u, ray_time)).normalize();
             // Fiber normal: direction from fiber centerline to hit point
             lightrt::Vec3 to_hit = (hit_pos - pos);
             N = to_hit - fiber_T * to_hit.dot(fiber_T);
@@ -286,6 +299,8 @@ void renderFrame(const scene::Scene& scene,
             if (N.dot(V) < 0.0f) N = N * -1.0f;
             // Resolve material (textured variant not needed for curves yet)
             mat = resolveMaterial(scene, hit);
+            if (!curve.colors.empty())
+              mat.base_color = curve.colorAt(hit.curve_u, ray_time);
           } else {
             // Triangle hit (existing path)
             const auto& mesh_blas = scene.meshes[inst.mesh_id];

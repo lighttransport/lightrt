@@ -1017,6 +1017,10 @@ enum class CurveType : uint8_t {
 struct Curve {
   std::vector<Vec3> control_points;  // Control points
   std::vector<float> radii;          // Radius at each control point (for varying width)
+  std::vector<Vec3> colors;          // Optional color at each control point/sample
+  std::vector<Vec3> control_points_close; // Optional shutter-close samples
+  std::vector<float> radii_close;
+  std::vector<Vec3> colors_close;
   CurveType type;
 
   Curve() noexcept : type(CurveType::Bezier) {}
@@ -1027,24 +1031,42 @@ struct Curve {
   AABB bounds() const noexcept;
 
   // Evaluate curve position at parameter t [0,1]
-  Vec3 evaluate(float t) const noexcept;
+  Vec3 evaluate(float t, float motion_time = 0.0f) const noexcept;
 
   // Evaluate curve tangent at parameter t
-  Vec3 evaluateTangent(float t) const noexcept;
+  Vec3 evaluateTangent(float t, float motion_time = 0.0f) const noexcept;
 
   // Interpolate radius at parameter t
-  float radiusAt(float t) const noexcept;
+  float radiusAt(float t, float motion_time = 0.0f) const noexcept;
+
+  // Interpolate an authored display color. Returns white when absent.
+  Vec3 colorAt(float t, float motion_time = 0.0f) const noexcept;
+
+  bool hasMotionSamples() const noexcept {
+    return control_points_close.size() == control_points.size() &&
+           !control_points_close.empty();
+  }
 
   // Ray-curve intersection
   // Returns true if hit, sets t_hit (ray parameter), u_hit (curve parameter)
-  bool intersect(const Ray& ray, float& t_hit, float& u_hit) const noexcept;
+  bool intersect(const Ray& ray, float& t_hit, float& u_hit,
+                 float motion_time = 0.0f) const noexcept;
+
+  // Intersect one linearized segment. This is public so scene adapters can
+  // put individual segments in a BLAS without rescanning the entire curve.
+  // Radii are linearly interpolated between the segment endpoints.
+  bool intersectSegment(const Ray& ray, uint32_t segment_index,
+                        float& t_hit, float& u_hit,
+                        float motion_time = 0.0f) const noexcept;
 
 private:
   // Phantom Ray-Hair algorithm for Bezier curves
-  bool intersectPhantom(const Ray& ray, float& t_hit, float& u_hit) const noexcept;
+  bool intersectPhantom(const Ray& ray, float& t_hit, float& u_hit,
+                        float motion_time) const noexcept;
 
-  // Simple linear segment intersection (fast approximation)
-  bool intersectLinear(const Ray& ray, float& t_hit, float& u_hit) const noexcept;
+  // Linearized curve intersection across all segments.
+  bool intersectLinear(const Ray& ray, float& t_hit, float& u_hit,
+                       float motion_time) const noexcept;
 };
 
 // ============================================================================

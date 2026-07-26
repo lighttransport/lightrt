@@ -25,7 +25,9 @@ if [ -d "$LIGHTUSD_C_DIR" ]; then
   echo "lightusd-c already cloned at $LIGHTUSD_C_DIR"
 else
   echo "Cloning lightusd-c..."
-  if [ -d "$HOME/work/lightusd-c/.git" ]; then
+  if [ -d "$HOME/work/lightusd_c/.git" ]; then
+    git clone "$HOME/work/lightusd_c" "$LIGHTUSD_C_DIR"
+  elif [ -d "$HOME/work/lightusd-c/.git" ]; then
     git clone "$HOME/work/lightusd-c" "$LIGHTUSD_C_DIR"
   else
     git clone --depth 1 \

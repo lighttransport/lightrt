@@ -270,6 +270,16 @@ static bool loader_composition() {
   return value && value[0] == '1';
 }
 
+static uint32_t loader_curve_segments() {
+  const char* value = std::getenv("LIGHTRT_USD_CURVE_SEGMENTS");
+  if (!value || !value[0]) return 8u;
+  char* end = nullptr;
+  const unsigned long parsed = std::strtoul(value, &end, 10);
+  if (end == value || *end != '\0') return 8u;
+  return static_cast<uint32_t>(std::max<unsigned long>(
+      1ul, std::min<unsigned long>(64ul, parsed)));
+}
+
 static int32_t resolve_material_id(LusdLayer_T* L, const LusdPrim_T* P,
                                    const std::map<std::string, int>& mat_map) {
   const char* path = lydra_c_resolve_material_binding(
@@ -293,13 +303,73 @@ static scene::Instance make_instance(const double world_xform[16],
   return inst;
 }
 
-static float curve_radius(const LydraCCurveData& data, uint32_t point_index,
-                          uint32_t curve_index) {
+static float curve_radius(const float* widths, uint64_t width_count,
+                          uint64_t point_count, uint64_t curve_count,
+                          uint32_t point_index, uint32_t curve_index) {
   float width = 1.0f;
-  if (data.width_count == 1) width = data.widths[0];
-  else if (data.width_count == data.point_count) width = data.widths[point_index];
-  else if (data.width_count == data.curve_count) width = data.widths[curve_index];
+  if (widths && width_count == 1) width = widths[0];
+  else if (widths && width_count == point_count) width = widths[point_index];
+  else if (widths && width_count == curve_count) width = widths[curve_index];
   return std::max(1.0e-6f, width * 0.5f);
+}
+
+static int curve_attribute_interpolation(LusdInstance instance, LusdPrim prim,
+                                         const char* attribute) {
+  LusdValue value = LUSD_NULL_HANDLE;
+  if (lusdPrimGetAttributeMetadata(prim, attribute, "interpolation",
+                                   &value) != LUSD_SUCCESS ||
+      !value)
+    return -1;
+  const char* text = nullptr;
+  LusdToken token = nullptr;
+  if (lusdValueGetToken(value, &token) == LUSD_SUCCESS && token)
+    text = lusdTokenGetText(token);
+  if (!text) (void)lusdValueGetString(value, &text);
+  int interpolation = -1;
+  if (text && std::strcmp(text, "constant") == 0)
+    interpolation = LYDRA_C_CURVE_INTERP_CONSTANT;
+  else if (text && std::strcmp(text, "uniform") == 0)
+    interpolation = LYDRA_C_CURVE_INTERP_UNIFORM;
+  else if (text && std::strcmp(text, "varying") == 0)
+    interpolation = LYDRA_C_CURVE_INTERP_VARYING;
+  else if (text && std::strcmp(text, "vertex") == 0)
+    interpolation = LYDRA_C_CURVE_INTERP_VERTEX;
+  lusdDestroyValue(instance, value);
+  return interpolation;
+}
+
+static const float* curve_float_array(LusdValue value, uint64_t& count,
+                                      std::vector<float>& converted) {
+  const float* floats = nullptr;
+  if (value && lusdValueGetArrayPtrFloat(value, &count, &floats) ==
+                   LUSD_SUCCESS)
+    return floats;
+  const double* doubles = nullptr;
+  if (!value || lusdValueGetArrayPtrDouble(value, &count, &doubles) !=
+                    LUSD_SUCCESS || !doubles)
+    return nullptr;
+  converted.resize(static_cast<size_t>(count));
+  std::transform(doubles, doubles + count, converted.begin(),
+                 [](double v) { return static_cast<float>(v); });
+  return converted.data();
+}
+
+static const float* curve_float2_array(LusdValue value, uint64_t& count,
+                                       std::vector<float>& converted) {
+  const LusdFloat2* floats = nullptr;
+  if (value && lusdValueGetArrayPtrFloat2(value, &count, &floats) ==
+                   LUSD_SUCCESS)
+    return reinterpret_cast<const float*>(floats);
+  const LusdDouble2* doubles = nullptr;
+  if (!value || lusdValueGetArrayPtrDouble2(value, &count, &doubles) !=
+                    LUSD_SUCCESS || !doubles)
+    return nullptr;
+  converted.resize(static_cast<size_t>(count) * 2u);
+  for (size_t i = 0; i < static_cast<size_t>(count); ++i) {
+    converted[i * 2u] = static_cast<float>(doubles[i].x);
+    converted[i * 2u + 1u] = static_cast<float>(doubles[i].y);
+  }
+  return converted.data();
 }
 
 static bool append_curve_set(LusdLayer_T* L, const LusdPrim_T* P,
@@ -311,12 +381,17 @@ static bool append_curve_set(LusdLayer_T* L, const LusdPrim_T* P,
   const uint32_t curve_mesh_id = static_cast<uint32_t>(out_scene.curve_meshes.size());
   out_scene.curve_meshes.emplace_back();
   auto& cb = out_scene.curve_meshes.back();
-  lightrt::BVHBuildConfig cfg = curves.size() > 4096
+  size_t segment_count = 0;
+  for (const auto& curve : curves) {
+    if (curve.control_points.size() >= 2)
+      segment_count += curve.control_points.size() - 1;
+  }
+  lightrt::BVHBuildConfig cfg = segment_count > 4096
                                     ? lightrt::BVHBuildConfig::fast()
                                     : lightrt::BVHBuildConfig();
-  cb.build(curves, cfg);
+  cb.build(std::move(curves), cfg);
   cb.default_material_id = resolve_material_id(L, P, mat_map);
-  cb.curve_material_ids.assign(curves.size(), cb.default_material_id);
+  cb.curve_material_ids.assign(cb.curves.size(), cb.default_material_id);
 
   scene::Instance inst = make_instance(world_xform, cb.local_bounds);
   inst.curve_mesh_id = curve_mesh_id;
@@ -328,17 +403,210 @@ static bool append_curve_set(LusdLayer_T* L, const LusdPrim_T* P,
 static bool append_curve_prim(LusdLayer_T* L, const LusdPrim_T* P,
                               scene::Scene& out_scene,
                               const std::map<std::string, int>& mat_map,
-                              const double world_xform[16]) {
+                              const double world_xform[16],
+                              double time_code) {
   const bool is_hermite = P->type_name &&
                           std::strcmp(P->type_name, "HermiteCurves") == 0;
+  const uint32_t tessellation_segments = loader_curve_segments();
+  LusdPrim prim = reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P));
+
+  LydraCCurveData data = {};
+  if (lydra_c_extract_curve(reinterpret_cast<LusdLayer>(L), prim, &data) !=
+      LUSD_SUCCESS) {
+    return false;
+  }
+
+  LusdValue point_value = LUSD_NULL_HANDLE;
+  LusdValue count_value = LUSD_NULL_HANDLE;
+  LusdValue width_value = LUSD_NULL_HANDLE;
+  LusdValue color_value = LUSD_NULL_HANDLE;
+  LusdValue order_value = LUSD_NULL_HANDLE;
+  LusdValue knot_value = LUSD_NULL_HANDLE;
+  LusdValue range_value = LUSD_NULL_HANDLE;
+  LusdValue weight_value = LUSD_NULL_HANDLE;
+  const LusdFloat3* evaluated_points = nullptr;
+  const int32_t* evaluated_counts = nullptr;
+  const float* evaluated_widths = nullptr;
+  const LusdFloat3* evaluated_colors = nullptr;
+  uint64_t point_count = 0;
+  uint64_t curve_count = 0;
+  uint64_t width_count = 0;
+  uint64_t color_count = 0;
+  const int32_t* evaluated_order = nullptr;
+  const float* evaluated_knots = nullptr;
+  const float* evaluated_ranges = nullptr;
+  const float* evaluated_weights = nullptr;
+  uint64_t order_count = 0;
+  uint64_t knot_count = 0;
+  uint64_t range_count = 0;
+  uint64_t weight_count = 0;
+  std::vector<float> converted_knots;
+  std::vector<float> converted_ranges;
+  std::vector<float> converted_weights;
+
+  if (lusdPrimGetAttributeValueAtTime(prim, "points", time_code,
+                                      &point_value) == LUSD_SUCCESS)
+    (void)lusdValueGetArrayPtrFloat3(point_value, &point_count,
+                                     &evaluated_points);
+  if (lusdPrimGetAttributeValueAtTime(prim, "curveVertexCounts", time_code,
+                                      &count_value) == LUSD_SUCCESS)
+    (void)lusdValueGetArrayPtrInt32(count_value, &curve_count,
+                                    &evaluated_counts);
+  if (lusdPrimGetAttributeValueAtTime(prim, "widths", time_code,
+                                      &width_value) == LUSD_SUCCESS)
+    (void)lusdValueGetArrayPtrFloat(width_value, &width_count,
+                                    &evaluated_widths);
+  if (!loader_geometry_only() &&
+      lusdPrimGetAttributeValueAtTime(prim, "primvars:displayColor", time_code,
+                                      &color_value) == LUSD_SUCCESS)
+    (void)lusdValueGetArrayPtrFloat3(color_value, &color_count,
+                                     &evaluated_colors);
+  if (P->type_name && std::strcmp(P->type_name, "NurbsCurves") == 0) {
+    if (lusdPrimGetAttributeValueAtTime(prim, "order", time_code,
+                                        &order_value) == LUSD_SUCCESS)
+      (void)lusdValueGetArrayPtrInt32(order_value, &order_count,
+                                      &evaluated_order);
+    if (lusdPrimGetAttributeValueAtTime(prim, "knots", time_code,
+                                        &knot_value) == LUSD_SUCCESS)
+      evaluated_knots = curve_float_array(knot_value, knot_count,
+                                           converted_knots);
+    if (lusdPrimGetAttributeValueAtTime(prim, "ranges", time_code,
+                                        &range_value) == LUSD_SUCCESS)
+      evaluated_ranges = curve_float2_array(range_value, range_count,
+                                             converted_ranges);
+    if (lusdPrimGetAttributeValueAtTime(prim, "pointWeights", time_code,
+                                        &weight_value) == LUSD_SUCCESS)
+      evaluated_weights = curve_float_array(weight_value, weight_count,
+                                             converted_weights);
+  }
+
+  if (!evaluated_points) {
+    evaluated_points = reinterpret_cast<const LusdFloat3*>(data.points);
+    point_count = data.point_count;
+  }
+  if (!evaluated_counts) {
+    evaluated_counts = data.curve_vertex_counts;
+    curve_count = data.curve_count;
+  }
+  if (!evaluated_widths) {
+    evaluated_widths = data.widths;
+    width_count = data.width_count;
+  }
+  if (!evaluated_order) {
+    evaluated_order = data.order;
+    order_count = data.order_count;
+  }
+  if (!evaluated_knots) {
+    evaluated_knots = data.knots;
+    knot_count = data.knot_count;
+  }
+  if (!evaluated_ranges) {
+    evaluated_ranges = data.ranges;
+    range_count = data.range_count;
+  }
+  if (!evaluated_weights) {
+    evaluated_weights = data.point_weights;
+    weight_count = data.point_weight_count;
+  }
+
+  auto cleanup_values = [&]() {
+    if (point_value) lusdDestroyValue(L->inst, point_value);
+    if (count_value) lusdDestroyValue(L->inst, count_value);
+    if (width_value) lusdDestroyValue(L->inst, width_value);
+    if (color_value) lusdDestroyValue(L->inst, color_value);
+    if (order_value) lusdDestroyValue(L->inst, order_value);
+    if (knot_value) lusdDestroyValue(L->inst, knot_value);
+    if (range_value) lusdDestroyValue(L->inst, range_value);
+    if (weight_value) lusdDestroyValue(L->inst, weight_value);
+    lydra_c_free_curve_data(&data);
+  };
+
+  if (!evaluated_points || point_count < 2 || !evaluated_counts ||
+      curve_count == 0 || point_count > UINT32_MAX ||
+      curve_count > UINT32_MAX) {
+    cleanup_values();
+    return false;
+  }
 
   // lightusd's renderer tessellator evaluates every BasisCurves wrap/basis
   // mode and rational NURBS (orders, knots, ranges, and point weights).
   if (!is_hermite) {
+    // The lightusd tessellator accepts constant/vertex/varying widths. Expand
+    // USD uniform widths (one value per logical curve) to vertex values so
+    // multi-strand prims retain their authored per-strand thickness.
+    std::vector<float> expanded_uniform_widths;
+    const float* tess_widths = evaluated_widths;
+    uint64_t tess_width_count = width_count;
+    const int width_interp = curve_attribute_interpolation(
+        L->inst, prim, "widths");
+    if (evaluated_widths &&
+        width_interp == LYDRA_C_CURVE_INTERP_UNIFORM &&
+        width_count == curve_count && width_count > 1u &&
+        width_count != point_count) {
+      expanded_uniform_widths.reserve(static_cast<size_t>(point_count));
+      uint64_t expanded_count = 0;
+      for (uint32_t ci = 0; ci < curve_count; ++ci) {
+        if (evaluated_counts[ci] <= 0) continue;
+        const uint64_t count = static_cast<uint64_t>(evaluated_counts[ci]);
+        if (expanded_count + count > point_count) {
+          expanded_uniform_widths.clear();
+          break;
+        }
+        expanded_uniform_widths.insert(expanded_uniform_widths.end(),
+                                       static_cast<size_t>(count),
+                                       evaluated_widths[ci]);
+        expanded_count += count;
+      }
+      if (expanded_uniform_widths.size() == point_count) {
+        tess_widths = expanded_uniform_widths.data();
+        tess_width_count = expanded_uniform_widths.size();
+      }
+    }
+
+    LydraCCurvesDesc desc = {};
+    desc.is_nurbs = P->type_name &&
+                    std::strcmp(P->type_name, "NurbsCurves") == 0;
+    desc.type = data.curve_type &&
+                        std::strcmp(data.curve_type, "linear") == 0
+                    ? LYDRA_C_CURVE_TYPE_LINEAR : LYDRA_C_CURVE_TYPE_CUBIC;
+    desc.basis = LYDRA_C_CURVE_BASIS_BEZIER;
+    if (data.basis && std::strcmp(data.basis, "bspline") == 0)
+      desc.basis = LYDRA_C_CURVE_BASIS_BSPLINE;
+    else if (data.basis && std::strcmp(data.basis, "catmullRom") == 0)
+      desc.basis = LYDRA_C_CURVE_BASIS_CATMULL_ROM;
+    desc.wrap = LYDRA_C_CURVE_WRAP_NONPERIODIC;
+    if (data.wrap && std::strcmp(data.wrap, "periodic") == 0)
+      desc.wrap = LYDRA_C_CURVE_WRAP_PERIODIC;
+    else if (data.wrap && std::strcmp(data.wrap, "pinned") == 0)
+      desc.wrap = LYDRA_C_CURVE_WRAP_PINNED;
+    desc.curve_vertex_counts = evaluated_counts;
+    desc.curve_count = static_cast<uint32_t>(curve_count);
+    desc.points = reinterpret_cast<const float*>(evaluated_points);
+    desc.point_count = static_cast<uint32_t>(point_count);
+    desc.order = evaluated_order;
+    desc.order_count = static_cast<uint32_t>(
+        std::min<uint64_t>(order_count, UINT32_MAX));
+    desc.knots = evaluated_knots;
+    desc.knot_count = static_cast<uint32_t>(
+        std::min<uint64_t>(knot_count, UINT32_MAX));
+    desc.ranges = evaluated_ranges;
+    desc.range_count = static_cast<uint32_t>(
+        std::min<uint64_t>(range_count, UINT32_MAX));
+    desc.point_weights = evaluated_weights;
+    desc.point_weight_count = static_cast<uint32_t>(
+        std::min<uint64_t>(weight_count, UINT32_MAX));
+    desc.widths = tess_widths;
+    desc.width_count = static_cast<uint32_t>(
+        std::min<uint64_t>(tess_width_count, UINT32_MAX));
+    desc.colors = reinterpret_cast<const float*>(evaluated_colors);
+    desc.color_elem_count = static_cast<uint32_t>(
+        std::min<uint64_t>(color_count, UINT32_MAX));
+    desc.colors_interp = curve_attribute_interpolation(
+        L->inst, prim, "primvars:displayColor");
+
     LydraCTessellatedCurves tess = {};
-    LusdResult result = lydra_c_extract_render_curves(
-        reinterpret_cast<LusdLayer>(L),
-        reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)), 8, &tess);
+    LusdResult result = lydra_c_tessellate_curves(
+        &desc, tessellation_segments, &tess);
     if (result == LUSD_SUCCESS && tess.points && tess.point_count >= 2) {
       std::vector<lightrt::Curve> curves;
       curves.reserve(tess.curve_count);
@@ -352,8 +620,13 @@ static bool append_curve_prim(LusdLayer_T* L, const LusdPrim_T* P,
         }
         std::vector<lightrt::Vec3> points;
         std::vector<float> radii;
+        std::vector<lightrt::Vec3> colors;
         points.reserve(count);
         radii.reserve(count);
+        const bool keep_colors = !loader_geometry_only() && tess.colors &&
+                                 tess.color_count >= offset + count;
+        if (keep_colors)
+          colors.reserve(count);
         for (uint32_t j = 0; j < count; ++j) {
           uint32_t pi = offset + j;
           points.emplace_back(tess.points[pi * 3], tess.points[pi * 3 + 1],
@@ -361,8 +634,14 @@ static bool append_curve_prim(LusdLayer_T* L, const LusdPrim_T* P,
           float width = (tess.widths && pi < tess.width_count)
                             ? tess.widths[pi] : 1.0f;
           radii.push_back(std::max(1.0e-6f, width * 0.5f));
+          if (keep_colors && pi < tess.color_count) {
+            colors.emplace_back(tess.colors[pi * 3],
+                                tess.colors[pi * 3 + 1],
+                                tess.colors[pi * 3 + 2]);
+          }
         }
         curves.emplace_back(points, radii, lightrt::CurveType::Linear);
+        curves.back().colors = std::move(colors);
         offset += count;
       }
       if (loader_verbose()) {
@@ -370,63 +649,89 @@ static bool append_curve_prim(LusdLayer_T* L, const LusdPrim_T* P,
           std::fprintf(stderr, "  Curve warning: %s\n", tess.warnings[i]);
       }
       lydra_c_free_tessellated_curves(&tess);
+      cleanup_values();
       return append_curve_set(L, P, out_scene, mat_map, world_xform,
                               std::move(curves));
     }
     lydra_c_free_tessellated_curves(&tess);
+    cleanup_values();
+    return false;
   }
 
   // HermiteCurves carries one tangent per control point. Evaluate cubic
   // Hermite spans directly; malformed/missing tangent arrays fall back to the
   // control polygon so the prim remains visible.
-  LydraCCurveData data = {};
-  if (lydra_c_extract_curve(
-          reinterpret_cast<LusdLayer>(L),
-          reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
-          &data) != LUSD_SUCCESS || !data.points || data.point_count < 2) {
-    lydra_c_free_curve_data(&data);
-    return false;
-  }
-
   LusdValue tangent_value = LUSD_NULL_HANDLE;
   const LusdFloat3* tangents = nullptr;
   uint64_t tangent_count = 0;
-  if (lusdPrimGetAttributeDefault(
-          reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)), "tangents",
-          &tangent_value) == LUSD_SUCCESS) {
+  if (lusdPrimGetAttributeValueAtTime(prim, "tangents", time_code,
+                                      &tangent_value) == LUSD_SUCCESS) {
     (void)lusdValueGetArrayPtrFloat3(tangent_value, &tangent_count, &tangents);
   }
 
   std::vector<lightrt::Curve> curves;
-  curves.reserve(data.curve_count);
+  curves.reserve(static_cast<size_t>(curve_count));
   uint32_t offset = 0;
-  constexpr uint32_t kSamplesPerSpan = 8;
-  for (uint32_t ci = 0; ci < data.curve_count; ++ci) {
-    uint32_t count = data.curve_vertex_counts[ci] > 0
-                         ? static_cast<uint32_t>(data.curve_vertex_counts[ci])
+  const uint32_t samples_per_span = tessellation_segments;
+  const int color_interp = curve_attribute_interpolation(
+      L->inst, prim, "primvars:displayColor");
+  for (uint32_t ci = 0; ci < curve_count; ++ci) {
+    uint32_t count = evaluated_counts[ci] > 0
+                         ? static_cast<uint32_t>(evaluated_counts[ci])
                          : 0u;
-    if (count < 2 || offset > data.point_count ||
-        count > data.point_count - offset) {
+    if (count < 2 || offset > point_count || count > point_count - offset) {
       offset += count;
       continue;
     }
     std::vector<lightrt::Vec3> points;
     std::vector<float> radii;
+    std::vector<lightrt::Vec3> colors;
+    const bool constant_color = evaluated_colors && color_count == 1;
+    const bool uniform_color = evaluated_colors && color_count >= curve_count &&
+        (color_interp == LYDRA_C_CURVE_INTERP_UNIFORM ||
+         (color_interp < 0 && color_count == curve_count));
+    const bool vertex_color = evaluated_colors && color_count == point_count &&
+        (color_interp == LYDRA_C_CURVE_INTERP_VERTEX ||
+         color_interp == LYDRA_C_CURVE_INTERP_VARYING || color_interp < 0);
+    auto color_at = [&](uint32_t i0, uint32_t i1, float u) {
+      if (constant_color) return lightrt::Vec3(
+          evaluated_colors[0].x, evaluated_colors[0].y,
+          evaluated_colors[0].z);
+      if (uniform_color) return lightrt::Vec3(
+          evaluated_colors[ci].x, evaluated_colors[ci].y,
+          evaluated_colors[ci].z);
+      if (vertex_color) {
+        const lightrt::Vec3 c0(evaluated_colors[i0].x,
+                               evaluated_colors[i0].y,
+                               evaluated_colors[i0].z);
+        const lightrt::Vec3 c1(evaluated_colors[i1].x,
+                               evaluated_colors[i1].y,
+                               evaluated_colors[i1].z);
+        return c0 + (c1 - c0) * u;
+      }
+      return lightrt::Vec3(1.0f, 1.0f, 1.0f);
+    };
+    const bool keep_colors = constant_color || uniform_color || vertex_color;
     if (tangents && offset + count <= tangent_count) {
-      points.reserve((count - 1) * kSamplesPerSpan + 1);
-      radii.reserve((count - 1) * kSamplesPerSpan + 1);
+      points.reserve((count - 1) * samples_per_span + 1);
+      radii.reserve((count - 1) * samples_per_span + 1);
+      if (keep_colors) colors.reserve((count - 1) * samples_per_span + 1);
       for (uint32_t span = 0; span + 1 < count; ++span) {
         uint32_t i0 = offset + span;
         uint32_t i1 = i0 + 1;
-        lightrt::Vec3 p0(data.points[i0*3], data.points[i0*3+1], data.points[i0*3+2]);
-        lightrt::Vec3 p1(data.points[i1*3], data.points[i1*3+1], data.points[i1*3+2]);
+        lightrt::Vec3 p0(evaluated_points[i0].x, evaluated_points[i0].y,
+                         evaluated_points[i0].z);
+        lightrt::Vec3 p1(evaluated_points[i1].x, evaluated_points[i1].y,
+                         evaluated_points[i1].z);
         lightrt::Vec3 t0(tangents[i0].x, tangents[i0].y, tangents[i0].z);
         lightrt::Vec3 t1(tangents[i1].x, tangents[i1].y, tangents[i1].z);
-        float r0 = curve_radius(data, i0, ci);
-        float r1 = curve_radius(data, i1, ci);
+        float r0 = curve_radius(evaluated_widths, width_count, point_count,
+                                curve_count, i0, ci);
+        float r1 = curve_radius(evaluated_widths, width_count, point_count,
+                                curve_count, i1, ci);
         for (uint32_t sample = span ? 1u : 0u;
-             sample <= kSamplesPerSpan; ++sample) {
-          float u = static_cast<float>(sample) / kSamplesPerSpan;
+             sample <= samples_per_span; ++sample) {
+          float u = static_cast<float>(sample) / samples_per_span;
           float u2 = u*u, u3 = u2*u;
           float h00 = 2*u3 - 3*u2 + 1;
           float h10 = u3 - 2*u2 + u;
@@ -434,23 +739,28 @@ static bool append_curve_prim(LusdLayer_T* L, const LusdPrim_T* P,
           float h11 = u3 - u2;
           points.push_back(p0*h00 + t0*h10 + p1*h01 + t1*h11);
           radii.push_back(r0 + (r1 - r0) * u);
+          if (keep_colors) colors.push_back(color_at(i0, i1, u));
         }
       }
     } else {
       points.reserve(count);
       radii.reserve(count);
+      if (keep_colors) colors.reserve(count);
       for (uint32_t j = 0; j < count; ++j) {
         uint32_t pi = offset + j;
-        points.emplace_back(data.points[pi*3], data.points[pi*3+1],
-                            data.points[pi*3+2]);
-        radii.push_back(curve_radius(data, pi, ci));
+        points.emplace_back(evaluated_points[pi].x, evaluated_points[pi].y,
+                            evaluated_points[pi].z);
+        radii.push_back(curve_radius(evaluated_widths, width_count, point_count,
+                                     curve_count, pi, ci));
+        if (keep_colors) colors.push_back(color_at(pi, pi, 0.0f));
       }
     }
     curves.emplace_back(points, radii, lightrt::CurveType::Linear);
+    curves.back().colors = std::move(colors);
     offset += count;
   }
   if (tangent_value) lusdDestroyValue(L->inst, tangent_value);
-  lydra_c_free_curve_data(&data);
+  cleanup_values();
   return append_curve_set(L, P, out_scene, mat_map, world_xform,
                           std::move(curves));
 }
@@ -844,7 +1154,7 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
       (strcmp(P->type_name, "BasisCurves") == 0 ||
        strcmp(P->type_name, "NurbsCurves") == 0 ||
        strcmp(P->type_name, "HermiteCurves") == 0)) {
-    append_curve_prim(L, P, out_scene, mat_map, world_xform);
+    append_curve_prim(L, P, out_scene, mat_map, world_xform, time_code);
   }
 
   if (P->type_name && strcmp(P->type_name, "Points") == 0) {
@@ -1206,12 +1516,15 @@ bool loadUSDScene(const std::string& filename, double timecode, scene::Scene& ou
 
   size_t triangle_count = 0;
   size_t curve_count = 0;
+  size_t curve_segment_count = 0;
   size_t point_count = 0;
   size_t gaussian_count = 0;
   for (const auto& mesh : out_scene.meshes)
     triangle_count += mesh.bvh.getTriangles().size();
-  for (const auto& curves : out_scene.curve_meshes)
+  for (const auto& curves : out_scene.curve_meshes) {
     curve_count += curves.curves.size();
+    curve_segment_count += curves.segment_aabbs.size();
+  }
   for (const auto& points : out_scene.point_meshes)
     point_count += points.points.size();
   for (const auto& gaussians : out_scene.gaussian_meshes)
@@ -1225,8 +1538,9 @@ bool loadUSDScene(const std::string& filename, double timecode, scene::Scene& ou
          out_scene.materials.size(), out_scene.cameras.size(),
          out_scene.lights.size(), composed ? ", composed" : "",
          geometry_only ? ", geometry only" : "");
-  printf("Geometry: %zu triangles, %zu curves, %zu points, %zu Gaussian splats\n",
-         triangle_count, curve_count, point_count, gaussian_count);
+  printf("Geometry: %zu triangles, %zu curves (%zu segments), %zu points, "
+         "%zu Gaussian splats\n", triangle_count, curve_count,
+         curve_segment_count, point_count, gaussian_count);
   printf("Scene bounds: [(%.6g, %.6g, %.6g) - (%.6g, %.6g, %.6g)]\n",
          out_scene.scene_bounds.min.x, out_scene.scene_bounds.min.y,
          out_scene.scene_bounds.min.z, out_scene.scene_bounds.max.x,
@@ -1241,7 +1555,9 @@ static void walk_prim_mblur(LusdLayer_T* L, const LusdPrim_T* P,
                              scene::Scene& out_scene,
                              const double parent_xform[16],
                              double time_code,
-                             uint32_t& instance_idx) {
+                             bool close_sample,
+                             uint32_t& mesh_instance_idx,
+                             uint32_t& curve_instance_idx) {
   double local_xform[16];
   double world_xform[16];
   int has_local = lydra_c_extract_xform_at(
@@ -1257,45 +1573,137 @@ static void walk_prim_mblur(LusdLayer_T* L, const LusdPrim_T* P,
   if (P->type_name && strcmp(P->type_name, "Mesh") == 0) {
     // Non-mesh prims also occupy instance slots. Advance to the next mesh
     // slot so an interleaved curve/points instance is never treated as a mesh.
-    while (instance_idx < out_scene.instances.size() &&
-           out_scene.instances[instance_idx].mesh_id == lightrt::kInvalidIndex)
-      instance_idx++;
-    if (instance_idx < out_scene.instances.size()) {
-      auto& inst = out_scene.instances[instance_idx];
-      float close_xform[12];
-      mat4d_to_3x4f(world_xform, close_xform);
-
-      bool differs = false;
-      for (int k = 0; k < 12; k++) {
-        if (std::abs(close_xform[k] - inst.transform[k]) > 1e-7f) {
-          differs = true;
-          break;
+    while (mesh_instance_idx < out_scene.instances.size() &&
+           out_scene.instances[mesh_instance_idx].mesh_id == lightrt::kInvalidIndex)
+      mesh_instance_idx++;
+    if (mesh_instance_idx < out_scene.instances.size()) {
+      auto& inst = out_scene.instances[mesh_instance_idx];
+      float sample_xform[12];
+      mat4d_to_3x4f(world_xform, sample_xform);
+      if (!close_sample) {
+        std::memcpy(inst.transform, sample_xform, sizeof(sample_xform));
+        scene::invert3x4(inst.transform, inst.inv_transform);
+        std::memcpy(inst.transform_close, sample_xform, sizeof(sample_xform));
+        std::memcpy(inst.inv_transform_close, inst.inv_transform,
+                    sizeof(inst.inv_transform));
+        inst.has_motion = false;
+      } else {
+        bool differs = false;
+        for (int k = 0; k < 12; k++) {
+          if (std::abs(sample_xform[k] - inst.transform[k]) > 1e-7f) {
+            differs = true;
+            break;
+          }
+        }
+        if (differs) {
+          std::memcpy(inst.transform_close, sample_xform,
+                      sizeof(sample_xform));
+          scene::invert3x4(inst.transform_close, inst.inv_transform_close);
+          inst.has_motion = true;
         }
       }
-      if (differs) {
-        std::memcpy(inst.transform_close, close_xform, sizeof(close_xform));
-        scene::invert3x4(inst.transform_close, inst.inv_transform_close);
-        inst.has_motion = true;
-        lightrt::AABB close_bounds = scene::transformAABB(
-            out_scene.meshes[inst.mesh_id].local_bounds, inst.transform_close);
-        inst.world_bounds.expand(close_bounds);
-        out_scene.scene_bounds.expand(close_bounds);
+      mesh_instance_idx++;
+    }
+  }
+
+  if (P->type_name &&
+      (strcmp(P->type_name, "BasisCurves") == 0 ||
+       strcmp(P->type_name, "NurbsCurves") == 0 ||
+       strcmp(P->type_name, "HermiteCurves") == 0)) {
+    while (curve_instance_idx < out_scene.instances.size() &&
+           out_scene.instances[curve_instance_idx].curve_mesh_id ==
+               lightrt::kInvalidIndex)
+      curve_instance_idx++;
+    if (curve_instance_idx < out_scene.instances.size()) {
+      scene::Scene close_scene;
+      const std::map<std::string, int> empty_materials;
+      if (append_curve_prim(L, P, close_scene, empty_materials, world_xform,
+                            time_code) &&
+          close_scene.curve_meshes.size() == 1 &&
+          close_scene.instances.size() == 1) {
+        auto& inst = out_scene.instances[curve_instance_idx];
+        auto& curves = out_scene.curve_meshes[inst.curve_mesh_id];
+        const auto& sample_curves = close_scene.curve_meshes[0];
+        float sample_xform[12];
+        mat4d_to_3x4f(world_xform, sample_xform);
+        if (!close_sample) {
+          if (!curves.replaceOpenSamples(sample_curves) && loader_verbose())
+            std::fprintf(stderr,
+                         "  Curve motion warning: shutter-open topology "
+                         "does not match the frame sample\n");
+          std::memcpy(inst.transform, sample_xform, sizeof(sample_xform));
+          scene::invert3x4(inst.transform, inst.inv_transform);
+          std::memcpy(inst.transform_close, sample_xform,
+                      sizeof(sample_xform));
+          std::memcpy(inst.inv_transform_close, inst.inv_transform,
+                      sizeof(inst.inv_transform));
+          inst.has_motion = false;
+        } else {
+          const bool compatible =
+              curves.hasCompatibleMotionTopology(sample_curves);
+          const bool geometry_differs = curves.setMotionSamples(sample_curves);
+          if (!compatible && loader_verbose())
+            std::fprintf(stderr,
+                         "  Curve motion warning: shutter-close topology "
+                         "does not match the open sample\n");
+          bool transform_differs = false;
+          for (int k = 0; k < 12; ++k) {
+            if (std::abs(sample_xform[k] - inst.transform[k]) > 1.0e-7f) {
+              transform_differs = true;
+              break;
+            }
+          }
+          if (geometry_differs || transform_differs) {
+            std::memcpy(inst.transform_close, sample_xform,
+                        sizeof(sample_xform));
+            scene::invert3x4(inst.transform_close, inst.inv_transform_close);
+            inst.has_motion = true;
+          }
+        }
       }
-      instance_idx++;
+      curve_instance_idx++;
     }
   }
 
   for (uint32_t j = 0; j < P->child_count; j++) {
     walk_prim_mblur(L, &L->prim_nodes[P->child_spec_indices[j]],
-                    out_scene, world_xform, time_code, instance_idx);
+                    out_scene, world_xform, time_code, close_sample,
+                    mesh_instance_idx, curve_instance_idx);
+  }
+}
+
+static void rebuild_motion_bounds(scene::Scene& scene) {
+  scene.scene_bounds = lightrt::AABB();
+  for (auto& inst : scene.instances) {
+    const lightrt::AABB* local_bounds = nullptr;
+    if (inst.mesh_id != lightrt::kInvalidIndex &&
+        inst.mesh_id < scene.meshes.size())
+      local_bounds = &scene.meshes[inst.mesh_id].local_bounds;
+    else if (inst.curve_mesh_id != lightrt::kInvalidIndex &&
+             inst.curve_mesh_id < scene.curve_meshes.size())
+      local_bounds = &scene.curve_meshes[inst.curve_mesh_id].local_bounds;
+    else if (inst.point_mesh_id != lightrt::kInvalidIndex &&
+             inst.point_mesh_id < scene.point_meshes.size())
+      local_bounds = &scene.point_meshes[inst.point_mesh_id].local_bounds;
+    else if (inst.gaussian_mesh_id != lightrt::kInvalidIndex &&
+             inst.gaussian_mesh_id < scene.gaussian_meshes.size())
+      local_bounds = &scene.gaussian_meshes[inst.gaussian_mesh_id].local_bounds;
+    if (!local_bounds) continue;
+
+    inst.world_bounds = scene::transformAABB(*local_bounds, inst.transform);
+    if (inst.has_motion)
+      inst.world_bounds.expand(
+          scene::transformAABB(*local_bounds, inst.transform_close));
+    scene.scene_bounds.expand(inst.world_bounds);
   }
 }
 
 void applyMotionBlur(const std::string& filename,
                      double timecode,
+                     double shutter_open_offset,
                      double shutter_close_offset,
                      scene::Scene& scene) {
-  if (shutter_close_offset == 0.0) return;
+  if (shutter_close_offset <= shutter_open_offset) return;
 
   LusdInstanceCreateInfo inst_info = {};
   inst_info.sType = LUSD_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -1342,22 +1750,38 @@ void applyMotionBlur(const std::string& filename,
   }
 
   LusdLayer_T* L = reinterpret_cast<LusdLayer_T*>(layer);
-  const double open_time = timecode < -1.0e20
-                               ? L->metas.start_time_code : timecode;
-  double close_time = open_time + shutter_close_offset;
+  const double frame_time = timecode < -1.0e20
+                                ? L->metas.start_time_code : timecode;
+  const double open_time = frame_time + shutter_open_offset;
+  const double close_time = frame_time + shutter_close_offset;
 
-  uint32_t instance_idx = 0;
+  if (shutter_open_offset != 0.0) {
+    uint32_t mesh_instance_idx = 0;
+    uint32_t curve_instance_idx = 0;
+    for (uint32_t i = 0; i < L->root_spec_count; i++) {
+      walk_prim_mblur(L, &L->prim_nodes[L->root_spec_indices[i]],
+                      scene, kIdentity4d, open_time, false,
+                      mesh_instance_idx, curve_instance_idx);
+    }
+  }
+
+  uint32_t mesh_instance_idx = 0;
+  uint32_t curve_instance_idx = 0;
   for (uint32_t i = 0; i < L->root_spec_count; i++) {
     walk_prim_mblur(L, &L->prim_nodes[L->root_spec_indices[i]],
-                    scene, kIdentity4d, close_time, instance_idx);
+                    scene, kIdentity4d, close_time, true,
+                    mesh_instance_idx, curve_instance_idx);
   }
+
+  rebuild_motion_bounds(scene);
 
   uint32_t motion_count = 0;
   for (const auto& inst : scene.instances)
     if (inst.has_motion) motion_count++;
   if (motion_count > 0)
-    printf("Motion blur: %u/%zu instances have different close-shutter transforms\n",
-           motion_count, scene.instances.size());
+    printf("Motion blur: %u/%zu instances sampled over shutter [%.3g, %.3g]\n",
+           motion_count, scene.instances.size(), shutter_open_offset,
+           shutter_close_offset);
 
   scene.buildAcceleration();
 
@@ -2036,52 +2460,78 @@ bool loadUSDScene(const std::string& filename, double timecode, scene::Scene& ou
 }
 
 void applyMotionBlur(const std::string& filename, double timecode,
+                     double shutter_open_offset,
                      double shutter_close_offset, scene::Scene& scene) {
-  if (shutter_close_offset <= 0.0) return;
+  if (shutter_close_offset <= shutter_open_offset) return;
 
   std::string warn, err;
   tinyusdz::Stage stage;
   if (!tinyusdz::LoadUSDFromFile(filename, &stage, &warn, &err)) return;
 
-  tinyusdz::tydra::RenderScene render_scene;
-  tinyusdz::tydra::RenderSceneConverter converter;
-  tinyusdz::tydra::RenderSceneConverterEnv env(stage);
-  env.mesh_config.triangulate = true;
-  env.timecode = timecode + shutter_close_offset;
+  auto sample_transforms = [&](double sample_time, bool close_sample) {
+    tinyusdz::tydra::RenderScene render_scene;
+    tinyusdz::tydra::RenderSceneConverter converter;
+    tinyusdz::tydra::RenderSceneConverterEnv env(stage);
+    env.mesh_config.triangulate = true;
+    env.timecode = sample_time;
+    if (!converter.ConvertToRenderScene(env, &render_scene)) return false;
 
-  if (!converter.ConvertToRenderScene(env, &render_scene)) return;
-
-  uint32_t inst_idx = 0;
-  std::function<void(const tinyusdz::tydra::Node&)> walkClose;
-  walkClose = [&](const tinyusdz::tydra::Node& node) {
-    if (node.nodeType == tinyusdz::tydra::NodeType::Mesh && node.id >= 0 &&
-        inst_idx < static_cast<uint32_t>(scene.instances.size())) {
-      auto& inst = scene.instances[inst_idx];
-      float close_xform[12];
-      scene::matrix4dTo3x4(node.global_matrix.m, close_xform);
-
-      bool differs = false;
-      for (int j = 0; j < 12; j++) {
-        if (std::fabs(close_xform[j] - inst.transform[j]) > 1e-6f) {
-          differs = true;
-          break;
+    uint32_t inst_idx = 0;
+    std::function<void(const tinyusdz::tydra::Node&)> walk_sample;
+    walk_sample = [&](const tinyusdz::tydra::Node& node) {
+      if (node.nodeType == tinyusdz::tydra::NodeType::Mesh && node.id >= 0 &&
+          inst_idx < static_cast<uint32_t>(scene.instances.size())) {
+        auto& inst = scene.instances[inst_idx];
+        float sample_xform[12];
+        scene::matrix4dTo3x4(node.global_matrix.m, sample_xform);
+        if (!close_sample) {
+          std::memcpy(inst.transform, sample_xform, sizeof(sample_xform));
+          scene::invert3x4(inst.transform, inst.inv_transform);
+          std::memcpy(inst.transform_close, sample_xform,
+                      sizeof(sample_xform));
+          std::memcpy(inst.inv_transform_close, inst.inv_transform,
+                      sizeof(inst.inv_transform));
+          inst.has_motion = false;
+        } else {
+          bool differs = false;
+          for (int j = 0; j < 12; j++) {
+            if (std::fabs(sample_xform[j] - inst.transform[j]) > 1e-6f) {
+              differs = true;
+              break;
+            }
+          }
+          if (differs) {
+            std::memcpy(inst.transform_close, sample_xform,
+                        sizeof(sample_xform));
+            scene::invert3x4(sample_xform, inst.inv_transform_close);
+            inst.has_motion = true;
+          }
         }
+        inst_idx++;
       }
-      if (differs) {
-        std::memcpy(inst.transform_close, close_xform, sizeof(close_xform));
-        scene::invert3x4(close_xform, inst.inv_transform_close);
-        inst.has_motion = true;
-        lightrt::AABB close_bounds = scene::transformAABB(
-          scene.meshes[inst.mesh_id].local_bounds, close_xform);
-        inst.world_bounds.expand(close_bounds);
-        scene.scene_bounds.expand(inst.world_bounds);
-      }
-      inst_idx++;
-    }
-    for (const auto& child : node.children) walkClose(child);
+      for (const auto& child : node.children) walk_sample(child);
+    };
+    for (const auto& root_node : render_scene.nodes) walk_sample(root_node);
+    return true;
   };
 
-  for (const auto& root_node : render_scene.nodes) walkClose(root_node);
+  if (shutter_open_offset != 0.0 &&
+      !sample_transforms(timecode + shutter_open_offset, false))
+    return;
+  if (!sample_transforms(timecode + shutter_close_offset, true)) return;
+
+  scene.scene_bounds = lightrt::AABB();
+  for (auto& inst : scene.instances) {
+    if (inst.mesh_id == lightrt::kInvalidIndex ||
+        inst.mesh_id >= scene.meshes.size())
+      continue;
+    const lightrt::AABB& local = scene.meshes[inst.mesh_id].local_bounds;
+    inst.world_bounds = scene::transformAABB(local, inst.transform);
+    if (inst.has_motion)
+      inst.world_bounds.expand(
+          scene::transformAABB(local, inst.transform_close));
+    scene.scene_bounds.expand(inst.world_bounds);
+  }
   scene.buildAcceleration();
 }
 
@@ -2092,7 +2542,8 @@ bool loadUSDScene(const std::string&, double, scene::Scene&) {
   return false;
 }
 
-void applyMotionBlur(const std::string&, double, double, scene::Scene&) {}
+void applyMotionBlur(const std::string&, double, double, double,
+                     scene::Scene&) {}
 
 #endif // LIGHTRT_HAS_TINYUSDZ
 

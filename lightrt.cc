@@ -463,17 +463,33 @@ Vec3 Curve::centroid() const noexcept {
 AABB Curve::bounds() const noexcept {
   AABB b;
   for (size_t i = 0; i < control_points.size(); i++) {
-    float r = i < radii.size() ? radii[i] : 0.01f;
+    float r = std::max(0.0f, i < radii.size() ? radii[i] : 0.01f);
     Vec3 p = control_points[i];
     b.expand(Vec3(p.x - r, p.y - r, p.z - r));
     b.expand(Vec3(p.x + r, p.y + r, p.z + r));
   }
+  if (control_points_close.size() == control_points.size()) {
+    for (size_t i = 0; i < control_points_close.size(); ++i) {
+      float r = std::max(0.0f, i < radii_close.size() ? radii_close[i]
+                : (i < radii.size() ? radii[i] : 0.01f));
+      const Vec3& p = control_points_close[i];
+      b.expand(Vec3(p.x - r, p.y - r, p.z - r));
+      b.expand(Vec3(p.x + r, p.y + r, p.z + r));
+    }
+  }
   return b;
 }
 
-Vec3 Curve::evaluate(float t) const noexcept {
+Vec3 Curve::evaluate(float t, float motion_time) const noexcept {
   if (control_points.empty()) return Vec3();
-  if (control_points.size() == 1) return control_points[0];
+  const bool moving = hasMotionSamples();
+  motion_time = std::max(0.0f, std::min(1.0f, motion_time));
+  auto point = [&](size_t i) noexcept {
+    if (!moving) return control_points[i];
+    return control_points[i] +
+           (control_points_close[i] - control_points[i]) * motion_time;
+  };
+  if (control_points.size() == 1) return point(0);
 
   t = std::max(0.0f, std::min(1.0f, t));
 
@@ -483,7 +499,8 @@ Vec3 Curve::evaluate(float t) const noexcept {
     size_t i = static_cast<size_t>(segment_t);
     i = std::min(i, control_points.size() - 2);
     float local_t = segment_t - static_cast<float>(i);
-    return control_points[i] + (control_points[i + 1] - control_points[i]) * local_t;
+    const Vec3 p0 = point(i), p1 = point(i + 1u);
+    return p0 + (p1 - p0) * local_t;
   }
 
   if (type == CurveType::Bezier && control_points.size() >= 4) {
@@ -494,10 +511,8 @@ Vec3 Curve::evaluate(float t) const noexcept {
     float t2 = t * t;
     float t3 = t2 * t;
 
-    return control_points[0] * u3 +
-           control_points[1] * (3.0f * u2 * t) +
-           control_points[2] * (3.0f * u * t2) +
-           control_points[3] * t3;
+    return point(0) * u3 + point(1) * (3.0f * u2 * t) +
+           point(2) * (3.0f * u * t2) + point(3) * t3;
   }
 
   if (type == CurveType::CatmullRom && control_points.size() >= 4) {
@@ -507,10 +522,10 @@ Vec3 Curve::evaluate(float t) const noexcept {
     i = std::min(i, control_points.size() - 4);
     float local_t = segment_t - static_cast<float>(i);
 
-    const Vec3& p0 = control_points[i];
-    const Vec3& p1 = control_points[i + 1];
-    const Vec3& p2 = control_points[i + 2];
-    const Vec3& p3 = control_points[i + 3];
+    const Vec3 p0 = point(i);
+    const Vec3 p1 = point(i + 1u);
+    const Vec3 p2 = point(i + 2u);
+    const Vec3 p3 = point(i + 3u);
 
     float t2 = local_t * local_t;
     float t3 = t2 * local_t;
@@ -533,8 +548,8 @@ Vec3 Curve::evaluate(float t) const noexcept {
     float b1 = (4.0f - 6.0f*u2 + 3.0f*u3) / 6.0f;
     float b2 = (1.0f + 3.0f*u + 3.0f*u2 - 3.0f*u3) / 6.0f;
     float b3 = u3 / 6.0f;
-    return control_points[i] * b0 + control_points[i + 1] * b1 +
-           control_points[i + 2] * b2 + control_points[i + 3] * b3;
+    return point(i) * b0 + point(i + 1u) * b1 +
+           point(i + 2u) * b2 + point(i + 3u) * b3;
   }
 
   // Fallback to linear
@@ -542,20 +557,28 @@ Vec3 Curve::evaluate(float t) const noexcept {
   size_t i = static_cast<size_t>(segment_t);
   i = std::min(i, control_points.size() - 2);
   float local_t = segment_t - static_cast<float>(i);
-  return control_points[i] + (control_points[i + 1] - control_points[i]) * local_t;
+  const Vec3 p0 = point(i), p1 = point(i + 1u);
+  return p0 + (p1 - p0) * local_t;
 }
 
-Vec3 Curve::evaluateTangent(float t) const noexcept {
+Vec3 Curve::evaluateTangent(float t, float motion_time) const noexcept {
   // Numerical differentiation
   const float h = 0.001f;
-  Vec3 p0 = evaluate(std::max(0.0f, t - h));
-  Vec3 p1 = evaluate(std::min(1.0f, t + h));
+  Vec3 p0 = evaluate(std::max(0.0f, t - h), motion_time);
+  Vec3 p1 = evaluate(std::min(1.0f, t + h), motion_time);
   return (p1 - p0).normalize();
 }
 
-float Curve::radiusAt(float t) const noexcept {
+float Curve::radiusAt(float t, float motion_time) const noexcept {
   if (radii.empty()) return 0.01f;
-  if (radii.size() == 1) return radii[0];
+  const bool moving = radii_close.size() == radii.size() &&
+                      !radii_close.empty();
+  motion_time = std::max(0.0f, std::min(1.0f, motion_time));
+  auto radius = [&](size_t i) noexcept {
+    if (!moving) return radii[i];
+    return radii[i] + (radii_close[i] - radii[i]) * motion_time;
+  };
+  if (radii.size() == 1) return radius(0);
 
   t = std::max(0.0f, std::min(1.0f, t));
   float segment_t = t * static_cast<float>(radii.size() - 1);
@@ -563,23 +586,46 @@ float Curve::radiusAt(float t) const noexcept {
   i = std::min(i, radii.size() - 2);
   float local_t = segment_t - static_cast<float>(i);
 
-  return radii[i] + (radii[i + 1] - radii[i]) * local_t;
+  const float r0 = radius(i), r1 = radius(i + 1u);
+  return r0 + (r1 - r0) * local_t;
 }
 
-bool Curve::intersect(const Ray& ray, float& t_hit, float& u_hit) const noexcept {
+Vec3 Curve::colorAt(float t, float motion_time) const noexcept {
+  if (colors.empty()) return Vec3(1.0f, 1.0f, 1.0f);
+  const bool moving = colors_close.size() == colors.size() &&
+                      !colors_close.empty();
+  motion_time = std::max(0.0f, std::min(1.0f, motion_time));
+  auto color = [&](size_t i) noexcept {
+    if (!moving) return colors[i];
+    return colors[i] + (colors_close[i] - colors[i]) * motion_time;
+  };
+  if (colors.size() == 1) return color(0);
+
+  t = std::max(0.0f, std::min(1.0f, t));
+  const float sample_t = t * static_cast<float>(colors.size() - 1u);
+  size_t i = static_cast<size_t>(sample_t);
+  i = std::min(i, colors.size() - 2u);
+  const float local_t = sample_t - static_cast<float>(i);
+  const Vec3 c0 = color(i), c1 = color(i + 1u);
+  return c0 + (c1 - c0) * local_t;
+}
+
+bool Curve::intersect(const Ray& ray, float& t_hit, float& u_hit,
+                      float motion_time) const noexcept {
   if (control_points.size() < 2) return false;
 
   if (type == CurveType::Linear) {
-    return intersectLinear(ray, t_hit, u_hit);
+    return intersectLinear(ray, t_hit, u_hit, motion_time);
   }
 
   // Use Phantom algorithm for smooth curves
-  return intersectPhantom(ray, t_hit, u_hit);
+  return intersectPhantom(ray, t_hit, u_hit, motion_time);
 }
 
 // Phantom Ray-Hair Intersector implementation
 // Based on Reshetov & Luebke, HPG 2018
-bool Curve::intersectPhantom(const Ray& ray, float& t_hit, float& u_hit) const noexcept {
+bool Curve::intersectPhantom(const Ray& ray, float& t_hit, float& u_hit,
+                             float motion_time) const noexcept {
   const int max_iterations = 10;
   const float epsilon = 1e-5f;
 
@@ -590,9 +636,9 @@ bool Curve::intersectPhantom(const Ray& ray, float& t_hit, float& u_hit) const n
 
   // Newton-Raphson iteration
   for (int iter = 0; iter < max_iterations; iter++) {
-    Vec3 curve_pos = evaluate(u);
-    Vec3 curve_tangent = evaluateTangent(u);
-    float r = radiusAt(u);
+    Vec3 curve_pos = evaluate(u, motion_time);
+    Vec3 curve_tangent = evaluateTangent(u, motion_time);
+    float r = radiusAt(u, motion_time);
 
     // Vector from ray origin to curve point
     Vec3 oc = curve_pos - ray.origin;
@@ -641,8 +687,8 @@ bool Curve::intersectPhantom(const Ray& ray, float& t_hit, float& u_hit) const n
   const int num_samples = 8;
   for (int i = 0; i <= num_samples; i++) {
     float sample_u = static_cast<float>(i) / num_samples;
-    Vec3 curve_pos = evaluate(sample_u);
-    float r = radiusAt(sample_u);
+    Vec3 curve_pos = evaluate(sample_u, motion_time);
+    float r = radiusAt(sample_u, motion_time);
 
     Vec3 oc = curve_pos - ray.origin;
     float t_closest = oc.dot(ray.direction) / ray.direction.dot(ray.direction);
@@ -671,88 +717,128 @@ bool Curve::intersectPhantom(const Ray& ray, float& t_hit, float& u_hit) const n
   return hit;
 }
 
-// Simple linear segment intersection (capsule-based)
-bool Curve::intersectLinear(const Ray& ray, float& t_hit, float& u_hit) const noexcept {
+bool Curve::intersectSegment(const Ray& ray, uint32_t segment_index,
+                             float& t_hit, float& u_hit,
+                             float motion_time) const noexcept {
+  if (segment_index + 1u >= control_points.size()) return false;
+
+  motion_time = std::max(0.0f, std::min(1.0f, motion_time));
+  Vec3 p0 = control_points[segment_index];
+  Vec3 p1 = control_points[segment_index + 1u];
+  if (hasMotionSamples()) {
+    p0 = p0 + (control_points_close[segment_index] - p0) * motion_time;
+    p1 = p1 + (control_points_close[segment_index + 1u] - p1) * motion_time;
+  }
+  float r0 = segment_index < radii.size() ? radii[segment_index] : 0.01f;
+  float r1 = segment_index + 1u < radii.size()
+                 ? radii[segment_index + 1u] : r0;
+  if (radii_close.size() == radii.size() && !radii_close.empty()) {
+    r0 += (radii_close[segment_index] - r0) * motion_time;
+    r1 += (radii_close[segment_index + 1u] - r1) * motion_time;
+  }
+  r0 = std::max(0.0f, r0);
+  r1 = std::max(0.0f, r1);
+  const Vec3 segment = p1 - p0;
+  const float length_sq = segment.dot(segment);
+  const float ray_length_sq = ray.direction.dot(ray.direction);
+  if (ray_length_sq < kEpsilon) return false;
+
   float best_t = ray.tmax;
+  float best_local_u = 0.0f;
   bool hit = false;
 
-  for (size_t i = 0; i < control_points.size() - 1; i++) {
-    const Vec3& p0 = control_points[i];
-    const Vec3& p1 = control_points[i + 1];
-    float r0 = i < radii.size() ? radii[i] : 0.01f;
-    float r1 = i + 1 < radii.size() ? radii[i + 1] : r0;
-    float r = (r0 + r1) * 0.5f;
+  auto test_cap = [&](const Vec3& center, float radius,
+                      float local_u) noexcept {
+    if (radius <= 0.0f) return;
+    float cap_t = best_t;
+    const Ray cap_ray(ray.origin, ray.direction, ray.tmin, best_t);
+    if (Sphere(center, radius).intersect(cap_ray, cap_t) && cap_t < best_t) {
+      best_t = cap_t;
+      best_local_u = local_u;
+      hit = true;
+    }
+  };
 
-    // Capsule intersection: cylinder + two spheres
-    Vec3 segment = p1 - p0;
-    float seg_len_sq = segment.dot(segment);
+  if (length_sq < kEpsilon) {
+    test_cap(p0, std::max(r0, r1), 0.0f);
+  } else {
+    const float length = std::sqrt(length_sq);
+    const Vec3 axis = segment * (1.0f / length);
+    const Vec3 rel = ray.origin - p0;
+    const float axial_origin = rel.dot(axis);
+    const float axial_direction = ray.direction.dot(axis);
+    const float radius_slope = (r1 - r0) / length;
+    const float radius_at_origin = r0 + radius_slope * axial_origin;
 
-    if (seg_len_sq < kEpsilon) {
-      // Degenerate segment, treat as sphere
-      Sphere sphere(p0, r);
-      float t;
-      if (sphere.intersect(ray, t) && t < best_t) {
-        best_t = t;
-        u_hit = static_cast<float>(i) / static_cast<float>(control_points.size() - 1);
-        hit = true;
+    // Intersect the linearly tapered tube body. With equal endpoint radii
+    // this reduces to the exact infinite-cylinder quadratic. Candidate roots
+    // are then clipped to the finite axial interval.
+    const float a = ray_length_sq - axial_direction * axial_direction -
+                    radius_slope * radius_slope *
+                        axial_direction * axial_direction;
+    const float b = 2.0f * (rel.dot(ray.direction) -
+                            axial_origin * axial_direction -
+                            radius_at_origin * radius_slope *
+                                axial_direction);
+    const float c = rel.dot(rel) - axial_origin * axial_origin -
+                    radius_at_origin * radius_at_origin;
+
+    auto test_body_root = [&](float candidate_t) noexcept {
+      if (candidate_t < ray.tmin || candidate_t >= best_t) return;
+      const float axial = axial_origin + candidate_t * axial_direction;
+      if (axial < 0.0f || axial > length) return;
+      best_t = candidate_t;
+      best_local_u = axial / length;
+      hit = true;
+    };
+
+    if (std::abs(a) > kEpsilon) {
+      const float discriminant = b * b - 4.0f * a * c;
+      if (discriminant >= 0.0f) {
+        const float root = std::sqrt(discriminant);
+        float t0 = (-b - root) / (2.0f * a);
+        float t1 = (-b + root) / (2.0f * a);
+        if (t0 > t1) std::swap(t0, t1);
+        test_body_root(t0);
+        test_body_root(t1);
       }
-      continue;
+    } else if (std::abs(b) > kEpsilon) {
+      test_body_root(-c / b);
     }
 
-    Vec3 seg_dir = segment * (1.0f / std::sqrt(seg_len_sq));
-
-    // Find closest points between ray and line segment
-    Vec3 w0 = ray.origin - p0;
-    float a = ray.direction.dot(ray.direction);
-    float b = ray.direction.dot(seg_dir);
-    float c = seg_dir.dot(seg_dir);
-    float d = ray.direction.dot(w0);
-    float e = seg_dir.dot(w0);
-
-    float denom = a * c - b * b;
-    float t_ray, t_seg;
-
-    if (std::abs(denom) < kEpsilon) {
-      // Parallel lines
-      t_ray = d / a;
-      t_seg = 0.0f;
-    } else {
-      t_ray = (b * e - c * d) / denom;
-      t_seg = (a * e - b * d) / denom;
-    }
-
-    // Clamp t_seg to segment
-    t_seg = std::max(0.0f, std::min(std::sqrt(seg_len_sq), t_seg));
-
-    // Recompute t_ray for clamped t_seg
-    Vec3 closest_on_seg = p0 + seg_dir * t_seg;
-    Vec3 oc = closest_on_seg - ray.origin;
-    t_ray = oc.dot(ray.direction) / a;
-
-    if (t_ray < ray.tmin || t_ray >= best_t) continue;
-
-    Vec3 ray_point = ray.at(t_ray);
-    Vec3 diff = ray_point - closest_on_seg;
-    float dist_sq = diff.dot(diff);
-
-    // Interpolate radius along segment
-    float seg_u = t_seg / std::sqrt(seg_len_sq);
-    float local_r = r0 + (r1 - r0) * seg_u;
-
-    if (dist_sq <= local_r * local_r) {
-      float inside_dist = std::sqrt(local_r * local_r - dist_sq);
-      float t_surface = t_ray - inside_dist;
-
-      if (t_surface > ray.tmin && t_surface < best_t) {
-        best_t = t_surface;
-        u_hit = (static_cast<float>(i) + seg_u) / static_cast<float>(control_points.size() - 1);
-        hit = true;
-      }
-    }
+    // Spherical endpoint caps make constant-width segments exact capsules and
+    // keep adjacent tapered segments watertight.
+    test_cap(p0, r0, 0.0f);
+    test_cap(p1, r1, 1.0f);
   }
 
+  if (!hit) return false;
+  t_hit = best_t;
+  const float segment_count =
+      static_cast<float>(control_points.size() - 1u);
+  u_hit = (static_cast<float>(segment_index) + best_local_u) / segment_count;
+  return true;
+}
+
+bool Curve::intersectLinear(const Ray& ray, float& t_hit,
+                            float& u_hit, float motion_time) const noexcept {
+  float best_t = ray.tmax;
+  float best_u = 0.0f;
+  bool hit = false;
+  for (uint32_t i = 0; i + 1u < control_points.size(); ++i) {
+    float segment_t = best_t;
+    float segment_u = 0.0f;
+    const Ray clipped_ray(ray.origin, ray.direction, ray.tmin, best_t);
+    if (intersectSegment(clipped_ray, i, segment_t, segment_u, motion_time) &&
+        segment_t < best_t) {
+      best_t = segment_t;
+      best_u = segment_u;
+      hit = true;
+    }
+  }
   if (hit) {
     t_hit = best_t;
+    u_hit = best_u;
   }
   return hit;
 }
