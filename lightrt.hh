@@ -1709,6 +1709,13 @@ public:
   
   // Traverse BVH using SIMD optimizations
   uint32_t traverseSIMD(const Ray& ray, float& hit_t) const noexcept;
+
+  // Collect every primitive AABB intersected by the ray up to max_t. This is
+  // the broad-phase traversal used by two-level scene graphs: unlike
+  // traverse(), it must not stop at the nearest AABB because that instance's
+  // geometry can still miss while a later instance hits.
+  void queryRay(const Ray& ray, float max_t,
+                std::vector<uint32_t>& results) const noexcept;
   
   // Get BVH statistics
   struct Stats {

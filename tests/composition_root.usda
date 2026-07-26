@@ -1,0 +1,5 @@
+#usda 1.0
+(
+    subLayers = [@advanced_curves.usda@]
+    upAxis = "Y"
+)

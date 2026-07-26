@@ -264,6 +264,11 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME lightrt_c_surfaces_test COMMAND lightrt_c_surfaces_test)
 
+    # C++ broad-phase ray query used by the scene TLAS and non-mesh BLASes.
+    add_executable(lightrt_query_ray_test tests/test_query_ray.cc)
+    target_link_libraries(lightrt_query_ray_test lightrt)
+    add_test(NAME lightrt_query_ray_test COMMAND lightrt_query_ray_test)
+
     # Vulkan GPU interop self-test. Skips (exit 0) when no Vulkan device is
     # present, so GPU-less CI stays green.
     if(LIGHTRT_BUILD_VK)

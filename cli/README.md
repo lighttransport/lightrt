@@ -1,130 +1,92 @@
-# LightRT CLI Renderer
+# LightRT USD CLI
 
-## Overview
+The CLI loads USD with `lightusd_c`, builds CPU LightRT BLASes and a scene TLAS,
+then renders an image. Direct single-layer loading is the low-memory default;
+`--compose` resolves the complete PCP arc graph before conversion.
 
-The LightRT CLI renderer provides command-line interface for rendering USD scenes using the LightRT BVH library.
+## Setup and build
+
+Dependencies are ordinary clones under `dep/`; no Git submodules are added.
+When `$HOME/work/lightusd-c` exists, the setup script clones that local worktree.
+
+```bash
+./scripts/setup_deps.sh
+cmake -S cli -B build_usd_cpu -DCMAKE_BUILD_TYPE=Release
+cmake --build build_usd_cpu -j
+```
+
+`LIGHTRT_USE_LIGHTUSD_C` defaults to `ON`. Set it to `OFF` only to build the
+older TinyUSDZ loader instead.
 
 ## Usage
 
-### Basic Rendering
-
 ```bash
-# Basic render with default options
-lightrt_cli input.usd -o output.png -w 800 -h 600
-
-# With timecode and camera selection
-lightrt_cli input.usd -t 1.5 --camera cam_001
+build_usd_cpu/lightrt_cli scene.usdc -o output.png -w 800 -h 600
+build_usd_cpu/lightrt_cli scene.usdc --load-only --geometry-only
+build_usd_cpu/lightrt_cli scene.usda --compose --load-only
+build_usd_cpu/lightrt_cli scene.usdc --camera fallback -w 256 -h 256
 ```
-
-### AOV Rendering
-
-```bash
-# Render all passes
-lightrt_cli input.usd --aov beauty,geom_normal,shading_normal,depth
-
-# Just depth pass
-lightrt_cli input.usd --aov depth
-
-# Geometry and shading normals
-lightrt_cli input.usd --aov geom_normal,shading_normal
-```
-
-### Command Line Options
 
 | Option | Description |
-|--------|-------------|
-| `-o <file>` | Output file (default: output.png) |
-| `-w <width>` | Image width (default: 800) |
-| `-h <height>` | Image height (default: 600) |
-| `-t <timecode>` | Timecode for rendering |
-| `--camera <name>` | Camera name or index |
-| `--mblur-samples <N>` | Motion blur samples |
+| --- | --- |
+| `-o <file>` | PNG, JPEG, BMP, or TGA output (default `output.png`) |
+| `-w <width>`, `-h <height>` | Output dimensions |
+| `-t <timecode>` | Load one time sample |
+| `--time-range <start> <end> <step>` | Render a sequence |
+| `--camera <name-or-index>` | Select an authored camera |
+| `--camera fallback` | Ignore authored cameras and frame the scene bounds |
+| `--mblur-samples <N>` | Motion-blur samples |
 | `--spp <N>` | Samples per pixel |
-| `--envmap <file>` | Environment map file |
-| `--aov <outputs>` | AOV output specification |
+| `--envmap <file>` | Environment map |
+| `--compose` | Resolve sublayers, references, payloads, variants, inherits, and specializes through lightusd PCP |
+| `--geometry-only` | Skip materials, textures, UVs, and shading normals to reduce large-scene memory |
+| `--load-only` | Load the layer and build acceleration structures without rendering |
 
-## AOV Render Options
+Set `LIGHTRT_USD_VERBOSE=1` for per-primitive loader diagnostics.
 
-| Output | Description |
-|--------|-------------|
-| `beauty` | Standard color output (final render) |
-| `geom_normal` | Geometry normals (pre-transformation) |
-| `shading_normal` | Normals after transformation (curved surfaces) |
-| `vertex_color` | Vertex `displayColor` from USD |
-| `vertex_opacity` | Vertex `displayOpacity` from USD |
-| `depth` | Distance to hit point |
-| `material_id` | Per-triangle material identifier |
+## Geometry support
 
-## Examples
+- `Mesh`, including per-face material subsets in the full shading path
+- `BasisCurves` with linear, Bezier, Catmull-Rom, or B-spline bases
+- Rational `NurbsCurves`, including orders, knots, ranges, and point weights
+- `HermiteCurves`, including authored tangent evaluation
+- `Points`, represented by analytic sphere primitives using authored widths
+- `ParticleField3DGaussianSplat`, including anisotropic scale, quaternion
+  orientation, opacity, and view-dependent spherical harmonics through degree 3
+- `Sphere`, represented analytically, and `Cube`
 
-### Render with AOV Outputs
+Meshes, curves, points, and Gaussian fields each build local acceleration
+structures. Instances are placed in a top-level BVH, so rays do not linearly
+scan large scene graphs. Gaussian fields use front-to-back density compositing
+in the CPU reference renderer.
 
-```bash
-# Beauty + depth
-lightrt_cli scene.usd --aov beauty,depth
+Composition serializes the resolved stage to an adopted in-memory USDC layer.
+This avoids a second copy, but a very large composed scene still temporarily
+holds both PCP stage data and flattened bytes; use direct loading when the input
+is already flattened.
 
-# All passes
-lightrt_cli scene.usd --aov beauty,geom_normal,shading_normal,vertex_color,vertex_opacity,depth,material_id
-```
-
-### Render with Time Range
-
-```bash
-# Time range with step
-lightrt_cli scene.usd --time-range 0 10 1
-```
-
-### Render with Camera Selection
+## Large-scene examples
 
 ```bash
-# By name
-lightrt_cli scene.usd --camera cam_001
+# Flattened, non-composed Caldera Island scene
+build_usd_cpu/lightrt_cli \
+  /mnt/disk1/data/caldera/build/caldera.flattened.usdc \
+  --geometry-only --camera fallback -w 256 -h 144 \
+  -o caldera.png
 
-# By index
-lightrt_cli scene.usd --camera 0
+# Individual, non-composed A-Lab payload containing meshes and curves
+build_usd_cpu/lightrt_cli \
+  /mnt/disk1/data/alab/_merged_ALab/fragment/geocache/animbase/stoat/render_high/cache/mk020_0281_geocache_animbase_stoat_render_high_cache/payload.usdc \
+  --geometry-only --camera fallback -w 256 -h 256 \
+  -o alab-stoat.png
+
+# Composed A-Lab splat: sublayer + variant + payload + camera reference
+build_usd_cpu/lightrt_cli \
+  /mnt/disk1/data/alab/_merged_ALab/extras/alab_splat_with_camera.usda \
+  --compose -w 512 -h 512 -o alab-splat.png
 ```
 
-## Building
+When `-t` is omitted, the loader evaluates time-sampled transforms and cameras
+at the layer's authored `startTimeCode`.
 
-```bash
-# Build with CMake
-mkdir build && cd build
-cmake ..
-make
-
-# Or use Makefile
-make
-```
-
-## Output Files
-
-When using AOV rendering, separate output files are created:
-- `beauty.png` - Standard beauty render
-- `depth.png` - Depth values
-- `geom_normal.png` - Geometry normals
-- etc.
-
-Or use `--aov-output-file` to specify custom output filename.
-
-## Troubleshooting
-
-### Camera Issues
-
-If camera transforms are incorrect, ensure you're using the same row-major convention as the USD file.
-
-### Lighting Issues
-
-For SphereLight, verify that area light sampling is enabled (`--mblur-samples > 1`).
-
-### Geometry Issues
-
-For Z-up/Y-up scenes, ensure the default camera up vector is set correctly based on scene coordinate system.
-
-## Documentation
-
-- [AOV Rendering](./AOV_RENDERING.md) - AOV rendering documentation
-- [Advanced Features](./ADVANCED_FEATURES.md) - SBVH, AutoTuner, MMapBVH
-- [Spatial Queries](./SPATIAL_QUERIES.md) - Spatial queries test integration
-- [Collision Detection](./COLLISION_DETECTION.md) - Collision detection examples
-- [Heatmap Writer](./HEATMAP_WRITER.md) - Heatmap writer usage
-
+Use `--load-only` first when qualifying a new production-scale layer.

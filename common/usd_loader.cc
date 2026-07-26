@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -15,10 +16,13 @@
 
 #if defined(LIGHTRT_USE_LIGHTUSD_C)
 // lightusd-c Layer API + lydra-c mesh utilities
+extern "C" {
 #include "lightusd/lightusd-c.h"
 #include "internal/lusd_layer_internal.h"
 #include "lydra_c_scene.h"
 #include "lydra_c_mesh.h"
+#include "lydra_c_curves.h"
+}
 
 #include "stb_image.h"
 #else
@@ -47,6 +51,70 @@ static CentroidKey makeCentroidKey(const lightrt::Triangle& tri) {
 }
 
 #if defined(LIGHTRT_USE_LIGHTUSD_C)
+
+static LusdResult host_read_file(void*, const char* path, uint8_t** out_data,
+                                 uint64_t* out_size) {
+  if (!path || !out_data || !out_size) return LUSD_ERROR_INVALID_ARGUMENT;
+  FILE* file = std::fopen(path, "rb");
+  if (!file) return LUSD_ERROR_FILE_NOT_FOUND;
+#if defined(_WIN32)
+  if (_fseeki64(file, 0, SEEK_END) != 0) { std::fclose(file); return LUSD_ERROR_IO_FAILED; }
+  const __int64 end = _ftelli64(file);
+  if (end <= 0 || _fseeki64(file, 0, SEEK_SET) != 0) {
+#else
+  if (fseeko(file, 0, SEEK_END) != 0) { std::fclose(file); return LUSD_ERROR_IO_FAILED; }
+  const off_t end = ftello(file);
+  if (end <= 0 || fseeko(file, 0, SEEK_SET) != 0) {
+#endif
+    std::fclose(file);
+    return LUSD_ERROR_IO_FAILED;
+  }
+  const uint64_t size = static_cast<uint64_t>(end);
+  if (size > static_cast<uint64_t>(SIZE_MAX)) {
+    std::fclose(file);
+    return LUSD_ERROR_OUT_OF_MEMORY;
+  }
+  uint8_t* data = static_cast<uint8_t*>(std::malloc(static_cast<size_t>(size)));
+  if (!data) { std::fclose(file); return LUSD_ERROR_OUT_OF_MEMORY; }
+  const size_t read_size = std::fread(data, 1, static_cast<size_t>(size), file);
+  std::fclose(file);
+  if (read_size != static_cast<size_t>(size)) {
+    std::free(data);
+    return LUSD_ERROR_IO_FAILED;
+  }
+  *out_data = data;
+  *out_size = size;
+  return LUSD_SUCCESS;
+}
+
+static void host_release_file(void*, uint8_t* data, uint64_t) {
+  std::free(data);
+}
+
+static const LusdFilesystemCallbacks kHostFilesystem = {
+    nullptr, host_read_file, host_release_file, nullptr, true};
+
+struct FlattenedBuffer {
+  uint8_t* data = nullptr;
+  uint64_t size = 0;
+};
+
+static LusdResult flattened_read_file(void* user, const char*,
+                                      uint8_t** out_data,
+                                      uint64_t* out_size) {
+  auto* buffer = static_cast<FlattenedBuffer*>(user);
+  if (!buffer || !buffer->data || !out_data || !out_size)
+    return LUSD_ERROR_INVALID_ARGUMENT;
+  *out_data = buffer->data;
+  *out_size = buffer->size;
+  return LUSD_SUCCESS;
+}
+
+static void flattened_release_file(void* user, uint8_t* data, uint64_t) {
+  auto* buffer = static_cast<FlattenedBuffer*>(user);
+  if (buffer && buffer->data == data) buffer->data = nullptr;
+  lusd_free(data);
+}
 
 static void collect_materials(LusdLayer_T* L, const LusdPrim_T* P,
                               scene::Scene& out_scene,
@@ -187,17 +255,387 @@ static const double kIdentity4d[16] = {
   1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1
 };
 
+static bool loader_verbose() {
+  const char* value = std::getenv("LIGHTRT_USD_VERBOSE");
+  return value && value[0] == '1';
+}
+
+static bool loader_geometry_only() {
+  const char* value = std::getenv("LIGHTRT_USD_GEOMETRY_ONLY");
+  return value && value[0] == '1';
+}
+
+static bool loader_composition() {
+  const char* value = std::getenv("LIGHTRT_USD_COMPOSE");
+  return value && value[0] == '1';
+}
+
+static int32_t resolve_material_id(LusdLayer_T* L, const LusdPrim_T* P,
+                                   const std::map<std::string, int>& mat_map) {
+  const char* path = lydra_c_resolve_material_binding(
+      reinterpret_cast<LusdLayer>(L),
+      reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)));
+  if (!path) return -1;
+  auto it = mat_map.find(path);
+  return it == mat_map.end() ? -1 : it->second;
+}
+
+static scene::Instance make_instance(const double world_xform[16],
+                                     const lightrt::AABB& local_bounds) {
+  scene::Instance inst;
+  mat4d_to_3x4f(world_xform, inst.transform);
+  scene::invert3x4(inst.transform, inst.inv_transform);
+  std::memcpy(inst.transform_close, inst.transform, sizeof(inst.transform));
+  std::memcpy(inst.inv_transform_close, inst.inv_transform,
+              sizeof(inst.inv_transform));
+  inst.has_motion = false;
+  inst.world_bounds = scene::transformAABB(local_bounds, inst.transform);
+  return inst;
+}
+
+static float curve_radius(const LydraCCurveData& data, uint32_t point_index,
+                          uint32_t curve_index) {
+  float width = 1.0f;
+  if (data.width_count == 1) width = data.widths[0];
+  else if (data.width_count == data.point_count) width = data.widths[point_index];
+  else if (data.width_count == data.curve_count) width = data.widths[curve_index];
+  return std::max(1.0e-6f, width * 0.5f);
+}
+
+static bool append_curve_set(LusdLayer_T* L, const LusdPrim_T* P,
+                             scene::Scene& out_scene,
+                             const std::map<std::string, int>& mat_map,
+                             const double world_xform[16],
+                             std::vector<lightrt::Curve>&& curves) {
+  if (curves.empty()) return false;
+  const uint32_t curve_mesh_id = static_cast<uint32_t>(out_scene.curve_meshes.size());
+  out_scene.curve_meshes.emplace_back();
+  auto& cb = out_scene.curve_meshes.back();
+  lightrt::BVHBuildConfig cfg = curves.size() > 4096
+                                    ? lightrt::BVHBuildConfig::fast()
+                                    : lightrt::BVHBuildConfig();
+  cb.build(curves, cfg);
+  cb.default_material_id = resolve_material_id(L, P, mat_map);
+  cb.curve_material_ids.assign(curves.size(), cb.default_material_id);
+
+  scene::Instance inst = make_instance(world_xform, cb.local_bounds);
+  inst.curve_mesh_id = curve_mesh_id;
+  out_scene.scene_bounds.expand(inst.world_bounds);
+  out_scene.instances.push_back(inst);
+  return true;
+}
+
+static bool append_curve_prim(LusdLayer_T* L, const LusdPrim_T* P,
+                              scene::Scene& out_scene,
+                              const std::map<std::string, int>& mat_map,
+                              const double world_xform[16]) {
+  const bool is_hermite = P->type_name &&
+                          std::strcmp(P->type_name, "HermiteCurves") == 0;
+
+  // lightusd's renderer tessellator evaluates every BasisCurves wrap/basis
+  // mode and rational NURBS (orders, knots, ranges, and point weights).
+  if (!is_hermite) {
+    LydraCTessellatedCurves tess = {};
+    LusdResult result = lydra_c_extract_render_curves(
+        reinterpret_cast<LusdLayer>(L),
+        reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)), 8, &tess);
+    if (result == LUSD_SUCCESS && tess.points && tess.point_count >= 2) {
+      std::vector<lightrt::Curve> curves;
+      curves.reserve(tess.curve_count);
+      uint32_t offset = 0;
+      for (uint32_t ci = 0; ci < tess.curve_count; ++ci) {
+        uint32_t count = tess.vertex_counts[ci];
+        if (count < 2 || offset > tess.point_count ||
+            count > tess.point_count - offset) {
+          offset += count;
+          continue;
+        }
+        std::vector<lightrt::Vec3> points;
+        std::vector<float> radii;
+        points.reserve(count);
+        radii.reserve(count);
+        for (uint32_t j = 0; j < count; ++j) {
+          uint32_t pi = offset + j;
+          points.emplace_back(tess.points[pi * 3], tess.points[pi * 3 + 1],
+                              tess.points[pi * 3 + 2]);
+          float width = (tess.widths && pi < tess.width_count)
+                            ? tess.widths[pi] : 1.0f;
+          radii.push_back(std::max(1.0e-6f, width * 0.5f));
+        }
+        curves.emplace_back(points, radii, lightrt::CurveType::Linear);
+        offset += count;
+      }
+      if (loader_verbose()) {
+        for (uint32_t i = 0; i < tess.warning_count; ++i)
+          std::fprintf(stderr, "  Curve warning: %s\n", tess.warnings[i]);
+      }
+      lydra_c_free_tessellated_curves(&tess);
+      return append_curve_set(L, P, out_scene, mat_map, world_xform,
+                              std::move(curves));
+    }
+    lydra_c_free_tessellated_curves(&tess);
+  }
+
+  // HermiteCurves carries one tangent per control point. Evaluate cubic
+  // Hermite spans directly; malformed/missing tangent arrays fall back to the
+  // control polygon so the prim remains visible.
+  LydraCCurveData data = {};
+  if (lydra_c_extract_curve(
+          reinterpret_cast<LusdLayer>(L),
+          reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
+          &data) != LUSD_SUCCESS || !data.points || data.point_count < 2) {
+    lydra_c_free_curve_data(&data);
+    return false;
+  }
+
+  LusdValue tangent_value = LUSD_NULL_HANDLE;
+  const LusdFloat3* tangents = nullptr;
+  uint64_t tangent_count = 0;
+  if (lusdPrimGetAttributeDefault(
+          reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)), "tangents",
+          &tangent_value) == LUSD_SUCCESS) {
+    (void)lusdValueGetArrayPtrFloat3(tangent_value, &tangent_count, &tangents);
+  }
+
+  std::vector<lightrt::Curve> curves;
+  curves.reserve(data.curve_count);
+  uint32_t offset = 0;
+  constexpr uint32_t kSamplesPerSpan = 8;
+  for (uint32_t ci = 0; ci < data.curve_count; ++ci) {
+    uint32_t count = data.curve_vertex_counts[ci] > 0
+                         ? static_cast<uint32_t>(data.curve_vertex_counts[ci])
+                         : 0u;
+    if (count < 2 || offset > data.point_count ||
+        count > data.point_count - offset) {
+      offset += count;
+      continue;
+    }
+    std::vector<lightrt::Vec3> points;
+    std::vector<float> radii;
+    if (tangents && offset + count <= tangent_count) {
+      points.reserve((count - 1) * kSamplesPerSpan + 1);
+      radii.reserve((count - 1) * kSamplesPerSpan + 1);
+      for (uint32_t span = 0; span + 1 < count; ++span) {
+        uint32_t i0 = offset + span;
+        uint32_t i1 = i0 + 1;
+        lightrt::Vec3 p0(data.points[i0*3], data.points[i0*3+1], data.points[i0*3+2]);
+        lightrt::Vec3 p1(data.points[i1*3], data.points[i1*3+1], data.points[i1*3+2]);
+        lightrt::Vec3 t0(tangents[i0].x, tangents[i0].y, tangents[i0].z);
+        lightrt::Vec3 t1(tangents[i1].x, tangents[i1].y, tangents[i1].z);
+        float r0 = curve_radius(data, i0, ci);
+        float r1 = curve_radius(data, i1, ci);
+        for (uint32_t sample = span ? 1u : 0u;
+             sample <= kSamplesPerSpan; ++sample) {
+          float u = static_cast<float>(sample) / kSamplesPerSpan;
+          float u2 = u*u, u3 = u2*u;
+          float h00 = 2*u3 - 3*u2 + 1;
+          float h10 = u3 - 2*u2 + u;
+          float h01 = -2*u3 + 3*u2;
+          float h11 = u3 - u2;
+          points.push_back(p0*h00 + t0*h10 + p1*h01 + t1*h11);
+          radii.push_back(r0 + (r1 - r0) * u);
+        }
+      }
+    } else {
+      points.reserve(count);
+      radii.reserve(count);
+      for (uint32_t j = 0; j < count; ++j) {
+        uint32_t pi = offset + j;
+        points.emplace_back(data.points[pi*3], data.points[pi*3+1],
+                            data.points[pi*3+2]);
+        radii.push_back(curve_radius(data, pi, ci));
+      }
+    }
+    curves.emplace_back(points, radii, lightrt::CurveType::Linear);
+    offset += count;
+  }
+  if (tangent_value) lusdDestroyValue(L->inst, tangent_value);
+  lydra_c_free_curve_data(&data);
+  return append_curve_set(L, P, out_scene, mat_map, world_xform,
+                          std::move(curves));
+}
+
+static bool append_points_prim(LusdLayer_T* L, const LusdPrim_T* P,
+                               scene::Scene& out_scene,
+                               const std::map<std::string, int>& mat_map,
+                               const double world_xform[16]) {
+  LydraCPointsData data = {};
+  if (lydra_c_extract_points(
+          reinterpret_cast<LusdLayer>(L),
+          reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
+          &data) != LUSD_SUCCESS || !data.points || data.point_count == 0) {
+    lydra_c_free_points_data(&data);
+    return false;
+  }
+
+  std::vector<lightrt::Sphere> points;
+  points.reserve(data.point_count);
+  for (uint32_t i = 0; i < data.point_count; ++i) {
+    float width = 1.0f;
+    if (data.width_count == 1) width = data.widths[0];
+    else if (data.width_count == data.point_count) width = data.widths[i];
+    points.emplace_back(
+        lightrt::Vec3(data.points[i * 3], data.points[i * 3 + 1],
+                      data.points[i * 3 + 2]),
+        std::max(1.0e-6f, width * 0.5f));
+  }
+
+  const uint32_t point_mesh_id = static_cast<uint32_t>(out_scene.point_meshes.size());
+  out_scene.point_meshes.emplace_back();
+  auto& pb = out_scene.point_meshes.back();
+  lightrt::BVHBuildConfig cfg = points.size() > 4096
+                                    ? lightrt::BVHBuildConfig::fast()
+                                    : lightrt::BVHBuildConfig();
+  pb.build(points, cfg);
+  pb.default_material_id = resolve_material_id(L, P, mat_map);
+  pb.point_material_ids.assign(points.size(), pb.default_material_id);
+
+  scene::Instance inst = make_instance(world_xform, pb.local_bounds);
+  inst.point_mesh_id = point_mesh_id;
+  out_scene.scene_bounds.expand(inst.world_bounds);
+  out_scene.instances.push_back(inst);
+  lydra_c_free_points_data(&data);
+  return true;
+}
+
+static bool append_gaussian_prim(LusdLayer_T* L, const LusdPrim_T* P,
+                                 scene::Scene& out_scene,
+                                 const double world_xform[16]) {
+  LusdPrim prim = reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P));
+  LusdValue position_value = LUSD_NULL_HANDLE;
+  LusdValue scale_value = LUSD_NULL_HANDLE;
+  LusdValue orientation_value = LUSD_NULL_HANDLE;
+  LusdValue opacity_value = LUSD_NULL_HANDLE;
+  LusdValue sh_value = LUSD_NULL_HANDLE;
+  LusdValue degree_value = LUSD_NULL_HANDLE;
+
+  const LusdFloat3* positions = nullptr;
+  const LusdFloat3* scales = nullptr;
+  const LusdQuatf* orientations = nullptr;
+  const float* opacities = nullptr;
+  const LusdFloat3* sh_coefficients = nullptr;
+  uint64_t position_count = 0, scale_count = 0, orientation_count = 0;
+  uint64_t opacity_count = 0, sh_count = 0;
+  int32_t authored_degree = 0;
+
+  bool valid =
+      lusdPrimGetAttributeDefault(prim, "positions", &position_value) == LUSD_SUCCESS &&
+      lusdValueGetArrayPtrFloat3(position_value, &position_count, &positions) == LUSD_SUCCESS &&
+      lusdPrimGetAttributeDefault(prim, "scales", &scale_value) == LUSD_SUCCESS &&
+      lusdValueGetArrayPtrFloat3(scale_value, &scale_count, &scales) == LUSD_SUCCESS &&
+      lusdPrimGetAttributeDefault(prim, "orientations", &orientation_value) == LUSD_SUCCESS &&
+      lusdValueGetArrayPtrQuatf(orientation_value, &orientation_count,
+                                &orientations) == LUSD_SUCCESS;
+  if (!valid || !positions || !scales || !orientations || position_count == 0 ||
+      scale_count < position_count || orientation_count < position_count) {
+    if (position_value) lusdDestroyValue(L->inst, position_value);
+    if (scale_value) lusdDestroyValue(L->inst, scale_value);
+    if (orientation_value) lusdDestroyValue(L->inst, orientation_value);
+    return false;
+  }
+
+  if (lusdPrimGetAttributeDefault(prim, "opacities", &opacity_value) == LUSD_SUCCESS)
+    (void)lusdValueGetArrayPtrFloat(opacity_value, &opacity_count, &opacities);
+  if (lusdPrimGetAttributeDefault(
+          prim, "radiance:sphericalHarmonicsCoefficients", &sh_value) ==
+      LUSD_SUCCESS)
+    (void)lusdValueGetArrayPtrFloat3(sh_value, &sh_count, &sh_coefficients);
+  if (lusdPrimGetAttributeDefault(
+          prim, "radiance:sphericalHarmonicsDegree", &degree_value) ==
+      LUSD_SUCCESS)
+    (void)lusdValueGetInt32(degree_value, &authored_degree);
+
+  uint32_t coefficient_count = 0;
+  if (sh_coefficients && sh_count >= position_count &&
+      sh_count % position_count == 0)
+    coefficient_count = static_cast<uint32_t>(
+        std::min<uint64_t>(16, sh_count / position_count));
+  uint32_t available_degree = coefficient_count >= 16 ? 3
+                            : coefficient_count >= 9 ? 2
+                            : coefficient_count >= 4 ? 1 : 0;
+  uint32_t degree = std::min<uint32_t>(
+      std::max(0, authored_degree), available_degree);
+  if (loader_geometry_only()) degree = 0;
+
+  std::vector<lightrt::GaussianSplat> splats;
+  splats.reserve(static_cast<size_t>(position_count));
+  for (uint64_t i = 0; i < position_count; ++i) {
+    float opacity = (opacities && i < opacity_count) ? opacities[i] : 1.0f;
+    if (opacity <= 1.0e-5f) continue;
+    lightrt::GaussianSplat splat;
+    splat.position = lightrt::Vec3(positions[i].x, positions[i].y,
+                                   positions[i].z);
+    splat.scale = lightrt::Vec3(std::max(1.0e-7f, std::abs(scales[i].x)),
+                                std::max(1.0e-7f, std::abs(scales[i].y)),
+                                std::max(1.0e-7f, std::abs(scales[i].z)));
+    // LusdQuatf is xyzw; LightRT stores wxyz.
+    splat.rotation[0] = orientations[i].w;
+    splat.rotation[1] = orientations[i].x;
+    splat.rotation[2] = orientations[i].y;
+    splat.rotation[3] = orientations[i].z;
+    float qlen = std::sqrt(splat.rotation[0]*splat.rotation[0] +
+                           splat.rotation[1]*splat.rotation[1] +
+                           splat.rotation[2]*splat.rotation[2] +
+                           splat.rotation[3]*splat.rotation[3]);
+    if (qlen > 1.0e-8f) {
+      for (float& q : splat.rotation) q /= qlen;
+    } else {
+      splat.rotation[0] = 1.0f;
+      splat.rotation[1] = splat.rotation[2] = splat.rotation[3] = 0.0f;
+    }
+    splat.opacity = std::max(0.0f, std::min(1.0f, opacity));
+    splat.sh_degree = static_cast<lightrt::SHDegree>(degree);
+    if (sh_coefficients && coefficient_count > 0) {
+      uint32_t copied_coefficients = degree == 0 ? 1u : (degree + 1u) * (degree + 1u);
+      for (uint32_t c = 0; c < copied_coefficients; ++c) {
+        const LusdFloat3& coefficient =
+            sh_coefficients[i * coefficient_count + c];
+        splat.sh_coeffs[c*3] = coefficient.x;
+        splat.sh_coeffs[c*3+1] = coefficient.y;
+        splat.sh_coeffs[c*3+2] = coefficient.z;
+      }
+    }
+    splats.push_back(splat);
+  }
+
+  if (position_value) lusdDestroyValue(L->inst, position_value);
+  if (scale_value) lusdDestroyValue(L->inst, scale_value);
+  if (orientation_value) lusdDestroyValue(L->inst, orientation_value);
+  if (opacity_value) lusdDestroyValue(L->inst, opacity_value);
+  if (sh_value) lusdDestroyValue(L->inst, sh_value);
+  if (degree_value) lusdDestroyValue(L->inst, degree_value);
+  if (splats.empty()) return false;
+
+  const uint32_t gaussian_mesh_id =
+      static_cast<uint32_t>(out_scene.gaussian_meshes.size());
+  out_scene.gaussian_meshes.emplace_back();
+  auto& gb = out_scene.gaussian_meshes.back();
+  lightrt::BVHBuildConfig cfg = lightrt::BVHBuildConfig::fast();
+  cfg.max_leaf_size = 8;
+  gb.build(std::move(splats), cfg);
+
+  scene::Instance inst = make_instance(world_xform, gb.local_bounds);
+  inst.gaussian_mesh_id = gaussian_mesh_id;
+  out_scene.scene_bounds.expand(inst.world_bounds);
+  out_scene.instances.push_back(inst);
+  if (loader_verbose())
+    std::printf("  Gaussian splats: %zu (SH degree %u)\n",
+                gb.splats.size(), degree);
+  return true;
+}
+
 static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
                       scene::Scene& out_scene,
                       const std::map<std::string, int>& mat_map,
                       const double parent_xform[16],
-                      const std::string& usd_base_dir) {
+                      const std::string& usd_base_dir,
+                      double time_code) {
   double local_xform[16];
   double world_xform[16];
-  int has_local = lydra_c_extract_xform(
+  int has_local = lydra_c_extract_xform_at(
       reinterpret_cast<LusdLayer>(L),
       reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
-      local_xform);
+      time_code, local_xform);
   if (has_local == 0) {
     mat4d_mul(parent_xform, local_xform, world_xform);
   } else {
@@ -245,11 +683,13 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
       triangles.reserve(tri_idx_count / 3);
 
       float* smooth_norms = nullptr;
-      bool has_authored_normals = (mesh_data_c.normals != nullptr && mesh_data_c.normal_count > 0);
+      const bool keep_prim_data = !loader_geometry_only();
+      bool has_authored_normals = keep_prim_data &&
+          (mesh_data_c.normals != nullptr && mesh_data_c.normal_count > 0);
       bool normals_facevarying = false;
       if (has_authored_normals) {
         normals_facevarying = (mesh_data_c.normal_count == mesh_data_c.fvi_count);
-      } else {
+      } else if (keep_prim_data) {
         lydra_c_compute_smooth_normals(
             mesh_data_c.points, pt_count,
             reinterpret_cast<uint32_t*>(mesh_data_c.face_vertex_indices),
@@ -257,7 +697,8 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
             &smooth_norms);
       }
 
-      bool has_uvs = (mesh_data_c.uvs != nullptr && mesh_data_c.uv_count > 0);
+      bool has_uvs = keep_prim_data &&
+                     (mesh_data_c.uvs != nullptr && mesh_data_c.uv_count > 0);
       bool uvs_facevarying = has_uvs && (mesh_data_c.uv_count == mesh_data_c.fvi_count);
 
       for (uint32_t i = 0; i + 2 < tri_idx_count; i += 3) {
@@ -299,8 +740,8 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
         }
       }
 
-      if (smooth_norms) free(smooth_norms);
-      if (owns_tri_idx) free(tri_idx);
+      if (smooth_norms) lusd_free(smooth_norms);
+      if (owns_tri_idx) lusd_free(tri_idx);
 
       if (!triangles.empty()) {
         size_t mi = out_scene.meshes.size();
@@ -316,13 +757,16 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
         }
         md.default_material_id = mat_id;
 
-        std::vector<int32_t> pre_mat_ids(triangles.size(), mat_id);
+        std::vector<int32_t> pre_mat_ids;
+        if (keep_prim_data) pre_mat_ids.assign(triangles.size(), mat_id);
 
         LydraCGeomSubset* subsets = nullptr;
-        uint32_t subset_count = lydra_c_extract_geom_subsets(
-            reinterpret_cast<LusdLayer>(L),
-            reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
-            &subsets);
+        uint32_t subset_count = keep_prim_data
+            ? lydra_c_extract_geom_subsets(
+                  reinterpret_cast<LusdLayer>(L),
+                  reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
+                  &subsets)
+            : 0;
         if (subset_count > 0 && !face_to_tri_start.empty()) {
           for (uint32_t si = 0; si < subset_count; si++) {
             int32_t subset_mat_id = -1;
@@ -348,8 +792,10 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
         }
 
         std::multimap<CentroidKey, size_t> centroid_map;
-        for (size_t ti = 0; ti < triangles.size(); ti++)
-          centroid_map.insert({makeCentroidKey(triangles[ti]), ti});
+        if (keep_prim_data) {
+          for (size_t ti = 0; ti < triangles.size(); ti++)
+            centroid_map.insert({makeCentroidKey(triangles[ti]), ti});
+        }
 
         lightrt::AABB& lb = md.local_bounds;
         for (const auto& tri : triangles) {
@@ -359,11 +805,13 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
 
         const auto& reordered = md.bvh.getTriangles();
         size_t num_tris = reordered.size();
-        md.tri_material_ids.resize(num_tris);
-        if (!pre_uvs.empty()) md.tri_uvs.resize(num_tris * 6);
-        if (!pre_normals.empty()) md.tri_normals.resize(num_tris * 9);
+        if (keep_prim_data) {
+          md.tri_material_ids.resize(num_tris);
+          if (!pre_uvs.empty()) md.tri_uvs.resize(num_tris * 6);
+          if (!pre_normals.empty()) md.tri_normals.resize(num_tris * 9);
+        }
 
-        for (size_t ti = 0; ti < num_tris; ti++) {
+        for (size_t ti = 0; keep_prim_data && ti < num_tris; ti++) {
           CentroidKey key = makeCentroidKey(reordered[ti]);
           auto range = centroid_map.equal_range(key);
           size_t orig = (range.first != range.second) ? range.first->second : ti;
@@ -392,110 +840,45 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
     }
   }
 
+  if (P->type_name &&
+      (strcmp(P->type_name, "BasisCurves") == 0 ||
+       strcmp(P->type_name, "NurbsCurves") == 0 ||
+       strcmp(P->type_name, "HermiteCurves") == 0)) {
+    append_curve_prim(L, P, out_scene, mat_map, world_xform);
+  }
+
+  if (P->type_name && strcmp(P->type_name, "Points") == 0) {
+    append_points_prim(L, P, out_scene, mat_map, world_xform);
+  }
+
+  if (P->type_name && std::strstr(P->type_name, "GaussianSplat")) {
+    append_gaussian_prim(L, P, out_scene, world_xform);
+  }
+
+  // Keep authored spheres analytic. Tessellating every sphere was especially
+  // costly in production scenes containing thousands of particle markers.
   if (P->type_name && strcmp(P->type_name, "Sphere") == 0) {
     float radius = 1.0f;
     lydra_c_read_float_attr(
         reinterpret_cast<LusdLayer>(L),
         reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
         "radius", &radius);
-
-    int32_t mat_id = -1;
-    {
-      const char* mat_path = lydra_c_resolve_material_binding(
-          reinterpret_cast<LusdLayer>(L),
-          reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)));
-      if (mat_path) {
-        auto it = mat_map.find(mat_path);
-        if (it != mat_map.end()) mat_id = it->second;
-      }
-    }
-
-    const int stacks = 32, slices = 64;
-    std::vector<lightrt::Triangle> triangles;
-    std::vector<float> pre_uvs, pre_normals;
-    triangles.reserve(stacks * slices * 2);
-
-    auto vert = [&](int si, int ti) -> std::pair<lightrt::Vec3, lightrt::Vec3> {
-      float phi = static_cast<float>(M_PI) * si / stacks;
-      float theta = 2.0f * static_cast<float>(M_PI) * ti / slices;
-      float sp = std::sin(phi), cp = std::cos(phi);
-      float st = std::sin(theta), ct = std::cos(theta);
-      lightrt::Vec3 n(sp * ct, cp, sp * st);
-      return {n * radius, n};
-    };
-
-    for (int si = 0; si < stacks; si++) {
-      for (int ti = 0; ti < slices; ti++) {
-        auto [v00, n00] = vert(si, ti);
-        auto [v10, n10] = vert(si + 1, ti);
-        auto [v01, n01] = vert(si, ti + 1);
-        auto [v11, n11] = vert(si + 1, ti + 1);
-
-        float u0 = static_cast<float>(ti) / slices;
-        float u1 = static_cast<float>(ti + 1) / slices;
-        float v0 = static_cast<float>(si) / stacks;
-        float v1 = static_cast<float>(si + 1) / stacks;
-
-        if (si > 0) {
-          lightrt::Triangle t0; t0.v0 = v00; t0.v1 = v10; t0.v2 = v01;
-          triangles.push_back(t0);
-          pre_uvs.insert(pre_uvs.end(), {u0, v0, u0, v1, u1, v0});
-          pre_normals.insert(pre_normals.end(), {n00.x, n00.y, n00.z, n10.x, n10.y, n10.z, n01.x, n01.y, n01.z});
-        }
-        if (si < stacks - 1) {
-          lightrt::Triangle t1; t1.v0 = v10; t1.v1 = v11; t1.v2 = v01;
-          triangles.push_back(t1);
-          pre_uvs.insert(pre_uvs.end(), {u0, v1, u1, v1, u1, v0});
-          pre_normals.insert(pre_normals.end(), {n10.x, n10.y, n10.z, n11.x, n11.y, n11.z, n01.x, n01.y, n01.z});
-        }
-      }
-    }
-
-    if (!triangles.empty()) {
-      size_t mi = out_scene.meshes.size();
-      out_scene.meshes.emplace_back();
-      auto& md = out_scene.meshes.back();
-      md.default_material_id = mat_id;
-
-      std::multimap<CentroidKey, size_t> centroid_map;
-      for (size_t ti = 0; ti < triangles.size(); ti++)
-        centroid_map.insert({makeCentroidKey(triangles[ti]), ti});
-
-      for (const auto& tri : triangles) {
-        md.local_bounds.expand(tri.v0);
-        md.local_bounds.expand(tri.v1);
-        md.local_bounds.expand(tri.v2);
-      }
-      md.bvh.build(triangles);
-
-      const auto& reordered = md.bvh.getTriangles();
-      size_t num_tris = reordered.size();
-      md.tri_material_ids.assign(num_tris, mat_id);
-      md.tri_uvs.resize(num_tris * 6);
-      md.tri_normals.resize(num_tris * 9);
-
-      for (size_t ti = 0; ti < num_tris; ti++) {
-        CentroidKey key = makeCentroidKey(reordered[ti]);
-        auto range = centroid_map.equal_range(key);
-        size_t orig = (range.first != range.second) ? range.first->second : ti;
-        if (range.first != range.second) centroid_map.erase(range.first);
-        if (orig * 6 + 5 < pre_uvs.size())
-          std::memcpy(&md.tri_uvs[ti * 6], &pre_uvs[orig * 6], 6 * sizeof(float));
-        if (orig * 9 + 8 < pre_normals.size())
-          std::memcpy(&md.tri_normals[ti * 9], &pre_normals[orig * 9], 9 * sizeof(float));
-      }
-
-      scene::Instance inst;
-      inst.mesh_id = static_cast<uint32_t>(mi);
-      mat4d_to_3x4f(world_xform, inst.transform);
-      scene::invert3x4(inst.transform, inst.inv_transform);
-      std::memcpy(inst.transform_close, inst.transform, sizeof(inst.transform));
-      std::memcpy(inst.inv_transform_close, inst.inv_transform, sizeof(inst.inv_transform));
-      inst.has_motion = false;
-      inst.world_bounds = scene::transformAABB(md.local_bounds, inst.transform);
+    if (radius > 1.0e-6f) {
+      const uint32_t point_mesh_id =
+          static_cast<uint32_t>(out_scene.point_meshes.size());
+      out_scene.point_meshes.emplace_back();
+      auto& pb = out_scene.point_meshes.back();
+      std::vector<lightrt::Sphere> sphere = {
+          lightrt::Sphere(lightrt::Vec3(0.0f, 0.0f, 0.0f), radius)};
+      pb.build(sphere);
+      pb.default_material_id = resolve_material_id(L, P, mat_map);
+      pb.point_material_ids.assign(1, pb.default_material_id);
+      scene::Instance inst = make_instance(world_xform, pb.local_bounds);
+      inst.point_mesh_id = point_mesh_id;
       out_scene.scene_bounds.expand(inst.world_bounds);
       out_scene.instances.push_back(inst);
-      printf("  Sphere radius=%.3f -> %zu triangles\n", radius, num_tris);
+      if (loader_verbose())
+        printf("  Sphere radius=%.6g -> analytic point primitive\n", radius);
     }
   }
 
@@ -505,6 +888,7 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
         reinterpret_cast<LusdLayer>(L),
         reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
         "size", &size);
+    if (size <= 1.0e-6f) goto recurse;
     float h = size * 0.5f;
 
     int32_t mat_id = -1;
@@ -590,16 +974,17 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
       inst.world_bounds = scene::transformAABB(md.local_bounds, inst.transform);
       out_scene.scene_bounds.expand(inst.world_bounds);
       out_scene.instances.push_back(inst);
-      printf("  Cube size=%.3f -> %zu triangles\n", size, num_tris);
+      if (loader_verbose())
+        printf("  Cube size=%.3f -> %zu triangles\n", size, num_tris);
     }
   }
 
   if (P->type_name && strcmp(P->type_name, "Camera") == 0) {
     LydraCCameraData cam_data;
-    lydra_c_extract_camera(
+    lydra_c_extract_camera_at(
         reinterpret_cast<LusdLayer>(L),
         reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
-        &cam_data);
+        time_code, &cam_data);
     scene::Camera cam;
     cam.name = P->name ? P->name : "";
     cam.fov_y_rad = 2.0f * std::atan(0.5f * cam_data.vertical_aperture / cam_data.focal_length);
@@ -615,10 +1000,10 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
                         strcmp(P->type_name, "SphereLight") == 0 ||
                         strcmp(P->type_name, "RectLight") == 0)) {
     LydraCLightData ld;
-    lydra_c_extract_light(
+    lydra_c_extract_light_at(
         reinterpret_cast<LusdLayer>(L),
         reinterpret_cast<LusdPrim>(const_cast<LusdPrim_T*>(P)),
-        &ld);
+        time_code, &ld);
     float multiplier = ld.intensity * std::pow(2.0f, ld.exposure);
     scene::LightData light;
     light.color = lightrt::Vec3(ld.color[0] * multiplier,
@@ -636,16 +1021,16 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
     } else if (ld.type == LYDRA_C_LIGHT_SPHERE) {
       light.type = scene::LightData::Sphere;
       light.position = lightrt::Vec3(
-          static_cast<float>(world_xform[3*4+0]),
-          static_cast<float>(world_xform[3*4+1]),
-          static_cast<float>(world_xform[3*4+2]));
+          static_cast<float>(world_xform[0*4+3]),
+          static_cast<float>(world_xform[1*4+3]),
+          static_cast<float>(world_xform[2*4+3]));
       light.radius = std::max(0.0f, ld.radius);
     } else if (ld.type == LYDRA_C_LIGHT_RECT) {
       light.type = scene::LightData::Rect;
       light.position = lightrt::Vec3(
-          static_cast<float>(world_xform[3*4+0]),
-          static_cast<float>(world_xform[3*4+1]),
-          static_cast<float>(world_xform[3*4+2]));
+          static_cast<float>(world_xform[0*4+3]),
+          static_cast<float>(world_xform[1*4+3]),
+          static_cast<float>(world_xform[2*4+3]));
       light.rect_axis_u = lightrt::Vec3(
           static_cast<float>(world_xform[0*4+0]),
           static_cast<float>(world_xform[1*4+0]),
@@ -719,11 +1104,12 @@ static void walk_prim(LusdLayer_T* L, const LusdPrim_T* P,
 
 recurse:
   for (uint32_t j = 0; j < P->child_count; j++) {
-    walk_prim(L, &L->prim_nodes[P->child_spec_indices[j]], out_scene, mat_map, world_xform, usd_base_dir);
+    walk_prim(L, &L->prim_nodes[P->child_spec_indices[j]], out_scene, mat_map,
+              world_xform, usd_base_dir, time_code);
   }
 }
 
-bool loadUSDScene(const std::string& filename, double /*timecode*/, scene::Scene& out_scene) {
+bool loadUSDScene(const std::string& filename, double timecode, scene::Scene& out_scene) {
   LusdInstanceCreateInfo inst_info = {};
   inst_info.sType = LUSD_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
   inst_info.apiVersion = 1;
@@ -737,25 +1123,63 @@ bool loadUSDScene(const std::string& filename, double /*timecode*/, scene::Scene
     return false;
   }
 
+  const bool composed = loader_composition();
+  FlattenedBuffer flattened;
+  LusdFilesystemCallbacks flattened_fs = {};
+
   LusdLayerCreateInfo ci = {};
   ci.sType = LUSD_STRUCTURE_TYPE_LAYER_CREATE_INFO;
   ci.pIdentifier = filename.c_str();
+  ci.pFilesystem = &kHostFilesystem;
+
+  if (composed) {
+    LusdFlattenOptions options = {};
+    options.inputFormat = LUSD_FORMAT_AUTO;
+    options.outputFormat = LUSD_FORMAT_USDC;
+    options.loadPayloads = true;
+    options.applyListOps = true;
+    options.pFilesystem = &kHostFilesystem;
+    LusdFlattenStats stats = {};
+    r = lusdFlattenFileToBuffer(instance, filename.c_str(), &options,
+                                &flattened.data, &flattened.size, &stats);
+    if (r != LUSD_SUCCESS) {
+      std::fprintf(stderr, "lightusd-c: composition failed: %s (%s)\n",
+                   lusdResultToString(r), lusdGetLastError(instance));
+      lusdDestroyInstance(instance, nullptr);
+      return false;
+    }
+    std::printf("Composed USD: %llu prims, %llu properties, %.1f MiB flattened USDC\n",
+                static_cast<unsigned long long>(stats.primCount),
+                static_cast<unsigned long long>(stats.propertyCount),
+                static_cast<double>(flattened.size) / (1024.0 * 1024.0));
+    flattened_fs.pUserData = &flattened;
+    flattened_fs.pfnReadFile = flattened_read_file;
+    flattened_fs.pfnReleaseFile = flattened_release_file;
+    flattened_fs.adoptReadFileBuffers = true;
+    ci.pIdentifier = "lightrt-composed.usdc";
+    ci.pFilesystem = &flattened_fs;
+  }
 
   LusdLayer layer = LUSD_NULL_HANDLE;
   r = lusdCreateLayer(instance, &ci, &layer);
   if (r != LUSD_SUCCESS) {
     fprintf(stderr, "lightusd-c: lusdCreateLayer failed: %s (%s)\n",
             lusdResultToString(r), lusdGetLastError(instance));
+    if (flattened.data) lusd_free(flattened.data);
     lusdDestroyInstance(instance, nullptr);
     return false;
   }
 
   LusdLayer_T* L = reinterpret_cast<LusdLayer_T*>(layer);
   out_scene.up_axis = L->metas.up_axis;
+  const double sample_time = timecode < -1.0e20
+                                 ? L->metas.start_time_code : timecode;
 
   std::string usd_base_dir;
   {
-    const char* effective_id = L->identifier ? L->identifier : filename.c_str();
+    const char* effective_id = composed ? filename.c_str()
+                                        : (L->identifier ? L->identifier
+                                                         : filename.c_str());
     std::string eid(effective_id);
     size_t slash_pos = eid.find_last_of("/\\");
     if (slash_pos != std::string::npos)
@@ -764,21 +1188,52 @@ bool loadUSDScene(const std::string& filename, double /*timecode*/, scene::Scene
 
   std::map<std::string, int> mat_map;
   std::map<std::string, int> tex_map;
-  for (uint32_t i = 0; i < L->root_spec_count; i++) {
-    collect_materials(L, &L->prim_nodes[L->root_spec_indices[i]], out_scene, mat_map, usd_base_dir, tex_map);
+  const char* geometry_only_env = std::getenv("LIGHTRT_USD_GEOMETRY_ONLY");
+  const bool geometry_only = geometry_only_env && geometry_only_env[0] == '1';
+  if (!geometry_only) {
+    for (uint32_t i = 0; i < L->root_spec_count; i++) {
+      collect_materials(L, &L->prim_nodes[L->root_spec_indices[i]], out_scene,
+                        mat_map, usd_base_dir, tex_map);
+    }
   }
 
   for (uint32_t i = 0; i < L->root_spec_count; i++) {
-    walk_prim(L, &L->prim_nodes[L->root_spec_indices[i]], out_scene, mat_map, kIdentity4d, usd_base_dir);
+    walk_prim(L, &L->prim_nodes[L->root_spec_indices[i]], out_scene, mat_map,
+              kIdentity4d, usd_base_dir, sample_time);
   }
 
-  lusdDestroyLayer(instance, layer);
-  lusdDestroyInstance(instance, nullptr);
+  out_scene.buildAcceleration();
 
-  printf("Loaded %zu meshes, %zu instances, %zu materials, %zu cameras, %zu lights (lightusd-c layer)\n",
-         out_scene.meshes.size(), out_scene.instances.size(),
+  size_t triangle_count = 0;
+  size_t curve_count = 0;
+  size_t point_count = 0;
+  size_t gaussian_count = 0;
+  for (const auto& mesh : out_scene.meshes)
+    triangle_count += mesh.bvh.getTriangles().size();
+  for (const auto& curves : out_scene.curve_meshes)
+    curve_count += curves.curves.size();
+  for (const auto& points : out_scene.point_meshes)
+    point_count += points.points.size();
+  for (const auto& gaussians : out_scene.gaussian_meshes)
+    gaussian_count += gaussians.splats.size();
+
+  printf("Loaded %zu meshes, %zu curve sets, %zu point sets, %zu Gaussian sets, %zu instances, "
+         "%zu materials, %zu cameras, %zu lights (lightusd-c layer%s%s)\n",
+         out_scene.meshes.size(), out_scene.curve_meshes.size(),
+         out_scene.point_meshes.size(), out_scene.gaussian_meshes.size(),
+         out_scene.instances.size(),
          out_scene.materials.size(), out_scene.cameras.size(),
-         out_scene.lights.size());
+         out_scene.lights.size(), composed ? ", composed" : "",
+         geometry_only ? ", geometry only" : "");
+  printf("Geometry: %zu triangles, %zu curves, %zu points, %zu Gaussian splats\n",
+         triangle_count, curve_count, point_count, gaussian_count);
+  printf("Scene bounds: [(%.6g, %.6g, %.6g) - (%.6g, %.6g, %.6g)]\n",
+         out_scene.scene_bounds.min.x, out_scene.scene_bounds.min.y,
+         out_scene.scene_bounds.min.z, out_scene.scene_bounds.max.x,
+         out_scene.scene_bounds.max.y, out_scene.scene_bounds.max.z);
+  lusdDestroyLayer(instance, layer);
+  if (flattened.data) lusd_free(flattened.data);
+  lusdDestroyInstance(instance, nullptr);
   return !out_scene.instances.empty();
 }
 
@@ -800,6 +1255,11 @@ static void walk_prim_mblur(LusdLayer_T* L, const LusdPrim_T* P,
   }
 
   if (P->type_name && strcmp(P->type_name, "Mesh") == 0) {
+    // Non-mesh prims also occupy instance slots. Advance to the next mesh
+    // slot so an interleaved curve/points instance is never treated as a mesh.
+    while (instance_idx < out_scene.instances.size() &&
+           out_scene.instances[instance_idx].mesh_id == lightrt::kInvalidIndex)
+      instance_idx++;
     if (instance_idx < out_scene.instances.size()) {
       auto& inst = out_scene.instances[instance_idx];
       float close_xform[12];
@@ -849,15 +1309,42 @@ void applyMotionBlur(const std::string& filename,
   LusdLayerCreateInfo ci = {};
   ci.sType = LUSD_STRUCTURE_TYPE_LAYER_CREATE_INFO;
   ci.pIdentifier = filename.c_str();
+  ci.pFilesystem = &kHostFilesystem;
+
+  FlattenedBuffer flattened;
+  LusdFilesystemCallbacks flattened_fs = {};
+  if (loader_composition()) {
+    LusdFlattenOptions options = {};
+    options.inputFormat = LUSD_FORMAT_AUTO;
+    options.outputFormat = LUSD_FORMAT_USDC;
+    options.loadPayloads = true;
+    options.applyListOps = true;
+    options.pFilesystem = &kHostFilesystem;
+    if (lusdFlattenFileToBuffer(instance, filename.c_str(), &options,
+                                &flattened.data, &flattened.size,
+                                nullptr) != LUSD_SUCCESS) {
+      lusdDestroyInstance(instance, nullptr);
+      return;
+    }
+    flattened_fs.pUserData = &flattened;
+    flattened_fs.pfnReadFile = flattened_read_file;
+    flattened_fs.pfnReleaseFile = flattened_release_file;
+    flattened_fs.adoptReadFileBuffers = true;
+    ci.pIdentifier = "lightrt-composed-mblur.usdc";
+    ci.pFilesystem = &flattened_fs;
+  }
 
   LusdLayer layer = LUSD_NULL_HANDLE;
   if (lusdCreateLayer(instance, &ci, &layer) != LUSD_SUCCESS) {
+    if (flattened.data) lusd_free(flattened.data);
     lusdDestroyInstance(instance, nullptr);
     return;
   }
 
   LusdLayer_T* L = reinterpret_cast<LusdLayer_T*>(layer);
-  double close_time = timecode + shutter_close_offset;
+  const double open_time = timecode < -1.0e20
+                               ? L->metas.start_time_code : timecode;
+  double close_time = open_time + shutter_close_offset;
 
   uint32_t instance_idx = 0;
   for (uint32_t i = 0; i < L->root_spec_count; i++) {
@@ -872,7 +1359,10 @@ void applyMotionBlur(const std::string& filename,
     printf("Motion blur: %u/%zu instances have different close-shutter transforms\n",
            motion_count, scene.instances.size());
 
+  scene.buildAcceleration();
+
   lusdDestroyLayer(instance, layer);
+  if (flattened.data) lusd_free(flattened.data);
   lusdDestroyInstance(instance, nullptr);
 }
 
@@ -1541,6 +2031,7 @@ bool loadUSDScene(const std::string& filename, double timecode, scene::Scene& ou
   printf("Loaded %zu meshes, %zu instances, %zu cameras (timecode=%.1f)\n",
          out_scene.meshes.size(), out_scene.instances.size(),
          out_scene.cameras.size(), timecode);
+  out_scene.buildAcceleration();
   return !out_scene.instances.empty();
 }
 
@@ -1591,6 +2082,7 @@ void applyMotionBlur(const std::string& filename, double timecode,
   };
 
   for (const auto& root_node : render_scene.nodes) walkClose(root_node);
+  scene.buildAcceleration();
 }
 
 #else

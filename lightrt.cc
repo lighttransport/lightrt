@@ -521,6 +521,22 @@ Vec3 Curve::evaluate(float t) const noexcept {
             (p1 * 3.0f - p0 - p2 * 3.0f + p3) * t3) * 0.5f;
   }
 
+  if (type == CurveType::BSpline && control_points.size() >= 4) {
+    // Uniform cubic B-spline, matching the common USD BasisCurves case.
+    float segment_t = t * static_cast<float>(control_points.size() - 3);
+    size_t i = static_cast<size_t>(segment_t);
+    i = std::min(i, control_points.size() - 4);
+    float u = segment_t - static_cast<float>(i);
+    float u2 = u * u;
+    float u3 = u2 * u;
+    float b0 = (1.0f - 3.0f*u + 3.0f*u2 - u3) / 6.0f;
+    float b1 = (4.0f - 6.0f*u2 + 3.0f*u3) / 6.0f;
+    float b2 = (1.0f + 3.0f*u + 3.0f*u2 - 3.0f*u3) / 6.0f;
+    float b3 = u3 / 6.0f;
+    return control_points[i] * b0 + control_points[i + 1] * b1 +
+           control_points[i + 2] * b2 + control_points[i + 3] * b3;
+  }
+
   // Fallback to linear
   float segment_t = t * static_cast<float>(control_points.size() - 1);
   size_t i = static_cast<size_t>(segment_t);
@@ -920,7 +936,11 @@ bool GaussianSplat::intersect(const Ray& ray, float& t_hit, float& density) cons
             2.0f * inv_cov[2] * oc.x * oc.z +
             2.0f * inv_cov[4] * oc.y * oc.z - 9.0f;
 
-  // Solve quadratic
+  // Solve quadratic and evaluate the Gaussian at the maximum-density point
+  // along the ray segment inside the conservative 3-sigma ellipsoid. Returning
+  // the entry point would always report exp(-4.5), making splats almost
+  // invisible regardless of how closely the ray passes their center.
+  if (std::abs(A) < kEpsilon) return false;
   float discriminant = B * B - 4.0f * A * C;
   if (discriminant < 0) {
     return false;
@@ -930,19 +950,17 @@ bool GaussianSplat::intersect(const Ray& ray, float& t_hit, float& density) cons
   float t0 = (-B - sqrt_disc) / (2.0f * A);
   float t1 = (-B + sqrt_disc) / (2.0f * A);
 
-  // Find nearest valid intersection
-  float t = t0;
-  if (t < ray.tmin || t > ray.tmax) {
-    t = t1;
-    if (t < ray.tmin || t > ray.tmax) {
-      return false;
-    }
-  }
+  if (t0 > t1) std::swap(t0, t1);
+  const float interval_min = std::max(t0, ray.tmin);
+  const float interval_max = std::min(t1, ray.tmax);
+  if (interval_min > interval_max) return false;
 
-  t_hit = t;
+  const float peak_t = std::max(interval_min,
+      std::min(interval_max, -B / (2.0f * A)));
+  t_hit = peak_t;
 
   // Compute density at hit point
-  Vec3 hit_point = ray.at(t);
+  Vec3 hit_point = ray.at(peak_t);
   density = evaluate(hit_point) * opacity;
 
   return true;
@@ -985,37 +1003,57 @@ float GaussianSplat::evaluate(const Vec3& point) const noexcept {
 }
 
 Vec3 GaussianSplat::getColor(const Vec3& view_dir) const noexcept {
-  // Evaluate spherical harmonics for view-dependent color
-  Vec3 color(0.0f, 0.0f, 0.0f);
+  // Real SH basis and coefficient ordering used by 3D Gaussian Splatting and
+  // UsdVol ParticleField3DGaussianSplat (coefficient-major RGB tuples).
+  constexpr float C0 = 0.28209479177387814f;
+  constexpr float C1 = 0.4886025119029199f;
+  constexpr float C2[5] = {1.0925484305920792f, -1.0925484305920792f,
+                           0.31539156525252005f, -1.0925484305920792f,
+                           0.5462742152960396f};
+  constexpr float C3[7] = {-0.5900435899266435f, 2.890611442640554f,
+                           -0.4570457994644658f, 0.3731763325901154f,
+                           -0.4570457994644658f, 1.445305721320277f,
+                           -0.5900435899266435f};
+  Vec3 color(0.5f + C0 * sh_coeffs[0],
+             0.5f + C0 * sh_coeffs[1],
+             0.5f + C0 * sh_coeffs[2]);
 
-  // DC term (degree 0)
-  color.x = sh_coeffs[0];
-  color.y = sh_coeffs[1];
-  color.z = sh_coeffs[2];
+  const float x = view_dir.x, y = view_dir.y, z = view_dir.z;
 
   if (sh_degree >= SHDegree::Degree1) {
-    // Degree 1 terms
-    float x = view_dir.x, y = view_dir.y, z = view_dir.z;
-    color.x += sh_coeffs[3] * y + sh_coeffs[6] * z + sh_coeffs[9] * x;
-    color.y += sh_coeffs[4] * y + sh_coeffs[7] * z + sh_coeffs[10] * x;
-    color.z += sh_coeffs[5] * y + sh_coeffs[8] * z + sh_coeffs[11] * x;
+    const float b[3] = {-C1 * y, C1 * z, -C1 * x};
+    for (int i = 0; i < 3; ++i) {
+      color.x += b[i] * sh_coeffs[(i + 1) * 3];
+      color.y += b[i] * sh_coeffs[(i + 1) * 3 + 1];
+      color.z += b[i] * sh_coeffs[(i + 1) * 3 + 2];
+    }
   }
 
   if (sh_degree >= SHDegree::Degree2) {
-    // Degree 2 terms
-    float x = view_dir.x, y = view_dir.y, z = view_dir.z;
-    float xy = x * y, yz = y * z, xz = x * z;
-    float x2 = x * x, y2 = y * y, z2 = z * z;
+    const float xx = x*x, yy = y*y, zz = z*z;
+    const float b[5] = {C2[0] * x*y, C2[1] * y*z,
+                        C2[2] * (2.0f*zz - xx - yy), C2[3] * x*z,
+                        C2[4] * (xx - yy)};
+    for (int i = 0; i < 5; ++i) {
+      color.x += b[i] * sh_coeffs[(i + 4) * 3];
+      color.y += b[i] * sh_coeffs[(i + 4) * 3 + 1];
+      color.z += b[i] * sh_coeffs[(i + 4) * 3 + 2];
+    }
+  }
 
-    color.x += sh_coeffs[12] * xy + sh_coeffs[15] * yz +
-               sh_coeffs[18] * (2.0f * z2 - x2 - y2) +
-               sh_coeffs[21] * xz + sh_coeffs[24] * (x2 - y2);
-    color.y += sh_coeffs[13] * xy + sh_coeffs[16] * yz +
-               sh_coeffs[19] * (2.0f * z2 - x2 - y2) +
-               sh_coeffs[22] * xz + sh_coeffs[25] * (x2 - y2);
-    color.z += sh_coeffs[14] * xy + sh_coeffs[17] * yz +
-               sh_coeffs[20] * (2.0f * z2 - x2 - y2) +
-               sh_coeffs[23] * xz + sh_coeffs[26] * (x2 - y2);
+  if (sh_degree >= SHDegree::Degree3) {
+    const float xx = x*x, yy = y*y, zz = z*z;
+    const float b[7] = {
+      C3[0] * y * (3.0f*xx - yy), C3[1] * x*y*z,
+      C3[2] * y * (4.0f*zz - xx - yy),
+      C3[3] * z * (2.0f*zz - 3.0f*xx - 3.0f*yy),
+      C3[4] * x * (4.0f*zz - xx - yy), C3[5] * z * (xx - yy),
+      C3[6] * x * (xx - 3.0f*yy)};
+    for (int i = 0; i < 7; ++i) {
+      color.x += b[i] * sh_coeffs[(i + 9) * 3];
+      color.y += b[i] * sh_coeffs[(i + 9) * 3 + 1];
+      color.z += b[i] * sh_coeffs[(i + 9) * 3 + 2];
+    }
   }
 
   // Clamp to valid range
@@ -1063,10 +1101,12 @@ void QuantizedGaussianSplat::quantize(const GaussianSplat& gs, const Vec3& pos_m
   // Quantize opacity
   opacity = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, gs.opacity * 255.0f)));
 
-  // Quantize DC color
-  color_dc[0] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, gs.sh_coeffs[0] * 255.0f)));
-  color_dc[1] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, gs.sh_coeffs[1] * 255.0f)));
-  color_dc[2] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, gs.sh_coeffs[2] * 255.0f)));
+  // Quantize the evaluated DC color. Full GaussianSplat stores raw SH
+  // coefficients, while this compact representation stores display RGB.
+  constexpr float C0 = 0.28209479177387814f;
+  color_dc[0] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, (0.5f + C0 * gs.sh_coeffs[0]) * 255.0f)));
+  color_dc[1] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, (0.5f + C0 * gs.sh_coeffs[1]) * 255.0f)));
+  color_dc[2] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, (0.5f + C0 * gs.sh_coeffs[2]) * 255.0f)));
 }
 
 GaussianSplat QuantizedGaussianSplat::dequantize(const Vec3& pos_min, const Vec3& pos_max,
@@ -1106,10 +1146,11 @@ GaussianSplat QuantizedGaussianSplat::dequantize(const Vec3& pos_min, const Vec3
   // Dequantize opacity
   gs.opacity = static_cast<float>(opacity) / 255.0f;
 
-  // Dequantize DC color
-  gs.sh_coeffs[0] = static_cast<float>(color_dc[0]) / 255.0f;
-  gs.sh_coeffs[1] = static_cast<float>(color_dc[1]) / 255.0f;
-  gs.sh_coeffs[2] = static_cast<float>(color_dc[2]) / 255.0f;
+  // Recover raw DC SH coefficients from compact display RGB.
+  constexpr float C0 = 0.28209479177387814f;
+  gs.sh_coeffs[0] = (static_cast<float>(color_dc[0]) / 255.0f - 0.5f) / C0;
+  gs.sh_coeffs[1] = (static_cast<float>(color_dc[1]) / 255.0f - 0.5f) / C0;
+  gs.sh_coeffs[2] = (static_cast<float>(color_dc[2]) / 255.0f - 0.5f) / C0;
   gs.sh_degree = SHDegree::DC;
 
   return gs;
@@ -1865,6 +1906,45 @@ uint32_t BVH::traverseSIMD(const Ray& ray, float& hit_t) const noexcept {
   }
 
   return hit_prim;
+}
+
+void BVH::queryRay(const Ray& ray, float max_t,
+                   std::vector<uint32_t>& results) const noexcept {
+  results.clear();
+  if (nodes_.empty()) return;
+
+  const RayContext ctx(ray);
+  uint32_t stack[128];
+  uint32_t stack_size = 0;
+  stack[stack_size++] = 0;
+
+  while (stack_size > 0) {
+    const uint32_t node_idx = stack[--stack_size];
+    if (node_idx >= nodes_.size()) continue;
+    const BVHNode& node = nodes_[node_idx];
+
+    float node_tmin;
+    if (!node.bounds.intersectFast(ctx, max_t, node_tmin)) continue;
+
+    if (node.isLeaf()) {
+      for (uint32_t i = 0; i < node.prim_count; ++i) {
+        const uint32_t slot = node.prim_offset + i;
+        if (slot >= prim_indices_.size()) continue;
+        const uint32_t prim_idx = prim_indices_[slot];
+        if (prim_idx >= prim_aabbs_.size()) continue;
+        float prim_tmin;
+        if (prim_aabbs_[prim_idx].intersectFast(ctx, max_t, prim_tmin))
+          results.push_back(prim_idx);
+      }
+    } else {
+      const uint32_t children[2] = {node.left_child, node.right_child};
+      const uint32_t sign = static_cast<uint32_t>(ctx.sign[node.splitAxis()]);
+      if (stack_size + 2 <= 128) {
+        stack[stack_size++] = children[1 - sign];
+        stack[stack_size++] = children[sign];
+      }
+    }
+  }
 }
 
 BVH::Stats BVH::getStats() const noexcept {

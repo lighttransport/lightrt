@@ -1,0 +1,27 @@
+#usda 1.0
+(
+    defaultPrim = "Curves"
+    upAxis = "Y"
+)
+
+def Xform "Curves"
+{
+    def NurbsCurves "RationalNurbs"
+    {
+        int[] curveVertexCounts = [4]
+        float[] knots = [0, 0, 0, 0, 1, 1, 1, 1]
+        int[] order = [4]
+        point3f[] points = [(-2, 0, 0), (-1, 2, 0), (1, -1, 0), (2, 1, 0)]
+        float[] pointWeights = [1, 0.5, 2, 1]
+        float2[] ranges = [(0, 1)]
+        float[] widths = [0.15]
+    }
+
+    def HermiteCurves "Hermite"
+    {
+        int[] curveVertexCounts = [3]
+        point3f[] points = [(-2, -1, 1), (0, 1, 1), (2, -1, 1)]
+        vector3f[] tangents = [(2, 3, 0), (2, 0, 0), (2, -3, 0)]
+        float[] widths = [0.12]
+    }
+}

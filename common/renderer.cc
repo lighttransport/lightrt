@@ -10,13 +10,26 @@
 
 namespace lightrt_common {
 
-// Resolve material for a hit (handles both triangle and curve hits)
+// Resolve material for triangle, curve, and point hits.
 static const scene::MaterialData& resolveMaterial(const scene::Scene& scene,
                                                   const scene::HitInfo& hit) {
   static const scene::MaterialData kDefaultMat;
   if (hit.instance_id == lightrt::kInvalidIndex) return kDefaultMat;
 
   const auto& inst = scene.instances[hit.instance_id];
+  if (hit.point_id != lightrt::kInvalidIndex &&
+      inst.point_mesh_id != lightrt::kInvalidIndex) {
+    const auto& pb = scene.point_meshes[inst.point_mesh_id];
+    if (hit.point_id < pb.point_material_ids.size()) {
+      int32_t mid = pb.point_material_ids[hit.point_id];
+      if (mid >= 0 && static_cast<size_t>(mid) < scene.materials.size())
+        return scene.materials[static_cast<size_t>(mid)];
+    }
+    if (pb.default_material_id >= 0 &&
+        static_cast<size_t>(pb.default_material_id) < scene.materials.size())
+      return scene.materials[static_cast<size_t>(pb.default_material_id)];
+    return kDefaultMat;
+  }
   if (hit.curve_id != lightrt::kInvalidIndex && inst.curve_mesh_id != lightrt::kInvalidIndex) {
     // Curve hit
     const auto& cb = scene.curve_meshes[inst.curve_mesh_id];
@@ -178,8 +191,11 @@ void renderFrame(const scene::Scene& scene,
   uint32_t total_samples = settings.spp * settings.mblur_samples;
   if (total_samples == 0) total_samples = 1;
 
-  for (uint32_t y = 0; y < settings.height; y++) {
-    for (uint32_t x = 0; x < settings.width; x++) {
+  lightrt::TaskSystem::parallelFor(
+      0, settings.height,
+      [&](uint32_t y_begin, uint32_t y_end) {
+    for (uint32_t y = y_begin; y < y_end; ++y) {
+      for (uint32_t x = 0; x < settings.width; x++) {
       float r_acc = 0.0f, g_acc = 0.0f, b_acc = 0.0f;
 
       uint32_t seed = y * settings.width + x;
@@ -211,18 +227,48 @@ void renderFrame(const scene::Scene& scene,
           const auto& inst = scene.instances[hit.instance_id];
           lightrt::Vec3 N, V = dir * -1.0f;
           lightrt::Vec3 hit_pos = camera.position + dir * hit.t;
+
+          // Gaussian splats carry emitted radiance rather than a surface
+          // material. Evaluate their view-dependent SH color directly and
+          // composite the peak ray density over the environment/background.
+          if (hit.gaussian_id != lightrt::kInvalidIndex &&
+              inst.gaussian_mesh_id != lightrt::kInvalidIndex) {
+            scene::GaussianRadiance radiance =
+                scene::traceGaussianRadiance(scene, ray, ray_time);
+            lightrt::Vec3 background = has_envmap
+                ? evalEnvmap(scene.envmap, dir)
+                : lightrt::Vec3(0.118f, 0.118f, 0.157f);
+            color = radiance.color + background * (1.0f - radiance.alpha);
+            r_acc += color.x;
+            g_acc += color.y;
+            b_acc += color.z;
+            continue;
+          }
+
           lightrt::Vec3 fiber_T; // tangent (for hair BSDF)
           float bias = 0.001f;
           bool is_curve = (hit.curve_id != lightrt::kInvalidIndex);
+          bool is_point = (hit.point_id != lightrt::kInvalidIndex);
+          uint32_t hit_prim_id = is_point ? hit.point_id
+                                : (is_curve ? hit.curve_id : hit.triangle_id);
           scene::MaterialData mat;
 
-          if (is_curve) {
+          if (is_point) {
+            const scene::PointBLAS& pb = scene.point_meshes[inst.point_mesh_id];
+            const lightrt::Sphere& point = pb.points[hit.point_id];
+            lightrt::Vec3 local_hit = scene::transformPoint(inst.inv_transform, hit_pos);
+            lightrt::Vec3 local_n = (local_hit - point.center).normalize();
+            N = scene::transformNormal(inst.inv_transform, local_n).normalize();
+            if (N.dot(V) < 0.0f) N = N * -1.0f;
+            mat = resolveMaterial(scene, hit);
+          } else if (is_curve) {
             // Curve hit — compute normal + tangent from the fiber
             const scene::CurveBLAS& cb = scene.curve_meshes[inst.curve_mesh_id];
             const lightrt::Curve& curve = cb.curves[hit.curve_id];
-            lightrt::Vec3 pos = curve.evaluate(hit.curve_u);
-            fiber_T = curve.evaluateTangent(hit.curve_u).normalize();
-            float radius = curve.radiusAt(hit.curve_u);
+            lightrt::Vec3 pos = scene::transformPoint(
+                inst.transform, curve.evaluate(hit.curve_u));
+            fiber_T = scene::transformDir(
+                inst.transform, curve.evaluateTangent(hit.curve_u)).normalize();
             // Fiber normal: direction from fiber centerline to hit point
             lightrt::Vec3 to_hit = (hit_pos - pos);
             N = to_hit - fiber_T * to_hit.dot(fiber_T);
@@ -289,7 +335,7 @@ void renderFrame(const scene::Scene& scene,
             float ndl = std::max(0.0f, N.dot(fallback_light_dir));
             lightrt::Ray shadow_ray(hit_pos + N * bias, fallback_light_dir);
             bool in_shadow = scene::traceSceneAnyHit(scene, shadow_ray,
-              hit.instance_id, hit.triangle_id, ray_time);
+              hit.instance_id, hit_prim_id, ray_time);
 
             float ambient = 0.15f;
             float diffuse = in_shadow ? 0.0f : ndl * 0.85f;
@@ -354,7 +400,7 @@ void renderFrame(const scene::Scene& scene,
 
               lightrt::Ray shadow_ray(hit_pos + N * bias, L, 0.0f, light_dist - bias);
               if (scene::traceSceneAnyHit(scene, shadow_ray, hit.instance_id,
-                                          hit.triangle_id, ray_time))
+                                          hit_prim_id, ray_time))
                 continue;
 
               lightrt::Vec3 brdf_ndl;
@@ -395,7 +441,7 @@ void renderFrame(const scene::Scene& scene,
                 F0.z + (1.0f - F0.z) * schlick);
               lightrt::Vec3 refl_d = (V * -1.0f + N * (2.0f * NdotV)).normalize();
               lightrt::Ray refl_ray(hit_pos + N * bias, refl_d);
-              if (!scene::traceSceneAnyHit(scene, refl_ray, hit.instance_id, hit.triangle_id, ray_time)) {
+              if (!scene::traceSceneAnyHit(scene, refl_ray, hit.instance_id, hit_prim_id, ray_time)) {
                 lightrt::Vec3 env_col = evalEnvmap(scene.envmap, refl_d);
                 color.x += F.x * env_col.x * brdf_scale;
                 color.y += F.y * env_col.y * brdf_scale;
@@ -413,7 +459,7 @@ void renderFrame(const scene::Scene& scene,
                 if (NdotL > 0.0f && env_pdf > 1e-8f) {
                   lightrt::Ray shadow_ray(hit_pos + N * bias, L);
                   if (!scene::traceSceneAnyHit(scene, shadow_ray, hit.instance_id,
-                                               hit.triangle_id, ray_time)) {
+                                               hit_prim_id, ray_time)) {
                     lightrt::Vec3 brdf_ndl = evalBRDF(N, V, L, mat);
                     lightrt::Vec3 env_col = evalEnvmap(scene.envmap, L);
                     lightrt::Vec3 H = (V + L).normalize();
@@ -454,7 +500,7 @@ void renderFrame(const scene::Scene& scene,
                 if (NdotL > 0.0f) {
                   lightrt::Ray shadow_ray(hit_pos + N * bias, L);
                   if (!scene::traceSceneAnyHit(scene, shadow_ray, hit.instance_id,
-                                               hit.triangle_id, ray_time)) {
+                                               hit_prim_id, ray_time)) {
                     lightrt::Vec3 brdf_ndl = evalBRDF(N, V, L, mat);
                     lightrt::Vec3 env_col = evalEnvmap(scene.envmap, L);
                     lightrt::Vec3 H = (V + L).normalize();
@@ -636,8 +682,10 @@ void renderFrame(const scene::Scene& scene,
                 lightrt::Vec3 refl_d = (V * -1.0f + fN * (2.0f * cos_i)).normalize();
                 lightrt::Ray refl_ray(hit_pos + fN * bias, refl_d);
                 scene::HitInfo rh = scene::traceScene(scene, refl_ray, ray_time);
-                if (rh.triangle_id != lightrt::kInvalidIndex) {
-                  trans_col = resolveMaterialTextured(scene, rh).base_color;
+                if (rh.instance_id != lightrt::kInvalidIndex) {
+                  trans_col = (rh.triangle_id != lightrt::kInvalidIndex)
+                                  ? resolveMaterialTextured(scene, rh).base_color
+                                  : resolveMaterial(scene, rh).base_color;
                 } else if (has_envmap) {
                   trans_col = evalEnvmap(scene.envmap, refl_d);
                 } else {
@@ -655,8 +703,10 @@ void renderFrame(const scene::Scene& scene,
                   refr_d = refr_d.normalize();
                   lightrt::Ray refr_ray(hit_pos - fN * bias, refr_d);
                   scene::HitInfo rh = scene::traceScene(scene, refr_ray, ray_time);
-                  if (rh.triangle_id != lightrt::kInvalidIndex) {
-                    trans_col = resolveMaterialTextured(scene, rh).base_color;
+                  if (rh.instance_id != lightrt::kInvalidIndex) {
+                    trans_col = (rh.triangle_id != lightrt::kInvalidIndex)
+                                    ? resolveMaterialTextured(scene, rh).base_color
+                                    : resolveMaterial(scene, rh).base_color;
                   } else if (has_envmap) {
                     trans_col = evalEnvmap(scene.envmap, refr_d);
                   } else {
@@ -697,7 +747,8 @@ void renderFrame(const scene::Scene& scene,
       uint8_t cb = static_cast<uint8_t>(std::min(255.0f, b * 255.0f));
       image[y * settings.width + x] = lightrt::RGB8(cr, cg, cb);
     }
-  }
+    }
+  }, 1);
 }
 
 } // namespace lightrt_common

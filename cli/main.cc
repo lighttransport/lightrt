@@ -33,16 +33,37 @@ struct Options {
   std::string camera_name;
   std::string envmap_file;
   int camera_index = -1; // -1 = auto
+  bool fallback_camera = false;
   uint32_t mblur_samples = 1;
   uint32_t spp = 1;
+  bool geometry_only = false;
+  bool compose = false;
+  bool load_only = false;
 };
+
+static void enableGeometryOnlyMode() {
+#if defined(_WIN32)
+  _putenv_s("LIGHTRT_USD_GEOMETRY_ONLY", "1");
+#else
+  setenv("LIGHTRT_USD_GEOMETRY_ONLY", "1", 1);
+#endif
+}
+
+static void enableCompositionMode() {
+#if defined(_WIN32)
+  _putenv_s("LIGHTRT_USD_COMPOSE", "1");
+#else
+  setenv("LIGHTRT_USD_COMPOSE", "1", 1);
+#endif
+}
 
 static bool parseArgs(int argc, char** argv, Options& opts) {
   if (argc < 2) {
     fprintf(stderr,
       "Usage: %s input.usd [-o output.png] [-w 800] [-h 600]\n"
       "       [-t timecode] [--time-range start end step]\n"
-      "       [--camera name_or_index] [--mblur-samples N] [--spp N]\n",
+      "       [--camera name_or_index] [--mblur-samples N] [--spp N]\n"
+      "       [--compose] [--geometry-only] [--load-only]\n",
       argv[0]);
     return false;
   }
@@ -63,6 +84,10 @@ static bool parseArgs(int argc, char** argv, Options& opts) {
       opts.has_time_range = true;
     } else if (strcmp(argv[i], "--camera") == 0 && i + 1 < argc) {
       ++i;
+      if (strcmp(argv[i], "fallback") == 0) {
+        opts.fallback_camera = true;
+        continue;
+      }
       char* endp = nullptr;
       long idx = strtol(argv[i], &endp, 10);
       if (endp != argv[i] && *endp == '\0') {
@@ -78,7 +103,24 @@ static bool parseArgs(int argc, char** argv, Options& opts) {
       if (opts.spp < 1) opts.spp = 1;
     } else if (strcmp(argv[i], "--envmap") == 0 && i + 1 < argc) {
       opts.envmap_file = argv[++i];
+    } else if (strcmp(argv[i], "--geometry-only") == 0) {
+      opts.geometry_only = true;
+    } else if (strcmp(argv[i], "--compose") == 0) {
+      opts.compose = true;
+    } else if (strcmp(argv[i], "--load-only") == 0) {
+      opts.load_only = true;
+    } else {
+      fprintf(stderr, "Unknown or incomplete option: %s\n", argv[i]);
+      return false;
     }
+  }
+  if (opts.width == 0 || opts.height == 0) {
+    fprintf(stderr, "Image dimensions must be greater than zero\n");
+    return false;
+  }
+  if (opts.has_time_range && opts.time_range_step <= 0.0) {
+    fprintf(stderr, "Time-range step must be greater than zero\n");
+    return false;
   }
   return true;
 }
@@ -116,10 +158,18 @@ static bool writeImage(const std::string& path, const std::vector<lightrt::RGB8>
 int main(int argc, char** argv) {
   Options opts;
   if (!parseArgs(argc, argv, opts)) return 1;
+  if (opts.geometry_only) enableGeometryOnlyMode();
+  if (opts.compose) enableCompositionMode();
 
   auto renderOneFrame = [&](double timecode, const std::string& outpath) -> bool {
     scene::Scene scene;
+    auto load_begin = std::chrono::high_resolution_clock::now();
     if (!lightrt_common::loadUSDScene(opts.input_file, timecode, scene)) return false;
+    auto load_end = std::chrono::high_resolution_clock::now();
+    double load_ms = std::chrono::duration<double, std::milli>(
+                         load_end - load_begin).count();
+    printf("USD load + CPU BVH build: %.1f ms\n", load_ms);
+    if (opts.load_only) return true;
 
     // CLI --envmap override: load HDR/EXR and set as environment map
     if (!opts.envmap_file.empty() && !scene.envmap.valid()) {
@@ -165,7 +215,7 @@ int main(int argc, char** argv) {
       for (size_t i = 0; i < scene.cameras.size(); i++) {
         if (scene.cameras[i].name == opts.camera_name) { cam_idx = static_cast<int>(i); break; }
       }
-    } else if (!scene.cameras.empty()) {
+    } else if (!opts.fallback_camera && !scene.cameras.empty()) {
       cam_idx = 0;
     }
 
@@ -173,26 +223,35 @@ int main(int argc, char** argv) {
       const auto& cam = scene.cameras[cam_idx];
       fov_y = cam.fov_y_rad;
       const float* m = cam.transform;
-      // USD row-vector convention: p_world = p_local * M (row-major, m[r*4+c]).
-      // Row r = where local basis vector r maps in world space.
-      // row0=right, row1=up, row2=backward (camera looks along local -Z).
-      // Translation in last row: m[12..14].
-      cam_pos = lightrt::Vec3(m[12], m[13], m[14]);              // row3 = position
-      cam_dir = lightrt::Vec3(-m[8], -m[9], -m[10]).normalize(); // -row2 = forward
-      cam_up  = lightrt::Vec3( m[4],  m[5],  m[6]).normalize();  //  row1 = up
+      // Row-major, column-vector transform, consistent with scene transforms.
+      cam_pos = lightrt::Vec3(m[3], m[7], m[11]);
+      cam_dir = lightrt::Vec3(-m[2], -m[6], -m[10]).normalize();
+      cam_up  = lightrt::Vec3( m[1],  m[5],  m[9]).normalize();
       printf("Using camera '%s' (fov=%.1f deg)\n",
              cam.name.c_str(), fov_y * 180.0f / 3.14159265f);
     } else {
       lightrt::Vec3 center = (scene.scene_bounds.min + scene.scene_bounds.max) * 0.5f;
       lightrt::Vec3 extent = scene.scene_bounds.max - scene.scene_bounds.min;
       float scene_radius = extent.length() * 0.5f;
-      // For flat scenes (very small Y extent), add 30-degree elevation so
-      // horizontal planes are visible instead of edge-on.
-      float y_extent = extent.y;
-      float xz_extent = std::sqrt(extent.x * extent.x + extent.z * extent.z);
-      bool is_flat = (xz_extent > 1e-4f) && (y_extent < xz_extent * 0.15f);
-      if (is_flat) {
-        float d = scene_radius * 2.5f;
+      float vertical_extent = extent.y;
+      float horizontal_extent = std::sqrt(extent.x * extent.x + extent.z * extent.z);
+      if (scene.up_axis == 1) {
+        vertical_extent = extent.z;
+        horizontal_extent = std::sqrt(extent.x * extent.x + extent.y * extent.y);
+      } else if (scene.up_axis == 2) {
+        vertical_extent = extent.x;
+        horizontal_extent = std::sqrt(extent.y * extent.y + extent.z * extent.z);
+      }
+      bool is_flat = (horizontal_extent > 1e-4f) &&
+                     (vertical_extent < horizontal_extent * 0.15f);
+      float d = std::max(scene_radius * 2.5f, 1.0f);
+      if (scene.up_axis == 1) {
+        cam_pos = center + lightrt::Vec3(0.0f, -d * 0.8f,
+                                        is_flat ? d * 0.6f : d * 0.3f);
+      } else if (scene.up_axis == 2) {
+        cam_pos = center + lightrt::Vec3(is_flat ? d * 0.6f : d * 0.3f,
+                                        0.0f, d * 0.8f);
+      } else if (is_flat) {
         cam_pos = center + lightrt::Vec3(0.0f, d * 0.6f, d * 0.8f);
       } else {
         cam_pos = center + lightrt::Vec3(0.0f, 0.0f, scene_radius * 2.5f);
@@ -273,132 +332,3 @@ int main(int argc, char** argv) {
 
   return 0;
 }
-
-// ============================================================================
-// AOV Rendering Support
-// ============================================================================
-
-// AOV (Arbitrary Output Variable) rendering - multiple render passes beyond beauty
-struct AOVRenderOptions {
-  bool beauty = true;           // Standard color output
-  bool geom_normal = false;     // Geometry normals
-  bool shading_normal = false;  // Normals after transformation
-  bool vertex_color = false;    // Vertex displayColor
-  bool vertex_opacity = false;  // Vertex displayOpacity
-  bool depth = false;           // Distance to hit point
-  bool material_id = false;     // Per-triangle material ID
-};
-
-// Extend Options struct with AOV flags
-struct AOVOptions {
-  AOVRenderOptions render_options;
-  std::string aov_outputs = "beauty"; // Comma-separated list: beauty,geom_normal,shading_normal,vertex_color,vertex_opacity,depth,material_id
-};
-
-// Parse AOV outputs string
-static bool parseAOVOutputs(const std::string& outputs, AOVRenderOptions& opts) {
-  std::string temp = outputs;
-  std::vector<std::string> parts;
-  
-  size_t start = 0;
-  while ((start = temp.find_first_of(',', start)) != std::string::npos) {
-    parts.push_back(temp.substr(start, temp.find(',', start) - start));
-    start++;
-  }
-  
-  for (const auto& part : parts) {
-    if (part == "beauty") opts.beauty = true;
-    else if (part == "geom_normal") opts.geom_normal = true;
-    else if (part == "shading_normal") opts.shading_normal = true;
-    else if (part == "vertex_color") opts.vertex_color = true;
-    else if (part == "vertex_opacity") opts.vertex_opacity = true;
-    else if (part == "depth") opts.depth = true;
-    else if (part == "material_id") opts.material_id = true;
-    else fprintf(stderr, "Unknown AOV output: %s\n", part.c_str());
-  }
-  return true;
-}
-
-// Extend Options struct
-struct ExtendedOptions {
-  Options base_options;
-  AOVOptions aov_options;
-  // ... other fields
-};
-
-
-// ============================================================================
-// AOV Rendering Integration
-// ============================================================================
-
-// Add AOV options to command line parsing
-struct ExtendedOptions {
-  std::string input_file;
-  std::string output_file = "output.png";
-  uint32_t width = 800;
-  uint32_t height = 600;
-  double timecode = -1e30;
-  double time_range_start = 0;
-  double time_range_end = 0;
-  double time_range_step = 1;
-  bool has_time_range = false;
-  std::string camera_name;
-  std::string envmap_file;
-  int camera_index = -1;
-  uint32_t mblur_samples = 1;
-  uint32_t spp = 1;
-  std::string aov_outputs = "beauty";  // AOV rendering outputs
-  AOVRenderOptions aov_opts;
-};
-
-// Modify parseArgs to include AOV outputs
-static bool parseArgsWithAOV(int argc, char** argv, ExtendedOptions& opts) {
-  if (argc < 2) {
-    fprintf(stderr,
-      "Usage: %s input.usd [-o output.png] [-w 800] [-h 600]\n"
-      "       [-t timecode] [--time-range start end step]\n"
-      "       [--camera name_or_index] [--mblur-samples N] [--spp N]\n"
-      "       [--aov beauty,geom_normal,shading_normal,vertex_color,vertex_opacity,depth,material_id]\n",
-      argv[0]);
-    return false;
-  }
-  opts.input_file = argv[1];
-  for (int i = 2; i < argc; i++) {
-    if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
-      opts.output_file = argv[++i];
-    } else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
-      opts.width = static_cast<uint32_t>(atoi(argv[++i]));
-    } else if (strcmp(argv[i], "-h") == 0 && i + 1 < argc) {
-      opts.height = static_cast<uint32_t>(atoi(argv[++i]));
-    } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
-      opts.timecode = atof(argv[++i]);
-    } else if (strcmp(argv[i], "--time-range") == 0 && i + 3 < argc) {
-      opts.time_range_start = atof(argv[++i]);
-      opts.time_range_end = atof(argv[++i]);
-      opts.time_range_step = atof(argv[++i]);
-      opts.has_time_range = true;
-    } else if (strcmp(argv[i], "--camera") == 0 && i + 1 < argc) {
-      ++i;
-      char* endp = nullptr;
-      long idx = strtol(argv[i], &endp, 10);
-      if (endp != argv[i] && *endp == '\0') {
-        opts.camera_index = static_cast<int>(idx);
-      } else {
-        opts.camera_name = argv[i];
-      }
-    } else if (strcmp(argv[i], "--mblur-samples") == 0 && i + 1 < argc) {
-      opts.mblur_samples = static_cast<uint32_t>(atoi(argv[++i]));
-      if (opts.mblur_samples < 1) opts.mblur_samples = 1;
-    } else if (strcmp(argv[i], "--spp") == 0 && i + 1 < argc) {
-      opts.spp = static_cast<uint32_t>(atoi(argv[++i]));
-      if (opts.spp < 1) opts.spp = 1;
-    } else if (strcmp(argv[i], "--envmap") == 0 && i + 1 < argc) {
-      opts.envmap_file = argv[++i];
-    } else if (strcmp(argv[i], "--aov") == 0 && i + 1 < argc) {
-      opts.aov_outputs = argv[++i];
-      opts.aov_opts.parse(opts.aov_outputs);
-    }
-  }
-  return true;
-}
-

@@ -30,15 +30,10 @@ else()
 endif()
 
 # USD backend selection
-# OFF (default): tinyusdz + tydra
-# ON:            lightusd-c + lydra  (standalone lightusd-c repo in deps/)
+# OFF: tinyusdz + tydra
+# ON (default): lightusd-c + lydra-c (standalone checkout in dep/)
 option(LIGHTRT_USE_LIGHTUSD_C
-  "Use lightusd-c + lydra USD backend instead of tinyusdz + tydra" OFF)
-
-set(TINYUSDZ_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../deps/tinyusdz")
-if(NOT EXISTS "${TINYUSDZ_DIR}/CMakeLists.txt")
-  message(FATAL_ERROR "TinyUSDZ not found at ${TINYUSDZ_DIR}. Run: bash scripts/setup_deps.sh")
-endif()
+  "Use lightusd-c + lydra USD backend instead of tinyusdz + tydra" ON)
 
 # LightRT sources
 set(LIGHTRT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/..")
@@ -56,13 +51,12 @@ add_executable(lightrt_cli
 target_include_directories(lightrt_cli PRIVATE
   "${LIGHTRT_DIR}"
   "${LIGHTRT_DIR}/common"
-  # stb_image_write.h is a standalone header used by both backends
-  "${TINYUSDZ_DIR}/src/external"
+  "${LIGHTRT_DIR}/viewer/third_party"
 )
 
 if(LIGHTRT_USE_LIGHTUSD_C)
-  # lightusd-c + lydra backend (no tinyusdz dependency)
-  set(LIGHTUSD_C_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../deps/lightusd-c")
+  # lightusd-c + lydra-c backend (no tinyusdz dependency)
+  set(LIGHTUSD_C_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../dep/lightusd_c")
   if(NOT EXISTS "${LIGHTUSD_C_DIR}")
     message(FATAL_ERROR
       "lightusd-c not found at ${LIGHTUSD_C_DIR}.\n"
@@ -93,6 +87,11 @@ if(LIGHTRT_USE_LIGHTUSD_C)
   message(STATUS "USD backend: lightusd-c + lydra-c (${LIGHTUSD_C_DIR})")
 else()
   # tinyusdz + tydra backend (default)
+  set(TINYUSDZ_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../deps/tinyusdz")
+  if(NOT EXISTS "${TINYUSDZ_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+      "TinyUSDZ not found at ${TINYUSDZ_DIR}. Run: bash scripts/setup_deps.sh")
+  endif()
   # Build tinyusdz with MinSizeRel to reduce library size.
   set(_saved_build_type "${CMAKE_BUILD_TYPE}")
   set(CMAKE_BUILD_TYPE MinSizeRel)
