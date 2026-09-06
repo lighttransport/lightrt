@@ -46,6 +46,22 @@ Use these as fast static gates around generated shader artifacts.
 
 ## Foundation Implemented In This Repo
 
+## 0) Self-contained non-Clair build
+
+The software raster/WebGPU path does not require Clair. Clair is disabled by
+default and can be enabled explicitly for WGSL compute/JIT coverage:
+
+```bash
+cmake -S . -B build_webgpu -DLIGHTRT_BUILD_WEBGPU=ON -DBUILD_TESTING=ON \
+  -DSOFTRT_WEBGPU_ENABLE_CLAIR=OFF
+cmake --build build_webgpu -j
+ctest --test-dir build_webgpu -L WebGPUNonClair --output-on-failure
+```
+
+With Clair disabled, Clair-only WGSL JIT executables and CTest entries are not
+created. The `webgpu_non_clair_raster` test validates the standalone software
+raster path.
+
 ## 1) CTest matrix for WGSL JIT checks
 
 `webgpu/CMakeLists.txt` registers all WGSL JIT tests with labels:

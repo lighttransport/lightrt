@@ -69,6 +69,18 @@ cmake -DNO_SVE=ON ..  # ARM only
 
 ## WebGPU Verification
 
+The self-contained software WebGPU/raster path builds without Clair:
+
+```bash
+cmake -S . -B build_webgpu -DLIGHTRT_BUILD_WEBGPU=ON -DBUILD_TESTING=ON \
+  -DSOFTRT_WEBGPU_ENABLE_CLAIR=OFF
+cmake --build build_webgpu -j
+ctest --test-dir build_webgpu -L WebGPUNonClair --output-on-failure
+```
+
+Clair WGSL compute/JIT tests remain available as an opt-in with
+`-DSOFTRT_WEBGPU_ENABLE_CLAIR=ON` and `-DSOFTRT_CLAIR_SOURCE_DIR=/path/to/clair`.
+
 Build and run the WGSL/WebGPU verification baseline:
 
 ```bash

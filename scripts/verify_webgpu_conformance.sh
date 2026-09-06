@@ -86,8 +86,12 @@ fi
 
 if [[ "$RUN_LOCAL" -eq 1 ]]; then
   echo "[verify] local WGSL/WebGPU checks"
-  if ctest --test-dir "${BUILD_DIR}" -N -L WebGPUWGSL >/dev/null 2>&1; then
+  if ctest --test-dir "${BUILD_DIR}" -N -L WebGPUWGSL 2>/dev/null \
+      | rg -q 'Test #[0-9]+:'; then
     ctest --test-dir "${BUILD_DIR}" --output-on-failure -L WebGPUWGSL
+  elif ctest --test-dir "${BUILD_DIR}" -N -L WebGPUNonClair 2>/dev/null \
+      | rg -q 'Test #[0-9]+:'; then
+    ctest --test-dir "${BUILD_DIR}" --output-on-failure -L WebGPUNonClair
   else
     echo "[verify] ctest labels not found; running manual matrix"
     test_bin_dir="${BUILD_DIR}/webgpu"
