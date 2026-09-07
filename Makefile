@@ -146,6 +146,11 @@ info:
 
 obj_bench: $(OBJ_BENCH_TARGET)
 
+# C++ spatial-query regression test (also registered with CTest).
+spatial_query_test: test_spatial_query.cc $(TARGET_LIB)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o lightrt_spatial_query_test test_spatial_query.cc $(TARGET_LIB)
+	@echo "Built lightrt_spatial_query_test (run: ./lightrt_spatial_query_test)"
+
 # ---- C11 fp32 triangle kernel self-test (scalar + SSE4/AVX2 on x86,
 #      NEON/SVE on aarch64). On A64FX: make c_tri_test CC=fcc && ./lightrt_c_tri_test
 C_TRI_TEST_SRC = tests/test_lightrt_c_tri.c lightrt_c_tri.c
