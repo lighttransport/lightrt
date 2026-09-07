@@ -221,7 +221,7 @@ build-minsizerel/lightrt_cli <file.usda> -o out.png -w 400 -h 300 --spp 16
 
 ### Test Coverage
 
-1. **Spatial queries** - Integrate test_spatial_query.cc into build
+1. [x] **Spatial queries** - Integrate test_spatial_query.cc into the CTest suite
 2. **Edge cases** - Add unit tests for pathological geometry
 3. **Thread safety** - Document concurrent traversal safety
 4. **Memory alignment** - Document SIMD alignment requirements
