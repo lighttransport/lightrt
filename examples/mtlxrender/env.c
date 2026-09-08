@@ -129,6 +129,18 @@ static int has_ext(const char *path, const char *ext) {
     return 1;
 }
 
+static void copy_exr_channel_as_float(float *dst, const void *src,
+                                      exr_pixel_type pt, size_t n) {
+    if (pt == EXR_PIXEL_FLOAT) {
+        memcpy(dst, src, sizeof(float) * n);
+    } else if (pt == EXR_PIXEL_HALF) {
+        exr_half_to_float((const uint16_t *)src, dst, n);
+    } else {
+        const uint32_t *u = (const uint32_t *)src;
+        for (size_t i = 0; i < n; i++) dst[i] = (float)u[i];
+    }
+}
+
 /* Load an equirect HDRI into interleaved float RGB. EXR via tinyexr, everything
  * else (Radiance .hdr, etc.) via stb_image's float loader. NULL on failure. */
 static float *load_hdri_pixels(const char *path, int *W, int *H) {
@@ -157,7 +169,7 @@ static float *load_hdri_pixels(const char *path, int *W, int *H) {
         float *tmp = (float *)malloc(sizeof(float) * npx);
         for (int k = 0; k < 3; k++) {
             exr_pixel_type pt = part->header.channels[ci[k]].pixel_type;
-            exr_convert_pixels(tmp, EXR_PIXEL_FLOAT, part->images[ci[k]], pt, npx, EXR_CONVERT_RAW);
+            copy_exr_channel_as_float(tmp, part->images[ci[k]], pt, npx);
             for (size_t i = 0; i < npx; i++) rgb[i * 3 + k] = tmp[i];
         }
         free(tmp);

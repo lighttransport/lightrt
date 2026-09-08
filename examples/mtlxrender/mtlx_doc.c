@@ -15,6 +15,8 @@ static MtlxType parse_type(const char *t) {
     if (!strcmp(t, "vector2")) return MV_VEC2;
     if (!strcmp(t, "vector3")) return MV_VEC3;
     if (!strcmp(t, "vector4")) return MV_VEC4;
+    if (!strcmp(t, "matrix33")) return MV_MATRIX33;
+    if (!strcmp(t, "matrix44")) return MV_MATRIX44;
     if (!strcmp(t, "integer")) return MV_INT;
     if (!strcmp(t, "boolean")) return MV_BOOL;
     if (!strcmp(t, "string")) return MV_STRING;
@@ -28,6 +30,8 @@ static int type_ncomp(MtlxType t) {
         case MV_VEC2: return 2;
         case MV_COLOR3: case MV_VEC3: return 3;
         case MV_COLOR4: case MV_VEC4: return 4;
+        case MV_MATRIX33: return 9;
+        case MV_MATRIX44: return 16;
         default: return 0;
     }
 }
@@ -66,8 +70,9 @@ typedef struct {
     /* pending output records: graph_id, output-name -> nodename (+sub) */
     struct { int graph_id; char *name; char *nodename; char *sub; } *outs;
     int nout;
-    /* pending material surfaceshader nodenames (top-level scope) */
+    /* pending material shader nodenames (top-level scope) */
     char **mat_shadernames;
+    char **mat_volumenames;
 } Builder;
 
 static int add_graph(Builder *b, const char *name) {
@@ -109,6 +114,8 @@ static void node_add_input(MtlxNode *n, const XmlNode *x, const char *fileprefix
     }
     const char *cs = xml_attr(x, "colorspace");
     if (cs && !strcmp(cs, "srgb_texture")) in->colorspace_srgb = 1;
+    const char *channels = xml_attr(x, "channels");
+    if (channels && channels[0]) in->channels = strdup(channels);
     /* connection attrs stashed temporarily as strings in src_output/value.s;
      * resolved in pass B. We store raw nodename/nodegraph/output via a small
      * side channel encoded in src_output: "N:<nodename>" or "G:<graph>|<out>". */
@@ -223,20 +230,28 @@ static MtlxDoc *mtlx_build(XmlNode *root) {
             for (int k = 0; k < el->nchild; k++)
                 if (!strcmp(el->children[k].tag, "input"))
                     node_add_input(&b.d.nodes[nid], &el->children[k], root_pre);
-        } else if (!strcmp(tag, "surfacematerial")) {
+        } else if (!strcmp(tag, "surfacematerial") ||
+                   !strcmp(tag, "volumematerial")) {
             b.d.mats = realloc(b.d.mats, sizeof(MtlxMaterial) * (b.d.nmat + 1));
             b.mat_shadernames = realloc(b.mat_shadernames, sizeof(char *) * (b.d.nmat + 1));
+            b.mat_volumenames = realloc(b.mat_volumenames, sizeof(char *) * (b.d.nmat + 1));
             MtlxMaterial *m = &b.d.mats[b.d.nmat];
             m->name = strdup(xml_attr(el, "name") ? xml_attr(el, "name") : "");
             m->surface_node = -1;
-            const char *shadername = NULL;
+            m->volume_node = -1;
+            const char *surface_name = NULL;
+            const char *volume_name = NULL;
             for (int k = 0; k < el->nchild; k++) {
                 const XmlNode *in = &el->children[k];
                 if (!strcmp(in->tag, "input") && xml_attr(in, "name") &&
                     !strcmp(xml_attr(in, "name"), "surfaceshader"))
-                    shadername = xml_attr(in, "nodename");
+                    surface_name = xml_attr(in, "nodename");
+                if (!strcmp(in->tag, "input") && xml_attr(in, "name") &&
+                    !strcmp(xml_attr(in, "name"), "volumeshader"))
+                    volume_name = xml_attr(in, "nodename");
             }
-            b.mat_shadernames[b.d.nmat] = strdup(shadername ? shadername : "");
+            b.mat_shadernames[b.d.nmat] = strdup(surface_name ? surface_name : "");
+            b.mat_volumenames[b.d.nmat] = strdup(volume_name ? volume_name : "");
             b.d.nmat++;
         } else if (!strcmp(tag, "look")) {
             for (int k = 0; k < el->nchild; k++) {
@@ -298,9 +313,12 @@ static MtlxDoc *mtlx_build(XmlNode *root) {
     /* ---- resolve material surface nodes (top-level scope) ---- */
     for (int i = 0; i < b.d.nmat; i++) {
         b.d.mats[i].surface_node = mtlx_find_node(&b.d, -1, b.mat_shadernames[i]);
+        b.d.mats[i].volume_node = mtlx_find_node(&b.d, -1, b.mat_volumenames[i]);
         free(b.mat_shadernames[i]);
+        free(b.mat_volumenames[i]);
     }
     free(b.mat_shadernames);
+    free(b.mat_volumenames);
 
     /* free pending output records */
     for (int i = 0; i < b.nout; i++) { free(b.outs[i].name); free(b.outs[i].nodename); free(b.outs[i].sub); }
@@ -332,6 +350,7 @@ void mtlx_free(MtlxDoc *d) {
             free(n->inputs[j].name);
             free(n->inputs[j].value.s);
             free(n->inputs[j].src_output);
+            free(n->inputs[j].channels);
         }
         free(n->inputs);
         free(n->category);

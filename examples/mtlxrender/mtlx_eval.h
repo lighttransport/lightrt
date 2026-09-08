@@ -34,6 +34,7 @@ typedef struct {
     v3    subsurface_color;
     v3    subsurface_radius;
     float subsurface_scale;
+    float subsurface_anisotropy;
     /* coat */
     float coat_weight;
     v3    coat_color;
@@ -56,14 +57,39 @@ typedef struct {
 } OpenPBRParams;
 
 typedef struct {
+    v3 absorption;
+    v3 scattering;
+    float anisotropy;
+    v3 emission;
+} MtlxVolumeParams;
+
+typedef struct {
     const MtlxDoc *doc;
     TextureCache  *tex;
     /* shade point */
     float uv[2];
+    /* UV footprint in screen-space. Zero/false preserves point evaluation. */
+    float uv_dx[2], uv_dy[2];
+    int has_uv_derivatives;
     v3    P;       /* world position (for position/noise nodes) */
+    v3    dPdx, dPdy; /* world-position screen-space derivatives */
+    int has_position_derivatives;
     v3    Ns;      /* shading normal (world) */
     v3    Ng;      /* geometric normal (world) */
     v3    dpdu, dpdv; /* tangent frame for normal mapping */
+    v3    V;       /* normalized direction from the shade point to the camera */
+    v3    dVdx, dVdy; /* view-direction screen-space derivatives */
+    int has_view_derivatives;
+    float time;    /* scene time in seconds */
+    float frame;   /* authored/render frame number */
+    /* Column-major affine transforms.  When has_space_transforms is zero,
+     * named-space transform nodes use the identity transform. */
+    float object_to_world[16], world_to_object[16];
+    float world_to_view[16], view_to_world[16];
+    int has_space_transforms;
+    /* Optional renderer callback for arbitrary geompropvalue primvars. */
+    int (*geomprop)(void *user,const char *name,MtlxType type,MtlxValue *out);
+    void *geomprop_user;
     /* per-shade-point memo (size doc->nnode) */
     MtlxValue *memo;
     char      *memo_done;
@@ -74,6 +100,10 @@ void openpbr_defaults(OpenPBRParams *p);
 
 /* Evaluate a surface shader node into params. Returns 0 on success. */
 int mtlx_eval_surface(ShadeContext *ctx, int surface_node, OpenPBRParams *out);
+
+/* Evaluate a MaterialX volume constructor and its connected VDF/EDF graph. */
+int mtlx_eval_volume(ShadeContext *ctx, int volume_node,
+                     MtlxVolumeParams *out);
 
 /* Evaluate any node by id (resets the per-shade memo first). For tests. */
 MtlxValue mtlx_eval_node_test(ShadeContext *ctx, int node_id);
