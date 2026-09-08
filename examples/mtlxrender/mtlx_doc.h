@@ -11,12 +11,13 @@
 
 typedef enum {
     MV_NONE = 0, MV_FLOAT, MV_COLOR3, MV_COLOR4,
-    MV_VEC2, MV_VEC3, MV_VEC4, MV_INT, MV_BOOL, MV_STRING, MV_FILENAME
+    MV_VEC2, MV_VEC3, MV_VEC4, MV_MATRIX33, MV_MATRIX44,
+    MV_INT, MV_BOOL, MV_STRING, MV_FILENAME
 } MtlxType;
 
 typedef struct {
     MtlxType type;
-    float    v[4];   /* numeric payload (color/vector/float/int/bool) */
+    float    v[16];  /* numeric payload, including column-major matrices */
     char    *s;      /* string/filename payload (owned), else NULL */
 } MtlxValue;
 
@@ -27,6 +28,7 @@ typedef struct {
     MtlxValue value;
     int      src_node;    /* connected upstream node id, or -1 */
     char    *src_output;  /* sub-output name on a multi-output node, or NULL */
+    char    *channels;    /* MaterialX input channels selector, e.g. "g" */
     int      colorspace_srgb; /* 1 if colorspace="srgb_texture" */
 } MtlxInput;
 
@@ -40,8 +42,9 @@ typedef struct {
 } MtlxNode;
 
 typedef struct {
-    char *name;          /* surfacematerial name, e.g. "M_Bishop_B" */
+    char *name;          /* surface/volume material name */
     int   surface_node;  /* resolved surface shader node id, or -1 */
+    int   volume_node;   /* resolved volume shader node id, or -1 */
 } MtlxMaterial;
 
 typedef struct {

@@ -171,6 +171,7 @@ static v3 fresnel_airy(float cosTheta, float ior_substrate, float tf_thickness_n
 /* ---- layered material ------------------------------------------------- */
 typedef struct {
     v3    diff_color;  /* effective diffuse albedo (incl. subsurface tint) */
+    float subsurface_w; /* normalized-diffusion strength */
     v3    F0;          /* specular reflectance at normal incidence */
     float alpha;       /* GGX roughness^2 */
     v3    sheen_color; float sheen_alpha, sheen_w;
@@ -190,6 +191,13 @@ static Layers extract(const OpenPBRParams *p) {
     if (p->subsurface > 0.0f)
         diff = v3_lerp(diff, v3_scale(p->subsurface_color, (1.0f - metal) * (1.0f - trans)), p->subsurface);
     L.diff_color = diff;
+    {
+        float mean_radius = (p->subsurface_radius.x + p->subsurface_radius.y +
+                             p->subsurface_radius.z) * (1.0f / 3.0f);
+        float radius_response = 1.0f - expf(-maxf(0.0f, mean_radius *
+                                                   p->subsurface_scale));
+        L.subsurface_w = clampf(p->subsurface * radius_response, 0.0f, 1.0f);
+    }
 
     float f0d = (p->specular_ior - 1.0f) / (p->specular_ior + 1.0f);
     f0d = f0d * f0d * p->specular_weight;
@@ -232,9 +240,21 @@ static v3 face_forward(v3 N, v3 wo) { return v3_dot(N, wo) < 0.0f ? v3_neg(N) : 
 
 /* Unified reflection-lobe evaluation (diffuse + spec + sheen + coat). Fills the
  * mixture pdf for the sampled wi. Returns f (rgb). Excludes the glass lobe. */
-static v3 eval_reflection(const Layers *L, v3 N, v3 wo, v3 wi, float *pdf) {
+/* Evaluate the reflection lobes. `out_diff` / `out_spec` (either may be NULL)
+ * receive the diffuse and the specular halves separately: a split-sum IBL has to
+ * weigh each against a DIFFERENT prefiltered environment (irradiance vs the
+ * reflection lobe), so handing it the sum makes it count both lobes twice. Sheen
+ * is grouped with the specular half: it is a directional grazing lobe, not part
+ * of the cosine-distributed diffuse response. */
+static v3 eval_reflection_split(const Layers *L, v3 N, v3 wo, v3 wi, float *pdf,
+                                v3 *out_diff, v3 *out_spec) {
     float NdotL = v3_dot(N, wi), NdotV = v3_dot(N, wo);
-    if (NdotL <= 0.0f || NdotV <= 0.0f) { *pdf = 0.0f; return v3_splat(0.0f); }
+    if (NdotL <= 0.0f || NdotV <= 0.0f) {
+        *pdf = 0.0f;
+        if (out_diff) *out_diff = v3_splat(0.0f);
+        if (out_spec) *out_spec = v3_splat(0.0f);
+        return v3_splat(0.0f);
+    }
     v3 H = v3_normalize(v3_add(wo, wi));
     float NdotH = v3_dot(N, H), VdotH = v3_dot(wo, H);
 
@@ -259,7 +279,25 @@ static v3 eval_reflection(const Layers *L, v3 N, v3 wo, v3 wi, float *pdf) {
                            diff_alb.y / (1.0f - diff_alb.y * k),
                            diff_alb.z / (1.0f - diff_alb.z * k));
     }
-    v3 diff = v3_mul(diff_alb, v3_scale(base_atten, MTLX_INV_PI));
+    /* Disney/Burley normalized-diffusion approximation. Unlike a plain tint,
+     * this broadens the diffuse response at grazing incidence and uses the
+     * authored scattering radius/scale to control how strongly the material
+     * behaves as a subsurface medium. The 1.25 normalization keeps the lobe's
+     * integrated energy close to Lambert. */
+    float diffuse_shape = 1.0f;
+    if (L->subsurface_w > 0.0f) {
+        float L5 = powf(1.0f - NdotL, 5.0f);
+        float V5 = powf(1.0f - NdotV, 5.0f);
+        float fss90 = L->alpha * NdotL * NdotL;
+        float fss = (1.0f + (fss90 - 1.0f) * L5) *
+                    (1.0f + (fss90 - 1.0f) * V5);
+        float ss = 1.25f * (fss * (1.0f / (NdotL + NdotV + 1.0e-4f) - 0.5f) +
+                            0.5f);
+        diffuse_shape = (1.0f - L->subsurface_w) +
+                        L->subsurface_w * maxf(0.0f, ss);
+    }
+    v3 diff = v3_mul(diff_alb,
+                     v3_scale(base_atten, MTLX_INV_PI * diffuse_shape));
 
     float D = ggx_D(NdotH, L->alpha), G = ggx_G(NdotV, NdotL, L->alpha);
     /* Thin film replaces the plain Fresnel with the iridescent airy reflectance
@@ -285,7 +323,13 @@ static v3 eval_reflection(const Layers *L, v3 N, v3 wo, v3 wi, float *pdf) {
     float pdf_coat = ggx_D(NdotH, L->coat_alpha) * NdotH / (4.0f * VdotH + 1e-6f);
     *pdf = L->pd * pdf_diff + L->ps * pdf_spec + L->pc * pdf_coat;
 
+    if (out_diff) *out_diff = diff;
+    if (out_spec) *out_spec = v3_add(spec, v3_add(sheen, coat));
     return v3_add(v3_add(diff, spec), v3_add(sheen, coat));
+}
+
+static v3 eval_reflection(const Layers *L, v3 N, v3 wo, v3 wi, float *pdf) {
+    return eval_reflection_split(L, N, wo, wi, pdf, (v3 *)0, (v3 *)0);
 }
 
 int bsdf_sample(const OpenPBRParams *p, v3 Ns, v3 wo, pcg32 *rng, BsdfSample *out) {
@@ -384,4 +428,11 @@ v3 bsdf_eval(const OpenPBRParams *p, v3 Ns, v3 wo, v3 wi, float *pdf_out) {
     v3 N = face_forward(v3_normalize(Ns), wo);
     Layers L = extract(p);
     return eval_reflection(&L, N, wo, wi, pdf_out);
+}
+
+v3 bsdf_eval_lobes(const OpenPBRParams *p, v3 Ns, v3 wo, v3 wi, v3 *out_diffuse,
+                   v3 *out_specular, float *pdf_out) {
+    v3 N = face_forward(v3_normalize(Ns), wo);
+    Layers L = extract(p);
+    return eval_reflection_split(&L, N, wo, wi, pdf_out, out_diffuse, out_specular);
 }
