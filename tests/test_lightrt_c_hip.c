@@ -1337,6 +1337,10 @@ int main(void) {
     printf("== GPU refit (animation) vs CPU refit ==\n");
     test_refit(e, "refit/BVH4", soup, ntris, LRT_TRI_LAYOUT_BVH4, 20000);
     test_refit(e, "refit/BVH8", grid, grid_n, LRT_TRI_LAYOUT_BVH8, 20000);
+    /* Tiny scenes: the root is a single leaf (node_count == 0); refit must not
+     * launch a zero-size grid (invalid configuration, poisons the stream). */
+    test_refit(e, "refit/BVH4 1 tri", soup, 1, LRT_TRI_LAYOUT_BVH4, 2000);
+    test_refit(e, "refit/BVH8 3 tris", soup, 3, LRT_TRI_LAYOUT_BVH8, 2000);
 
     test_device_pipeline(e, soup, ntris);
 
