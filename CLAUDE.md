@@ -1250,6 +1250,16 @@ all hits verify 100% against the fp64 oracle. CMake also gained an aarch64
 `-march=armv8.2-a+sve` branch (top-level + `benchmark_c`); for fcc under CMake
 pass `-DCMAKE_C_FLAGS=-Nclang`.
 
+## Formal verification (`formal/`)
+
+Lean 4 + Mathlib (v4.35.0) specs and proofs for slab/MT/Woop/BVH, a binary32
+rounding model, and a C→Lean bridge (`formal/tools/c2lean.py`, ported from
+tinygltf) that translates the scalar kernels of `lightrt_c_tri.c`
+(`tri_ray_setup`, `tri_slab_scalar`, `tri_mt_one`, …) into MiniC. Run
+`make formal` (build + `c2lean --check` + sorry budget + axiom allowlist +
+3-way cdiff). If you edit a translated C function, regenerate with
+`python3 formal/tools/c2lean.py`. Plan/status: `formal/PLAN.md`.
+
 ## Code Conventions
 
 - C++17, no RTTI (`-fno-rtti`), no exceptions (`-fno-exceptions`)

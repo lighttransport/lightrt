@@ -244,4 +244,15 @@ info_cuda:
 	@echo "CUDA_ARCH: $(CUDA_ARCH)"
 	@echo "CUDA_FLAGS: $(CUDA_FLAGS)"
 
-.PHONY: all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip cuda_test info_cuda
+.PHONY: all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip cuda_test info_cuda formal
+
+# Lean 4 formal verification (formal/): build specs+proofs, check the c2lean
+# translation is up to date, the sorry budget, the axiom allowlist, and run
+# 3-way differential testing (compiled C vs MiniC vs Lean reference).
+FORMAL_SORRY_MAX ?= 31
+formal:
+	cd formal && lake build
+	python3 formal/tools/c2lean.py --check
+	sh formal/tools/count_sorry.sh --max $(FORMAL_SORRY_MAX)
+	python3 formal/tools/check_axioms.py > /dev/null
+	python3 formal/tools/cdiff.py --n 1000
