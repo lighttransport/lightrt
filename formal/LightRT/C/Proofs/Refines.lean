@@ -5,7 +5,7 @@
       lightrt_c_tri.c ──c2lean──▶ Gen (MiniC) ══refines══▶ Ref (bits) ══▶ Robust/Geom (ℝ)
                                          ▲ cdiff: bit-identical with compiled C
 -/
-import LightRT.C.Proofs.SlabRefines
+import LightRT.C.Proofs.MTRefines
 import LightRT.Robust.Slab
 import LightRT.Geom.MTReal
 
@@ -39,21 +39,29 @@ theorem tri_slab_scalar_refines (rc : Ref.RayCtx) (lo hi : Fin 3 → Ref.F) (tbe
       ∀ b, b ≠ bOut → m' b = m b :=
   tri_slab_scalar_refines' rc lo hi tbest m bRc bs bOut hrc hlo hhi hout
 
-/-- `tri_mt_one` returns the reference result (and writes `t,u,v` only on a hit). -/
+/-- `tri_mt_one` returns the reference result and writes `t,u,v` only on a hit
+    (all inputs, incl. NaN/∞; loads precede stores, so input/output aliasing is
+    irrelevant; the three outputs must be distinct). Proved in `MTRefines.lean`. -/
 theorem tri_mt_one_refines (o d v0 v1 v2 : Fin 3 → Ref.F) (tmin tbest : Ref.F) (m : Mem)
-    (bv : Fin 5 → Nat) (bt bu bvv : Nat)
-    (hv : ∀ k, m (bv k) = some (f32Block (vecWords ([o, d, v0, v1, v2].getD k.val o))))
-    (hout : ∀ b ∈ [bt, bu, bvv], ∃ blk, m b = some blk ∧ blk.length = 4)
-    (hdis : [bt, bu, bvv].Nodup ∧ ∀ k, bv k ∉ [bt, bu, bvv]) :
-    ∃ m', callFunc Gen.prog 10000 Gen.fid_tri_mt_one
-        [.ptr (bv 0) 0, .ptr (bv 1) 0, .ptr (bv 2) 0, .ptr (bv 3) 0, .ptr (bv 4) 0,
+    (bo bd b0 b1 b2 bt bu bvv : Nat)
+    (ho : m bo = some (f32Block (vecWords o))) (hd : m bd = some (f32Block (vecWords d)))
+    (h0 : m b0 = some (f32Block (vecWords v0))) (h1 : m b1 = some (f32Block (vecWords v1)))
+    (h2 : m b2 = some (f32Block (vecWords v2)))
+    (ht : ∃ blk, m bt = some blk ∧ blk.length = 4) (hu : ∃ blk, m bu = some blk ∧ blk.length = 4)
+    (hvv : ∃ blk, m bvv = some blk ∧ blk.length = 4)
+    (hne : bt ≠ bu ∧ bt ≠ bvv ∧ bu ≠ bvv) :
+    ∃ m', (∃ K, ∀ n, K ≤ n → callFunc Gen.prog n Gen.fid_tri_mt_one
+        [.ptr bo 0, .ptr bd 0, .ptr b0 0, .ptr b1 0, .ptr b2 0,
          .f32 tmin.toNat, .f32 tbest.toNat, .ptr bt 0, .ptr bu 0, .ptr bvv 0] m =
-        .ok (some (.int ⟨32, true⟩ (if (Ref.mt o d v0 v1 v2 tmin tbest).isSome then 1 else 0)), m') ∧
+        .ok (some (.int ⟨32, true⟩ (if (Ref.mt o d v0 v1 v2 tmin tbest).isSome then 1 else 0)), m')) ∧
       (match Ref.mt o d v0 v1 v2 tmin tbest with
        | some (t, u, v) => m' bt = some (f32Block [t.toNat]) ∧ m' bu = some (f32Block [u.toNat]) ∧
-                           m' bvv = some (f32Block [v.toNat])
+                           m' bvv = some (f32Block [v.toNat]) ∧
+                           ∀ b, b ≠ bt → b ≠ bu → b ≠ bvv → m' b = m b
        | none => m' = m) := by
-  sorry
+  obtain ⟨s', hx, hp⟩ :=
+    tri_mt_one_refines' o d v0 v1 v2 tmin tbest m bo bd b0 b1 b2 bt bu bvv ho hd h0 h1 h2 ht hu hvv hne
+  exact ⟨s'.mem, callFunc_of_ExS (p := Gen.prog) rfl rfl hx, hp⟩
 
 /-- Value of a finite binary32 word as a real. -/
 noncomputable def val (w : Ref.F) : ℝ := (((Binary32.decode w).toQ?).getD 0 : ℝ)

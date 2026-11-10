@@ -134,5 +134,31 @@ theorem EvE.loadAt {a} {b o : Nat} {ws : List Nat} {tl : Block} {w : UInt32}
   simp [Locals.upd]
 theorem upd_ne' (l : Locals) {i j : Nat} (v : Val) (h : j ≠ i) : l.upd i v j = l j := by
   simp [Locals.upd, h]
+
+theorem EvE.land' {a b} {x y : Bool} (ha : EvE p s a (boolVal x)) (hb : EvE p s b (boolVal y)) :
+    EvE p s (.land a b) (boolVal (x && y)) := by
+  cases x
+  · exact EvE.land_false ha (truthy_boolVal _)
+  · exact EvE.land_true ha (truthy_boolVal _) hb (truthy_boolVal _)
+
+theorem EvE.lor' {a b} {x y : Bool} (ha : EvE p s a (boolVal x)) (hb : EvE p s b (boolVal y)) :
+    EvE p s (.lor a b) (boolVal (x || y)) := by
+  cases x
+  · exact EvE.lor_false ha (truthy_boolVal _) hb (truthy_boolVal _)
+  · exact EvE.lor_true ha (truthy_boolVal _)
+
+theorem EvE.constF (n : Nat) (h : n < 2 ^ 32) :
+    EvE p s (.const (.f32 n)) (.f32 (n.toUInt32).toNat) := by
+  have : (n.toUInt32).toNat = n := by simp [Nat.toUInt32]; omega
+  rw [this]; exact EvE.const _
+
+theorem EvE.fneg' {a} {x : UInt32} (ha : EvE p s a (.f32 x.toNat)) :
+    EvE p s (.fneg a) (.f32 (Ref.neg x).toNat) := by
+  obtain ⟨K, h⟩ := ha
+  refine ⟨K + 1, fun n hn => ?_⟩
+  obtain ⟨m, rfl⟩ : ∃ m, n = m + 1 := ⟨n - 1, by omega⟩
+  simp only [evalExpr, h m (by omega), Res.bind_eq, Res.bind_ok, Ref.neg, UInt32.toNat_xor]
+  rfl
+
 end
 end LightRT.C.Proofs

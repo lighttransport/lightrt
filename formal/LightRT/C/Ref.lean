@@ -66,26 +66,52 @@ def slabInflated (rc : RayCtx) (lo hi : Fin 3 → F) (tbest K : F) : Bool :=
   let tfar := mulBits (fmin (fmin (tf 0) (tf 1)) (fmin (tf 2) tbest)) K
   leBits tnear tfar
 
+/-! `tri_mt_one`, split into its intermediate values (same evaluation order as the C). -/
+def mtE1 (v0 v1 : Fin 3 → F) (k : Fin 3) : F := subBits (v1 k) (v0 k)
+def mtE2 (v0 v2 : Fin 3 → F) (k : Fin 3) : F := subBits (v2 k) (v0 k)
+def mtPx (d v0 v2 : Fin 3 → F) : F :=
+  subBits (mulBits (d 1) (mtE2 v0 v2 2)) (mulBits (d 2) (mtE2 v0 v2 1))
+def mtPy (d v0 v2 : Fin 3 → F) : F :=
+  subBits (mulBits (d 2) (mtE2 v0 v2 0)) (mulBits (d 0) (mtE2 v0 v2 2))
+def mtPz (d v0 v2 : Fin 3 → F) : F :=
+  subBits (mulBits (d 0) (mtE2 v0 v2 1)) (mulBits (d 1) (mtE2 v0 v2 0))
+def mtDet (d v0 v1 v2 : Fin 3 → F) : F :=
+  addBits (addBits (mulBits (mtE1 v0 v1 0) (mtPx d v0 v2)) (mulBits (mtE1 v0 v1 1) (mtPy d v0 v2)))
+    (mulBits (mtE1 v0 v1 2) (mtPz d v0 v2))
+def mtInv (d v0 v1 v2 : Fin 3 → F) : F := divBits one (mtDet d v0 v1 v2)
+def mtTv (o v0 : Fin 3 → F) (k : Fin 3) : F := subBits (o k) (v0 k)
+def mtU (o d v0 v1 v2 : Fin 3 → F) : F :=
+  mulBits (addBits (addBits (mulBits (mtTv o v0 0) (mtPx d v0 v2)) (mulBits (mtTv o v0 1) (mtPy d v0 v2)))
+    (mulBits (mtTv o v0 2) (mtPz d v0 v2))) (mtInv d v0 v1 v2)
+def mtQx (o v0 v1 : Fin 3 → F) : F :=
+  subBits (mulBits (mtTv o v0 1) (mtE1 v0 v1 2)) (mulBits (mtTv o v0 2) (mtE1 v0 v1 1))
+def mtQy (o v0 v1 : Fin 3 → F) : F :=
+  subBits (mulBits (mtTv o v0 2) (mtE1 v0 v1 0)) (mulBits (mtTv o v0 0) (mtE1 v0 v1 2))
+def mtQz (o v0 v1 : Fin 3 → F) : F :=
+  subBits (mulBits (mtTv o v0 0) (mtE1 v0 v1 1)) (mulBits (mtTv o v0 1) (mtE1 v0 v1 0))
+def mtV (o d v0 v1 v2 : Fin 3 → F) : F :=
+  mulBits (addBits (addBits (mulBits (d 0) (mtQx o v0 v1)) (mulBits (d 1) (mtQy o v0 v1)))
+    (mulBits (d 2) (mtQz o v0 v1))) (mtInv d v0 v1 v2)
+def mtT (o d v0 v1 v2 : Fin 3 → F) : F :=
+  mulBits (addBits (addBits (mulBits (mtE2 v0 v2 0) (mtQx o v0 v1)) (mulBits (mtE2 v0 v2 1) (mtQy o v0 v1)))
+    (mulBits (mtE2 v0 v2 2) (mtQz o v0 v1))) (mtInv d v0 v1 v2)
+
+/-- The four rejection tests of `tri_mt_one`, in order. -/
+def mtRej1 (d v0 v1 v2 : Fin 3 → F) : Bool :=
+  ltBits (neg detEps) (mtDet d v0 v1 v2) && ltBits (mtDet d v0 v1 v2) detEps
+def mtRej2 (o d v0 v1 v2 : Fin 3 → F) : Bool :=
+  ltBits (mtU o d v0 v1 v2) zero || ltBits one (mtU o d v0 v1 v2)
+def mtRej3 (o d v0 v1 v2 : Fin 3 → F) : Bool :=
+  ltBits (mtV o d v0 v1 v2) zero || ltBits one (addBits (mtU o d v0 v1 v2) (mtV o d v0 v1 v2))
+def mtRej4 (o d v0 v1 v2 : Fin 3 → F) (tmin tbest : F) : Bool :=
+  ltBits (mtT o d v0 v1 v2) tmin || leBits tbest (mtT o d v0 v1 v2)
+
 /-- `tri_mt_one`: `some (t, u, v)` on a hit. -/
 def mt (o d v0 v1 v2 : Fin 3 → F) (tmin tbest : F) : Option (F × F × F) :=
-  let sub := subBits; let mul := mulBits; let add := addBits
-  let e1 := fun k => sub (v1 k) (v0 k)
-  let e2 := fun k => sub (v2 k) (v0 k)
-  let px := sub (mul (d 1) (e2 2)) (mul (d 2) (e2 1))
-  let py := sub (mul (d 2) (e2 0)) (mul (d 0) (e2 2))
-  let pz := sub (mul (d 0) (e2 1)) (mul (d 1) (e2 0))
-  let det := add (add (mul (e1 0) px) (mul (e1 1) py)) (mul (e1 2) pz)
-  if ltBits (neg detEps) det && ltBits det detEps then none else
-  let inv := divBits one det
-  let tvx := sub (o 0) (v0 0); let tvy := sub (o 1) (v0 1); let tvz := sub (o 2) (v0 2)
-  let uu := mul (add (add (mul tvx px) (mul tvy py)) (mul tvz pz)) inv
-  if ltBits uu zero || ltBits one uu then none else
-  let qx := sub (mul tvy (e1 2)) (mul tvz (e1 1))
-  let qy := sub (mul tvz (e1 0)) (mul tvx (e1 2))
-  let qz := sub (mul tvx (e1 1)) (mul tvy (e1 0))
-  let vv := mul (add (add (mul (d 0) qx) (mul (d 1) qy)) (mul (d 2) qz)) inv
-  if ltBits vv zero || ltBits one (add uu vv) then none else
-  let tt := mul (add (add (mul (e2 0) qx) (mul (e2 1) qy)) (mul (e2 2) qz)) inv
-  if ltBits tt tmin || leBits tbest tt then none else some (tt, uu, vv)
+  if mtRej1 d v0 v1 v2 then none else
+  if mtRej2 o d v0 v1 v2 then none else
+  if mtRej3 o d v0 v1 v2 then none else
+  if mtRej4 o d v0 v1 v2 tmin tbest then none else
+  some (mtT o d v0 v1 v2, mtU o d v0 v1 v2, mtV o d v0 v1 v2)
 
 end LightRT.C.Ref
