@@ -73,6 +73,8 @@ typedef struct vk_lrts_header {
     uint64_t node_offset;
     uint64_t block_offset;
     uint64_t file_size;
+    uint64_t aux_offset; /* v2: watertight exact vertices ride here */
+    uint64_t aux_size;
 } vk_lrts_header;
 
 /* ------------------------------------------------------------------------- */
@@ -834,6 +836,7 @@ typedef struct trace_push {
     uint32_t ray_count;
     uint32_t prim_kind;
     uint32_t point_type;
+    uint32_t nwverts; /* > 0: watertight leaf on binding 4 */
 } trace_push;
 
 /* Bucket the traversal stack depth so pipelines are reused across scenes. */
@@ -882,7 +885,7 @@ static vk_pipeline *trace_get_pipeline(lrt_vk_engine *e, uint32_t w,
     spec.pMapEntries = ents;
     spec.dataSize = sizeof(spec_data);
     spec.pData = spec_data;
-    if (!vk_pipeline_build(e, trace_bvh_spv, sizeof(trace_bvh_spv), 4, NULL,
+    if (!vk_pipeline_build(e, trace_bvh_spv, sizeof(trace_bvh_spv), 5, NULL,
                            (uint32_t)sizeof(trace_push), &spec, slot))
         return NULL;
     slot->key_w = w;
@@ -1045,7 +1048,20 @@ int lrt_vk_trace_scene(lrt_vk_engine *e, const lrt_tri_scene *s,
     size_t blocks_bytes = (size_t)h->block_count * h->block_stride;
     uint32_t tile = vk_ray_tile_size();
     if (tile == 0 || tile > n) tile = n;
-    vk_buffer b_nodes, b_blocks, b_rays, b_hits;
+    /* Exact vertices for the watertight leaf (aux {nloops = 0, npts = ntris},
+     * float[9 * ntris]; only LRT_TRI_WATERTIGHT_TRI builds carry them). */
+    const void *wv = NULL;
+    uint32_t nwv = 0;
+    if (h->prim_kind == 0u && h->aux_size >= 8u && h->aux_offset + h->aux_size <= blob_n) {
+        const uint32_t *ah = (const uint32_t *)((const char *)blob + h->aux_offset);
+        if (ah[0] == 0u && ah[1] > 0u && 8u + (uint64_t)ah[1] * 36u <= h->aux_size) {
+            wv = ah + 2;
+            nwv = ah[1];
+        }
+    }
+    static const uint32_t wv_dummy = 0;
+    vk_buffer b_nodes, b_blocks, b_rays, b_hits, b_wv;
+    memset(&b_wv, 0, sizeof(b_wv));
     memset(&b_nodes, 0, sizeof(b_nodes));
     memset(&b_blocks, 0, sizeof(b_blocks));
     memset(&b_rays, 0, sizeof(b_rays));
@@ -1060,14 +1076,16 @@ int lrt_vk_trace_scene(lrt_vk_engine *e, const lrt_tri_scene *s,
               * the shader, so a staging round-trip would only add a copy. Only
               * the tile is resident, not the frame. */
              vk_buffer_create(e, (VkDeviceSize)tile * sizeof(lrt_ray), &b_rays) &&
-             vk_buffer_create(e, (VkDeviceSize)tile * sizeof(lrt_hit), &b_hits);
+             vk_buffer_create(e, (VkDeviceSize)tile * sizeof(lrt_hit), &b_hits) &&
+             vk_bvh_buffer(e, nwv ? (size_t)nwv * 36u : 4u, nwv ? wv : (const void *)&wv_dummy,
+                           nwv ? (size_t)nwv * 36u : 4u, &b_wv);
     if (!ok) goto fail_buffers;
 
     {
-        vk_buffer set_bufs[4] = {b_nodes, b_blocks, b_rays, b_hits};
+        vk_buffer set_bufs[5] = {b_nodes, b_blocks, b_rays, b_hits, b_wv};
         VkDescriptorPool pool;
         VkDescriptorSet set;
-        if (!vk_descriptors_bind(e, pipe->dsl, set_bufs, 4, &pool, &set))
+        if (!vk_descriptors_bind(e, pipe->dsl, set_bufs, 5, &pool, &set))
             goto fail_buffers;
         int run_ok = 1;
         for (uint32_t off = 0; off < n && run_ok; off += tile) {
@@ -1084,6 +1102,7 @@ int lrt_vk_trace_scene(lrt_vk_engine *e, const lrt_tri_scene *s,
             pc.ray_count = cnt;
             pc.prim_kind = h->prim_kind;
             pc.point_type = h->reserved0;
+            pc.nwverts = nwv;
             uint32_t groups = (cnt + 63u) / 64u;
             run_ok = vk_dispatch(e, pipe, set, &pc, (uint32_t)sizeof(pc), groups) &&
                      vk_buffer_read(e, &b_hits, out + off,
@@ -1097,6 +1116,7 @@ int lrt_vk_trace_scene(lrt_vk_engine *e, const lrt_tri_scene *s,
     vk_buffer_destroy(e, &b_blocks);
     vk_buffer_destroy(e, &b_rays);
     vk_buffer_destroy(e, &b_hits);
+    vk_buffer_destroy(e, &b_wv);
     free(blob);
 
     int hits = 0;
@@ -1110,6 +1130,7 @@ fail_buffers:
     vk_buffer_destroy(e, &b_blocks);
     vk_buffer_destroy(e, &b_rays);
     vk_buffer_destroy(e, &b_hits);
+    vk_buffer_destroy(e, &b_wv);
     free(blob);
     if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
     return -1;
