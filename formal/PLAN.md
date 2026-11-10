@@ -1,6 +1,6 @@
 # LightRT formal verification plan (Lean 4 + Mathlib)
 
-Status as of 2026-11-10. Everything below builds with `make formal`. The codebase has **21 `sorry`s** (`tools/count_sorry.sh`). **84 theorems are closed** with axioms limited to {`propext`, `Classical.choice`, `Quot.sound`}. That count includes 52 MiniC logic lemmas ported from tinygltf; 32 are new to this project, including the full M1 Ize slab bound (`slab_no_false_miss`, `slab_t_err`, `slab_t_err_fma`, `ize_constant_sufficient`/`_gamma3_insufficient`). No closed theorem uses `native_decide`.
+Status as of 2026-11-10. Everything below builds with `make formal`. The codebase has **15 `sorry`s** (`tools/count_sorry.sh`). **116 theorems are closed** with axioms limited to {`propext`, `Classical.choice`, `Quot.sound`}. That count includes 52 MiniC logic lemmas ported from tinygltf; 64 are new to this project, including the full M1 Ize slab bound (`slab_no_false_miss`, `slab_t_err`, `slab_t_err_fma`, `ize_constant_sufficient`/`_gamma3_insufficient`). The binary32 instance `Binary32.model` is now sorry-free (`rneR_rel`, `rneR_mono`, `rneR_neg`, `rneR_idem`, `rne_cast`, `mul_num_refines`), so `slab_no_false_miss` holds for real binary32 RNE. No closed theorem uses `native_decide`.
 
 ## 1. Repo layout
 
@@ -34,7 +34,7 @@ Each library was cloned and read on 2026-11-10. The `sorry` counts are real toke
 | Last commit | 2026-09-13 | 2026-04-07 | 2026-11-07 | — |
 | Toolchain | v4.34.0-rc2 | v4.27.0-rc1 | v4.35.0 ✓ | v4.35.0 |
 | License | Apache-2.0 | Apache-2.0 | MIT | MIT (LightRT) |
-| `sorry` / `axiom` | 0 / 0 | 0 / 0 | 0 / 0 | 21 (ours, tracked) |
+| `sorry` / `axiom` | 0 / 0 | 0 / 0 | 0 / 0 | 15 (ours, tracked) |
 | Size | 80 files | 9 files | 1451 files, `native_decide` in 6 | 3 files |
 | Executable bit-exact binary32 for cdiff | unclear | partial | yes | yes |
 
