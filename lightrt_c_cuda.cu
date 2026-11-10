@@ -2632,6 +2632,9 @@ static void refit_core(lrt_cuda_engine *e, lrt_cuda_scene *s,
     const uint32_t W = s->layout;
     uint32_t leaf_threads = s->block_count * W;
     uint32_t lg = (leaf_threads + 255u) / 256u;
+    /* A zero-size grid is an invalid launch configuration (as in the HIP
+     * backend, fa1655d): skip empty passes for single-leaf scenes. */
+    if (lg == 0u) return;
     if (W == 4u)
         hipLaunchKernelGGL((k_refit_leaves<4>), dim3(lg), dim3(256), 0,
                            e->stream, s->d_blocks, d_verts, s->block_count,
@@ -2641,6 +2644,7 @@ static void refit_core(lrt_cuda_engine *e, lrt_cuda_scene *s,
                            e->stream, s->d_blocks, d_verts, s->block_count,
                            ntris);
     uint32_t ng = (s->node_count + 255u) / 256u;
+    if (ng == 0u) return;
     uint32_t passes = s->max_depth + 1u;
     for (uint32_t p = 0; p < passes; p++) {
         if (W == 4u)
