@@ -18,3 +18,4 @@ import LightRT.C.Proofs.Refines
 import LightRT.C.Proofs.MTGap
 import LightRT.C.Proofs.WoopRefines
 import LightRT.C.Proofs.WoopWatertight
+import LightRT.C.Proofs.WoopDet
