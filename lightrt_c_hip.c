@@ -14,7 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "hipew.h"
+#include "lightrt_hipew.h"
 #include "hip/trace_bvh_hip.h"
 
 /* On-disk / in-memory LRTS header produced by lrt_tri_scene_save_to_memory().
@@ -114,11 +114,16 @@ lrt_hip_engine *lrt_hip_engine_create(const lrt_hip_engine_options *opts,
         hip_set_err(e, "hiprtcCreateProgram failed");
         goto fail;
     }
+    /* -ffp-contract=off: like the precompiled .hip backend, keep every
+     * multiply-add unfused so the kernel is bit-faithful to the scalar CPU
+     * kernel (and the Woop edge functions stay exactly antisymmetric, which
+     * the watertightness proof needs). hiprtc contracts by default. */
 #ifdef LRT_TRI_SLAB_ROBUST
-    const char *hopts[] = {"-DLRT_TRI_SLAB_ROBUST"};
-    hiprtcResult cres = hiprtcCompileProgram(prog, 1, hopts);
+    const char *hopts[] = {"-ffp-contract=off", "-DLRT_TRI_SLAB_ROBUST"};
+    hiprtcResult cres = hiprtcCompileProgram(prog, 2, hopts);
 #else
-    hiprtcResult cres = hiprtcCompileProgram(prog, 0, NULL);
+    const char *hopts[] = {"-ffp-contract=off"};
+    hiprtcResult cres = hiprtcCompileProgram(prog, 1, hopts);
 #endif
     if (cres != HIPRTC_SUCCESS) {
         size_t log_n = 0;
@@ -263,11 +268,11 @@ int lrt_hip_trace_scene(lrt_hip_engine *e, const lrt_tri_scene *s,
         failed = 1;
         goto cleanup;
     }
-    if (!hip_ok(hipMemcpyHtoD(d_nodes, (const char *)blob + h->node_offset,
+    if (!hip_ok(hipMemcpyHtoD(d_nodes, (char *)blob + h->node_offset,
                               nodes_bytes)) ||
-        !hip_ok(hipMemcpyHtoD(d_blocks, (const char *)blob + h->block_offset,
+        !hip_ok(hipMemcpyHtoD(d_blocks, (char *)blob + h->block_offset,
                               blocks_bytes)) ||
-        !hip_ok(hipMemcpyHtoD(d_rays, rays, rays_bytes)) ||
+        !hip_ok(hipMemcpyHtoD(d_rays, (void *)rays, rays_bytes)) ||
         (nwv && !hip_ok(hipMemcpyHtoD(d_wv, (void *)wv, (size_t)nwv * 36u)))) {
         hip_set_err(e, "host->device copy failed");
         failed = 1;
