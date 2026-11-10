@@ -1266,7 +1266,7 @@ shared edges for every input. Run
 - `-DLRT_TRI_WATERTIGHT_TRI`: watertight Woop main triangle leaf on exact vertices, scalar kernels. Run `make c_tri_seam_test`.
 - `-DLRT_TRI_EXACT_NEAREST`: closest-hit node tests ignore the current best, so the result is exactly the brute-force nearest hit (`Flat.run_exact`). This gives up early-out pruning.
 
-`SLAB_ROBUST` covers scalar, SSE/AVX2, the NEON shim, SVE, the quantized node formats and the GPU kernels (hiprtc, CUDA, Vulkan via specialization constant 2). Run `make c_tri_parallel_test`. If you edit a translated C function, regenerate with
+`SLAB_ROBUST` covers scalar, SSE/AVX2, the NEON shim, SVE, the quantized node formats and the GPU kernels (hiprtc, CUDA, Vulkan via specialization constant 2). Run `make c_tri_parallel_test`. The HIP (hiprtc) and Vulkan kernels also run the watertight leaf when the scene carries exact vertices (`WATERTIGHT_TRI` builds); CUDA does not yet. If you edit a translated C function, regenerate with
 `python3 formal/tools/c2lean.py`. Plan/status: `formal/PLAN.md`.
 
 ## Code Conventions

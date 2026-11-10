@@ -37,6 +37,8 @@ typedef struct hip_lrts_header {
     uint64_t node_offset;
     uint64_t block_offset;
     uint64_t file_size;
+    uint64_t aux_offset; /* v2: watertight exact vertices ride here */
+    uint64_t aux_size;
 } hip_lrts_header;
 
 struct lrt_hip_engine {
@@ -239,12 +241,24 @@ int lrt_hip_trace_scene(lrt_hip_engine *e, const lrt_tri_scene *s,
     size_t rays_bytes = (size_t)n * sizeof(lrt_ray);
     size_t hits_bytes = (size_t)n * sizeof(lrt_hit);
 
-    hipDeviceptr_t d_nodes = NULL, d_blocks = NULL, d_rays = NULL, d_hits = NULL;
+    /* Exact vertices for the watertight leaf (aux {nloops = 0, npts = ntris},
+     * float[9 * ntris]; present only for LRT_TRI_WATERTIGHT_TRI builds). */
+    const float *wv = NULL;
+    uint32_t nwv = 0;
+    if (h->prim_kind == 0u && h->aux_size >= 8u && h->aux_offset + h->aux_size <= blob_n) {
+        const uint32_t *ah = (const uint32_t *)((const char *)blob + h->aux_offset);
+        if (ah[0] == 0u && ah[1] > 0u && 8u + (uint64_t)ah[1] * 36u <= h->aux_size) {
+            wv = (const float *)(ah + 2);
+            nwv = ah[1];
+        }
+    }
+    hipDeviceptr_t d_nodes = NULL, d_blocks = NULL, d_rays = NULL, d_hits = NULL, d_wv = NULL;
     int failed = 0;
     if (!hip_ok(hipMalloc(&d_nodes, nodes_bytes ? nodes_bytes : 1)) ||
         !hip_ok(hipMalloc(&d_blocks, blocks_bytes ? blocks_bytes : 1)) ||
         !hip_ok(hipMalloc(&d_rays, rays_bytes)) ||
-        !hip_ok(hipMalloc(&d_hits, hits_bytes))) {
+        !hip_ok(hipMalloc(&d_hits, hits_bytes)) ||
+        !hip_ok(hipMalloc(&d_wv, nwv ? (size_t)nwv * 36u : 4u))) {
         hip_set_err(e, "hipMalloc failed");
         failed = 1;
         goto cleanup;
@@ -253,7 +267,8 @@ int lrt_hip_trace_scene(lrt_hip_engine *e, const lrt_tri_scene *s,
                               nodes_bytes)) ||
         !hip_ok(hipMemcpyHtoD(d_blocks, (const char *)blob + h->block_offset,
                               blocks_bytes)) ||
-        !hip_ok(hipMemcpyHtoD(d_rays, rays, rays_bytes))) {
+        !hip_ok(hipMemcpyHtoD(d_rays, rays, rays_bytes)) ||
+        (nwv && !hip_ok(hipMemcpyHtoD(d_wv, (void *)wv, (size_t)nwv * 36u)))) {
         hip_set_err(e, "host->device copy failed");
         failed = 1;
         goto cleanup;
@@ -268,7 +283,7 @@ int lrt_hip_trace_scene(lrt_hip_engine *e, const lrt_tri_scene *s,
         uint32_t point_type = h->reserved0;
         void *params[] = {&d_nodes, &d_blocks, &d_rays, &d_hits,
                           &root,    &ray_count, &kw,     &kstack,
-                          &prim_kind, &point_type};
+                          &prim_kind, &point_type, &d_wv, &nwv};
         unsigned int groups = (n + 63u) / 64u;
         if (!hip_ok(hipModuleLaunchKernel(e->kernel, groups, 1, 1, 64, 1, 1, 0,
                                           NULL, params, NULL))) {
@@ -294,6 +309,7 @@ cleanup:
     if (d_blocks) hipFree(d_blocks);
     if (d_rays) hipFree(d_rays);
     if (d_hits) hipFree(d_hits);
+    if (d_wv) hipFree(d_wv);
     free(blob);
     if (failed) {
         if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
