@@ -59,7 +59,9 @@ theorem fl_nonpos {x : ℝ} (h : x ≤ 0) : R.fl x ≤ 0 := by
 
 /-- Helper: the relative bound in absolute-error form. -/
 theorem abs_err {x : ℝ} (hx : R.InRange x) : |R.fl x - x| ≤ R.u * |x| := by
-  sorry
+  obtain ⟨δ, hδ, he⟩ := R.rel x hx
+  rw [he, show x * (1 + δ) - x = δ * x by ring, abs_mul]
+  exact mul_le_mul_of_nonneg_right hδ (abs_nonneg _)
 
 /-- Non-vacuity: exact arithmetic is a rounding model for any `0 < u < 1`, so the
     class's axioms are consistent (a contradictory model would make every

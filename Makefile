@@ -249,7 +249,7 @@ info_cuda:
 # Lean 4 formal verification (formal/): build specs+proofs, check the c2lean
 # translation is up to date, the sorry budget, the axiom allowlist, and run
 # 3-way differential testing (compiled C vs MiniC vs Lean reference).
-FORMAL_SORRY_MAX ?= 31
+FORMAL_SORRY_MAX ?= 21
 formal:
 	cd formal && lake build
 	python3 formal/tools/c2lean.py --check
