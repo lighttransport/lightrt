@@ -343,6 +343,30 @@ theorem run_root {inside : α → B → Prop} {sub : B → B → Prop} (F : Flat
       exact ⟨hw.1, fun p hp t ht _ => htmin p hp t ht⟩) (by simp)
   simpa using this
 
+/-- **Exact-nearest mode** (`-DLRT_TRI_EXACT_NEAREST`): the box test ignores the
+    current best (`test0` against `tmax`) and children are pushed with
+    `tnear = tmin`. Then C2 holds trivially and the loop returns EXACTLY the
+    brute-force nearest hit, needing only containment (`WF`) and conservativity
+    of `test0` for hits below `tmax`. -/
+theorem run_exact {inside : α → B → Prop} {sub : B → B → Prop} (F : Flat B α)
+    (hw : F.WF inside sub) (mono : ∀ p b b', inside p b' → sub b' b → inside p b)
+    (test0 : B → Bool) (isect : α → Option T)
+    (order : List (CRef × T) → List (CRef × T)) (hord : ∀ l, (order l).Perm l)
+    (tmin tmax : T)
+    (hrange : ∀ p t, isect p = some t → tmin ≤ t ∧ t < tmax)
+    (C1 : ∀ p b t, inside p b → isect p = some t → test0 b = true) :
+    run F (fun b _ => if test0 b then some tmin else none) isect order
+        (F.visitsRef F.root + 1) [(F.root, tmin)] tmax =
+      some ((F.denRef F.root).foldl (step isect) tmax) := by
+  refine run_root F hw mono _ isect order hord ?_ ?_ tmin tmax
+    (fun p _ t ht => (hrange p t ht).1)
+  · intro p b t best hin ht _
+    simp [C1 p b t hin ht]
+  · intro p b t best tn htn hin ht _
+    have := C1 p b t hin ht
+    simp only [this, ite_true, Option.some.injEq] at htn
+    exact htn ▸ (hrange p t ht).1
+
 /-! ### Approximate culling: `tnear` may exceed the hit `t` by a slack `g` -/
 
 theorem le_foldl_iff (isect : α → Option T) (x : T) : ∀ (l : List α) (b : T),

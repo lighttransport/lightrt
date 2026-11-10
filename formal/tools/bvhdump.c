@@ -63,7 +63,12 @@ int main(int argc, char **argv) {
 #else
     int robust = 0;
 #endif
-    printf("W %d ROOT %08x NODES %u BLOCKS %u ROBUST %d\n", W, s->root, s->node_count, s->block_count, robust);
+#ifdef LRT_TRI_EXACT_NEAREST
+    int exactn = 1;
+#else
+    int exactn = 0;
+#endif
+    printf("W %d ROOT %08x NODES %u BLOCKS %u ROBUST %d EXACTN %d\n", W, s->root, s->node_count, s->block_count, robust, exactn);
     for (uint32_t i = 0; i < s->node_count; i++) {
         const float *lo[3], *hi[3]; const uint32_t *ch; uint32_t nc;
         if (W == 4) { const lrt_bvh4_node *nd = &s->nodes4[i];

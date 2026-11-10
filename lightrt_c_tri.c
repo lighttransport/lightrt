@@ -133,6 +133,9 @@ static inline int lrt_ctz(unsigned int x) { return __builtin_ctz(x); }
  * LRT_TRI_HAS_SVE. LRT_TRI_NEON_SHIM marks this mode (e.g. for kernel names). */
 #if LRT_TRI_HAS_NEON && !LRT_TRI_HAS_SSE4
 #define LRT_TRI_NEON_SHIM 1
+#if defined(LRT_TRI_SLAB_ROBUST) || defined(LRT_TRI_BITEXACT)
+#define LRT_SSE2NEON_EXACT_MINMAX 1 /* x86 a<b?a:b NaN semantics */
+#endif
 #include "lightrt_sse2neon_min.h"
 #undef LRT_TRI_HAS_SSE4
 #define LRT_TRI_HAS_SSE4 1
@@ -783,6 +786,19 @@ static void tri_aligned_free(void *p) {
 
 static inline float tri_minf(float a, float b) { return a < b ? a : b; }
 static inline float tri_maxf(float a, float b) { return a > b ? a : b; }
+/* LRT_TRI_EXACT_NEAREST: closest-hit node tests never depend on the current
+ * best hit (box test against tmax, children pushed with tnear = tmin), so the
+ * tnear-vs-hit-t comparison that can cull a nearer hit at the ulp level never
+ * happens (formal: Flat.run_root with C2 trivial, i.e. exactly brute force,
+ * given a conservative box test, see LRT_TRI_SLAB_ROBUST / _LEAF_BOX_EXACT).
+ * Costs early-out pruning; plain-triangle closest-hit (scalar/SSE/AVX2). */
+#ifdef LRT_TRI_EXACT_NEAREST
+#define TRI_CULL_T(best, tmax) (tmax)
+#define TRI_PUSH_TN(tn, tmin) (tmin)
+#else
+#define TRI_CULL_T(best, tmax) (best)
+#define TRI_PUSH_TN(tn, tmin) (tn)
+#endif
 /* Per-axis slab entry: min(tl, th); under LRT_TRI_SLAB_ROBUST the operands are
  * swapped so a NaN plane (parallel ray on it) is dropped (see tri_slab_scalar). */
 #ifdef LRT_TRI_SLAB_ROBUST
@@ -4427,6 +4443,9 @@ static inline int tri_mt_one(const float *o, const float *d, const float *v0,
  * `woop_no_gap`, C/Proofs/WoopRefines). The paper's double-precision re-test of
  * exact-zero edge functions is omitted: ties may report a hit on both sides,
  * never on neither. Used by the quad/tetra leaves when LRT_TRI_WATERTIGHT. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((unused))
+#endif
 static inline int tri_woop_one(const float *o, const float *d, const float *v0,
                                const float *v1, const float *v2, float tmin,
                                float tbest, float *t, float *u, float *v) {
@@ -5494,7 +5513,8 @@ static int tri_intersect_scalar(const lrt_tri_scene *s, const lrt_ray *ray,
         for (int i = 0; i < nchildren; i++) {
             float tnear;
             if (tri_slab_scalar(lo_x, lo_y, lo_z, hi_x, hi_y, hi_z, i, &rc,
-                                best_t, &tnear)) {
+                                TRI_CULL_T(best_t, ray->tmax), &tnear)) {
+                tnear = TRI_PUSH_TN(tnear, rc.tmin);
                 /* insertion: keep ascending tnear */
                 int j = nhit++;
                 while (j > 0 && hit_tnear[j - 1] > tnear) {
@@ -6247,7 +6267,8 @@ static int tri_intersect_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray,
 
         const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(e.ref)];
         _Alignas(16) float tnear[4];
-        int mask = tri_bvh4_slab_sse(n, &sc, _mm_set1_ps(best_t), tnear);
+        int mask = tri_bvh4_slab_sse(n, &sc, _mm_set1_ps(TRI_CULL_T(best_t, ray->tmax)), tnear);
+        for (int k = 0; k < 4; k++) tnear[k] = TRI_PUSH_TN(tnear[k], rc.tmin);
         mask &= (1 << n->nchildren) - 1;
 #ifdef LRT_TRI_BITEXACT
         /* tri_intersect_scalar's order: insertion-sort hits by tnear (stable,
@@ -8421,7 +8442,8 @@ static int tri_intersect_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray,
 
         const lrt_bvh8_node *n = &s->nodes8[TRI_REF_NODE(e.ref)];
         _Alignas(32) float tnear[8];
-        int mask = tri_bvh8_slab_avx(n, &ac, _mm256_set1_ps(best_t), tnear);
+        int mask = tri_bvh8_slab_avx(n, &ac, _mm256_set1_ps(TRI_CULL_T(best_t, ray->tmax)), tnear);
+        for (int k = 0; k < 8; k++) tnear[k] = TRI_PUSH_TN(tnear[k], rc.tmin);
         mask &= (1 << n->nchildren) - 1;
         uint32_t hit_ref[8];
         float hit_tn[8];
@@ -8493,6 +8515,34 @@ static int tri_occluded_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray) {
     return 0;
 }
 
+#ifdef LRT_TRI_SLAB_ROBUST
+#define TRI_Q8F(arr) _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(const void *)(arr))))
+/* Robust slab on 8 decoded child boxes (bound = node_org + q*scale, the same
+ * float decode as tri_bvh8q_decode): (bound - org) * sinv, NaN-dropping
+ * operand order (see tri_slab_scalar). Used by every quantized AVX2 node
+ * format under LRT_TRI_SLAB_ROBUST instead of the clamped FMA plane form. */
+static inline int tri_slab8_robust_q(const float org3[3], const float scale3[3],
+                                     __m256 qlx, __m256 qhx, __m256 qly, __m256 qhy,
+                                     __m256 qlz, __m256 qhz, const tri_ray_ctx *rc,
+                                     __m256 tmin8, __m256 t_best, float *tnear_out) {
+#define TRI_DQ(q, a) _mm256_add_ps(_mm256_set1_ps(org3[a]), _mm256_mul_ps(q, _mm256_set1_ps(scale3[a])))
+#define TRI_PL(b, a) _mm256_mul_ps(_mm256_sub_ps(b, _mm256_set1_ps(rc->org[a])), _mm256_set1_ps(rc->sinv[a]))
+    __m256 tlx = TRI_PL(TRI_DQ(qlx, 0), 0), thx = TRI_PL(TRI_DQ(qhx, 0), 0);
+    __m256 tly = TRI_PL(TRI_DQ(qly, 1), 1), thy = TRI_PL(TRI_DQ(qhy, 1), 1);
+    __m256 tlz = TRI_PL(TRI_DQ(qlz, 2), 2), thz = TRI_PL(TRI_DQ(qhz, 2), 2);
+#undef TRI_DQ
+#undef TRI_PL
+    __m256 tnear = _mm256_max_ps(
+        _mm256_max_ps(_mm256_min_ps(thx, tlx), _mm256_min_ps(thy, tly)),
+        _mm256_max_ps(_mm256_min_ps(thz, tlz), tmin8));
+    __m256 tfar = _mm256_min_ps(
+        _mm256_min_ps(_mm256_max_ps(tlx, thx), _mm256_max_ps(tly, thy)),
+        _mm256_min_ps(_mm256_max_ps(tlz, thz), t_best));
+    _mm256_store_ps(tnear_out, tnear);
+    return _mm256_movemask_ps(_mm256_cmp_ps(tnear, tfar, _CMP_LE_OQ));
+}
+#endif
+
 /* Quantized-node slab: decode 8-bit child bounds on the fly. With
  * s = scale*invd and b = (org_node - org_ray)*invd per axis, each plane is
  * t = q * s + b (one cvt + fma per plane). invd is clamped to +/-1e18 at ray
@@ -8500,6 +8550,9 @@ static int tri_occluded_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray) {
 static inline int tri_bvh8q_slab_avx(const lrt_bvh8q_node *n,
                                      const tri_ray_ctx *rc, __m256 tmin8,
                                      __m256 t_best, float *tnear_out) {
+#ifdef LRT_TRI_SLAB_ROBUST
+    return tri_slab8_robust_q(n->org, n->scale, TRI_Q8F(n->qlo_x), TRI_Q8F(n->qhi_x), TRI_Q8F(n->qlo_y), TRI_Q8F(n->qhi_y), TRI_Q8F(n->qlo_z), TRI_Q8F(n->qhi_z), rc, tmin8, t_best, tnear_out);
+#endif
     __m256 sx = _mm256_set1_ps(n->scale[0] * rc->invd[0]);
     __m256 sy = _mm256_set1_ps(n->scale[1] * rc->invd[1]);
     __m256 sz = _mm256_set1_ps(n->scale[2] * rc->invd[2]);
@@ -8666,6 +8719,9 @@ static inline __m256 tri_q4_unpack_avx(const uint8_t packed[4]) {
 static inline int tri_bvh8qf8_slab_avx(const lrt_bvh8q_node *n,
                                        const tri_ray_ctx *rc, __m256 tmin8,
                                        __m256 t_best, float *tnear_out) {
+#ifdef LRT_TRI_SLAB_ROBUST
+    return tri_slab8_robust_q(n->org, n->scale, tri_e4m3_expand_avx(n->qlo_x), tri_e4m3_expand_avx(n->qhi_x), tri_e4m3_expand_avx(n->qlo_y), tri_e4m3_expand_avx(n->qhi_y), tri_e4m3_expand_avx(n->qlo_z), tri_e4m3_expand_avx(n->qhi_z), rc, tmin8, t_best, tnear_out);
+#endif
     __m256 sx = _mm256_set1_ps(n->scale[0] * rc->invd[0]);
     __m256 sy = _mm256_set1_ps(n->scale[1] * rc->invd[1]);
     __m256 sz = _mm256_set1_ps(n->scale[2] * rc->invd[2]);
@@ -8691,6 +8747,9 @@ static inline int tri_bvh8qf8_slab_avx(const lrt_bvh8q_node *n,
 static inline int tri_bvh8q4_slab_avx(const lrt_bvh8q4_node *n,
                                       const tri_ray_ctx *rc, __m256 tmin8,
                                       __m256 t_best, float *tnear_out) {
+#ifdef LRT_TRI_SLAB_ROBUST
+    return tri_slab8_robust_q(n->org, n->scale, tri_q4_unpack_avx(n->qlo[0]), tri_q4_unpack_avx(n->qhi[0]), tri_q4_unpack_avx(n->qlo[1]), tri_q4_unpack_avx(n->qhi[1]), tri_q4_unpack_avx(n->qlo[2]), tri_q4_unpack_avx(n->qhi[2]), rc, tmin8, t_best, tnear_out);
+#endif
     __m256 sx = _mm256_set1_ps(n->scale[0] * rc->invd[0]);
     __m256 sy = _mm256_set1_ps(n->scale[1] * rc->invd[1]);
     __m256 sz = _mm256_set1_ps(n->scale[2] * rc->invd[2]);
@@ -8715,6 +8774,48 @@ static inline int tri_bvh8q4_slab_avx(const lrt_bvh8q4_node *n,
 
 /* Generate intersect/occluded AVX2 kernels for an 8-wide quantized node format
  * (identical traversal; only the node type, scene pointer, and slab differ). */
+/* Leaf of the quantized-node AVX2 kernels: AVX2 Moller-Trumbore, or under
+ * LRT_TRI_WATERTIGHT_TRI the watertight scalar lane test on exact vertices. */
+static inline void tri_qleaf_isect(const lrt_tri_scene *s, const lrt_tri8 *blk,
+                                   const tri_ray_ctx *rc, const tri_avx_ctx *ac,
+                                   float *best_t, float *best_u, float *best_v,
+                                   uint32_t *best_prim) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    if (s->wverts) {
+        const float *f = (const float *)(const void *)blk;
+        for (int lane = 0; lane < 8; lane++) {
+            float t, u, v;
+            if (blk->prim_id[lane] == LRT_TRI_NO_HIT) continue;
+            if (tri_isect_lane_s(s, f, 8, lane, rc, *best_t, &t, &u, &v)) {
+                *best_t = t; *best_u = u; *best_v = v; *best_prim = blk->prim_id[lane];
+            }
+        }
+        return;
+    }
+#endif
+    (void)s; (void)rc;
+    tri_block_isect_avx(blk, ac, best_t, best_u, best_v, best_prim);
+}
+static inline int tri_qleaf_occluded(const lrt_tri_scene *s, const lrt_tri8 *blk,
+                                     const tri_ray_ctx *rc, const tri_avx_ctx *ac,
+                                     __m256 tmax8) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    if (s->wverts) {
+        const float *f = (const float *)(const void *)blk;
+        _Alignas(32) float tm[8];
+        _mm256_store_ps(tm, tmax8);
+        for (int lane = 0; lane < 8; lane++) {
+            float t, u, v;
+            if (blk->prim_id[lane] == LRT_TRI_NO_HIT) continue;
+            if (tri_isect_lane_s(s, f, 8, lane, rc, tm[0], &t, &u, &v)) return 1;
+        }
+        return 0;
+    }
+#endif
+    (void)s; (void)rc;
+    return tri_block_occluded_avx(blk, ac, tmax8);
+}
+
 #define TRI_DEFINE_QNODE_KERNELS(SUF, NODET, NODES, SLAB)                      \
     static int tri_intersect_##SUF##_avx2(const lrt_tri_scene *s,             \
                                           const lrt_ray *ray, lrt_hit *hit) {  \
@@ -8736,8 +8837,8 @@ static inline int tri_bvh8q4_slab_avx(const lrt_bvh8q4_node *n,
                 uint32_t blk0 = TRI_REF_BLOCK(e.ref), nblk = TRI_REF_NBLOCKS(e.ref); \
                 const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;         \
                 for (uint32_t b = 0; b < nblk; b++)                          \
-                    tri_block_isect_avx(&blocks[blk0 + b], &ac, &best_t,      \
-                                        &best_u, &best_v, &best_prim);        \
+                    tri_qleaf_isect(s, &blocks[blk0 + b], &rc, &ac, &best_t,  \
+                                    &best_u, &best_v, &best_prim);            \
                 continue;                                                     \
             }                                                                 \
             const NODET *n = &s->NODES[TRI_REF_NODE(e.ref)];                  \
@@ -8790,7 +8891,7 @@ static inline int tri_bvh8q4_slab_avx(const lrt_bvh8q4_node *n,
                 uint32_t blk0 = TRI_REF_BLOCK(ref), nblk = TRI_REF_NBLOCKS(ref); \
                 const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;         \
                 for (uint32_t b = 0; b < nblk; b++)                          \
-                    if (tri_block_occluded_avx(&blocks[blk0 + b], &ac, tmax8)) \
+                    if (tri_qleaf_occluded(s, &blocks[blk0 + b], &rc, &ac, tmax8)) \
                         return 1;                                            \
                 continue;                                                     \
             }                                                                 \
@@ -9068,26 +9169,57 @@ static inline void tri_node_load(const lrt_tri_scene *s, uint32_t node_ref,
 #if LRT_TRI_HAS_SVE
 
 #define TRI_SVE_P8() svwhilelt_b32((uint32_t)0, (uint32_t)8)
+/* Leaf multiply-adds: fused by default; separate mul + add under
+ * LRT_TRI_BITEXACT (same left-associated order as tri_isect_lane). */
+#ifdef LRT_TRI_BITEXACT
+#define TRI_SVMLA(pg, acc, a, b) svadd_f32_x(pg, acc, svmul_f32_x(pg, a, b))
+#define TRI_SVMLS(pg, acc, a, b) svsub_f32_x(pg, acc, svmul_f32_x(pg, a, b))
+#else
+#define TRI_SVMLA(pg, acc, a, b) svmla_f32_x(pg, acc, a, b)
+#define TRI_SVMLS(pg, acc, a, b) svmls_f32_x(pg, acc, a, b)
+#endif
+/* Slab min/max: native svmin/svmax (NaN-propagating) by default; under
+ * LRT_TRI_SLAB_ROBUST the x86 semantics `a < b ? a : b` (svsel) with the
+ * NaN-dropping operand order of tri_slab_scalar, and sinv for d == 0. */
+#ifdef LRT_TRI_SLAB_ROBUST
+#define TRI_SVMIN(pg, a, b) svsel_f32(svcmplt_f32(pg, a, b), a, b)
+#define TRI_SVMAX(pg, a, b) svsel_f32(svcmpgt_f32(pg, a, b), a, b)
+#define TRI_SVTN(pg, tl, th) TRI_SVMIN(pg, th, tl)
+#define TRI_SINV(rc, k) ((rc)->sinv[k])
+#else
+#define TRI_SVMIN(pg, a, b) svmin_f32_x(pg, a, b)
+#define TRI_SVMAX(pg, a, b) svmax_f32_x(pg, a, b)
+#define TRI_SVTN(pg, tl, th) svmin_f32_x(pg, tl, th)
+#define TRI_SINV(rc, k) ((rc)->invd[k])
+#endif
 
 /* Relative parallel-det cull (8 lanes), mirror of tri_isect_det_parallel8. */
 static inline svbool_t tri_det_parallel_sve(svbool_t pg, svfloat32_t e1x,
                                             svfloat32_t e1y, svfloat32_t e1z,
                                             svfloat32_t e2x, svfloat32_t e2y,
                                             svfloat32_t e2z, svfloat32_t det) {
-    svfloat32_t e1l2 = svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e1x, e1x),
+    svfloat32_t e1l2 = TRI_SVMLA(pg, TRI_SVMLA(pg, svmul_f32_x(pg, e1x, e1x),
                                                     e1y, e1y),
                                    e1z, e1z);
-    svfloat32_t e2l2 = svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e2x, e2x),
+    svfloat32_t e2l2 = TRI_SVMLA(pg, TRI_SVMLA(pg, svmul_f32_x(pg, e2x, e2x),
                                                     e2y, e2y),
                                    e2z, e2z);
     svfloat32_t zero = svdup_f32(0.0f);
     svfloat32_t scale = svadd_f32_x(pg, svsqrt_f32_x(pg, svmax_f32_x(pg, e1l2, zero)),
                                     svsqrt_f32_x(pg, svmax_f32_x(pg, e2l2, zero)));
+#ifdef LRT_TRI_BITEXACT /* scalar order/predicate, as tri_isect_det_parallel */
+    svfloat32_t rel = svmul_f32_x(pg, svmul_f32_x(pg, svdup_f32(TRI_ISECT_DET_EPS_SCALE), scale), scale);
+    rel = svsel_f32(svcmplt_f32(pg, rel, svdup_f32(TRI_ISECT_DET_EPS_MIN)), svdup_f32(TRI_ISECT_DET_EPS_MIN), rel);
+    rel = svsel_f32(svcmpgt_f32(pg, rel, svdup_f32(TRI_ISECT_DET_EPS_MAX)), svdup_f32(TRI_ISECT_DET_EPS_MAX), rel);
+    svbool_t par = svand_b_z(pg, svcmpgt_f32(pg, det, svneg_f32_x(pg, rel)), svcmplt_f32(pg, det, rel));
+    return svnot_b_z(pg, par);
+#else
     svfloat32_t rel = svmul_f32_x(pg, svdup_f32(TRI_ISECT_DET_EPS_SCALE),
                                   svmul_f32_x(pg, scale, scale));
     rel = svmax_f32_x(pg, svdup_f32(TRI_ISECT_DET_EPS_MIN), rel);
     rel = svmin_f32_x(pg, svdup_f32(TRI_ISECT_DET_EPS_MAX), rel);
     return svcmpgt_f32(pg, svabs_f32_x(pg, det), rel);
+#endif
 }
 
 /* 8-wide SoA Moller-Trumbore over one lrt_tri8 block. Updates best in place. */
@@ -9102,10 +9234,10 @@ static inline void tri_block_isect_sve(const lrt_tri8 *blk,
                 e1z = svld1_f32(pg, blk->e1z);
     svfloat32_t e2x = svld1_f32(pg, blk->e2x), e2y = svld1_f32(pg, blk->e2y),
                 e2z = svld1_f32(pg, blk->e2z);
-    svfloat32_t px = svmls_f32_x(pg, svmul_f32_x(pg, diry, e2z), dirz, e2y);
-    svfloat32_t py = svmls_f32_x(pg, svmul_f32_x(pg, dirz, e2x), dirx, e2z);
-    svfloat32_t pz = svmls_f32_x(pg, svmul_f32_x(pg, dirx, e2y), diry, e2x);
-    svfloat32_t det = svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e1x, px),
+    svfloat32_t px = TRI_SVMLS(pg, svmul_f32_x(pg, diry, e2z), dirz, e2y);
+    svfloat32_t py = TRI_SVMLS(pg, svmul_f32_x(pg, dirz, e2x), dirx, e2z);
+    svfloat32_t pz = TRI_SVMLS(pg, svmul_f32_x(pg, dirx, e2y), diry, e2x);
+    svfloat32_t det = TRI_SVMLA(pg, TRI_SVMLA(pg, svmul_f32_x(pg, e1x, px),
                                                   e1y, py),
                                   e1z, pz);
     svbool_t valid = tri_det_parallel_sve(pg, e1x, e1y, e1z, e2x, e2y, e2z, det);
@@ -9116,18 +9248,18 @@ static inline void tri_block_isect_sve(const lrt_tri8 *blk,
     svfloat32_t tvy = svsub_f32_x(pg, svdup_f32(rc->org[1]), svld1_f32(pg, blk->v0y));
     svfloat32_t tvz = svsub_f32_x(pg, svdup_f32(rc->org[2]), svld1_f32(pg, blk->v0z));
     svfloat32_t u = svmul_f32_x(
-        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, tvx, px), tvy, py),
+        pg, TRI_SVMLA(pg, TRI_SVMLA(pg, svmul_f32_x(pg, tvx, px), tvy, py),
                         tvz, pz),
         inv_det);
     valid = svand_b_z(pg, valid, svcmpge_f32(pg, u, svdup_f32(0.0f)));
     valid = svand_b_z(pg, valid, svcmple_f32(pg, u, svdup_f32(1.0f)));
     if (!svptest_any(pg, valid)) return;
 
-    svfloat32_t qx = svmls_f32_x(pg, svmul_f32_x(pg, tvy, e1z), tvz, e1y);
-    svfloat32_t qy = svmls_f32_x(pg, svmul_f32_x(pg, tvz, e1x), tvx, e1z);
-    svfloat32_t qz = svmls_f32_x(pg, svmul_f32_x(pg, tvx, e1y), tvy, e1x);
+    svfloat32_t qx = TRI_SVMLS(pg, svmul_f32_x(pg, tvy, e1z), tvz, e1y);
+    svfloat32_t qy = TRI_SVMLS(pg, svmul_f32_x(pg, tvz, e1x), tvx, e1z);
+    svfloat32_t qz = TRI_SVMLS(pg, svmul_f32_x(pg, tvx, e1y), tvy, e1x);
     svfloat32_t v = svmul_f32_x(
-        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, dirx, qx), diry, qy),
+        pg, TRI_SVMLA(pg, TRI_SVMLA(pg, svmul_f32_x(pg, dirx, qx), diry, qy),
                         dirz, qz),
         inv_det);
     valid = svand_b_z(pg, valid, svcmpge_f32(pg, v, svdup_f32(0.0f)));
@@ -9136,7 +9268,7 @@ static inline void tri_block_isect_sve(const lrt_tri8 *blk,
     if (!svptest_any(pg, valid)) return;
 
     svfloat32_t t = svmul_f32_x(
-        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e2x, qx), e2y, qy),
+        pg, TRI_SVMLA(pg, TRI_SVMLA(pg, svmul_f32_x(pg, e2x, qx), e2y, qy),
                         e2z, qz),
         inv_det);
     valid = svand_b_z(pg, valid, svcmpge_f32(pg, t, svdup_f32(rc->tmin)));
@@ -9168,10 +9300,10 @@ static inline int tri_block_occluded_sve(const lrt_tri8 *blk,
                 e1z = svld1_f32(pg, blk->e1z);
     svfloat32_t e2x = svld1_f32(pg, blk->e2x), e2y = svld1_f32(pg, blk->e2y),
                 e2z = svld1_f32(pg, blk->e2z);
-    svfloat32_t px = svmls_f32_x(pg, svmul_f32_x(pg, diry, e2z), dirz, e2y);
-    svfloat32_t py = svmls_f32_x(pg, svmul_f32_x(pg, dirz, e2x), dirx, e2z);
-    svfloat32_t pz = svmls_f32_x(pg, svmul_f32_x(pg, dirx, e2y), diry, e2x);
-    svfloat32_t det = svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e1x, px),
+    svfloat32_t px = TRI_SVMLS(pg, svmul_f32_x(pg, diry, e2z), dirz, e2y);
+    svfloat32_t py = TRI_SVMLS(pg, svmul_f32_x(pg, dirz, e2x), dirx, e2z);
+    svfloat32_t pz = TRI_SVMLS(pg, svmul_f32_x(pg, dirx, e2y), diry, e2x);
+    svfloat32_t det = TRI_SVMLA(pg, TRI_SVMLA(pg, svmul_f32_x(pg, e1x, px),
                                                   e1y, py),
                                   e1z, pz);
     svbool_t valid = tri_det_parallel_sve(pg, e1x, e1y, e1z, e2x, e2y, e2z, det);
@@ -9181,17 +9313,17 @@ static inline int tri_block_occluded_sve(const lrt_tri8 *blk,
     svfloat32_t tvy = svsub_f32_x(pg, svdup_f32(rc->org[1]), svld1_f32(pg, blk->v0y));
     svfloat32_t tvz = svsub_f32_x(pg, svdup_f32(rc->org[2]), svld1_f32(pg, blk->v0z));
     svfloat32_t u = svmul_f32_x(
-        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, tvx, px), tvy, py),
+        pg, TRI_SVMLA(pg, TRI_SVMLA(pg, svmul_f32_x(pg, tvx, px), tvy, py),
                         tvz, pz),
         inv_det);
     valid = svand_b_z(pg, valid, svcmpge_f32(pg, u, svdup_f32(0.0f)));
     valid = svand_b_z(pg, valid, svcmple_f32(pg, u, svdup_f32(1.0f)));
     if (!svptest_any(pg, valid)) return 0;
-    svfloat32_t qx = svmls_f32_x(pg, svmul_f32_x(pg, tvy, e1z), tvz, e1y);
-    svfloat32_t qy = svmls_f32_x(pg, svmul_f32_x(pg, tvz, e1x), tvx, e1z);
-    svfloat32_t qz = svmls_f32_x(pg, svmul_f32_x(pg, tvx, e1y), tvy, e1x);
+    svfloat32_t qx = TRI_SVMLS(pg, svmul_f32_x(pg, tvy, e1z), tvz, e1y);
+    svfloat32_t qy = TRI_SVMLS(pg, svmul_f32_x(pg, tvz, e1x), tvx, e1z);
+    svfloat32_t qz = TRI_SVMLS(pg, svmul_f32_x(pg, tvx, e1y), tvy, e1x);
     svfloat32_t v = svmul_f32_x(
-        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, dirx, qx), diry, qy),
+        pg, TRI_SVMLA(pg, TRI_SVMLA(pg, svmul_f32_x(pg, dirx, qx), diry, qy),
                         dirz, qz),
         inv_det);
     valid = svand_b_z(pg, valid, svcmpge_f32(pg, v, svdup_f32(0.0f)));
@@ -9199,7 +9331,7 @@ static inline int tri_block_occluded_sve(const lrt_tri8 *blk,
                       svcmple_f32(pg, svadd_f32_x(pg, u, v), svdup_f32(1.0f)));
     if (!svptest_any(pg, valid)) return 0;
     svfloat32_t t = svmul_f32_x(
-        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e2x, qx), e2y, qy),
+        pg, TRI_SVMLA(pg, TRI_SVMLA(pg, svmul_f32_x(pg, e2x, qx), e2y, qy),
                         e2z, qz),
         inv_det);
     valid = svand_b_z(pg, valid, svcmpge_f32(pg, t, svdup_f32(rc->tmin)));
@@ -9214,20 +9346,20 @@ static inline void tri_bvh8_slab_sve(const lrt_bvh8_node *n,
     svbool_t pg = TRI_SVE_P8();
     svfloat32_t orgx = svdup_f32(rc->org[0]), orgy = svdup_f32(rc->org[1]),
                 orgz = svdup_f32(rc->org[2]);
-    svfloat32_t invdx = svdup_f32(rc->invd[0]), invdy = svdup_f32(rc->invd[1]),
-                invdz = svdup_f32(rc->invd[2]);
+    svfloat32_t invdx = svdup_f32(TRI_SINV(rc, 0)), invdy = svdup_f32(TRI_SINV(rc, 1)),
+                invdz = svdup_f32(TRI_SINV(rc, 2));
     svfloat32_t tlx = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->lo_x), orgx), invdx);
     svfloat32_t thx = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->hi_x), orgx), invdx);
     svfloat32_t tly = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->lo_y), orgy), invdy);
     svfloat32_t thy = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->hi_y), orgy), invdy);
     svfloat32_t tlz = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->lo_z), orgz), invdz);
     svfloat32_t thz = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->hi_z), orgz), invdz);
-    svfloat32_t tnear = svmax_f32_x(
-        pg, svmax_f32_x(pg, svmin_f32_x(pg, tlx, thx), svmin_f32_x(pg, tly, thy)),
-        svmax_f32_x(pg, svmin_f32_x(pg, tlz, thz), svdup_f32(rc->tmin)));
-    svfloat32_t tfar = svmin_f32_x(
-        pg, svmin_f32_x(pg, svmax_f32_x(pg, tlx, thx), svmax_f32_x(pg, tly, thy)),
-        svmin_f32_x(pg, svmax_f32_x(pg, tlz, thz), svdup_f32(best_t)));
+    svfloat32_t tnear = TRI_SVMAX(
+        pg, TRI_SVMAX(pg, TRI_SVTN(pg, tlx, thx), TRI_SVTN(pg, tly, thy)),
+        TRI_SVMAX(pg, TRI_SVTN(pg, tlz, thz), svdup_f32(rc->tmin)));
+    svfloat32_t tfar = TRI_SVMIN(
+        pg, TRI_SVMIN(pg, TRI_SVMAX(pg, tlx, thx), TRI_SVMAX(pg, tly, thy)),
+        TRI_SVMIN(pg, TRI_SVMAX(pg, tlz, thz), svdup_f32(best_t)));
     svst1_f32(pg, tnear_out, tnear);
     svst1_f32(pg, tfar_out, tfar);
 }
@@ -9263,8 +9395,12 @@ static int tri_intersect_bvh8_sve(const lrt_tri_scene *s, const lrt_ray *ray,
 
         const lrt_bvh8_node *n = &s->nodes8[TRI_REF_NODE(e.ref)];
         _Alignas(64) float tnear[8], tfar[8];
-        tri_bvh8_slab_sve(n, &rc, best_t, tnear, tfar);
+        tri_bvh8_slab_sve(n, &rc, TRI_CULL_T(best_t, ray->tmax), tnear, tfar);
         int nch = (int)n->nchildren;
+#ifdef LRT_TRI_EXACT_NEAREST
+        for (int k = 0; k < nch; k++)
+            if (tnear[k] <= tfar[k]) tnear[k] = rc.tmin; /* keep hit test, push tmin */
+#endif
         uint32_t hit_ref[8];
         float hit_tn[8];
         int nhit = 0;
@@ -9344,10 +9480,10 @@ static inline void tri_block_isect_sve16(const lrt_tri16 *blk,
                 e1z = svld1_f32(pg, blk->e1z);
     svfloat32_t e2x = svld1_f32(pg, blk->e2x), e2y = svld1_f32(pg, blk->e2y),
                 e2z = svld1_f32(pg, blk->e2z);
-    svfloat32_t px = svmls_f32_x(pg, svmul_f32_x(pg, diry, e2z), dirz, e2y);
-    svfloat32_t py = svmls_f32_x(pg, svmul_f32_x(pg, dirz, e2x), dirx, e2z);
-    svfloat32_t pz = svmls_f32_x(pg, svmul_f32_x(pg, dirx, e2y), diry, e2x);
-    svfloat32_t det = svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e1x, px),
+    svfloat32_t px = TRI_SVMLS(pg, svmul_f32_x(pg, diry, e2z), dirz, e2y);
+    svfloat32_t py = TRI_SVMLS(pg, svmul_f32_x(pg, dirz, e2x), dirx, e2z);
+    svfloat32_t pz = TRI_SVMLS(pg, svmul_f32_x(pg, dirx, e2y), diry, e2x);
+    svfloat32_t det = TRI_SVMLA(pg, TRI_SVMLA(pg, svmul_f32_x(pg, e1x, px),
                                                   e1y, py),
                                   e1z, pz);
     svbool_t valid = tri_det_parallel_sve(pg, e1x, e1y, e1z, e2x, e2y, e2z, det);
@@ -9357,17 +9493,17 @@ static inline void tri_block_isect_sve16(const lrt_tri16 *blk,
     svfloat32_t tvy = svsub_f32_x(pg, svdup_f32(rc->org[1]), svld1_f32(pg, blk->v0y));
     svfloat32_t tvz = svsub_f32_x(pg, svdup_f32(rc->org[2]), svld1_f32(pg, blk->v0z));
     svfloat32_t u = svmul_f32_x(
-        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, tvx, px), tvy, py),
+        pg, TRI_SVMLA(pg, TRI_SVMLA(pg, svmul_f32_x(pg, tvx, px), tvy, py),
                         tvz, pz),
         inv_det);
     valid = svand_b_z(pg, valid, svcmpge_f32(pg, u, svdup_f32(0.0f)));
     valid = svand_b_z(pg, valid, svcmple_f32(pg, u, svdup_f32(1.0f)));
     if (!svptest_any(pg, valid)) return;
-    svfloat32_t qx = svmls_f32_x(pg, svmul_f32_x(pg, tvy, e1z), tvz, e1y);
-    svfloat32_t qy = svmls_f32_x(pg, svmul_f32_x(pg, tvz, e1x), tvx, e1z);
-    svfloat32_t qz = svmls_f32_x(pg, svmul_f32_x(pg, tvx, e1y), tvy, e1x);
+    svfloat32_t qx = TRI_SVMLS(pg, svmul_f32_x(pg, tvy, e1z), tvz, e1y);
+    svfloat32_t qy = TRI_SVMLS(pg, svmul_f32_x(pg, tvz, e1x), tvx, e1z);
+    svfloat32_t qz = TRI_SVMLS(pg, svmul_f32_x(pg, tvx, e1y), tvy, e1x);
     svfloat32_t v = svmul_f32_x(
-        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, dirx, qx), diry, qy),
+        pg, TRI_SVMLA(pg, TRI_SVMLA(pg, svmul_f32_x(pg, dirx, qx), diry, qy),
                         dirz, qz),
         inv_det);
     valid = svand_b_z(pg, valid, svcmpge_f32(pg, v, svdup_f32(0.0f)));
@@ -9375,7 +9511,7 @@ static inline void tri_block_isect_sve16(const lrt_tri16 *blk,
                       svcmple_f32(pg, svadd_f32_x(pg, u, v), svdup_f32(1.0f)));
     if (!svptest_any(pg, valid)) return;
     svfloat32_t t = svmul_f32_x(
-        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e2x, qx), e2y, qy),
+        pg, TRI_SVMLA(pg, TRI_SVMLA(pg, svmul_f32_x(pg, e2x, qx), e2y, qy),
                         e2z, qz),
         inv_det);
     valid = svand_b_z(pg, valid, svcmpge_f32(pg, t, svdup_f32(rc->tmin)));
@@ -9402,10 +9538,10 @@ static inline int tri_block_occluded_sve16(const lrt_tri16 *blk,
                 e1z = svld1_f32(pg, blk->e1z);
     svfloat32_t e2x = svld1_f32(pg, blk->e2x), e2y = svld1_f32(pg, blk->e2y),
                 e2z = svld1_f32(pg, blk->e2z);
-    svfloat32_t px = svmls_f32_x(pg, svmul_f32_x(pg, diry, e2z), dirz, e2y);
-    svfloat32_t py = svmls_f32_x(pg, svmul_f32_x(pg, dirz, e2x), dirx, e2z);
-    svfloat32_t pz = svmls_f32_x(pg, svmul_f32_x(pg, dirx, e2y), diry, e2x);
-    svfloat32_t det = svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e1x, px),
+    svfloat32_t px = TRI_SVMLS(pg, svmul_f32_x(pg, diry, e2z), dirz, e2y);
+    svfloat32_t py = TRI_SVMLS(pg, svmul_f32_x(pg, dirz, e2x), dirx, e2z);
+    svfloat32_t pz = TRI_SVMLS(pg, svmul_f32_x(pg, dirx, e2y), diry, e2x);
+    svfloat32_t det = TRI_SVMLA(pg, TRI_SVMLA(pg, svmul_f32_x(pg, e1x, px),
                                                   e1y, py),
                                   e1z, pz);
     svbool_t valid = tri_det_parallel_sve(pg, e1x, e1y, e1z, e2x, e2y, e2z, det);
@@ -9415,17 +9551,17 @@ static inline int tri_block_occluded_sve16(const lrt_tri16 *blk,
     svfloat32_t tvy = svsub_f32_x(pg, svdup_f32(rc->org[1]), svld1_f32(pg, blk->v0y));
     svfloat32_t tvz = svsub_f32_x(pg, svdup_f32(rc->org[2]), svld1_f32(pg, blk->v0z));
     svfloat32_t u = svmul_f32_x(
-        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, tvx, px), tvy, py),
+        pg, TRI_SVMLA(pg, TRI_SVMLA(pg, svmul_f32_x(pg, tvx, px), tvy, py),
                         tvz, pz),
         inv_det);
     valid = svand_b_z(pg, valid, svcmpge_f32(pg, u, svdup_f32(0.0f)));
     valid = svand_b_z(pg, valid, svcmple_f32(pg, u, svdup_f32(1.0f)));
     if (!svptest_any(pg, valid)) return 0;
-    svfloat32_t qx = svmls_f32_x(pg, svmul_f32_x(pg, tvy, e1z), tvz, e1y);
-    svfloat32_t qy = svmls_f32_x(pg, svmul_f32_x(pg, tvz, e1x), tvx, e1z);
-    svfloat32_t qz = svmls_f32_x(pg, svmul_f32_x(pg, tvx, e1y), tvy, e1x);
+    svfloat32_t qx = TRI_SVMLS(pg, svmul_f32_x(pg, tvy, e1z), tvz, e1y);
+    svfloat32_t qy = TRI_SVMLS(pg, svmul_f32_x(pg, tvz, e1x), tvx, e1z);
+    svfloat32_t qz = TRI_SVMLS(pg, svmul_f32_x(pg, tvx, e1y), tvy, e1x);
     svfloat32_t v = svmul_f32_x(
-        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, dirx, qx), diry, qy),
+        pg, TRI_SVMLA(pg, TRI_SVMLA(pg, svmul_f32_x(pg, dirx, qx), diry, qy),
                         dirz, qz),
         inv_det);
     valid = svand_b_z(pg, valid, svcmpge_f32(pg, v, svdup_f32(0.0f)));
@@ -9433,7 +9569,7 @@ static inline int tri_block_occluded_sve16(const lrt_tri16 *blk,
                       svcmple_f32(pg, svadd_f32_x(pg, u, v), svdup_f32(1.0f)));
     if (!svptest_any(pg, valid)) return 0;
     svfloat32_t t = svmul_f32_x(
-        pg, svmla_f32_x(pg, svmla_f32_x(pg, svmul_f32_x(pg, e2x, qx), e2y, qy),
+        pg, TRI_SVMLA(pg, TRI_SVMLA(pg, svmul_f32_x(pg, e2x, qx), e2y, qy),
                         e2z, qz),
         inv_det);
     valid = svand_b_z(pg, valid, svcmpge_f32(pg, t, svdup_f32(rc->tmin)));
@@ -9448,20 +9584,20 @@ static inline void tri_bvh16_slab_sve(const lrt_bvh16_node *n,
     svbool_t pg = svptrue_b32();
     svfloat32_t orgx = svdup_f32(rc->org[0]), orgy = svdup_f32(rc->org[1]),
                 orgz = svdup_f32(rc->org[2]);
-    svfloat32_t invdx = svdup_f32(rc->invd[0]), invdy = svdup_f32(rc->invd[1]),
-                invdz = svdup_f32(rc->invd[2]);
+    svfloat32_t invdx = svdup_f32(TRI_SINV(rc, 0)), invdy = svdup_f32(TRI_SINV(rc, 1)),
+                invdz = svdup_f32(TRI_SINV(rc, 2));
     svfloat32_t tlx = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->lo_x), orgx), invdx);
     svfloat32_t thx = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->hi_x), orgx), invdx);
     svfloat32_t tly = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->lo_y), orgy), invdy);
     svfloat32_t thy = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->hi_y), orgy), invdy);
     svfloat32_t tlz = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->lo_z), orgz), invdz);
     svfloat32_t thz = svmul_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, n->hi_z), orgz), invdz);
-    svfloat32_t tnear = svmax_f32_x(
-        pg, svmax_f32_x(pg, svmin_f32_x(pg, tlx, thx), svmin_f32_x(pg, tly, thy)),
-        svmax_f32_x(pg, svmin_f32_x(pg, tlz, thz), svdup_f32(rc->tmin)));
-    svfloat32_t tfar = svmin_f32_x(
-        pg, svmin_f32_x(pg, svmax_f32_x(pg, tlx, thx), svmax_f32_x(pg, tly, thy)),
-        svmin_f32_x(pg, svmax_f32_x(pg, tlz, thz), svdup_f32(best_t)));
+    svfloat32_t tnear = TRI_SVMAX(
+        pg, TRI_SVMAX(pg, TRI_SVTN(pg, tlx, thx), TRI_SVTN(pg, tly, thy)),
+        TRI_SVMAX(pg, TRI_SVTN(pg, tlz, thz), svdup_f32(rc->tmin)));
+    svfloat32_t tfar = TRI_SVMIN(
+        pg, TRI_SVMIN(pg, TRI_SVMAX(pg, tlx, thx), TRI_SVMAX(pg, tly, thy)),
+        TRI_SVMIN(pg, TRI_SVMAX(pg, tlz, thz), svdup_f32(best_t)));
     svst1_f32(pg, tnear_out, tnear);
     svst1_f32(pg, tfar_out, tfar);
 }

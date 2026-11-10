@@ -156,6 +156,27 @@ static uint32_t trace_stack_for(uint32_t max_depth, uint32_t w) {
 #define LRT_HIP_LEAF_BIT 0x80000000u
 #define LRT_HIP_NO_HIT 0xFFFFFFFFu
 #define LRT_HIP_INVD_MAX 1e18f
+/* Slab min/max + slab reciprocal. Default: fminf/fmaxf and the clamped invd
+ * (bit-identical to the CPU scalar kernel for non-NaN planes). Under
+ * LRT_TRI_SLAB_ROBUST (mirror of the CPU flag): +inf slab reciprocal for d == 0
+ * and x86 `a < b ? a : b` min/max with the NaN-dropping operand order, so a
+ * ray lying exactly on a slab plane is not rejected (fminf would IGNORE the
+ * NaN and return the other, infinite, bound). */
+#ifdef LRT_TRI_SLAB_ROBUST
+#define HP_MIN(a, b) ((a) < (b) ? (a) : (b))
+#define HP_MAX(a, b) ((a) > (b) ? (a) : (b))
+#define HP_TN(tl, th) HP_MIN(th, tl)
+#define HP_SLAB_SINV(dd, ix, iy, iz) \
+    const float sinvx = (dd)[0] == 0.0f ? __builtin_inff() : (ix); \
+    const float sinvy = (dd)[1] == 0.0f ? __builtin_inff() : (iy); \
+    const float sinvz = (dd)[2] == 0.0f ? __builtin_inff() : (iz)
+#else
+#define HP_MIN(a, b) fminf(a, b)
+#define HP_MAX(a, b) fmaxf(a, b)
+#define HP_TN(tl, th) fminf(tl, th)
+#define HP_SLAB_SINV(dd, ix, iy, iz) \
+    const float sinvx = (ix), sinvy = (iy), sinvz = (iz)
+#endif
 
 __device__ __forceinline__ float fu(uint32_t i) { return __uint_as_float(i); }
 
@@ -193,6 +214,7 @@ __launch_bounds__(64) __global__
         invd[k] = inv;
     }
     const float invdx = invd[0], invdy = invd[1], invdz = invd[2];
+    HP_SLAB_SINV(dd, invdx, invdy, invdz);
 
     float best_t = tmax;
     float best_u = 0.0f, best_v = 0.0f;
@@ -269,17 +291,17 @@ __launch_bounds__(64) __global__
             float hi_x = fu(nodes[nb + 3u * W + i]);
             float hi_y = fu(nodes[nb + 4u * W + i]);
             float hi_z = fu(nodes[nb + 5u * W + i]);
-            float tlx = (lo_x - orgx) * invdx;
-            float thx = (hi_x - orgx) * invdx;
-            float tly = (lo_y - orgy) * invdy;
-            float thy = (hi_y - orgy) * invdy;
-            float tlz = (lo_z - orgz) * invdz;
-            float thz = (hi_z - orgz) * invdz;
-            float tnx = fminf(tlx, thx), tfx = fmaxf(tlx, thx);
-            float tny = fminf(tly, thy), tfy = fmaxf(tly, thy);
-            float tnz = fminf(tlz, thz), tfz = fmaxf(tlz, thz);
-            float tnear = fmaxf(fmaxf(tnx, tny), fmaxf(tnz, tmin));
-            float tfar = fminf(fminf(tfx, tfy), fminf(tfz, best_t));
+            float tlx = (lo_x - orgx) * sinvx;
+            float thx = (hi_x - orgx) * sinvx;
+            float tly = (lo_y - orgy) * sinvy;
+            float thy = (hi_y - orgy) * sinvy;
+            float tlz = (lo_z - orgz) * sinvz;
+            float thz = (hi_z - orgz) * sinvz;
+            float tnx = HP_TN(tlx, thx), tfx = HP_MAX(tlx, thx);
+            float tny = HP_TN(tly, thy), tfy = HP_MAX(tly, thy);
+            float tnz = HP_TN(tlz, thz), tfz = HP_MAX(tlz, thz);
+            float tnear = HP_MAX(HP_MAX(tnx, tny), HP_MAX(tnz, tmin));
+            float tfar = HP_MIN(HP_MIN(tfx, tfy), HP_MIN(tfz, best_t));
             if (tnear <= tfar) {
                 int j = nhit++;
                 while (j > 0 && hit_tn[j - 1] > tnear) {
@@ -348,6 +370,7 @@ __launch_bounds__(64) __global__
         invd[k] = inv;
     }
     const float invdx = invd[0], invdy = invd[1], invdz = invd[2];
+    HP_SLAB_SINV(dd, invdx, invdy, invdz);
 
     uint8_t hit = 0u;
     uint32_t stk_ref[STACK];
@@ -414,16 +437,16 @@ __launch_bounds__(64) __global__
             float hi_x = fu(nodes[nb + 3u * W + i]);
             float hi_y = fu(nodes[nb + 4u * W + i]);
             float hi_z = fu(nodes[nb + 5u * W + i]);
-            float tlx = (lo_x - orgx) * invdx;
-            float thx = (hi_x - orgx) * invdx;
-            float tly = (lo_y - orgy) * invdy;
-            float thy = (hi_y - orgy) * invdy;
-            float tlz = (lo_z - orgz) * invdz;
-            float thz = (hi_z - orgz) * invdz;
-            float tnear = fmaxf(fmaxf(fminf(tlx, thx), fminf(tly, thy)),
-                                fmaxf(fminf(tlz, thz), tmin));
-            float tfar = fminf(fminf(fmaxf(tlx, thx), fmaxf(tly, thy)),
-                               fminf(fmaxf(tlz, thz), tmax));
+            float tlx = (lo_x - orgx) * sinvx;
+            float thx = (hi_x - orgx) * sinvx;
+            float tly = (lo_y - orgy) * sinvy;
+            float thy = (hi_y - orgy) * sinvy;
+            float tlz = (lo_z - orgz) * sinvz;
+            float thz = (hi_z - orgz) * sinvz;
+            float tnear = HP_MAX(HP_MAX(HP_TN(tlx, thx), HP_TN(tly, thy)),
+                                HP_MAX(HP_TN(tlz, thz), tmin));
+            float tfar = HP_MIN(HP_MIN(HP_MAX(tlx, thx), HP_MAX(tly, thy)),
+                               HP_MIN(HP_MAX(tlz, thz), tmax));
             if (tnear <= tfar) {
                 /* Stack would overflow (unreachable for scenes accepted by
                  * trace_stack_for). Degrade conservatively: report occluded so
@@ -1483,6 +1506,7 @@ __launch_bounds__(64) __global__
         invd[k] = inv;
     }
     float invdx = invd[0], invdy = invd[1], invdz = invd[2];
+    HP_SLAB_SINV(dd, invdx, invdy, invdz);
     float best_t = tmax, best_u = 0.0f, best_v = 0.0f;
     uint32_t best_prim = LRT_HIP_NO_HIT;
     uint32_t stk_ref[STACK];
@@ -1513,13 +1537,13 @@ __launch_bounds__(64) __global__
                   lo_z = fu(nodes[nb + 2u * W + i]);
             float hi_x = fu(nodes[nb + 3u * W + i]), hi_y = fu(nodes[nb + 4u * W + i]),
                   hi_z = fu(nodes[nb + 5u * W + i]);
-            float tlx = (lo_x - ox) * invdx, thx = (hi_x - ox) * invdx;
-            float tly = (lo_y - oy) * invdy, thy = (hi_y - oy) * invdy;
-            float tlz = (lo_z - oz) * invdz, thz = (hi_z - oz) * invdz;
-            float tnear = fmaxf(fmaxf(fminf(tlx, thx), fminf(tly, thy)),
-                                fmaxf(fminf(tlz, thz), tmin));
-            float tfar = fminf(fminf(fmaxf(tlx, thx), fmaxf(tly, thy)),
-                               fminf(fmaxf(tlz, thz), best_t));
+            float tlx = (lo_x - ox) * sinvx, thx = (hi_x - ox) * sinvx;
+            float tly = (lo_y - oy) * sinvy, thy = (hi_y - oy) * sinvy;
+            float tlz = (lo_z - oz) * sinvz, thz = (hi_z - oz) * sinvz;
+            float tnear = HP_MAX(HP_MAX(HP_TN(tlx, thx), HP_TN(tly, thy)),
+                                HP_MAX(HP_TN(tlz, thz), tmin));
+            float tfar = HP_MIN(HP_MIN(HP_MAX(tlx, thx), HP_MAX(tly, thy)),
+                               HP_MIN(HP_MAX(tlz, thz), best_t));
             if (tnear <= tfar) {
                 int j = nhit++;
                 while (j > 0 && hit_tn[j - 1] > tnear) {
@@ -1576,6 +1600,7 @@ __launch_bounds__(64) __global__
         invd[k] = inv;
     }
     float invdx = invd[0], invdy = invd[1], invdz = invd[2];
+    HP_SLAB_SINV(dd, invdx, invdy, invdz);
     uint8_t hit = 0u;
     uint32_t stk_ref[STACK];
     int sp = 0;
@@ -1602,13 +1627,13 @@ __launch_bounds__(64) __global__
                   lo_z = fu(nodes[nb + 2u * W + i]);
             float hi_x = fu(nodes[nb + 3u * W + i]), hi_y = fu(nodes[nb + 4u * W + i]),
                   hi_z = fu(nodes[nb + 5u * W + i]);
-            float tlx = (lo_x - ox) * invdx, thx = (hi_x - ox) * invdx;
-            float tly = (lo_y - oy) * invdy, thy = (hi_y - oy) * invdy;
-            float tlz = (lo_z - oz) * invdz, thz = (hi_z - oz) * invdz;
-            float tnear = fmaxf(fmaxf(fminf(tlx, thx), fminf(tly, thy)),
-                                fmaxf(fminf(tlz, thz), tmin));
-            float tfar = fminf(fminf(fmaxf(tlx, thx), fmaxf(tly, thy)),
-                               fminf(fmaxf(tlz, thz), tmax));
+            float tlx = (lo_x - ox) * sinvx, thx = (hi_x - ox) * sinvx;
+            float tly = (lo_y - oy) * sinvy, thy = (hi_y - oy) * sinvy;
+            float tlz = (lo_z - oz) * sinvz, thz = (hi_z - oz) * sinvz;
+            float tnear = HP_MAX(HP_MAX(HP_TN(tlx, thx), HP_TN(tly, thy)),
+                                HP_MAX(HP_TN(tlz, thz), tmin));
+            float tfar = HP_MIN(HP_MIN(HP_MAX(tlx, thx), HP_MAX(tly, thy)),
+                               HP_MIN(HP_MAX(tlz, thz), tmax));
             if (tnear <= tfar) {
                 if ((uint32_t)sp >= STACK) { hit = 1u; break; }
                 stk_ref[sp++] = nodes[nb + 6u * W + i];

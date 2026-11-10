@@ -112,7 +112,12 @@ lrt_hip_engine *lrt_hip_engine_create(const lrt_hip_engine_options *opts,
         hip_set_err(e, "hiprtcCreateProgram failed");
         goto fail;
     }
+#ifdef LRT_TRI_SLAB_ROBUST
+    const char *hopts[] = {"-DLRT_TRI_SLAB_ROBUST"};
+    hiprtcResult cres = hiprtcCompileProgram(prog, 1, hopts);
+#else
     hiprtcResult cres = hiprtcCompileProgram(prog, 0, NULL);
+#endif
     if (cres != HIPRTC_SUCCESS) {
         size_t log_n = 0;
         hiprtcGetProgramLogSize(prog, &log_n);

@@ -165,6 +165,13 @@ c_tri_seam_test: tests/test_lightrt_c_tri_seam.c lightrt_c_tri.c
 	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_WATERTIGHT_TRI -o lightrt_c_tri_seam_test_wt $^ -lm -lpthread
 	./lightrt_c_tri_seam_test && ./lightrt_c_tri_seam_test_wt
 
+# Axis-parallel rays exactly on box faces, all node formats; the _rb build
+# (robust slab + exact leaf boxes + watertight leaf) requires 0 misses.
+c_tri_parallel_test: tests/test_lightrt_c_tri_parallel.c lightrt_c_tri.c
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -o lightrt_c_tri_parallel_test $^ -lm -lpthread
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_SLAB_ROBUST -DLRT_TRI_LEAF_BOX_EXACT -DLRT_TRI_WATERTIGHT_TRI -o lightrt_c_tri_parallel_test_rb $^ -lm -lpthread
+	./lightrt_c_tri_parallel_test && ./lightrt_c_tri_parallel_test_rb
+
 # ---- Vulkan GPU interop (opt-in; runtime dlopen of libvulkan, no SDK, no -lvulkan) ----
 # Build + run the GPU-interop self-test:  make vk_test && ./lightrt_c_vk_test
 VK_SOURCES = lightrt_vkew.c lightrt_c_vk.c lightrt_c_tri.c
@@ -251,7 +258,7 @@ info_cuda:
 	@echo "CUDA_ARCH: $(CUDA_ARCH)"
 	@echo "CUDA_FLAGS: $(CUDA_FLAGS)"
 
-.PHONY: c_tri_seam_test all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip cuda_test info_cuda formal
+.PHONY: c_tri_parallel_test c_tri_seam_test all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip cuda_test info_cuda formal
 
 # Lean 4 formal verification (formal/): build specs+proofs, check the c2lean
 # translation is up to date, the sorry budget, the axiom allowlist, and run
