@@ -5,6 +5,7 @@ import LightRT.Geom.Basic
 import LightRT.Geom.SlabReal
 import LightRT.Geom.MTReal
 import LightRT.Robust.Slab
+import LightRT.Robust.SlabMissReal
 import LightRT.Robust.Woop
 import LightRT.BVH.Tree
 import LightRT.C.Semantics

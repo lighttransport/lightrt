@@ -5,21 +5,12 @@
       lightrt_c_tri.c ──c2lean──▶ Gen (MiniC) ══refines══▶ Ref (bits) ══▶ Robust/Geom (ℝ)
                                          ▲ cdiff: bit-identical with compiled C
 -/
-import LightRT.C.Gen
-import LightRT.C.Ref
+import LightRT.C.Proofs.SlabRefines
 import LightRT.Robust.Slab
 import LightRT.Geom.MTReal
 
 namespace LightRT.C.Proofs
 open LightRT.C LightRT.FP
-
-def f32Block (ws : List Nat) : Block := ws.flatMap (fun w => encodeLE 4 w)
-def vecWords (v : Fin 3 → Ref.F) : List Nat := [(v 0).toNat, (v 1).toNat, (v 2).toNat]
-
-/-- Bytes of a `tri_ray_ctx` (56 B, layout from the c2lean probe). -/
-def ctxBlock (rc : Ref.RayCtx) : Block :=
-  f32Block (vecWords rc.org ++ vecWords rc.dir ++ vecWords rc.invd ++ vecWords rc.oinv ++
-    [rc.tmin.toNat]) ++ encodeLE 4 rc.octant
 
 /-- `tri_ray_setup` writes exactly the reference context into `*rc`, for every
     input (including NaN/∞/subnormal), with no UB, and touches nothing else. -/
@@ -31,21 +22,22 @@ theorem tri_ray_setup_refines (org dir : Fin 3 → Ref.F) (tmin tmax : Ref.F) (m
       m' bRc = some (ctxBlock (Ref.raySetup org dir tmin)) ∧ ∀ b, b ≠ bRc → m' b = m b := by
   sorry
 
-/-- `tri_slab_scalar` returns the reference verdict and stores the reference `tnear`. -/
+/-- `tri_slab_scalar` returns the reference verdict and stores the reference `tnear`
+    (for all sufficiently large fuel; no aliasing hypotheses are needed because every
+    load precedes the single store). Proved in `SlabRefines.lean`. -/
 theorem tri_slab_scalar_refines (rc : Ref.RayCtx) (lo hi : Fin 3 → Ref.F) (tbest : Ref.F)
     (m : Mem) (bRc : Nat) (bs : Fin 6 → Nat) (bOut : Nat)
     (hrc : m bRc = some (ctxBlock rc))
     (hlo : ∀ k : Fin 3, m (bs ⟨k, by omega⟩) = some (f32Block [(lo k).toNat]))
     (hhi : ∀ k : Fin 3, m (bs ⟨k + 3, by omega⟩) = some (f32Block [(hi k).toNat]))
-    (hout : ∃ blk, m bOut = some blk ∧ blk.length = 4)
-    (hdis : bOut ≠ bRc ∧ ∀ k, bs k ≠ bOut) :
-    ∃ m', callFunc Gen.prog 10000 Gen.fid_tri_slab_scalar
+    (hout : ∃ blk, m bOut = some blk ∧ blk.length = 4) :
+    ∃ m', (∃ K, ∀ n, K ≤ n → callFunc Gen.prog n Gen.fid_tri_slab_scalar
         [.ptr (bs 0) 0, .ptr (bs 1) 0, .ptr (bs 2) 0, .ptr (bs 3) 0, .ptr (bs 4) 0, .ptr (bs 5) 0,
          .int ⟨32, true⟩ 0, .ptr bRc 0, .f32 tbest.toNat, .ptr bOut 0] m =
-        .ok (some (.int ⟨32, true⟩ (if (Ref.slab rc lo hi tbest).1 then 1 else 0)), m') ∧
+        .ok (some (.int ⟨32, true⟩ (if (Ref.slab rc lo hi tbest).1 then 1 else 0)), m')) ∧
       m' bOut = some (f32Block [(Ref.slab rc lo hi tbest).2.toNat]) ∧
-      ∀ b, b ≠ bOut → m' b = m b := by
-  sorry
+      ∀ b, b ≠ bOut → m' b = m b :=
+  tri_slab_scalar_refines' rc lo hi tbest m bRc bs bOut hrc hlo hhi hout
 
 /-- `tri_mt_one` returns the reference result (and writes `t,u,v` only on a hit). -/
 theorem tri_mt_one_refines (o d v0 v1 v2 : Fin 3 → Ref.F) (tmin tbest : Ref.F) (m : Mem)
