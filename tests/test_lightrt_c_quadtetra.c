@@ -66,6 +66,26 @@ static void make_ray(lrt_ray *r) {
     r->tmax = 1e9f;
 }
 
+/* Double-precision MT (reference for the seam test). */
+static int mtd(const double *o, const double *d, const double *v0,
+               const double *v1, const double *v2, double *tout) {
+    double e1[3], e2[3], tv[3];
+    for (int k = 0; k < 3; k++) {
+        e1[k] = v1[k] - v0[k]; e2[k] = v2[k] - v0[k]; tv[k] = o[k] - v0[k];
+    }
+    double p[3] = {d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2],
+                   d[0] * e2[1] - d[1] * e2[0]};
+    double det = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2];
+    if (det == 0.0) return 0;
+    double u = (tv[0] * p[0] + tv[1] * p[1] + tv[2] * p[2]) / det;
+    double q[3] = {tv[1] * e1[2] - tv[2] * e1[1], tv[2] * e1[0] - tv[0] * e1[2],
+                   tv[0] * e1[1] - tv[1] * e1[0]};
+    double v = (d[0] * q[0] + d[1] * q[1] + d[2] * q[2]) / det;
+    if (u < 0 || v < 0 || u + v > 1) return 0;
+    *tout = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) / det;
+    return 1;
+}
+
 int main(void) {
     const size_t N = 3000, NR = 30000;
 
@@ -196,6 +216,43 @@ int main(void) {
                   nb);
         }
         free(br); free(h1); free(hN); free(o1); free(oN);
+    }
+
+
+    /* ---- Seam test: rays aimed at each quad's shared diagonal v0-v2. In exact
+     * (double) arithmetic every such ray hits the quad; a float miss is a crack.
+     * Moller-Trumbore leaks some; the Woop test (LRT_TRI_WATERTIGHT) must not. */
+    {
+        size_t leaks = 0, tested = 0;
+        for (size_t i = 0; i < N; i++) {
+            const float *q = &quads[i * 12];
+            float sp = rf(0.2f, 0.8f);
+            lrt_ray r;
+            float d[3] = {rf(-1, 1), rf(-1, 1), rf(-1, 1)};
+            float l = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            if (l < 1e-3f) continue;
+            for (int k = 0; k < 3; k++) {
+                r.dir[k] = d[k] / l;
+                float pt = q[k] + sp * (q[6 + k] - q[k]);
+                r.org[k] = pt - 3.0f * r.dir[k];
+            }
+            r.tmin = 0.0f;
+            r.tmax = 1e9f;
+            double od[3], dd[3], v[4][3];
+            for (int k = 0; k < 3; k++) { od[k] = r.org[k]; dd[k] = r.dir[k]; }
+            for (int j = 0; j < 4; j++)
+                for (int k = 0; k < 3; k++) v[j][k] = q[3 * j + k];
+            double te;
+            if (!mtd(od, dd, v[0], v[1], v[2], &te) && !mtd(od, dd, v[0], v[2], v[3], &te))
+                continue;
+            tested++;
+            lrt_hit h;
+            if (!lrt_tri_intersect1(qs, &r, &h) || h.t > te + 1e-3) leaks++;
+        }
+        printf("quad seam: %zu/%zu diagonal rays leaked\n", leaks, tested);
+#ifdef LRT_TRI_WATERTIGHT
+        CHECK(leaks == 0, "watertight quad seam leaked %zu rays", leaks);
+#endif
     }
 
     free(quads);

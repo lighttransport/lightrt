@@ -37,6 +37,7 @@ FUNCTIONS = [
     "tri_slab_scalar",
     "tri_mt_one",
     "tri_ray_setup",
+    "tri_woop_one",
 ]
 
 # String literals live in one read-only block at this index.

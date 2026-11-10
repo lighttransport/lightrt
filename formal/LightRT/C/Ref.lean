@@ -114,4 +114,71 @@ def mt (o d v0 v1 v2 : Fin 3 → F) (tmin tbest : F) : Option (F × F × F) :=
   if mtRej4 o d v0 v1 v2 tmin tbest then none else
   some (mtT o d v0 v1 v2, mtU o d v0 v1 v2, mtV o d v0 v1 v2)
 
+/-! `tri_woop_one` (watertight, Woop–Benthin–Wald), split as in the C. -/
+
+def fin3succ (k : Fin 3) : Fin 3 := if k = 2 then 0 else k + 1
+
+/-- Dominant axis `kz` of `|d|` (first maximum, with NaN never winning a `>`). -/
+def woopKz (d : Fin 3 → F) : Fin 3 :=
+  let a := fun k => copysign (d k) one
+  let k1 : Fin 3 := if ltBits (a 0) (a 1) then 1 else 0
+  if ltBits (a 0) (a 2) && ltBits (a 1) (a 2) then 2 else k1
+
+/-- `(kx, ky, kz)`, with `kx, ky` swapped when `d[kz] < 0` to keep the winding. -/
+def woopAxes (d : Fin 3 → F) : Fin 3 × Fin 3 × Fin 3 :=
+  let kz := woopKz d
+  let kx := fin3succ kz
+  let ky := fin3succ kx
+  if ltBits (d kz) zero then (ky, kx, kz) else (kx, ky, kz)
+
+abbrev Axes := Fin 3 × Fin 3 × Fin 3
+
+def woopSx (k : Axes) (d : Fin 3 → F) : F := divBits (d k.1) (d k.2.2)
+def woopSy (k : Axes) (d : Fin 3 → F) : F := divBits (d k.2.1) (d k.2.2)
+def woopSz (k : Axes) (d : Fin 3 → F) : F := divBits one (d k.2.2)
+
+/-- Sheared 2D image `(x, y)` and the translated `z` of a vertex, for axes `k`. -/
+def woopVx (k : Axes) (o d v : Fin 3 → F) : F :=
+  subBits (subBits (v k.1) (o k.1)) (mulBits (woopSx k d) (subBits (v k.2.2) (o k.2.2)))
+def woopVy (k : Axes) (o d v : Fin 3 → F) : F :=
+  subBits (subBits (v k.2.1) (o k.2.1)) (mulBits (woopSy k d) (subBits (v k.2.2) (o k.2.2)))
+def woopVz (k : Axes) (o v : Fin 3 → F) : F := subBits (v k.2.2) (o k.2.2)
+
+/-- 2D edge function `p.x q.y - p.y q.x`. -/
+def woopEdge (px py qx qy : F) : F := subBits (mulBits px qy) (mulBits py qx)
+
+def woopU (k : Axes) (o d v0 v1 v2 : Fin 3 → F) : F :=
+  woopEdge (woopVx k o d v2) (woopVy k o d v2) (woopVx k o d v1) (woopVy k o d v1)
+def woopV (k : Axes) (o d v0 v1 v2 : Fin 3 → F) : F :=
+  woopEdge (woopVx k o d v0) (woopVy k o d v0) (woopVx k o d v2) (woopVy k o d v2)
+def woopW (k : Axes) (o d v0 v1 v2 : Fin 3 → F) : F :=
+  woopEdge (woopVx k o d v1) (woopVy k o d v1) (woopVx k o d v0) (woopVy k o d v0)
+
+def woopRej1 (k : Axes) (o d v0 v1 v2 : Fin 3 → F) : Bool :=
+  (ltBits (woopU k o d v0 v1 v2) zero || ltBits (woopV k o d v0 v1 v2) zero ||
+      ltBits (woopW k o d v0 v1 v2) zero) &&
+    (ltBits zero (woopU k o d v0 v1 v2) || ltBits zero (woopV k o d v0 v1 v2) ||
+      ltBits zero (woopW k o d v0 v1 v2))
+def woopDet (k : Axes) (o d v0 v1 v2 : Fin 3 → F) : F :=
+  addBits (addBits (woopU k o d v0 v1 v2) (woopV k o d v0 v1 v2)) (woopW k o d v0 v1 v2)
+def woopRej2 (k : Axes) (o d v0 v1 v2 : Fin 3 → F) : Bool := eqF (woopDet k o d v0 v1 v2) zero
+def woopT (k : Axes) (o d v0 v1 v2 : Fin 3 → F) : F :=
+  divBits (addBits (addBits (mulBits (woopU k o d v0 v1 v2) (mulBits (woopSz k d) (woopVz k o v0)))
+      (mulBits (woopV k o d v0 v1 v2) (mulBits (woopSz k d) (woopVz k o v1))))
+      (mulBits (woopW k o d v0 v1 v2) (mulBits (woopSz k d) (woopVz k o v2)))) (woopDet k o d v0 v1 v2)
+def woopRej3 (k : Axes) (o d v0 v1 v2 : Fin 3 → F) (tmin tbest : F) : Bool :=
+  !(leBits tmin (woopT k o d v0 v1 v2) && ltBits (woopT k o d v0 v1 v2) tbest)
+
+/-- The body of `tri_woop_one` after the axis selection, for axes `k`. -/
+def woopK (k : Axes) (o d v0 v1 v2 : Fin 3 → F) (tmin tbest : F) : Option (F × F × F) :=
+  if woopRej1 k o d v0 v1 v2 then none else
+  if woopRej2 k o d v0 v1 v2 then none else
+  if woopRej3 k o d v0 v1 v2 tmin tbest then none else
+  some (woopT k o d v0 v1 v2, divBits (woopV k o d v0 v1 v2) (woopDet k o d v0 v1 v2),
+    divBits (woopW k o d v0 v1 v2) (woopDet k o d v0 v1 v2))
+
+/-- `tri_woop_one`: `some (t, u, v)` on a hit (`u`, `v` weight `v1`, `v2` as in `tri_mt_one`). -/
+def woop (o d v0 v1 v2 : Fin 3 → F) (tmin tbest : F) : Option (F × F × F) :=
+  woopK (woopAxes d) o d v0 v1 v2 tmin tbest
+
 end LightRT.C.Ref
