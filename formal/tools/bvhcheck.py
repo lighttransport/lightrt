@@ -21,7 +21,9 @@ def main():
     a = ap.parse_args()
     tmp = tempfile.mkdtemp()
     exe = {}
-    for name, flags in (("plain", []), ("exact", ["-DLRT_TRI_LEAF_BOX_EXACT"])):
+    variants = (("plain", []), ("exact", ["-DLRT_TRI_LEAF_BOX_EXACT"]),
+                ("robust", ["-DLRT_TRI_LEAF_BOX_EXACT", "-DLRT_TRI_SLAB_ROBUST", "-DLRT_TRI_BITEXACT"]))
+    for name, flags in variants:
         exe[name] = os.path.join(tmp, "bvhdump_" + name)
         subprocess.check_call(["cc", "-O1", "-ffp-contract=off", "-msse4.1", "-mavx2", "-mfma",
                                "-w", "-I" + ROOT, *flags, "-o", exe[name],
@@ -30,11 +32,15 @@ def main():
     chk = os.path.join(FORMAL, ".lake", "build", "bin", "checkbvh")
     # (ntris, quality, layout, scene): LBVH/SAH x BVH4/BVH8 x soup/heightfield
     cfgs = [(400, 0, 4, 0), (500, 1, 4, 0), (1000, 1, 4, 1), (800, 0, 8, 1), (800, 1, 8, 0)]
+    hq = [(600, 2, 4, 1), (600, 2, 4, 0)]  # SBVH: clipped boxes, coverage (run_cover) not WF
     bad = 0
-    tot = {"rays": 0, "brute": 0, "miss": 0, "wf_plain_fail": 0, "trees": 0}
+    tot = {"rays": 0, "brute": 0, "miss": 0, "wf_plain_fail": 0, "trees": 0,
+           "rob_miss": 0, "rob_brute": 0, "rob_simd": 0, "hq": 0}
     for seed in range(1, a.seeds + 1):
-        for (n, q, w, g) in cfgs:
-            for name in ("plain", "exact"):
+        for (n, q, w, g) in cfgs + hq:
+            for name in ("plain", "exact", "robust"):
+                if (n, q, w, g) in hq and name != "plain":
+                    continue
                 dump = subprocess.run([exe[name], str(seed), str(n), str(a.rays), str(q), str(w), str(g)],
                                       check=True, capture_output=True).stdout
                 out = subprocess.run([chk], input=dump, check=True, capture_output=True).stdout.decode()
@@ -47,6 +53,17 @@ def main():
                 if same != rays:
                     print(f"FAIL seed={seed} cfg={(n,q,w,g)} {name}: Lean mirror != C on {rays-same} rays")
                     bad += 1
+                full = int(re.search(r"\(t,prim\)==C-dispatched=(\d+)", out).group(1))
+                if (n, q, w, g) in hq:
+                    tot["hq"] += 1
+                    continue
+                if name == "robust":
+                    tot["rob_miss"] += miss; tot["rob_brute"] += rays - brute
+                    if full != rays:
+                        print(f"FAIL seed={seed} cfg={(n,q,w,g)}: SIMD != scalar on {rays-full} rays under LRT_TRI_BITEXACT")
+                        bad += 1
+                    if not wf:
+                        print(f"FAIL seed={seed} cfg={(n,q,w,g)}: checkWF false (robust)"); bad += 1
                 if name == "exact":
                     tot["trees"] += 1; tot["rays"] += rays
                     tot["brute"] += rays - brute; tot["miss"] += miss
@@ -57,7 +74,9 @@ def main():
                     tot["wf_plain_fail"] += 1
     print(f"{tot['trees']} C-built BVHs x {a.rays} rays: Lean traversal == C scalar on all; "
           f"checkWF true on all with LRT_TRI_LEAF_BOX_EXACT (false on {tot['wf_plain_fail']} without); "
-          f"{tot['brute']} rays differ from brute force ({tot['miss']} hit/miss, rest <= few-ulp t)")
+          f"{tot['brute']} rays differ from brute force ({tot['miss']} hit/miss, rest <= few-ulp t); "
+          f"robust+bitexact: SIMD == scalar (t,prim) on all, {tot['rob_brute']} differ from brute ({tot['rob_miss']} hit/miss); "
+          f"{tot['hq']} SBVH trees: Lean traversal == C scalar")
     sys.exit(1 if bad else 0)
 
 if __name__ == "__main__":

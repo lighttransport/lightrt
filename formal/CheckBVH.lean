@@ -37,26 +37,26 @@ def insRev : List (CRef × Ref.F) → CRef × Ref.F → List (CRef × Ref.F)
   | e :: rest, x => if ltBits x.2 e.2 then e :: insRev rest x else x :: e :: rest
 
 /-- Lean mirror of `tri_intersect_scalar` (prim-id tracking, bit-level). -/
-def runC (G : Flat Box6 ℕ) (ids : ℕ → UInt32) (tab : ℕ → Option UInt32) (rc : Ref.RayCtx) :
+def runC (robust : Bool) (G : Flat Box6 ℕ) (ids : ℕ → UInt32) (tab : ℕ → Option UInt32) (rc : Ref.RayCtx) :
     ℕ → List (CRef × Ref.F) → Ref.F → UInt32 → Ref.F × UInt32
   | 0, _, best, prim => (best, prim)
   | _ + 1, [], best, prim => (best, prim)
   | f + 1, (r, tn) :: st, best, prim =>
-    if leBits best tn then runC G ids tab rc f st best prim else
+    if leBits best tn then runC robust G ids tab rc f st best prim else
     match r with
     | .leaf blk n =>
       let (b', p') := (G.leafPrims blk n).foldl (fun (b, p) s =>
         match tab s with
         | some t => if !(leBits b t) then (t, ids s) else (b, p)
         | none => (b, p)) (best, prim)
-      runC G ids tab rc f st b' p'
+      runC robust G ids tab rc f st b' p'
     | .node i =>
       let hits := (G.children i).foldl (fun acc c =>
         let lo : Fin 3 → Ref.F := fun k => c.1[k.val]!
         let hi : Fin 3 → Ref.F := fun k => c.1[k.val + 3]!
-        let (ok, tnear) := Ref.slab rc lo hi best
+        let (ok, tnear) := if robust then Ref.slabRobust rc lo hi best else Ref.slab rc lo hi best
         if ok then insRev acc (c.2, tnear) else acc) []
-      runC G ids tab rc f (hits.reverse ++ st) best prim
+      runC robust G ids tab rc f (hits.reverse ++ st) best prim
 
 def main : IO Unit := do
   let stdin ← IO.getStdin
@@ -70,6 +70,7 @@ def main : IO Unit := do
   let root := decRef (hexU hdr[3]!)
   let nN := hdr[5]!.toNat!
   let nB := hdr[7]!.toNat!
+  let robust := hdr.getD 9 "0" == "1"
   let nodes : List (List (Box6 × CRef)) := (List.range nN).map fun i =>
     let ws := (lines[1 + i]!.drop 2).map hexU
     (chunks 7 ws.length ws).map fun c => ((c.take 6).toArray, decRef (c.getD 6 0))
@@ -112,6 +113,7 @@ def main : IO Unit := do
   let mut maxUlpB := 0
   let mut missB := 0
   let mut maxUlpS := 0
+  let mut fullS := 0
   let mut i := 1 + nN + nB
   let fuel := G.visitsRef root + 1
   while i + 1 < lines.size do
@@ -126,7 +128,7 @@ def main : IO Unit := do
       | some "-" => none
       | some x => some (hexU x)
       | none => none
-    let (bt, bp) := runC G ids tab rc fuel [(root, rc.tmin)] w[7]! 0xffffffff
+    let (bt, bp) := runC robust G ids tab rc fuel [(root, rc.tmin)] w[7]! 0xffffffff
     let res : Nat × UInt32 × UInt32 := if bp == 0xffffffff then (0, 0, bp) else (1, bt, bp)
     let cS : Nat × UInt32 × UInt32 := (R[8]!.toNat!, hexU R[9]!, hexU R[10]!)
     let cV : Nat × UInt32 × UInt32 := (R[11]!.toNat!, hexU R[12]!, hexU R[13]!)
@@ -139,6 +141,7 @@ def main : IO Unit := do
     if res == cS then agreeC := agreeC + 1
     else IO.eprintln s!"ray {rays}: lean {res} C {cS}"
     if res.2.1 == cV.2.1 && res.1 == cV.1 then agreeS := agreeS + 1
+    if res == cV then fullS := fullS + 1
     if (res.1, res.2.1) == resB then agreeBrute := agreeBrute + 1
     else
       let tq := fun (x : UInt32) => ((q x).getD 0).toFloat
@@ -149,4 +152,4 @@ def main : IO Unit := do
     if res.1 != resB.1 then missB := missB + 1
     if res.1 == 1 && cV.1 == 1 then maxUlpS := max maxUlpS (ulpd res.2.1 cV.2.1)
   IO.println s!"W={W} nodes={nN} blocks={nB} reachable={reach.length} checkWF={wf} (bad leaf={badLeaf} sub={badSub} idx={badIdx})"
-  IO.println s!"rays={rays} hits={hits} lean==C-scalar(t,prim)={agreeC} t==C-dispatched={agreeS} t==brute={agreeBrute} hit/miss-vs-brute={missB} max-ulp(t-brute)={maxUlpB} max-ulp(scalar-dispatched)={maxUlpS}"
+  IO.println s!"rays={rays} hits={hits} lean==C-scalar(t,prim)={agreeC} t==C-dispatched={agreeS} (t,prim)==C-dispatched={fullS} t==brute={agreeBrute} hit/miss-vs-brute={missB} max-ulp(t-brute)={maxUlpB} max-ulp(scalar-dispatched)={maxUlpS}"

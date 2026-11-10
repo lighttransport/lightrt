@@ -1260,7 +1260,10 @@ watertight triangle test `tri_woop_one` (Woop–Benthin–Wald; CPU quad/tetra l
 `-DLRT_TRI_WATERTIGHT`) is proved to refine `Ref.woop` and to be watertight on
 shared edges for every input. Run
 `make formal` (build + `c2lean --check` + sorry budget + axiom allowlist +
-3-way cdiff + `tools/bvhcheck.py`, which validates real C-built BVH4/BVH8 trees against the Lean flat-BVH traversal theorem in `LightRT/BVH/Flat.lean`). `-DLRT_TRI_LEAF_BOX_EXACT` (opt-in) makes node boxes contain the stored, rounded leaf triangles exactly; it is needed for the checker's `checkWF` to pass. If you edit a translated C function, regenerate with
+3-way cdiff + `tools/bvhcheck.py`, which validates real C-built BVH4/BVH8 trees against the Lean flat-BVH traversal theorem in `LightRT/BVH/Flat.lean`). `-DLRT_TRI_LEAF_BOX_EXACT` (opt-in) makes node boxes contain the stored, rounded leaf triangles exactly; it is needed for the checker's `checkWF` to pass. Further opt-in robustness flags, all validated by `bvhcheck.py` and described in PLAN.md M7:
+- `-DLRT_TRI_SLAB_ROBUST`: no false miss for a ray lying exactly on a slab plane. Scalar and SSE/AVX2 only.
+- `-DLRT_TRI_BITEXACT`: the SIMD leaf and det test use scalar evaluation order. With `SLAB_ROBUST`, SIMD traversal is bit-identical to scalar.
+- `-DLRT_TRI_WATERTIGHT_TRI`: watertight Woop main triangle leaf on exact vertices, scalar kernels. Run `make c_tri_seam_test`. If you edit a translated C function, regenerate with
 `python3 formal/tools/c2lean.py`. Plan/status: `formal/PLAN.md`.
 
 ## Code Conventions
