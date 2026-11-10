@@ -1,6 +1,6 @@
 # LightRT formal verification plan (Lean 4 + Mathlib)
 
-Status as of 2026-11-10. Everything below builds with `make formal`. The codebase has **31 `sorry`s** (`tools/count_sorry.sh`). **70 theorems are closed** with axioms limited to {`propext`, `Classical.choice`, `Quot.sound`}. That count includes 52 MiniC logic lemmas ported from tinygltf; 18 are new to this project. No closed theorem uses `native_decide`.
+Status as of 2026-11-10. Everything below builds with `make formal`. The codebase has **21 `sorry`s** (`tools/count_sorry.sh`). **84 theorems are closed** with axioms limited to {`propext`, `Classical.choice`, `Quot.sound`}. That count includes 52 MiniC logic lemmas ported from tinygltf; 32 are new to this project, including the full M1 Ize slab bound (`slab_no_false_miss`, `slab_t_err`, `slab_t_err_fma`, `ize_constant_sufficient`/`_gamma3_insufficient`). No closed theorem uses `native_decide`.
 
 ## 1. Repo layout
 
@@ -34,7 +34,7 @@ Each library was cloned and read on 2026-11-10. The `sorry` counts are real toke
 | Last commit | 2026-09-13 | 2026-04-07 | 2026-11-07 | — |
 | Toolchain | v4.34.0-rc2 | v4.27.0-rc1 | v4.35.0 ✓ | v4.35.0 |
 | License | Apache-2.0 | Apache-2.0 | MIT | MIT (LightRT) |
-| `sorry` / `axiom` | 0 / 0 | 0 / 0 | 0 / 0 | 31 (ours, tracked) |
+| `sorry` / `axiom` | 0 / 0 | 0 / 0 | 0 / 0 | 21 (ours, tracked) |
 | Size | 80 files | 9 files | 1451 files, `native_decide` in 6 | 3 files |
 | Executable bit-exact binary32 for cdiff | unclear | partial | yes | yes |
 
@@ -139,7 +139,7 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
 
 - **M0 (done):** Project, pinned toolchain, Stage 1–6 statements, c2lean port, three-way cdiff, CI gates.
   - c2lean was ported with f32 support, `copysignf`, scalar replacement of constant-indexed local arrays, and fixes for loop-variable ordering and enums.
-- **M1:** Woop edge antisymmetry (✅ done: `woop_edge_antisymm`, `woop_no_gap`), plus Ize's slab bound (`slab_t_err` → `slab_no_false_miss`, together with `gamma`/`prod_one_add_le`).
+- **M1:** Woop edge antisymmetry (✅ done: `woop_edge_antisymm`, `woop_no_gap`), plus Ize's slab bound (✅ done: `slab_t_err`, `slab_t_err_fma`, `slab_no_false_miss` under `6u<1`, `InflationOK`; spec fix: `slab_axis_iff`/`slabReal_iff` needed `lo ≤ hi`).
 - **M2:** binary32 model obligations (`rneR_*`) and `slab_ref_eq_fpSlab`.
 - **M3:** `tri_ray_setup_refines` and `tri_slab_scalar_refines`. Together with the kernel-checked witness these yield `tri_slab_scalar_false_miss_exists`. Then patch the C: inflate `tfar` by `0x3f800005` (1+10u) behind a flag, and re-verify.
 - **M4:** Woop vertex fan, optional C port, and `tri_mt_one_refines`. Möller–Trumbore *non*-watertightness would be shown with a cdiff witness.
