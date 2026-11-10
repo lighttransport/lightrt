@@ -469,6 +469,49 @@ theorem mul_num_refines (a b : Bool) (x y : ℚ)
     · rw [abs_of_nonpos (hs.1 hn)]; push_cast; ring
     · rw [abs_of_nonneg (hs.2 (not_lt.1 hn))]
 
+theorem roundQ_toQ (p : ℚ) (z : Bool) (hfin : ∃ n r, roundQ p z = .num n r) :
+    (((roundQ p z).toQ?.getD 0 : ℚ) : ℝ) = rneR (p : ℝ) := by
+  rw [rne_cast]
+  obtain ⟨n, r, hr⟩ := hfin
+  revert hr
+  simp only [roundQ]
+  split_ifs with h0 h1
+  · intro _; simp [V.toQ?, h0, rne]
+  · intro hr; cases hr
+  · intro _
+    simp only [V.toQ?, Option.getD_some]
+    have hs := rne_sign_q p
+    split_ifs with hn
+    · rw [abs_of_nonpos (hs.1 hn)]; push_cast; ring
+    · rw [abs_of_nonneg (hs.2 (not_lt.1 hn))]
+
+/-- Bridge: on finite results, `V.add` of two finite values is `rneR` of the exact sum. -/
+theorem add_num_refines (a b : Bool) (x y : ℚ)
+    (hfin : ∃ n r, (V.num a x).add (V.num b y) = .num n r) :
+    (((V.num a x).add (V.num b y)).toQ?.getD 0 : ℝ) =
+      rneR (((V.num a x).toQ?.getD 0 : ℝ) + ((V.num b y).toQ?.getD 0 : ℝ)) := by
+  simp only [V.add] at hfin ⊢
+  rw [roundQ_toQ _ _ hfin]; push_cast; rfl
+
+/-- Bridge: `V.sub` (= add of the negation, as in IEEE) is `rneR` of the exact difference. -/
+theorem sub_num_refines (a b : Bool) (x y : ℚ)
+    (hfin : ∃ n r, (V.num a x).sub (V.num b y) = .num n r) :
+    (((V.num a x).sub (V.num b y)).toQ?.getD 0 : ℝ) =
+      rneR (((V.num a x).toQ?.getD 0 : ℝ) - ((V.num b y).toQ?.getD 0 : ℝ)) := by
+  simp only [V.sub, V.negate] at hfin ⊢
+  rw [add_num_refines a (!b) x y hfin, sub_eq_add_neg]
+  congr 2; cases b <;> simp [V.toQ?]
+
+/-- Bridge: `V.div` by a nonzero finite value is `rneR` of the exact quotient. -/
+theorem div_num_refines (a b : Bool) (x y : ℚ) (hy : y ≠ 0)
+    (hfin : ∃ n r, (V.num a x).div (V.num b y) = .num n r) :
+    (((V.num a x).div (V.num b y)).toQ?.getD 0 : ℝ) =
+      rneR (((V.num a x).toQ?.getD 0 : ℝ) / ((V.num b y).toQ?.getD 0 : ℝ)) := by
+  simp only [V.div, hy, if_false] at hfin ⊢
+  rw [roundQ_toQ _ _ hfin]
+  congr 1
+  cases a <;> cases b <;> simp [V.toQ?] <;> push_cast <;> ring
+
 noncomputable def model : RoundingModel where
   fl := rneR
   u := (2 : ℝ) ^ (-24 : ℤ)

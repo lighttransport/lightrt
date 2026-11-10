@@ -1,6 +1,6 @@
 # LightRT formal verification plan (Lean 4 + Mathlib)
 
-Status as of 2026-11-10. Everything below builds with `make formal`. The codebase has **15 `sorry`s** (`tools/count_sorry.sh`). **116 theorems are closed** with axioms limited to {`propext`, `Classical.choice`, `Quot.sound`}. That count includes 52 MiniC logic lemmas ported from tinygltf; 64 are new to this project, including the full M1 Ize slab bound (`slab_no_false_miss`, `slab_t_err`, `slab_t_err_fma`, `ize_constant_sufficient`/`_gamma3_insufficient`). The binary32 instance `Binary32.model` is now sorry-free (`rneR_rel`, `rneR_mono`, `rneR_neg`, `rneR_idem`, `rne_cast`, `mul_num_refines`), so `slab_no_false_miss` holds for real binary32 RNE. No closed theorem uses `native_decide`.
+Status as of 2026-11-10. Everything below builds with `make formal`. The codebase has **12 `sorry`s** (`tools/count_sorry.sh`). **169 theorems are closed** with axioms limited to {`propext`, `Classical.choice`, `Quot.sound`}. That count includes 52 MiniC logic lemmas ported from tinygltf; 117 are new to this project, including the full M1 Ize slab bound (`slab_no_false_miss`, `slab_t_err`, `slab_t_err_fma`, `ize_constant_sufficient`/`_gamma3_insufficient`). The binary32 instance `Binary32.model` is now sorry-free (`rneR_rel`, `rneR_mono`, `rneR_neg`, `rneR_idem`, `rne_cast`, `mul_num_refines`), so `slab_no_false_miss` holds for real binary32 RNE. No closed theorem uses `native_decide`.
 
 ## 1. Repo layout
 
@@ -141,6 +141,6 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   - c2lean was ported with f32 support, `copysignf`, scalar replacement of constant-indexed local arrays, and fixes for loop-variable ordering and enums.
 - **M1:** Woop edge antisymmetry (✅ done: `woop_edge_antisymm`, `woop_no_gap`), plus Ize's slab bound (✅ done: `slab_t_err`, `slab_t_err_fma`, `slab_no_false_miss` under `6u<1`, `InflationOK`; spec fix: `slab_axis_iff`/`slabReal_iff` needed `lo ≤ hi`).
 - **M2:** binary32 model obligations (`rneR_*`) and `slab_ref_eq_fpSlab`.
-- **M3:** `tri_ray_setup_refines` and `tri_slab_scalar_refines`. Together with the kernel-checked witness these yield `tri_slab_scalar_false_miss_exists`. Then patch the C: inflate `tfar` by `0x3f800005` (1+10u) behind a flag, and re-verify.
+- **M3:** ✅ `tri_slab_scalar_refines`, `tri_mt_one_refines` (all inputs, eventual-fuel form), `tri_slab_scalar_false_miss_exists` (over ℝ, `Binary32.model`), add/sub/mul/div value bridges, and the opt-in C patch `LRT_TRI_SLAB_INFLATE` (`tfar *= 0x3f800005`). Open: `tri_ray_setup_refines` (loop + struct stores) and `slab_ref_eq_fpSlab` (needs the encode/decode round-trip on representable values).
 - **M4:** Woop vertex fan, optional C port, and `tri_mt_one_refines`. Möller–Trumbore *non*-watertightness would be shown with a cdiff witness.
 - **M5:** BVH `traverse_eq_brute` / `traverseOrdered_eq_brute`, instantiated with the Stage 3 box test.

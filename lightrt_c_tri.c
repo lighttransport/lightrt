@@ -4310,6 +4310,15 @@ static inline int tri_slab_scalar(const float *lo_x, const float *lo_y,
     float tnz = tri_minf(tlz, thz), tfz = tri_maxf(tlz, thz);
     float tnear = tri_maxf(tri_maxf(tnx, tny), tri_maxf(tnz, rc->tmin));
     float tfar = tri_minf(tri_minf(tfx, tfy), tri_minf(tfz, t_best));
+#ifdef LRT_TRI_SLAB_INFLATE
+    /* Ize-style conservative far bound: tfar *= (1 + 10u) (binary32 0x3f800005).
+     * formal/LightRT/Robust/Slab.lean proves that a factor K with
+     * 1 + g3 <= (1 - g3)(1 - u) K (e.g. 1 + 2 g4 <= 1 + 10u) rules out false
+     * misses of this scalar test; without it, false misses exist
+     * (Robust/SlabMissReal.lean, C/Proofs/SlabMiss.lean). Opt-in: it changes
+     * hit sets at the ulp level and is not mirrored in the SIMD/GPU kernels. */
+    tfar *= 0x1.00000ap+0f;
+#endif
     *tnear_out = tnear;
     return tnear <= tfar;
 }
