@@ -6,6 +6,7 @@
                                          ▲ cdiff: bit-identical with compiled C
 -/
 import LightRT.C.Proofs.MTRefines
+import LightRT.C.Proofs.RaySetupRefines
 import LightRT.C.Proofs.SlabFP
 import LightRT.Robust.Slab
 import LightRT.Geom.MTReal
@@ -14,14 +15,17 @@ namespace LightRT.C.Proofs
 open LightRT.C LightRT.FP
 
 /-- `tri_ray_setup` writes exactly the reference context into `*rc`, for every
-    input (including NaN/∞/subnormal), with no UB, and touches nothing else. -/
+    input (including NaN/∞/subnormal), with no UB, and touches nothing else
+    (for all sufficiently large fuel; the 56-byte `*rc` may start with any contents).
+    Proved in `RaySetupRefines.lean`. -/
 theorem tri_ray_setup_refines (org dir : Fin 3 → Ref.F) (tmin tmax : Ref.F) (m : Mem)
     (bRay bRc : Nat) (hne : bRay ≠ bRc)
     (hray : m bRay = some (f32Block (vecWords org ++ [tmin.toNat] ++ vecWords dir ++ [tmax.toNat])))
     (hrc : ∃ blk, m bRc = some blk ∧ blk.length = 56) :
-    ∃ m', callFunc Gen.prog 10000 Gen.fid_tri_ray_setup [.ptr bRay 0, .ptr bRc 0] m = .ok (none, m') ∧
-      m' bRc = some (ctxBlock (Ref.raySetup org dir tmin)) ∧ ∀ b, b ≠ bRc → m' b = m b := by
-  sorry
+    ∃ m', (∃ K, ∀ n, K ≤ n → callFunc Gen.prog n Gen.fid_tri_ray_setup [.ptr bRay 0, .ptr bRc 0] m =
+        .ok (none, m')) ∧
+      m' bRc = some (ctxBlock (Ref.raySetup org dir tmin)) ∧ ∀ b, b ≠ bRc → m' b = m b :=
+  tri_ray_setup_refines' org dir tmin tmax m bRay bRc hne hray hrc
 
 /-- `tri_slab_scalar` returns the reference verdict and stores the reference `tnear`
     (for all sufficiently large fuel; no aliasing hypotheses are needed because every

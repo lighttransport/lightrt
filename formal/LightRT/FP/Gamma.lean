@@ -21,19 +21,6 @@ theorem gamma_mono {u : ℝ} {m n : ℕ} (hu : 0 ≤ u) (hmn : m ≤ n)
   have h2 : 0 < 1 - (m : ℝ) * u := by linarith
   rw [div_le_div_iff₀ h2 h1]; nlinarith
 
-/-- Higham Lemma 3.1: a product of `n` factors `(1+δᵢ)^{±1}` is `1 + θ`, `|θ| ≤ γₙ`.
-    Each `δᵢ` is independent (`δ : Fin n → ℝ`). -/
-theorem prod_one_add_le {u : ℝ} {n : ℕ} (hu : 0 ≤ u) (hn : (n : ℝ) * u < 1)
-    (δ : Fin n → ℝ) (hδ : ∀ i, |δ i| ≤ u) :
-    |(∏ i, (1 + δ i)) - 1| ≤ gamma u n := by
-  sorry
-
-/-- Same, allowing each factor to be inverted (needed for `1/d`). -/
-theorem prod_one_add_zpow_le {u : ℝ} {n : ℕ} (hu : 0 ≤ u) (hn : (n : ℝ) * u < 1)
-    (δ : Fin n → ℝ) (hδ : ∀ i, |δ i| ≤ u) (s : Fin n → Bool) :
-    |(∏ i, (if s i then (1 + δ i) else (1 + δ i)⁻¹)) - 1| ≤ gamma u n := by
-  sorry
-
 /-- Composition: `(1+θₘ)(1+θₙ) = 1+θ_{m+n}`. -/
 theorem gamma_compose {u : ℝ} {m n : ℕ} (hu : 0 ≤ u) (h : ((m + n : ℕ) : ℝ) * u < 1)
     {a b : ℝ} (ha : |a| ≤ gamma u m) (hb : |b| ≤ gamma u n) :
@@ -62,5 +49,37 @@ theorem gamma_compose {u : ℝ} {m n : ℕ} (hu : 0 ≤ u) (h : ((m + n : ℕ) :
   calc |(1 + a) * (1 + b) - 1| = |a + b + a * b| := by ring_nf
     _ ≤ |a| + |b| + |a * b| := abs_add_three _ _ _
     _ ≤ _ := by linarith
+
+/-- Same, allowing each factor to be inverted (needed for `1/d`). -/
+theorem prod_one_add_zpow_le {u : ℝ} {n : ℕ} (hu : 0 ≤ u) (hn : (n : ℝ) * u < 1)
+    (δ : Fin n → ℝ) (hδ : ∀ i, |δ i| ≤ u) (s : Fin n → Bool) :
+    |(∏ i, (if s i then (1 + δ i) else (1 + δ i)⁻¹)) - 1| ≤ gamma u n := by
+  induction n with
+  | zero => simp [gamma]
+  | succ n ih =>
+    rw [Fin.prod_univ_succ]
+    have hn' : (n : ℝ) * u < 1 := by push_cast at hn; nlinarith
+    have hu1 : u < 1 := by push_cast at hn; nlinarith [Nat.cast_nonneg (α := ℝ) n]
+    have hr := ih hn' (fun i => δ i.succ) (fun i => hδ i.succ) (fun i => s i.succ)
+    have h0 : |(if s 0 then (1 + δ 0) else (1 + δ 0)⁻¹) - 1| ≤ gamma u 1 := by
+      have hd := abs_le.1 (hδ 0)
+      unfold gamma; norm_num
+      split_ifs
+      · rw [le_div_iff₀ (by linarith)]; simp only [add_sub_cancel_left]
+        nlinarith [hδ 0, abs_nonneg (δ 0)]
+      · have hp : 0 < 1 + δ 0 := by linarith
+        rw [show (1 + δ 0)⁻¹ - 1 = -δ 0 / (1 + δ 0) by field_simp; ring, abs_div, abs_neg,
+          abs_of_pos hp, div_le_div_iff₀ hp (by linarith)]
+        nlinarith [hδ 0, abs_nonneg (δ 0)]
+    have := gamma_compose (m := 1) (n := n) hu (by rw [add_comm]; exact hn) h0 hr
+    rw [add_comm 1 n] at this
+    simpa using this
+
+/-- Higham Lemma 3.1: a product of `n` factors `(1+δᵢ)^{±1}` is `1 + θ`, `|θ| ≤ γₙ`.
+    Each `δᵢ` is independent (`δ : Fin n → ℝ`). -/
+theorem prod_one_add_le {u : ℝ} {n : ℕ} (hu : 0 ≤ u) (hn : (n : ℝ) * u < 1)
+    (δ : Fin n → ℝ) (hδ : ∀ i, |δ i| ≤ u) :
+    |(∏ i, (1 + δ i)) - 1| ≤ gamma u n := by
+  simpa using prod_one_add_zpow_le hu hn δ hδ (fun _ => true)
 
 end LightRT.FP

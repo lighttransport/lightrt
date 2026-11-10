@@ -88,8 +88,14 @@ theorem build_contains (bound : α → Box) (split : List α → List α × List
 /-- The build neither loses nor duplicates primitives, if `split` partitions. -/
 theorem build_prims_perm (bound : α → Box) (split : List α → List α × List α) (leafSize : ℕ)
     (hsplit : ∀ ps, ((split ps).1 ++ (split ps).2).Perm ps) :
-    ∀ (n : ℕ) (ps : List α), (build bound split leafSize n ps).prims.Perm ps := by
-  sorry
+    ∀ (n : ℕ) (ps : List α), (build bound split leafSize n ps).prims.Perm ps
+  | 0, ps => List.Perm.refl _
+  | n + 1, ps => by
+    unfold build
+    split_ifs
+    · exact List.Perm.refl _
+    · exact ((build_prims_perm bound split leafSize hsplit n _).append
+        (build_prims_perm bound split leafSize hsplit n _)).trans (hsplit ps)
 
 /-! ### Traversal -/
 
@@ -98,9 +104,43 @@ def minOpt : Option ℝ → Option ℝ → Option ℝ
   | a, none => a
   | some a, some b => some (min a b)
 
+theorem minOpt_assoc (a b c : Option ℝ) : minOpt (minOpt a b) c = minOpt a (minOpt b c) := by
+  cases a <;> cases b <;> cases c <;> simp [minOpt, min_assoc]
+
+theorem minOpt_comm (a b : Option ℝ) : minOpt a b = minOpt b a := by
+  cases a <;> cases b <;> simp [minOpt, min_comm]
+
+@[simp] theorem minOpt_none_left (a : Option ℝ) : minOpt none a = a := by cases a <;> rfl
+@[simp] theorem minOpt_none_right (a : Option ℝ) : minOpt a none = a := by cases a <;> rfl
+
 /-- Brute force: nearest hit parameter over a list. -/
 def brute (isect : α → Option ℝ) (ps : List α) : Option ℝ :=
   ps.foldr (fun p acc => minOpt (isect p) acc) none
+
+theorem brute_append (isect : α → Option ℝ) (l r : List α) :
+    brute isect (l ++ r) = minOpt (brute isect l) (brute isect r) := by
+  induction l with
+  | nil => simp [brute]
+  | cons p l ih =>
+    simp only [brute, List.cons_append, List.foldr_cons] at ih ⊢
+    rw [ih, minOpt_assoc]
+
+/-- If every hit is no nearer than `best`, merging the brute result changes nothing. -/
+theorem minOpt_brute_of_far (isect : α → Option ℝ) (best : Option ℝ) :
+    ∀ ps : List α, (∀ p ∈ ps, ∀ t, isect p = some t → ∃ b, best = some b ∧ b ≤ t) →
+      minOpt best (brute isect ps) = best
+  | [], _ => by simp [brute]
+  | p :: ps, h => by
+    have ih := minOpt_brute_of_far isect best ps (fun q hq => h q (List.mem_cons_of_mem _ hq))
+    show minOpt best (minOpt (isect p) (brute isect ps)) = best
+    rw [← minOpt_assoc]
+    have : minOpt best (isect p) = best := by
+      cases hp : isect p with
+      | none => simp
+      | some t =>
+        obtain ⟨b, rfl, hb⟩ := h p (List.mem_cons_self ..) t hp
+        simp [minOpt, min_eq_left hb]
+    rw [this, ih]
 
 /-- Recursive traversal (order-free; the ordered/early-cull variant is `traverseOrdered`). -/
 def traverse (boxTest : Box → Bool) (isect : α → Option ℝ) : Tree α → Option ℝ
@@ -117,7 +157,23 @@ def Conservative (bound : α → Box) (boxTest : Box → Bool) (isect : α → O
 theorem traverse_eq_brute (bound : α → Box) (boxTest : Box → Bool) (isect : α → Option ℝ)
     (hcons : Conservative bound boxTest isect) :
     ∀ T : Tree α, Contains bound T → traverse boxTest isect T = brute isect T.prims := by
-  sorry
+  have miss : ∀ T : Tree α, Contains bound T → boxTest T.box = false → brute isect T.prims = none := by
+    intro T hT hb
+    have := minOpt_brute_of_far isect none T.prims (fun p hp t ht => by
+      have := hcons _ p t (hT.prim_subset p hp) ht; rw [hb] at this; cases this)
+    simpa using this
+  intro T hT
+  induction T with
+  | leaf b ps =>
+    simp only [traverse]; split_ifs with h
+    · rfl
+    · exact (miss _ hT (by simpa [box] using h)).symm
+  | node b l r ihl ihr =>
+    have hT' := hT
+    obtain ⟨_, _, cl, cr⟩ := hT
+    simp only [traverse]; split_ifs with h
+    · rw [ihl cl, ihr cr]; simp only [prims, brute_append]
+    · exact (miss _ hT' (by simpa [box] using h)).symm
 
 /-- Ordered traversal with `t_best` culling (LightRT's actual loop shape): the box
     test also receives the current best hit, and nearer child first. -/
@@ -143,7 +199,32 @@ theorem traverseOrdered_eq_brute (bound : α → Box) (boxTest : Box → Option 
     (hcons : ConservativeBest bound boxTest isect) :
     ∀ T : Tree α, Contains bound T →
       traverseOrdered boxTest isect nearFirst none T = brute isect T.prims := by
-  sorry
+  have far : ∀ (T : Tree α) best, Contains bound T → boxTest T.box best = false →
+      minOpt best (brute isect T.prims) = best := by
+    intro T best hT hb
+    apply minOpt_brute_of_far
+    intro p hp t ht
+    by_contra hc
+    have : ∀ b, best = some b → t < b := by
+      intro b hb'; by_contra h'; exact hc ⟨b, hb', not_lt.1 h'⟩
+    have := hcons _ p t best (hT.prim_subset p hp) ht this; rw [hb] at this; cases this
+  have gen : ∀ (T : Tree α) best, Contains bound T →
+      traverseOrdered boxTest isect nearFirst best T = minOpt best (brute isect T.prims) := by
+    intro T
+    induction T with
+    | leaf b ps =>
+      intro best hT; simp only [traverseOrdered]; split_ifs with h
+      · rfl
+      · exact (far (leaf b ps) best hT (by simpa [box] using h)).symm
+    | node b l r ihl ihr =>
+      intro best hT
+      obtain ⟨h1, h2, cl, cr⟩ := hT
+      simp only [traverseOrdered]; split_ifs with h hn
+      · rw [ihl best cl, ihr _ cr, minOpt_assoc]; simp only [prims, brute_append]
+      · rw [ihr best cr, ihl _ cl, minOpt_assoc, minOpt_comm (brute isect r.prims)]
+        simp only [prims, brute_append]
+      · exact (far (node b l r) best ⟨h1, h2, cl, cr⟩ (by simpa [box] using h)).symm
+  intro T hT; simpa using gen T none hT
 
 end Tree
 end
