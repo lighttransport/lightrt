@@ -58,7 +58,12 @@ int main(int argc, char **argv) {
     int W = s->layout;
     if (W != 4 && W != 8) { fprintf(stderr, "layout %d unsupported\n", W); return 1; }
     if (W == 8 && s->quantized) { fprintf(stderr, "quantized\n"); return 1; }
-    printf("W %d ROOT %08x NODES %u BLOCKS %u\n", W, s->root, s->node_count, s->block_count);
+    #ifdef LRT_TRI_SLAB_ROBUST
+    int robust = 1;
+#else
+    int robust = 0;
+#endif
+    printf("W %d ROOT %08x NODES %u BLOCKS %u ROBUST %d\n", W, s->root, s->node_count, s->block_count, robust);
     for (uint32_t i = 0; i < s->node_count; i++) {
         const float *lo[3], *hi[3]; const uint32_t *ch; uint32_t nc;
         if (W == 4) { const lrt_bvh4_node *nd = &s->nodes4[i];

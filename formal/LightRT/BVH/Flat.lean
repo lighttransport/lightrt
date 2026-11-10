@@ -478,5 +478,212 @@ theorem run_approx {inside : α → B → Prop} {sub : B → B → Prop} (F : Fl
 
 end Traverse
 
+/-! ### Spatial-split BVHs (SBVH): coverage instead of containment
+
+An SBVH leaf box is CLIPPED: it may cover only part of a triangle referenced in
+it, so `WF`'s containment fails by design. What the traversal needs instead,
+for the ray at hand, is COVERAGE: every primitive hit by the ray has at least
+one reference whose whole box path contains the hit point (`hitIn p b`). -/
+
+/-- Only the index part of `WF` (child node indices increase, are in range). -/
+def WFidx (F : Flat B α) : Prop :=
+  (∀ j, F.root = .node j → j < F.nodes.length) ∧
+  ∀ i < F.nodes.length, ∀ c ∈ F.children i, ∀ j, c.2 = .node j → i < j ∧ j < F.nodes.length
+
+theorem WF.idx {inside : α → B → Prop} {sub : B → B → Prop} {F : Flat B α}
+    (hw : F.WF inside sub) : F.WFidx := by
+  refine ⟨hw.1, fun i hi c hc j hj => ?_⟩
+  have := hw.2 i hi c hc
+  rcases c with ⟨b, r⟩; simp only at hj; subst hj; exact ⟨this.1, this.2.1⟩
+
+theorem den_wfi {F : Flat B α} (hw : F.WFidx) {i : ℕ} (hi : i < F.nodes.length) :
+    F.den i = (F.children i).flatMap fun c => F.denRef c.2 := by
+  rw [den_eq]
+  apply List.flatMap_congr
+  intro c hc
+  rcases c with ⟨b, r⟩; cases r with
+  | leaf blk n => rfl
+  | node j => have := hw.2 i hi _ hc j rfl; simp [denRef, this.1, this.2]
+
+theorem visits_wfi {F : Flat B α} (hw : F.WFidx) {i : ℕ} (hi : i < F.nodes.length) :
+    F.visits i = 1 + ((F.children i).map fun c => F.visitsRef c.2).sum := by
+  rw [visits_eq]
+  congr 2
+  apply List.map_congr_left
+  intro c hc
+  rcases c with ⟨b, r⟩; cases r with
+  | leaf blk n => rfl
+  | node j => have := hw.2 i hi _ hc j rfl; simp [visitsRef, this.1, this.2]
+
+/-- `p` has a reference below node `i` whose box path contains its hit point. -/
+def goodN (F : Flat B α) (hitIn : α → B → Prop) (p : α) (i : ℕ) : Prop :=
+  ∃ c ∈ (F.children i).attach, hitIn p c.1.1 ∧
+    match c.1.2 with
+    | .leaf blk n => p ∈ F.leafPrims blk n
+    | .node j => if h : i < j ∧ j < F.nodes.length then F.goodN hitIn p j else False
+termination_by F.nodes.length - i
+
+def goodRef (F : Flat B α) (hitIn : α → B → Prop) (p : α) : CRef → Prop
+  | .leaf blk n => p ∈ F.leafPrims blk n
+  | .node j => F.goodN hitIn p j
+
+theorem goodN_iff {F : Flat B α} (hw : F.WFidx) (hitIn : α → B → Prop) (p : α) {i : ℕ}
+    (hi : i < F.nodes.length) :
+    F.goodN hitIn p i ↔ ∃ c ∈ F.children i, hitIn p c.1 ∧ F.goodRef hitIn p c.2 := by
+  rw [goodN]
+  constructor
+  · rintro ⟨⟨c, hc⟩, -, h1, h2⟩
+    refine ⟨c, hc, h1, ?_⟩
+    rcases c with ⟨b, r⟩; cases r with
+    | leaf blk n => exact h2
+    | node j =>
+      have := hw.2 i hi _ hc j rfl
+      simp only [this.1, this.2, and_self, dite_true] at h2; exact h2
+  · rintro ⟨c, hc, h1, h2⟩
+    refine ⟨⟨c, hc⟩, List.mem_attach _ _, h1, ?_⟩
+    rcases c with ⟨b, r⟩; cases r with
+    | leaf blk n => exact h2
+    | node j =>
+      have := hw.2 i hi _ hc j rfl
+      simp only [this.1, this.2, and_self, dite_true]; exact h2
+
+section Cover
+variable [LinearOrder T]
+
+/-- **SBVH traversal (coverage form).** With box tests conservative for hit
+    POINTS (`C1`: a box containing the hit point of a hit `t < best` passes;
+    `C2g`: its `tnear ≤ g t`), the loop terminates with `r` such that
+    `brute ≤ r ≤ best`, and `r ≤ g t` for every hit `t < best` of a primitive
+    that has a good reference on the stack. -/
+theorem run_cover (F : Flat B α) (hw : F.WFidx) (hitIn : α → B → Prop)
+    (test : B → T → Option T) (isect : α → Option T)
+    (order : List (CRef × T) → List (CRef × T)) (hord : ∀ l, (order l).Perm l)
+    (g : T → T) (hg : ∀ t, t ≤ g t)
+    (C1 : ∀ p b t best, hitIn p b → isect p = some t → t < best → (test b best).isSome)
+    (C2g : ∀ p b t best tn, test b best = some tn → hitIn p b → isect p = some t → t < best →
+      tn ≤ g t) :
+    ∀ f (st : List (CRef × T)) best,
+      (∀ e ∈ st, ∀ j, e.1 = .node j → j < F.nodes.length) →
+      (st.map (F.visitsRef ∘ Prod.fst)).sum < f →
+      ∃ r, run F test isect order f st best = some r ∧
+        (st.flatMap (F.denRef ∘ Prod.fst)).foldl (step isect) best ≤ r ∧ r ≤ best ∧
+        ∀ p t, isect p = some t → t < best →
+          (∃ e ∈ st, F.goodRef hitIn p e.1 ∧ e.2 ≤ g t) → r ≤ g t := by
+  intro f
+  induction f with
+  | zero => intro st best _ hf; omega
+  | succ f ih =>
+    intro st best hv hf
+    match st with
+    | [] => exact ⟨best, by simp [run], by simp, le_rfl, by simp⟩
+    | (r0, tn) :: st =>
+      have hvst : ∀ e ∈ st, ∀ j, e.1 = .node j → j < F.nodes.length :=
+        fun e he => hv e (by simp [he])
+      have hr := hv (r0, tn) (by simp)
+      simp only [List.map_cons, List.sum_cons, Function.comp] at hf
+      simp only [run, List.flatMap_cons]
+      split_ifs with hskip
+      · obtain ⟨r, hrun, ha, hb, hc⟩ := ih st best hvst (by have := F.visitsRef_pos r0; omega)
+        refine ⟨r, hrun, ?_, hb, ?_⟩
+        · rw [List.foldl_append]
+          exact le_trans ((le_foldl_iff isect _ _ _).2 ⟨(foldl_le isect _ _).trans (foldl_le isect _ _),
+            fun p hp t ht => foldl_le_hit isect _ _ hp ht⟩) ha
+        · rintro p t ht hlt ⟨e, he, hg1, hg2⟩
+          rcases List.mem_cons.1 he with rfl | he
+          · exact hb.trans (hskip.trans hg2)
+          · exact hc p t ht hlt ⟨e, he, hg1, hg2⟩
+      · cases r0 with
+        | leaf blk n =>
+          set b' := (F.leafPrims blk n).foldl (step isect) best
+          have hb' : b' ≤ best := foldl_le isect _ _
+          obtain ⟨r, hrun, ha, hb, hc⟩ := ih st b' hvst
+            (by have := F.visitsRef_pos (.leaf blk n); omega)
+          refine ⟨r, hrun, by rw [List.foldl_append]; exact ha, hb.trans hb', ?_⟩
+          rintro p t ht hlt ⟨e, he, hg1, hg2⟩
+          rcases List.mem_cons.1 he with rfl | he
+          · exact hb.trans ((foldl_le_hit isect _ _ (show p ∈ F.leafPrims blk n from hg1) ht).trans (hg t))
+          · by_cases h : t < b'
+            · exact hc p t ht h ⟨e, he, hg1, hg2⟩
+            · exact hb.trans ((not_lt.1 h).trans (hg t))
+        | node i =>
+          have hi := hr i rfl
+          dsimp only
+          set X := (F.children i).filterMap fun c => (test c.1 best).map (c.2, ·) with hX
+          obtain ⟨hX1, hX2⟩ := filterMap_facts F test best (F.children i)
+          rw [← hX] at hX1 hX2
+          have hmemX : ∀ e ∈ X, ∃ c ∈ F.children i, test c.1 best = some e.2 ∧ e.1 = c.2 := by
+            intro e he
+            rw [hX, List.mem_filterMap] at he
+            obtain ⟨c, hc, hce⟩ := he
+            cases htc : test c.1 best with
+            | none => simp [htc] at hce
+            | some tn' =>
+              simp only [htc, Option.map_some, Option.some.injEq] at hce
+              exact ⟨c, hc, by rw [← hce]; exact htc, by rw [← hce]⟩
+          have hvX : ∀ e ∈ order X ++ st, ∀ j, e.1 = .node j → j < F.nodes.length := by
+            intro e he j hj
+            rcases List.mem_append.1 he with he | he
+            · obtain ⟨c, hc, -, hce⟩ := hmemX e ((hord X).mem_iff.1 he)
+              exact (hw.2 i hi c hc j (hce ▸ hj)).2
+            · exact hvst e he j hj
+          obtain ⟨r, hrun, ha, hb, hc⟩ := ih _ best hvX (by
+            rw [List.map_append, List.sum_append, ((hord X).map _).sum_eq]
+            rw [show F.visitsRef (.node i) = F.visits i from rfl, visits_wfi hw hi] at hf
+            simp only [Function.comp_def] at hX2 hf ⊢; omega)
+          have hpush : ∀ p, p ∈ (order X ++ st).flatMap (F.denRef ∘ Prod.fst) →
+              p ∈ F.denRef (.node i) ∨ p ∈ st.flatMap (F.denRef ∘ Prod.fst) := by
+            intro p hp
+            rw [List.flatMap_append, List.mem_append] at hp
+            rcases hp with hp | hp
+            · left
+              rw [((hord X).flatMap_right _).mem_iff, hX1, List.mem_flatMap] at hp
+              obtain ⟨c, hc, hp⟩ := hp
+              rw [show F.denRef (.node i) = F.den i from rfl, den_wfi hw hi, List.mem_flatMap]
+              exact ⟨c, (List.mem_filter.1 hc).1, hp⟩
+            · exact Or.inr hp
+          refine ⟨r, hrun, ?_, hb, ?_⟩
+          · refine le_trans ?_ ha
+            rw [le_foldl_iff]
+            have h0 := (le_foldl_iff isect
+              ((F.denRef (.node i) ++ st.flatMap (F.denRef ∘ Prod.fst)).foldl (step isect) best)
+              (F.denRef (.node i) ++ st.flatMap (F.denRef ∘ Prod.fst)) best).1 le_rfl
+            rw [List.foldl_append] at h0 ⊢
+            exact ⟨h0.1, fun p hp t ht => h0.2 p (List.mem_append.2 (hpush p hp)) t ht⟩
+          · rintro p t ht hlt ⟨e, he, hg1, hg2⟩
+            rcases List.mem_cons.1 he with rfl | he
+            · -- the good path continues through some child `c` that the box test passes
+              obtain ⟨c, hcm, hin, hgc⟩ := (goodN_iff hw hitIn p hi).1 hg1
+              obtain ⟨tn', htn⟩ := Option.isSome_iff_exists.1 (C1 p c.1 t best hin ht hlt)
+              apply hc p t ht hlt
+              refine ⟨(c.2, tn'), List.mem_append_left _ ((hord X).mem_iff.2 ?_), hgc,
+                C2g p c.1 t best tn' htn hin ht hlt⟩
+              rw [hX, List.mem_filterMap]
+              exact ⟨c, hcm, by simp [htn]⟩
+            · exact hc p t ht hlt ⟨e, List.mem_append_right _ he, hg1, hg2⟩
+
+/-- **SBVH root form.** If every primitive the ray hits below `tmax` has a good
+    reference (coverage) and `tmin ≤ g t`, the result is within `g` of the
+    brute-force nearest hit: `brute ≤ r` and `r ≤ g t` for every hit `t < tmax`.
+    With `g = id` it is exactly the brute-force nearest hit. -/
+theorem run_cover_root (F : Flat B α) (hw : F.WFidx) (hitIn : α → B → Prop)
+    (test : B → T → Option T) (isect : α → Option T)
+    (order : List (CRef × T) → List (CRef × T)) (hord : ∀ l, (order l).Perm l)
+    (g : T → T) (hg : ∀ t, t ≤ g t)
+    (C1 : ∀ p b t best, hitIn p b → isect p = some t → t < best → (test b best).isSome)
+    (C2g : ∀ p b t best tn, test b best = some tn → hitIn p b → isect p = some t → t < best →
+      tn ≤ g t)
+    (tmin tmax : T)
+    (hcov : ∀ p t, isect p = some t → t < tmax → F.goodRef hitIn p F.root ∧ tmin ≤ g t) :
+    ∃ r, run F test isect order (F.visitsRef F.root + 1) [(F.root, tmin)] tmax = some r ∧
+      (F.denRef F.root).foldl (step isect) tmax ≤ r ∧ r ≤ tmax ∧
+      ∀ p t, isect p = some t → t < tmax → r ≤ g t := by
+  obtain ⟨r, h1, h2, h3, h4⟩ := run_cover F hw hitIn test isect order hord g hg C1 C2g
+    (F.visitsRef F.root + 1) [(F.root, tmin)] tmax
+    (by intro e he; simp only [List.mem_singleton] at he; subst he; exact hw.1) (by simp)
+  refine ⟨r, h1, by simpa using h2, h3, fun p t ht hlt => h4 p t ht hlt ?_⟩
+  exact ⟨(F.root, tmin), by simp, (hcov p t ht hlt).1, (hcov p t ht hlt).2⟩
+
+end Cover
+
 end Flat
 end LightRT.BVH

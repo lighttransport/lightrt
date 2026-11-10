@@ -57,6 +57,20 @@ def slab (rc : RayCtx) (lo hi : Fin 3 → F) (tbest : F) : Bool × F :=
   let tfar := fmin (fmin (tf 0) (tf 1)) (fmin (tf 2) tbest)
   (leBits tnear tfar, tnear)
 
+def posInf : F := 0x7f800000
+
+/-- `tri_slab_scalar` under `-DLRT_TRI_SLAB_ROBUST`: slab reciprocal `+∞` for
+    `d = ±0` (`rc->sinv`) and the entry bound `min(th, tl)` (operands swapped),
+    so the `0·∞ = NaN` of a parallel ray lying on a plane is dropped. -/
+def slabRobust (rc : RayCtx) (lo hi : Fin 3 → F) (tbest : F) : Bool × F :=
+  let sinv := fun k => if eqF (rc.dir k) zero then posInf else rc.invd k
+  let t := fun (x : F) k => mulBits (subBits x (rc.org k)) (sinv k)
+  let tn := fun k => fmin (t (hi k) k) (t (lo k) k)
+  let tf := fun k => fmax (t (lo k) k) (t (hi k) k)
+  let tnear := fmax (fmax (tn 0) (tn 1)) (fmax (tn 2) rc.tmin)
+  let tfar := fmin (fmin (tf 0) (tf 1)) (fmin (tf 2) tbest)
+  (leBits tnear tfar, tnear)
+
 /-- Proposed patch: Ize-style inflation, `tfar ← fl(tfar · K)` (Stage 3, `fpSlab … K`). -/
 def slabInflated (rc : RayCtx) (lo hi : Fin 3 → F) (tbest K : F) : Bool :=
   let t := fun (x : F) k => mulBits (subBits x (rc.org k)) (rc.invd k)

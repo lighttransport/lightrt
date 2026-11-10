@@ -31,4 +31,15 @@ theorem slab_parallel_false_miss :
     (Ref.slab (Ref.raySetup pO pD 0) pLo pHi pTmax).1 = false := by
   decide +kernel
 
+set_option maxRecDepth 100000 in
+/-- The `-DLRT_TRI_SLAB_ROBUST` slab accepts the same box. -/
+theorem slabRobust_parallel_hit :
+    (Ref.slabRobust (Ref.raySetup pO pD 0) pLo pHi pTmax).1 = true := by
+  decide +kernel
+
+/-- Mirror case: the ray on the `lo` face (`org.x = 0`), also accepted. -/
+theorem slabRobust_parallel_hit_lo :
+    (Ref.slabRobust (Ref.raySetup ![0, 0x40000000, 0x3f000000] pD 0) pLo pHi pTmax).1 = true := by
+  decide +kernel
+
 end LightRT.C.Proofs

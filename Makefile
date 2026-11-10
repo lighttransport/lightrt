@@ -158,6 +158,13 @@ c_tri_test: $(C_TRI_TEST_SRC)
 	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -o lightrt_c_tri_test $^ -lm -lpthread
 	@echo "Built lightrt_c_tri_test (run: ./lightrt_c_tri_test)"
 
+# Seam (watertightness) test of the main triangle leaf: default build reports the
+# Moller-Trumbore leak count; the _wt build (-DLRT_TRI_WATERTIGHT_TRI) requires 0.
+c_tri_seam_test: tests/test_lightrt_c_tri_seam.c lightrt_c_tri.c
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -o lightrt_c_tri_seam_test $^ -lm -lpthread
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_WATERTIGHT_TRI -o lightrt_c_tri_seam_test_wt $^ -lm -lpthread
+	./lightrt_c_tri_seam_test && ./lightrt_c_tri_seam_test_wt
+
 # ---- Vulkan GPU interop (opt-in; runtime dlopen of libvulkan, no SDK, no -lvulkan) ----
 # Build + run the GPU-interop self-test:  make vk_test && ./lightrt_c_vk_test
 VK_SOURCES = lightrt_vkew.c lightrt_c_vk.c lightrt_c_tri.c
@@ -244,7 +251,7 @@ info_cuda:
 	@echo "CUDA_ARCH: $(CUDA_ARCH)"
 	@echo "CUDA_FLAGS: $(CUDA_FLAGS)"
 
-.PHONY: all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip cuda_test info_cuda formal
+.PHONY: c_tri_seam_test all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip cuda_test info_cuda formal
 
 # Lean 4 formal verification (formal/): build specs+proofs, check the c2lean
 # translation is up to date, the sorry budget, the axiom allowlist, and run
@@ -256,4 +263,4 @@ formal:
 	sh formal/tools/count_sorry.sh --max $(FORMAL_SORRY_MAX)
 	python3 formal/tools/check_axioms.py > /dev/null
 	python3 formal/tools/cdiff.py --n 1000
-	python3 formal/tools/bvhcheck.py --rays 100 --seeds 1
+	python3 formal/tools/bvhcheck.py --rays 100 --seeds 2
