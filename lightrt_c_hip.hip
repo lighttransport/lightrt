@@ -51,6 +51,8 @@ typedef struct hip_lrts_header {
     uint64_t node_offset;
     uint64_t block_offset;
     uint64_t file_size;
+    uint64_t aux_offset; /* v2: watertight exact vertices ride here */
+    uint64_t aux_size;
 } hip_lrts_header;
 
 /* ------------------------------------------------------------------------- */
@@ -95,6 +97,10 @@ struct lrt_hip_scene {
      * NULL unless a parametric-surface / linear-curve scene was uploaded. */
     float *d_shade_cps;
     float *d_shade_dom; /* NURBS only (stride 64), else NULL */
+    /* Exact vertices (9 floats/prim) for the watertight Woop leaf; NULL/0 =>
+     * Moller-Trumbore. Only LRT_TRI_WATERTIGHT_TRI scenes carry them. */
+    float *d_wverts;
+    uint32_t nwverts;
     uint32_t shade_nprims;
     uint32_t shade_stride; /* floats/prim: 12/48/64 surfaces, 8 linear curve */
     size_t mem_bytes;
@@ -180,12 +186,50 @@ static uint32_t trace_stack_for(uint32_t max_depth, uint32_t w) {
 
 __device__ __forceinline__ float fu(uint32_t i) { return __uint_as_float(i); }
 
+/* Watertight Woop-Benthin-Wald leaf: line-for-line port of the CPU
+ * tri_woop_one (formal: tri_woop_one_refines, woop_no_gap_bits); compiled
+ * without fp contraction like the rest of this file, so the edge functions
+ * stay exactly antisymmetric. Reads the exact vertices of prim from wverts. */
+__device__ __forceinline__ bool hp_woop_lane(const float *__restrict__ wverts,
+                                             uint32_t prim, float ox, float oy,
+                                             float oz, float dx, float dy,
+                                             float dz, float tmin, float tbest,
+                                             float *t, float *u, float *v) {
+    const float o[3] = {ox, oy, oz}, d[3] = {dx, dy, dz};
+    const float *v0 = wverts + 9u * prim, *v1 = v0 + 3, *v2 = v0 + 6;
+    float a0 = fabsf(d[0]), a1 = fabsf(d[1]), a2 = fabsf(d[2]);
+    int kz = 0;
+    if (a1 > a0) kz = 1;
+    if (a2 > a0 && a2 > a1) kz = 2;
+    int kx = kz + 1; if (kx == 3) kx = 0;
+    int ky = kx + 1; if (ky == 3) ky = 0;
+    if (d[kz] < 0.0f) { int tmp = kx; kx = ky; ky = tmp; }
+    float sx = d[kx] / d[kz], sy = d[ky] / d[kz], sz = 1.0f / d[kz];
+    float ax = v0[kx] - o[kx], ay = v0[ky] - o[ky], az = v0[kz] - o[kz];
+    float bx = v1[kx] - o[kx], by = v1[ky] - o[ky], bz = v1[kz] - o[kz];
+    float cx = v2[kx] - o[kx], cy = v2[ky] - o[ky], cz = v2[kz] - o[kz];
+    ax = ax - sx * az; ay = ay - sy * az;
+    bx = bx - sx * bz; by = by - sy * bz;
+    cx = cx - sx * cz; cy = cy - sy * cz;
+    float ue = cx * by - cy * bx;
+    float ve = ax * cy - ay * cx;
+    float we = bx * ay - by * ax;
+    if ((ue < 0.0f || ve < 0.0f || we < 0.0f) && (ue > 0.0f || ve > 0.0f || we > 0.0f)) return false;
+    float det = ue + ve + we;
+    if (det == 0.0f) return false;
+    float tt = (ue * (sz * az) + ve * (sz * bz) + we * (sz * cz)) / det;
+    if (!(tt >= tmin && tt < tbest)) return false;
+    *t = tt; *u = ve / det; *v = we / det;
+    return true;
+}
+
 template <unsigned W, unsigned STACK>
 __launch_bounds__(64) __global__
     void k_trace(const uint32_t *__restrict__ nodes,
                  const uint32_t *__restrict__ blocks,
                  const uint32_t *__restrict__ rays, uint32_t *__restrict__ hits,
-                 uint32_t root, uint32_t ray_count) {
+                 uint32_t root, uint32_t ray_count,
+                 const float *__restrict__ wverts, uint32_t nwverts) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= ray_count) return;
 
@@ -241,6 +285,14 @@ __launch_bounds__(64) __global__
                 for (uint32_t lane = 0u; lane < W; lane++) {
                     uint32_t prim = blocks[bb + prim_off + lane];
                     if (prim == LRT_HIP_NO_HIT) continue;
+                    if (prim < nwverts) {
+                        float tw, uw, vw;
+                        if (hp_woop_lane(wverts, prim, orgx, orgy, orgz, dirx, diry, dirz,
+                                         tmin, best_t, &tw, &uw, &vw)) {
+                            best_t = tw; best_u = uw; best_v = vw; best_prim = prim;
+                        }
+                        continue;
+                    }
                     float v0x = fu(blocks[bb + 0u * W + lane]);
                     float v0y = fu(blocks[bb + 1u * W + lane]);
                     float v0z = fu(blocks[bb + 2u * W + lane]);
@@ -342,7 +394,8 @@ __launch_bounds__(64) __global__
                     const uint32_t *__restrict__ blocks,
                     const uint32_t *__restrict__ rays,
                     uint8_t *__restrict__ occ, uint32_t root,
-                    uint32_t ray_count) {
+                    uint32_t ray_count,
+                    const float *__restrict__ wverts, uint32_t nwverts) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= ray_count) return;
 
@@ -394,6 +447,15 @@ __launch_bounds__(64) __global__
                 for (uint32_t lane = 0u; lane < W; lane++) {
                     uint32_t prim = blocks[bb + prim_off + lane];
                     if (prim == LRT_HIP_NO_HIT) continue;
+                    if (prim < nwverts) {
+                        float tw, uw, vw;
+                        if (hp_woop_lane(wverts, prim, orgx, orgy, orgz, dirx, diry, dirz,
+                                         tmin, tmax, &tw, &uw, &vw)) {
+                            hit = 1u;
+                            break;
+                        }
+                        continue;
+                    }
                     float v0x = fu(blocks[bb + 0u * W + lane]);
                     float v0y = fu(blocks[bb + 1u * W + lane]);
                     float v0z = fu(blocks[bb + 2u * W + lane]);
@@ -1920,7 +1982,7 @@ static hipError_t launch_trace(lrt_hip_engine *e, const lrt_hip_scene *s,
 #define LAUNCH(w, st)                                                          \
     hipLaunchKernelGGL((k_trace<w, st>), dim3(((n) + 63u) / 64u), dim3(64), 0, \
                        e->stream, s->d_nodes, s->d_blocks, d_rays, d_hits,     \
-                       root, n)
+                       root, n, s->d_wverts, s->nwverts)
     if (W == 4u) {
         if (S == 32u) LAUNCH(4, 32);
         else if (S == 64u) LAUNCH(4, 64);
@@ -1957,7 +2019,7 @@ static hipError_t launch_occluded(lrt_hip_engine *e, const lrt_hip_scene *s,
 #define LAUNCH(w, st)                                                          \
     hipLaunchKernelGGL((k_occluded<w, st>), dim3(((n) + 63u) / 64u), dim3(64), \
                        0, e->stream, s->d_nodes, s->d_blocks, d_rays, d_occ,   \
-                       root, n)
+                       root, n, s->d_wverts, s->nwverts)
     if (W == 4u) {
         if (S == 32u) LAUNCH(4, 32);
         else if (S == 64u) LAUNCH(4, 64);
@@ -2302,6 +2364,22 @@ extern "C" lrt_hip_scene *lrt_hip_scene_upload(lrt_hip_engine *e,
         if (err) *err = LRT_RESULT_OUT_OF_MEMORY;
         return NULL;
     }
+    /* Watertight-leaf exact vertices from the LRTS aux region ({nloops = 0,
+     * npts = ntris}, float[9 * ntris]); best effort: without them the
+     * kernels keep the Moller-Trumbore leaf. */
+    if (pk == HIP_PRIM_TRI && h->aux_size >= 8u && h->aux_offset + h->aux_size <= blob_n) {
+        const uint32_t *ah = (const uint32_t *)((const char *)blob + h->aux_offset);
+        if (ah[0] == 0u && ah[1] > 0u && 8u + (uint64_t)ah[1] * 36u <= h->aux_size &&
+            hipMalloc((void **)&sc->d_wverts, (size_t)ah[1] * 36u) == hipSuccess) {
+            if (hipMemcpy(sc->d_wverts, ah + 2, (size_t)ah[1] * 36u, hipMemcpyHostToDevice) == hipSuccess) {
+                sc->nwverts = ah[1];
+                sc->mem_bytes += (size_t)ah[1] * 36u;
+            } else {
+                hip_free(sc->d_wverts);
+                sc->d_wverts = NULL;
+            }
+        }
+    }
     free(blob);
     /* Surfaces (bilinear/bezpatch/rbez) + round-linear curve: upload shade CPs
      * so lrt_hip_scene_trace_normals can compute device normals. */
@@ -2319,6 +2397,7 @@ extern "C" void lrt_hip_scene_free(lrt_hip_engine *e, lrt_hip_scene *s) {
     hip_free(s->d_trim_pts);
     hip_free(s->d_shade_cps);
     hip_free(s->d_shade_dom);
+    hip_free(s->d_wverts);
     free(s);
 }
 
@@ -2511,6 +2590,11 @@ extern "C" int lrt_hip_scene_occluded(lrt_hip_engine *e, lrt_hip_scene *s,
  * vertex buffer. No allocation, copy, or sync — the caller owns those. */
 static void refit_core(lrt_hip_engine *e, lrt_hip_scene *s,
                        const float *d_verts, uint32_t ntris) {
+    /* Keep the watertight leaf's exact vertices in sync (same per-prim
+     * 9-float layout as the refit input). */
+    if (s->d_wverts && ntris == s->nwverts)
+        hipMemcpyAsync(s->d_wverts, d_verts, (size_t)ntris * 36u, hipMemcpyDeviceToDevice,
+                       e->stream);
     const uint32_t W = s->layout;
     uint32_t leaf_threads = s->block_count * W;
     uint32_t lg = (leaf_threads + 255u) / 256u;

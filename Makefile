@@ -220,6 +220,17 @@ hip_test: hip_dev_objs
 	$(HIPCC) --offload-arch=$(HIP_ARCH) -O2 /tmp/lrt_hip_test.o $(HIP_DEV_OBJS) $(HIP_C_OBJS) -o lightrt_c_hip_test -lm
 	@echo "Built lightrt_c_hip_test (run: ./lightrt_c_hip_test)"
 
+# hiprtc Path-A trace (lightrt_c_hip.c): plain C, dlopen'd HIP/hiprtc via
+# lightrt_hipew.c (no hipcc/ROCm SDK at build time). Defines the same lrt_hip_*
+# engine symbols as the precompiled lightrt_c_hip.hip backend, so it is built as
+# a separate binary. The _rb variant (robust slab + exact leaf boxes +
+# watertight leaf) requires 0 GPU misses and GPU == CPU bit for bit.
+HIP_RTC_SRC = tests/test_lightrt_c_hip_rtc.c lightrt_c_hip.c lightrt_hipew.c lightrt_c_tri.c lightrt_c.c
+hip_rtc_test: $(HIP_RTC_SRC)
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -o lightrt_c_hip_rtc_test $(HIP_RTC_SRC) -ldl -lm -lpthread
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_SLAB_ROBUST -DLRT_TRI_LEAF_BOX_EXACT -DLRT_TRI_WATERTIGHT_TRI -o lightrt_c_hip_rtc_test_rb $(HIP_RTC_SRC) -ldl -lm -lpthread
+	./lightrt_c_hip_rtc_test && ./lightrt_c_hip_rtc_test_rb
+
 benchmark_hip: hip_dev_objs
 	$(CC) $(CFLAGS) $(INCLUDES) -c lightrt_c.c -o /tmp/lrt_hip_c.o
 	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -c lightrt_c_tri.c -o /tmp/lrt_hip_c_tri.o
@@ -258,7 +269,7 @@ info_cuda:
 	@echo "CUDA_ARCH: $(CUDA_ARCH)"
 	@echo "CUDA_FLAGS: $(CUDA_FLAGS)"
 
-.PHONY: c_tri_parallel_test c_tri_seam_test all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip cuda_test info_cuda formal
+.PHONY: hip_rtc_test c_tri_parallel_test c_tri_seam_test all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip cuda_test info_cuda formal
 
 # Lean 4 formal verification (formal/): build specs+proofs, check the c2lean
 # translation is up to date, the sorry budget, the axiom allowlist, and run
