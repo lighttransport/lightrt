@@ -16,3 +16,5 @@ import LightRT.C.Proofs.SlabMiss
 import LightRT.C.Ref
 import LightRT.C.Proofs.Refines
 import LightRT.C.Proofs.MTGap
+import LightRT.C.Proofs.WoopRefines
+import LightRT.C.Proofs.WoopWatertight

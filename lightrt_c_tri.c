@@ -4353,6 +4353,62 @@ static inline int tri_mt_one(const float *o, const float *d, const float *v0,
     return 1;
 }
 
+/* Watertight ray/triangle test (Woop, Benthin, Wald, JCGT 2013), same contract
+ * as tri_mt_one. The ray is sheared so that it becomes +z through the origin;
+ * a vertex's 2D image depends only on the vertex and the ray, and the 2D edge
+ * functions are exactly antisymmetric in floating point, so a ray crossing an
+ * edge shared by two triangles is never lost (proved in formal/: Robust/Woop
+ * `woop_no_gap`, C/Proofs/WoopRefines). The paper's double-precision re-test of
+ * exact-zero edge functions is omitted: ties may report a hit on both sides,
+ * never on neither. Used by the quad/tetra leaves when LRT_TRI_WATERTIGHT. */
+static inline int tri_woop_one(const float *o, const float *d, const float *v0,
+                               const float *v1, const float *v2, float tmin,
+                               float tbest, float *t, float *u, float *v) {
+    float a0 = copysignf(d[0], 1.0f);
+    float a1 = copysignf(d[1], 1.0f);
+    float a2 = copysignf(d[2], 1.0f);
+    int kz = 0;
+    if (a1 > a0) kz = 1;
+    if (a2 > a0 && a2 > a1) kz = 2;
+    int kx = kz + 1;
+    if (kx == 3) kx = 0;
+    int ky = kx + 1;
+    if (ky == 3) ky = 0;
+    if (d[kz] < 0.0f) {
+        int tmp = kx;
+        kx = ky;
+        ky = tmp;
+    }
+    float sx = d[kx] / d[kz];
+    float sy = d[ky] / d[kz];
+    float sz = 1.0f / d[kz];
+    float ax = v0[kx] - o[kx], ay = v0[ky] - o[ky], az = v0[kz] - o[kz];
+    float bx = v1[kx] - o[kx], by = v1[ky] - o[ky], bz = v1[kz] - o[kz];
+    float cx = v2[kx] - o[kx], cy = v2[ky] - o[ky], cz = v2[kz] - o[kz];
+    ax = ax - sx * az; ay = ay - sy * az;
+    bx = bx - sx * bz; by = by - sy * bz;
+    cx = cx - sx * cz; cy = cy - sy * cz;
+    float ue = cx * by - cy * bx;
+    float ve = ax * cy - ay * cx;
+    float we = bx * ay - by * ax;
+    if ((ue < 0.0f || ve < 0.0f || we < 0.0f) &&
+        (ue > 0.0f || ve > 0.0f || we > 0.0f)) return 0;
+    float det = ue + ve + we;
+    if (det == 0.0f) return 0;
+    float tt = (ue * (sz * az) + ve * (sz * bz) + we * (sz * cz)) / det;
+    if (!(tt >= tmin && tt < tbest)) return 0;
+    *t = tt;
+    *u = ve / det;
+    *v = we / det;
+    return 1;
+}
+
+#ifdef LRT_TRI_WATERTIGHT
+#define TRI_TRI_ONE tri_woop_one
+#else
+#define TRI_TRI_ONE tri_mt_one
+#endif
+
 /* Planar quad leaf: two triangles (v0,v1,v2) and (v0,v2,v3) per lane. */
 static inline void tri_quad4_isect(const lrt_quad4 *blk, const tri_ray_ctx *rc,
                                    float *best_t, float *best_u, float *best_v,
@@ -4364,11 +4420,11 @@ static inline void tri_quad4_isect(const lrt_quad4 *blk, const tri_ray_ctx *rc,
         float v2[3] = {blk->x2[lane], blk->y2[lane], blk->z2[lane]};
         float v3[3] = {blk->x3[lane], blk->y3[lane], blk->z3[lane]};
         float t, u, v;
-        if (tri_mt_one(rc->org, rc->dir, v0, v1, v2, rc->tmin, *best_t, &t, &u,
+        if (TRI_TRI_ONE(rc->org, rc->dir, v0, v1, v2, rc->tmin, *best_t, &t, &u,
                        &v)) {
             *best_t = t; *best_u = u; *best_v = v; *best_prim = blk->prim[lane];
         }
-        if (tri_mt_one(rc->org, rc->dir, v0, v2, v3, rc->tmin, *best_t, &t, &u,
+        if (TRI_TRI_ONE(rc->org, rc->dir, v0, v2, v3, rc->tmin, *best_t, &t, &u,
                        &v)) {
             *best_t = t; *best_u = u; *best_v = v; *best_prim = blk->prim[lane];
         }
@@ -4390,7 +4446,7 @@ static inline void tri_tetra4_isect(const lrt_quad4 *blk, const tri_ray_ctx *rc,
         static const int F[4][3] = {{0, 1, 2}, {0, 1, 3}, {0, 2, 3}, {1, 2, 3}};
         for (int f = 0; f < 4; f++) {
             float t, u, v;
-            if (tri_mt_one(rc->org, rc->dir, p[F[f][0]], p[F[f][1]], p[F[f][2]],
+            if (TRI_TRI_ONE(rc->org, rc->dir, p[F[f][0]], p[F[f][1]], p[F[f][2]],
                            rc->tmin, *best_t, &t, &u, &v)) {
                 *best_t = t; *best_u = u; *best_v = v;
                 *best_prim = blk->prim[lane];

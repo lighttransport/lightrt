@@ -71,6 +71,18 @@ def runMt (w : List Nat) : String :=
   | .ub => "UB"
   | .timeout => "TIMEOUT"
 
+def runWoop (w : List Nat) : String :=
+  let vecs := (List.range 5).map (fun k => blockOf ((w.drop (3 * k)).take 3))
+  let m0 := mkMem (vecs ++ [blockOf [0], blockOf [0], blockOf [0]])
+  let args : List Val := [.ptr 0 0, .ptr 1 0, .ptr 2 0, .ptr 3 0, .ptr 4 0,
+    .f32 (w.getD 15 0), .f32 (w.getD 16 0), .ptr 5 0, .ptr 6 0, .ptr 7 0]
+  match callFunc Gen.prog fuel Gen.fid_tri_woop_one args m0 with
+  | .ok (some (.int _ r), m) =>
+    if r = 1 then s!"1 {hex8 (rd32 m 5 0)} {hex8 (rd32 m 6 0)} {hex8 (rd32 m 7 0)}" else s!"{r}"
+  | .ok _ => "ERR noval"
+  | .ub => "UB"
+  | .timeout => "TIMEOUT"
+
 def v3 (w : List Nat) (k : Nat) : Fin 3 → Ref.F := fun i => (w.getD (k + i.val) 0).toUInt32
 def h (x : Ref.F) : String := hex8 x.toNat
 
@@ -88,12 +100,19 @@ def refMt (w : List Nat) : String :=
   | some (t, u, v) => s!"1 {h t} {h u} {h v}"
   | none => "0"
 
+def refWoop (w : List Nat) : String :=
+  match Ref.woop (v3 w 0) (v3 w 3) (v3 w 6) (v3 w 9) (v3 w 12) (w.getD 15 0).toUInt32
+      (w.getD 16 0).toUInt32 with
+  | some (t, u, v) => s!"1 {h t} {h u} {h v}"
+  | none => "0"
+
 /-- MiniC result; if the Lean reference disagrees, flag it so cdiff fails. -/
 def runLine (line : String) : String :=
   let check (mc ref : String) := if mc == ref then mc else mc ++ " REFDIFF " ++ ref
   match (line.trimAscii.toString.splitOn " ").filter (· ≠ "") with
   | "slab" :: rest => let w := rest.map hexNat; check (runSlab w) (refSlab w)
   | "mt" :: rest => let w := rest.map hexNat; check (runMt w) (refMt w)
+  | "woop" :: rest => let w := rest.map hexNat; check (runWoop w) (refWoop w)
   | "slabk" :: rest =>
     let w := rest.map hexNat
     let rc := Ref.raySetup (v3 w 0) (v3 w 4) (w.getD 3 0).toUInt32

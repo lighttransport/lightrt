@@ -71,6 +71,10 @@ def vec_mt(r):
     return "mt " + " ".join(f"{bits(fl(v)):08x}" for v in vals)
 
 
+def vec_woop(r):
+    return "woop" + vec_mt(r)[2:]
+
+
 def norm(line):
     out = []
     for w in line.split():
@@ -178,7 +182,8 @@ def main():
         if args.search_miss:
             return search_miss(args, cexe, lexe)
         r = random.Random(args.seed)
-        lines = [vec_slab(r) if k % 2 == 0 else vec_mt(r) for k in range(args.n)]
+        gens = [vec_slab, vec_mt, vec_woop]
+        lines = [gens[k % 3](r) for k in range(args.n)]
         inp = "\n".join(lines) + "\n"
         cout = run([cexe], inp)
         lout = run(lexe, inp)
@@ -192,7 +197,7 @@ def main():
                 if bad <= 5:
                     print("MISMATCH\n  in:   ", line, "\n  C:    ", c, "\n  MiniC:", l)
         hits = sum(1 for c in cout if c.startswith("1 "))
-        print(f"{len(lines)} vectors, {bad} mismatches, {hits} MT hits")
+        print(f"{len(lines)} vectors, {bad} mismatches, {hits} MT/Woop hits")
         return 1 if bad else 0
 
 

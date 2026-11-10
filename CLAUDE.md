@@ -1255,7 +1255,10 @@ pass `-DCMAKE_C_FLAGS=-Nclang`.
 Lean 4 + Mathlib (v4.35.0) specs and proofs for slab/MT/Woop/BVH, a binary32
 rounding model, and a C→Lean bridge (`formal/tools/c2lean.py`, ported from
 tinygltf) that translates the scalar kernels of `lightrt_c_tri.c`
-(`tri_ray_setup`, `tri_slab_scalar`, `tri_mt_one`, …) into MiniC. Run
+(`tri_ray_setup`, `tri_slab_scalar`, `tri_mt_one`, …) into MiniC. The opt-in
+watertight triangle test `tri_woop_one` (Woop–Benthin–Wald; CPU quad/tetra leaves,
+`-DLRT_TRI_WATERTIGHT`) is proved to refine `Ref.woop` and to be watertight on
+shared edges for every input. Run
 `make formal` (build + `c2lean --check` + sorry budget + axiom allowlist +
 3-way cdiff). If you edit a translated C function, regenerate with
 `python3 formal/tools/c2lean.py`. Plan/status: `formal/PLAN.md`.

@@ -40,6 +40,15 @@ int main(void) {
             int r = tri_mt_one(&v[0], &v[3], &v[6], &v[9], &v[12], f(w[15]), f(w[16]), &t, &u, &vv);
             if (r == 1) printf("1 %08x %08x %08x\n", b(t), b(u), b(vv));
             else printf("%d\n", r);
+        } else if (strcmp(kind, "woop") == 0) {
+            unsigned w[17];
+            for (int k = 0; k < 17; k++) if (scanf("%x", &w[k]) != 1) return 1;
+            float v[15];
+            for (int k = 0; k < 15; k++) v[k] = f(w[k]);
+            float t = 0, u = 0, vv = 0;
+            int r = tri_woop_one(&v[0], &v[3], &v[6], &v[9], &v[12], f(w[15]), f(w[16]), &t, &u, &vv);
+            if (r == 1) printf("1 %08x %08x %08x\n", b(t), b(u), b(vv));
+            else printf("%d\n", r);
         } else {
             printf("BADLINE\n");
         }
