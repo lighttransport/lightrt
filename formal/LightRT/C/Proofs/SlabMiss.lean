@@ -54,7 +54,7 @@ set_option maxRecDepth 100000
 
 /-- **The C slab test has a false miss** (kernel-checked, no `native_decide`):
     the exact ray segment `[0, ∞)` meets the box, but `tri_slab_scalar` returns 0.
-    Lifting this to `Robust.tri_slab_scalar_false_miss_exists` needs the
+    Its model-level counterpart is `Robust.tri_slab_scalar_false_miss_exists`; linking the two goes through
     refinement `tri_slab_scalar_refines` (milestone M3). -/
 theorem tri_slab_scalar_false_miss : missExact = true ∧ missRun = some 0 :=
   ⟨by decide +kernel, by decide +kernel⟩

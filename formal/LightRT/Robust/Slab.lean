@@ -231,14 +231,7 @@ theorem slab_no_false_miss (r : Ray) (b : Box) (K : ℝ)
   refine le_trans ?_ step
   exact max_le (max_le (hN 0) (hN 1)) (max_le (hN 2) (by nlinarith))
 
-/-- Without inflation the scalar LightRT test can miss a real hit in binary32.
-    To be discharged by an explicit witness found with `tools/cdiff.py --search-miss`. -/
-theorem tri_slab_scalar_false_miss_exists :
-    ∃ (r : Ray) (b : Box), (∀ i, r.d i ≠ 0) ∧ 0 ≤ r.tmin ∧
-      (∀ i, Binary32.model.Repr (r.o i) ∧ Binary32.model.Repr (r.d i) ∧
-            Binary32.model.Repr (b.lo i) ∧ Binary32.model.Repr (b.hi i)) ∧
-      HitsBox r b ∧ ¬ fpSlab Binary32.model r b 1 := by
-  sorry
+-- `tri_slab_scalar_false_miss_exists` (no inflation ⇒ false miss) is in `Robust/SlabMissReal.lean`.
 
 end
 end LightRT.Robust
