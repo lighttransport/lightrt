@@ -862,16 +862,23 @@ static vk_pipeline *trace_get_pipeline(lrt_vk_engine *e, uint32_t w,
         vk_pipeline_destroy(e, &e->trace_pipes[0]);
         slot = &e->trace_pipes[0];
     }
-    uint32_t spec_data[2] = {w, stack};
-    VkSpecializationMapEntry ents[2];
+#ifdef LRT_TRI_SLAB_ROBUST
+    uint32_t spec_data[3] = {w, stack, 1u};
+#else
+    uint32_t spec_data[3] = {w, stack, 0u};
+#endif
+    VkSpecializationMapEntry ents[3];
     ents[0].constantID = 0;
     ents[0].offset = 0;
     ents[0].size = sizeof(uint32_t);
     ents[1].constantID = 1;
     ents[1].offset = sizeof(uint32_t);
     ents[1].size = sizeof(uint32_t);
+    ents[2].constantID = 2;
+    ents[2].offset = 2 * sizeof(uint32_t);
+    ents[2].size = sizeof(uint32_t);
     VkSpecializationInfo spec;
-    spec.mapEntryCount = 2;
+    spec.mapEntryCount = 3;
     spec.pMapEntries = ents;
     spec.dataSize = sizeof(spec_data);
     spec.pData = spec_data;

@@ -23,6 +23,13 @@ layout(local_size_x = 64) in;
 
 layout(constant_id = 0) const uint W = 8u;     // SoA lane width: 4 (BVH4) or 8 (BVH8)
 layout(constant_id = 1) const uint STACK = 96u; // per-invocation traversal stack depth
+// 1 = LRT_TRI_SLAB_ROBUST (host sets it when built with the flag): +inf slab
+// reciprocal for d == 0 and x86 `a < b ? a : b` min/max with the NaN-dropping
+// operand order of tri_slab_scalar (GLSL min/max are undefined on NaN).
+layout(constant_id = 2) const uint ROBUST = 0u;
+float smin(float a, float b) { return ROBUST != 0u ? (a < b ? a : b) : min(a, b); }
+float smax(float a, float b) { return ROBUST != 0u ? (a > b ? a : b) : max(a, b); }
+float stn(float tl, float th) { return ROBUST != 0u ? smin(th, tl) : min(tl, th); }
 
 layout(std430, binding = 0) readonly buffer Nodes  { uint nodes[]; };
 layout(std430, binding = 1) readonly buffer Blocks { uint blocks[]; };
@@ -66,6 +73,10 @@ void main() {
         }
         invd[k] = inv;
     }
+    vec3 sinv = invd;
+    if (ROBUST != 0u)
+        for (int k = 0; k < 3; k++)
+            if (dir[k] == 0.0) sinv[k] = uintBitsToFloat(0x7f800000u);
 
     float best_t = tmax;
     float best_u = 0.0, best_v = 0.0;
@@ -183,17 +194,17 @@ void main() {
             float hi_x = fu(nodes[nb + 3u * W + i]);
             float hi_y = fu(nodes[nb + 4u * W + i]);
             float hi_z = fu(nodes[nb + 5u * W + i]);
-            float tlx = (lo_x - org.x) * invd.x;
-            float thx = (hi_x - org.x) * invd.x;
-            float tly = (lo_y - org.y) * invd.y;
-            float thy = (hi_y - org.y) * invd.y;
-            float tlz = (lo_z - org.z) * invd.z;
-            float thz = (hi_z - org.z) * invd.z;
-            float tnx = min(tlx, thx), tfx = max(tlx, thx);
-            float tny = min(tly, thy), tfy = max(tly, thy);
-            float tnz = min(tlz, thz), tfz = max(tlz, thz);
-            float tnear = max(max(tnx, tny), max(tnz, tmin));
-            float tfar  = min(min(tfx, tfy), min(tfz, best_t));
+            float tlx = (lo_x - org.x) * sinv.x;
+            float thx = (hi_x - org.x) * sinv.x;
+            float tly = (lo_y - org.y) * sinv.y;
+            float thy = (hi_y - org.y) * sinv.y;
+            float tlz = (lo_z - org.z) * sinv.z;
+            float thz = (hi_z - org.z) * sinv.z;
+            float tnx = stn(tlx, thx), tfx = smax(tlx, thx);
+            float tny = stn(tly, thy), tfy = smax(tly, thy);
+            float tnz = stn(tlz, thz), tfz = smax(tlz, thz);
+            float tnear = smax(smax(tnx, tny), smax(tnz, tmin));
+            float tfar  = smin(smin(tfx, tfy), smin(tfz, best_t));
             if (tnear <= tfar) {
                 int j = nhit++;
                 while (j > 0 && hit_tn[j - 1] > tnear) {

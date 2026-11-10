@@ -22,7 +22,9 @@ def main():
     tmp = tempfile.mkdtemp()
     exe = {}
     variants = (("plain", []), ("exact", ["-DLRT_TRI_LEAF_BOX_EXACT"]),
-                ("robust", ["-DLRT_TRI_LEAF_BOX_EXACT", "-DLRT_TRI_SLAB_ROBUST", "-DLRT_TRI_BITEXACT"]))
+                ("robust", ["-DLRT_TRI_LEAF_BOX_EXACT", "-DLRT_TRI_SLAB_ROBUST", "-DLRT_TRI_BITEXACT"]),
+                ("exactn", ["-DLRT_TRI_LEAF_BOX_EXACT", "-DLRT_TRI_SLAB_ROBUST", "-DLRT_TRI_BITEXACT",
+                            "-DLRT_TRI_EXACT_NEAREST"]))
     for name, flags in variants:
         exe[name] = os.path.join(tmp, "bvhdump_" + name)
         subprocess.check_call(["cc", "-O1", "-ffp-contract=off", "-msse4.1", "-mavx2", "-mfma",
@@ -38,7 +40,7 @@ def main():
            "rob_miss": 0, "rob_brute": 0, "rob_simd": 0, "hq": 0}
     for seed in range(1, a.seeds + 1):
         for (n, q, w, g) in cfgs + hq:
-            for name in ("plain", "exact", "robust"):
+            for name in ("plain", "exact", "robust", "exactn"):
                 if (n, q, w, g) in hq and name != "plain":
                     continue
                 dump = subprocess.run([exe[name], str(seed), str(n), str(a.rays), str(q), str(w), str(g)],
@@ -49,13 +51,21 @@ def main():
                 rays = int(re.search(r"rays=(\d+)", out).group(1))
                 same = int(re.search(r"lean==C-scalar\(t,prim\)=(\d+)", out).group(1))
                 brute = int(re.search(r"t==brute=(\d+)", out).group(1))
-                miss = int(re.search(r"hit/miss-vs-brute=(\d+)", out).group(1))
+                miss = int(re.search(r" hit/miss-vs-brute=(\d+)", out).group(1))
+                smiss = int(re.search(r"dispatched-hit/miss-vs-brute=(\d+)", out).group(1))
                 if same != rays:
                     print(f"FAIL seed={seed} cfg={(n,q,w,g)} {name}: Lean mirror != C on {rays-same} rays")
                     bad += 1
                 full = int(re.search(r"\(t,prim\)==C-dispatched=(\d+)", out).group(1))
                 if (n, q, w, g) in hq:
                     tot["hq"] += 1
+                    continue
+                if name == "exactn":
+                    tot["exn"] = tot.get("exn", 0) + 1
+                    if brute != rays or full != rays or not wf:
+                        print(f"FAIL seed={seed} cfg={(n,q,w,g)}: exact-nearest != brute on {rays-brute} rays "
+                              f"(SIMD!=scalar {rays-full}, wf={wf})")
+                        bad += 1
                     continue
                 if name == "robust":
                     tot["rob_miss"] += miss; tot["rob_brute"] += rays - brute
@@ -66,7 +76,7 @@ def main():
                         print(f"FAIL seed={seed} cfg={(n,q,w,g)}: checkWF false (robust)"); bad += 1
                 if name == "exact":
                     tot["trees"] += 1; tot["rays"] += rays
-                    tot["brute"] += rays - brute; tot["miss"] += miss
+                    tot["brute"] += rays - brute; tot["miss"] += miss; tot["smiss"] = tot.get("smiss", 0) + smiss
                     if not wf:
                         print(f"FAIL seed={seed} cfg={(n,q,w,g)}: checkWF false with LRT_TRI_LEAF_BOX_EXACT")
                         bad += 1
@@ -74,9 +84,10 @@ def main():
                     tot["wf_plain_fail"] += 1
     print(f"{tot['trees']} C-built BVHs x {a.rays} rays: Lean traversal == C scalar on all; "
           f"checkWF true on all with LRT_TRI_LEAF_BOX_EXACT (false on {tot['wf_plain_fail']} without); "
-          f"{tot['brute']} rays differ from brute force ({tot['miss']} hit/miss, rest <= few-ulp t); "
+          f"{tot['brute']} rays differ from brute force ({tot['miss']} hit/miss, rest <= few-ulp t; SIMD path {tot.get('smiss', 0)} hit/miss); "
           f"robust+bitexact: SIMD == scalar (t,prim) on all, {tot['rob_brute']} differ from brute ({tot['rob_miss']} hit/miss); "
-          f"{tot['hq']} SBVH trees: Lean traversal == C scalar")
+          f"{tot['hq']} SBVH trees: Lean traversal == C scalar; "
+          f"exact-nearest: t == brute force (and SIMD == scalar) on all rays of {tot.get('exn', 0)} trees")
     sys.exit(1 if bad else 0)
 
 if __name__ == "__main__":
