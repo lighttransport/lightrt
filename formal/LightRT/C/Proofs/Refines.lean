@@ -6,6 +6,7 @@
                                          ▲ cdiff: bit-identical with compiled C
 -/
 import LightRT.C.Proofs.MTRefines
+import LightRT.C.Proofs.SlabFP
 import LightRT.Robust.Slab
 import LightRT.Geom.MTReal
 
@@ -63,12 +64,9 @@ theorem tri_mt_one_refines (o d v0 v1 v2 : Fin 3 → Ref.F) (tmin tbest : Ref.F)
     tri_mt_one_refines' o d v0 v1 v2 tmin tbest m bo bd b0 b1 b2 bt bu bvv ho hd h0 h1 h2 ht hu hvv hne
   exact ⟨s'.mem, callFunc_of_ExS (p := Gen.prog) rfl rfl hx, hp⟩
 
-/-- Value of a finite binary32 word as a real. -/
-noncomputable def val (w : Ref.F) : ℝ := (((Binary32.decode w).toQ?).getD 0 : ℝ)
-
 /-- Bridge to Stage 3: on finite inputs whose intermediates stay in the normal
     range, the bit-level slab verdict is the abstract `fpSlab` over
-    `Binary32.model` with `K = 1` and `invd` unclamped (`|d| ≥ 1e-18`). -/
+    `Binary32.model` with `K = 1` and `invd` unclamped (`|d| ≥ 1e-18`). Proved in `SlabFP.lean`. -/
 theorem slab_ref_eq_fpSlab (org dir : Fin 3 → Ref.F) (tmin tmax : Ref.F) (lo hi : Fin 3 → Ref.F)
     (hfin : ∀ w ∈ [org 0, org 1, org 2, dir 0, dir 1, dir 2, tmin, tmax, lo 0, lo 1, lo 2,
                     hi 0, hi 1, hi 2], ∃ s q, Binary32.decode w = .num s q)
@@ -79,7 +77,7 @@ theorem slab_ref_eq_fpSlab (org dir : Fin 3 → Ref.F) (tmin tmax : Ref.F) (lo h
     (Ref.slab (Ref.raySetup org dir tmin) lo hi tmax).1 = true ↔
       Robust.fpSlab Binary32.model
         ⟨fun k => val (org k), fun k => val (dir k), val tmin, val tmax⟩
-        ⟨fun k => val (lo k), fun k => val (hi k)⟩ 1 := by
-  sorry
+        ⟨fun k => val (lo k), fun k => val (hi k)⟩ 1 :=
+  slab_ref_eq_fpSlab' org dir tmin tmax lo hi hfin hdir hrange
 
 end LightRT.C.Proofs

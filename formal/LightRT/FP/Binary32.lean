@@ -525,4 +525,254 @@ noncomputable def model : RoundingModel where
   fl_zero := rneR_zero
   fl_idem := rneR_idem
 
+/-! ### Bit-level round trip: `decode ∘ encode = id` on representable values -/
+
+theorem pack_toNat (s : Bool) (E M : ℕ) (hE : E < 256) (hM : M < 2^23) :
+    ((if s then (0x80000000 : UInt32) else 0) ||| (E.toUInt32 <<< 23) ||| M.toUInt32).toNat =
+      (if s then 2^31 else 0) + E * 2^23 + M := by
+  have h1 : (E.toUInt32 <<< 23).toNat = E * 2^23 := by
+    rw [UInt32.toNat_shiftLeft]; simp [Nat.shiftLeft_eq]; omega
+  have h2 : (M.toUInt32).toNat = M := by simp; omega
+  rw [UInt32.toNat_or, UInt32.toNat_or, h1, h2, Nat.or_assoc]
+  have h3 : E * 2^23 ||| M = 2^23 * E + M := by
+    rw [mul_comm]; exact (Nat.two_pow_add_eq_or_of_lt hM E).symm
+  rw [h3]
+  cases s
+  · simp; ring
+  · simp only [ite_true]
+    have : (0x80000000 : UInt32).toNat = 2^31 * 1 := by decide
+    rw [this, ← Nat.two_pow_add_eq_or_of_lt (by omega)]; ring
+
+theorem decode_of_toNat (w : UInt32) (S E M : ℕ) (_hS : S ≤ 1) (hE : E < 256) (hM : M < 2^23)
+    (hw : w.toNat = S * 2^31 + E * 2^23 + M) :
+    decode w = if E = 255 then (if M = 0 then .inf (S = 1) else .nan)
+      else if E = 0 then .num (S = 1) ((M : ℚ) * (2 : ℚ) ^ (-149 : ℤ))
+      else .num (S = 1) (((2 ^ 23 + M : ℕ) : ℚ) * (2 : ℚ) ^ ((E : ℤ) - 150)) := by
+  have hs : ((w >>> 31) == 1) = decide (S = 1) := by
+    have : (w >>> 31).toNat = S := by
+      rw [UInt32.toNat_shiftRight]; simp [Nat.shiftRight_eq_div_pow]; omega
+    by_cases h : S = 1
+    · simp [h]; apply UInt32.toNat_inj.mp; rw [this, h]; rfl
+    · simp [h]; intro hc; apply h; rw [← this, hc]; rfl
+  have he : ((w >>> 23) &&& 0xff).toNat = E := by
+    rw [UInt32.toNat_and, UInt32.toNat_shiftRight]
+    have : (0xff : UInt32).toNat = 2^8 - 1 := by decide
+    rw [this, Nat.and_two_pow_sub_one_eq_mod]; simp [Nat.shiftRight_eq_div_pow]; omega
+  have hm : (w &&& 0x7fffff).toNat = M := by
+    rw [UInt32.toNat_and]
+    have : (0x7fffff : UInt32).toNat = 2^23 - 1 := by decide
+    rw [this, Nat.and_two_pow_sub_one_eq_mod]; omega
+  unfold decode; simp only [hs, he, hm]
+
+/-- `r ≥ 0` lies on the binary32 grid (unbounded above). -/
+def Grid (r : ℚ) : Prop := ∃ (n : ℕ) (q : ℤ), -149 ≤ q ∧ n < 2^24 ∧ r = n * (2:ℚ) ^ q
+
+theorem nat_of_grid (n : ℕ) (q k : ℤ) (h : 0 ≤ q + k) :
+    (n : ℚ) * (2:ℚ) ^ q * (2:ℚ) ^ k = ((n * 2 ^ (q + k).toNat : ℕ) : ℚ) := by
+  push_cast; rw [← zpow_natCast, Int.toNat_of_nonneg h, mul_assoc, ← zpow_add₀ (by norm_num)]
+
+theorem sign_dec (s : Bool) : decide ((if s then 1 else 0 : ℕ) = 1) = s := by cases s <;> rfl
+
+theorem decode_encode_num (s : Bool) (r : ℚ) (hg : Grid r) (hmax : r ≤ maxFinite) :
+    decode (encode (.num s r)) = .num s r := by
+  obtain ⟨n, q, hq, hn, rfl⟩ := hg
+  have hsb : ∀ X : UInt32, (if s then (0x80000000 : UInt32) else 0) ||| X =
+      (if s then (0x80000000 : UInt32) else 0) ||| ((0 : ℕ).toUInt32 <<< 23) ||| X := by
+    intro X; simp
+  have hS : (if s then 1 else 0 : ℕ) ≤ 1 := by cases s <;> simp
+  have hsn : ∀ X : ℕ, (if s then 2^31 else 0 : ℕ) + X = (if s then 1 else 0 : ℕ) * 2^31 + X := by
+    intro X; cases s <;> simp
+  by_cases h0 : (n : ℚ) * 2 ^ q = 0
+  · simp only [encode, h0, ite_true]
+    rw [show (if s then (0x80000000 : UInt32) else 0) = (if s then (0x80000000 : UInt32) else 0)
+      ||| ((0 : ℕ).toUInt32 <<< 23) ||| (0 : ℕ).toUInt32 by cases s <;> decide]
+    rw [decode_of_toNat _ _ 0 0 hS (by norm_num) (by norm_num)]
+    · simp [sign_dec]
+    · rw [pack_toNat s 0 0 (by norm_num) (by norm_num), hsn]
+  have hpos : 0 < (n : ℚ) * 2 ^ q := by
+    rcases Nat.eq_zero_or_pos n with h | h
+    · simp [h] at h0
+    · positivity
+  by_cases hsub : (n : ℚ) * 2 ^ q < (2 : ℚ) ^ (-126 : ℤ)
+  · simp only [encode, h0, hsub, ite_true, ite_false]
+    rw [nat_of_grid n q 149 (by omega), show ∀ x : ℚ, x.floor = ⌊x⌋ from fun _ => rfl,
+      Int.floor_natCast]
+    set N := n * 2 ^ (q + 149).toNat
+    have hN : (N : ℚ) = (n : ℚ) * 2 ^ q * 2 ^ (149:ℤ) := (nat_of_grid n q 149 (by omega)).symm
+    have hNlt : N < 2^23 := by
+      have : (N : ℚ) < 2^23 := by
+        rw [hN]; calc _ < (2:ℚ) ^ (-126 : ℤ) * 2 ^ (149:ℤ) := by gcongr
+          _ = 2^23 := by norm_num
+      exact_mod_cast this
+    simp only [Int.toNat_natCast]
+    rw [hsb, decode_of_toNat _ _ 0 N hS (by norm_num) hNlt]
+    · rw [if_neg (by norm_num), if_pos rfl, sign_dec, hN, mul_assoc, ← zpow_add₀ (by norm_num : (2:ℚ) ≠ 0)]
+      norm_num
+    · rw [pack_toNat s 0 N (by norm_num) hNlt, hsn]
+  · push_neg at hsub
+    simp only [encode, h0, not_lt.2 hsub, ite_false]
+    set r : ℚ := (n : ℚ) * 2 ^ q with hr
+    set e := Int.log 2 r
+    have he1 : (2:ℚ) ^ e ≤ r := by exact_mod_cast Int.zpow_log_le_self (b := 2) (by norm_num) hpos
+    have he2 : r < (2:ℚ) ^ (e + 1) := by exact_mod_cast Int.lt_zpow_succ_log_self (b := 2) (by norm_num) r
+    have hlo : -126 ≤ e := by
+      have := (zpow_lt_zpow_iff_right₀ (by norm_num : (1:ℚ) < 2)).1 (lt_of_le_of_lt hsub he2); omega
+    have hhi : e ≤ 127 := by
+      have : (2:ℚ) ^ e < 2 ^ (128:ℤ) := lt_of_le_of_lt he1 (lt_of_le_of_lt hmax (by unfold maxFinite; norm_num))
+      have := (zpow_lt_zpow_iff_right₀ (by norm_num : (1:ℚ) < 2)).1 this; omega
+    have hqe : e ≤ q + 23 := by
+      have : (2:ℚ) ^ e < 2 ^ (q + 24) := by
+        calc (2:ℚ) ^ e ≤ r := he1
+          _ < (2 ^ 24 : ℕ) * 2 ^ q := by rw [hr]; gcongr
+          _ = _ := by rw [zpow_add₀ (by norm_num)]; push_cast; ring
+      have := (zpow_lt_zpow_iff_right₀ (by norm_num : (1:ℚ) < 2)).1 this; omega
+    set P := n * 2 ^ (q + (23 - e)).toNat
+    have hP : (P : ℚ) = r * 2 ^ (23 - e) := (nat_of_grid n q (23 - e) (by omega)).symm
+    have hP1 : (2:ℚ) ^ 23 ≤ P := by
+      rw [hP]; calc (2:ℚ) ^ 23 = 2 ^ e * 2 ^ (23 - e) := by rw [← zpow_add₀ (by norm_num)]; norm_num
+        _ ≤ _ := by gcongr
+    have hP2 : (P : ℚ) < 2 ^ 24 := by
+      rw [hP]; calc r * 2 ^ (23 - e) < 2 ^ (e + 1) * 2 ^ (23 - e) := by gcongr
+        _ = 2 ^ 24 := by rw [← zpow_add₀ (by norm_num), show e + 1 + (23 - e) = (24:ℤ) by ring]; norm_num
+    have hP1' : 2 ^ 23 ≤ P := by exact_mod_cast hP1
+    have hP2' : P < 2 ^ 24 := by exact_mod_cast hP2
+    have hm : (r * 2 ^ (23 - e) - 2 ^ 23 : ℚ) = ((P - 2 ^ 23 : ℕ) : ℚ) := by
+      rw [← hP, Nat.cast_sub hP1']; norm_num
+    rw [hm, show ∀ x : ℚ, x.floor = ⌊x⌋ from fun _ => rfl, Int.floor_natCast, Int.toNat_natCast]
+    have hE : (e + 127).toNat < 256 := by omega
+    have hM : P - 2 ^ 23 < 2 ^ 23 := by omega
+    rw [decode_of_toNat _ _ _ _ hS hE hM]
+    · rw [if_neg (show (e + 127).toNat ≠ 255 by omega), if_neg (show (e + 127).toNat ≠ 0 by omega),
+        sign_dec]
+      have h23 : 2 ^ 23 + (P - 2 ^ 23) = P := Nat.add_sub_cancel' hP1'
+      rw [h23, hP, Int.toNat_of_nonneg (by omega), mul_assoc,
+        ← zpow_add₀ (by norm_num : (2:ℚ) ≠ 0)]
+      rw [show 23 - e + ((e + 127 : ℤ) - 150) = 0 by ring]; simp
+    · rw [pack_toNat s _ _ hE hM, hsn]
+
+
+
+theorem rne_maxFinite : rne maxFinite = maxFinite := by decide +kernel
+
+theorem abs_rne_grid (p : ℚ) : Grid |rne p| := by
+  by_cases h0 : p = 0
+  · exact ⟨0, -149, le_refl _, by norm_num, by simp [h0, rne]⟩
+  set Q := qexp p with hQ
+  set N := roundEven (|p| / (2:ℚ) ^ Q)
+  have hQ' : Q = max (Int.log 2 |p|) (-126) - 23 := by simp [hQ, qexp, prec, emin]
+  have hpa : 0 < |p| := abs_pos.2 h0
+  have hm0 : 0 ≤ |p| / (2:ℚ) ^ Q := by positivity
+  have hm1 : |p| / (2:ℚ) ^ Q ≤ ((2 ^ 24 : ℤ) : ℚ) := by
+    rw [div_le_iff₀ (by positivity)]
+    have h1 : |p| < (2:ℚ) ^ (Int.log 2 |p| + 1) := by
+      exact_mod_cast Int.lt_zpow_succ_log_self (b := 2) (by norm_num) |p|
+    have h2 : (2:ℚ) ^ (Int.log 2 |p| + 1) ≤ 2 ^ (Q + 24) :=
+      zpow_le_zpow_right₀ (by norm_num) (by omega)
+    rw [show (2:ℚ) ^ (Q + 24) = 2 ^ Q * 16777216 by rw [zpow_add₀ (by norm_num)]; norm_num] at h2
+    push_cast; linarith
+  have hN0 : 0 ≤ N := by
+    show 0 ≤ roundEven _; rw [← roundEven_ratCast]; exact roundEven_nonneg (by exact_mod_cast hm0)
+  have hN1 : N ≤ 2 ^ 24 := by
+    show roundEven _ ≤ _; rw [← roundEven_ratCast]
+    exact roundEven_le_of_le (by exact_mod_cast hm1)
+  have hr : |rne p| = (N : ℚ) * 2 ^ Q := by
+    unfold rne; rw [if_neg h0]; dsimp only
+    rw [abs_mul, abs_mul]
+    have : |(if p < 0 then (-1 : ℚ) else 1)| = 1 := by split_ifs <;> simp
+    rw [this, one_mul, abs_of_nonneg (by exact_mod_cast hN0), abs_of_pos (zpow_pos (by norm_num : (0:ℚ) < 2) _)]
+  have hQ149 : -149 ≤ Q := by omega
+  rcases lt_or_eq_of_le hN1 with h | h
+  · refine ⟨N.toNat, Q, hQ149, by omega, ?_⟩
+    rw [hr]; congr 1; exact_mod_cast (Int.toNat_of_nonneg hN0).symm
+  · refine ⟨2 ^ 23, Q + 1, by omega, by norm_num, ?_⟩
+    rw [hr, h, zpow_add₀ (by norm_num)]; push_cast; ring
+
+
+theorem grid_fixed {r : ℚ} (hg : Grid r) : rne r = r := by
+  obtain ⟨n, q, hq, hn, rfl⟩ := hg
+  rcases Nat.eq_zero_or_pos n with h | h
+  · simp [h, rne]
+  have hc : ((rne ((n : ℚ) * 2 ^ q) : ℚ) : ℝ) = (((n : ℚ) * 2 ^ q : ℚ) : ℝ) := by
+    rw [← rne_cast]; push_cast
+    have hy : (0:ℝ) < n * 2 ^ q := by positivity
+    apply rne_of_grid hy n q
+    · rw [qexp_eq, abs_of_pos hy]
+      have : Int.log 2 ((n:ℝ) * 2 ^ q) ≤ q + 23 := by
+        have h1 := Int.zpow_log_le_self (b := 2) (by norm_num) hy
+        have h2 : (n:ℝ) * 2 ^ q < (2:ℝ) ^ (q + 24) := by
+          rw [zpow_add₀ (by norm_num), mul_comm]; gcongr; exact_mod_cast hn
+        have := lt_of_le_of_lt h1 h2; push_cast at this
+        have := (zpow_lt_zpow_iff_right₀ (by norm_num : (1:ℝ) < 2)).1 this; omega
+      omega
+    · push_cast; rfl
+  exact_mod_cast hc
+
+theorem rne_bound (p : ℚ) (h : |p| ≤ maxFinite) : |rne p| ≤ maxFinite := by
+  have hm : rneR (maxFinite : ℝ) = maxFinite := by rw [rne_cast, rne_maxFinite]
+  have h1 : rneR (p : ℝ) ≤ maxFinite := by
+    rw [← hm]; exact rneR_mono (by exact_mod_cast (le_abs_self p).trans h)
+  have h2 : -(maxFinite : ℝ) ≤ rneR (p : ℝ) := by
+    rw [← hm, ← rneR_neg]; exact rneR_mono (by have := neg_abs_le p; push_cast; exact_mod_cast (by linarith))
+  rw [rne_cast] at h1 h2
+  have : |((rne p : ℚ) : ℝ)| ≤ maxFinite := abs_le.2 ⟨h2, h1⟩
+  exact_mod_cast this
+
+theorem roundQ_ok (p : ℚ) (z : Bool) (h : |p| ≤ maxFinite) :
+    ∃ s r, roundQ p z = .num s r ∧ Grid r ∧ r ≤ maxFinite := by
+  unfold roundQ
+  by_cases h0 : p = 0
+  · exact ⟨z, 0, by simp [h0], ⟨0, -149, le_refl _, by norm_num, by simp⟩, by unfold maxFinite; norm_num⟩
+  have hb := rne_bound p h
+  simp only [h0, ite_false, gt_iff_lt, not_lt.2 hb]
+  exact ⟨_, _, rfl, abs_rne_grid p, hb⟩
+
+theorem and_exp_mask (x : ℕ) : x &&& 0x7f800000 = (x / 2 ^ 23 % 256) * 2 ^ 23 := by
+  have hm : (x &&& 0x7f800000) % 2 ^ 23 = 0 := by
+    rw [Nat.and_mod_two_pow]; norm_num
+  have hd : (x &&& 0x7f800000) / 2 ^ 23 = x / 2 ^ 23 % 256 := by
+    rw [Nat.and_div_two_pow, show (0x7f800000 : ℕ) / 2 ^ 23 = 2 ^ 8 - 1 by norm_num,
+      Nat.and_two_pow_sub_one_eq_mod]
+  have := Nat.div_add_mod (x &&& 0x7f800000) (2 ^ 23)
+  rw [hm, hd] at this; omega
+
+theorem decode_fields (w : UInt32) :
+    decode w = if w.toNat / 2^23 % 256 = 255 then
+        (if w.toNat % 2^23 = 0 then .inf (w.toNat / 2^31 = 1) else .nan)
+      else if w.toNat / 2^23 % 256 = 0 then
+        .num (w.toNat / 2^31 = 1) (((w.toNat % 2^23 : ℕ) : ℚ) * (2 : ℚ) ^ (-149 : ℤ))
+      else .num (w.toNat / 2^31 = 1)
+        (((2 ^ 23 + w.toNat % 2^23 : ℕ) : ℚ) * (2 : ℚ) ^ (((w.toNat / 2^23 % 256 : ℕ) : ℤ) - 150)) := by
+  have := w.toNat_lt
+  exact decode_of_toNat w _ _ _ (by omega) (by omega) (by omega) (by omega)
+
+theorem isNaNBits_false {w : UInt32} {s : Bool} {q : ℚ} (h : decode w = .num s q) :
+    isNaNBits w = false := by
+  unfold isNaNBits
+  rw [decode_fields] at h
+  by_contra hc
+  simp only [Bool.not_eq_false, Bool.and_eq_true, beq_iff_eq, bne_iff_ne, ne_eq] at hc
+  obtain ⟨h1, h2⟩ := hc
+  have e1 := congrArg UInt32.toNat h1
+  rw [UInt32.toNat_and, show (0x7f800000 : UInt32).toNat = 0x7f800000 by decide, and_exp_mask] at e1
+  have e2 : (w &&& 0x7fffff).toNat ≠ 0 := fun hh => h2 (UInt32.toNat_inj.mp (by rw [hh]; rfl))
+  rw [UInt32.toNat_and, show (0x7fffff : UInt32).toNat = 2^23 - 1 by decide,
+    Nat.and_two_pow_sub_one_eq_mod] at e2
+  have : w.toNat / 2 ^ 23 % 256 = 255 := by omega
+  rw [if_pos this, if_neg e2] at h; cases h
+
+theorem decode_grid {w : UInt32} {s : Bool} {q : ℚ} (h : decode w = .num s q) :
+    Grid q ∧ q ≤ maxFinite := by
+  rw [decode_fields] at h
+  have := w.toNat_lt
+  split_ifs at h with h1 h2 <;> cases h
+  · refine ⟨⟨_, -149, le_refl _, by omega, rfl⟩, ?_⟩
+    calc _ ≤ ((2^23 : ℕ) : ℚ) * (2:ℚ) ^ (-149:ℤ) := by gcongr; omega
+      _ ≤ maxFinite := by unfold maxFinite; norm_num
+  · refine ⟨⟨_, _, by omega, by omega, rfl⟩, ?_⟩
+    have hE : w.toNat / 2 ^ 23 % 256 ≤ 254 := by omega
+    calc _ ≤ ((2^24 - 1 : ℕ) : ℚ) * (2:ℚ) ^ (((254 : ℕ) : ℤ) - 150) := by
+          gcongr
+          all_goals first | omega | norm_num | (push_cast; omega)
+      _ = maxFinite := by unfold maxFinite; norm_num
+
 end LightRT.FP.Binary32
