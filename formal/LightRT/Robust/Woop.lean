@@ -74,7 +74,11 @@ theorem woop_no_gap (w : WoopRay) (a b c d : Vec3)
 theorem edgeFn_sign_weak (p q : ℝ × ℝ) :
     (0 ≤ p.1 * q.2 - p.2 * q.1 → 0 ≤ edgeFn R p q) ∧
     (p.1 * q.2 - p.2 * q.1 ≤ 0 → edgeFn R p q ≤ 0) := by
-  sorry
+  constructor
+  · intro h; unfold edgeFn RoundingModel.sub RoundingModel.mul
+    apply R.fl_nonneg; have := R.mono (show p.2 * q.1 ≤ p.1 * q.2 by linarith); linarith
+  · intro h; unfold edgeFn RoundingModel.sub RoundingModel.mul
+    apply R.fl_nonpos; have := R.mono (show p.1 * q.2 ≤ p.2 * q.1 by linarith); linarith
 
 /-- **Vertex consistency (fan).** Around a shared vertex `v` with ring
     `w 0, …, w n` (cyclic), triangles `(v, w i, w (i+1))`. If the outer edges
@@ -86,7 +90,13 @@ theorem woop_vertex_fan (wr : WoopRay) {n : ℕ} (v : Vec3) (w : Fin (n + 1) →
                                       (shear R wr v).2 * (shear R wr (w j)).1
                     s i ≤ 0 ∧ 0 ≤ s (i + 1)) :
     ∃ i, Accept (woopUVW R wr v (w i) (w (i + 1))) := by
-  sorry
+  obtain ⟨i, hi, hi1⟩ := hsector
+  refine ⟨i, Or.inl ⟨(hout i).le, ?_, ?_⟩, fun h0 => (hout i).ne' h0.1⟩
+  · exact (edgeFn_sign_weak R _ _).1 hi1
+  · show 0 ≤ edgeFn R _ _
+    rw [woop_edge_antisymm R]
+    have := (edgeFn_sign_weak R (shear R wr v) (shear R wr (w i))).2 hi
+    linarith
 
 end
 end LightRT.Robust

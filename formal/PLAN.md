@@ -1,6 +1,6 @@
 # LightRT formal verification plan (Lean 4 + Mathlib)
 
-Status as of 2026-11-10. Everything below builds with `make formal`. The codebase has **11 `sorry`s** (`tools/count_sorry.sh`). **169 theorems are closed** with axioms limited to {`propext`, `Classical.choice`, `Quot.sound`}. That count includes 52 MiniC logic lemmas ported from tinygltf; 117 are new to this project, including the full M1 Ize slab bound (`slab_no_false_miss`, `slab_t_err`, `slab_t_err_fma`, `ize_constant_sufficient`/`_gamma3_insufficient`). The binary32 instance `Binary32.model` is now sorry-free (`rneR_rel`, `rneR_mono`, `rneR_neg`, `rneR_idem`, `rne_cast`, `mul_num_refines`), so `slab_no_false_miss` holds for real binary32 RNE. No closed theorem uses `native_decide`.
+Status as of 2026-11-10. Everything below builds with `make formal`. The codebase has **0 `sorry`s** (`tools/count_sorry.sh`; `FORMAL_SORRY_MAX = 0`). Every stated theorem is closed, including `tri_ray_setup_refines` (loop + struct stores), the Higham γₙ product lemmas, Möller–Trumbore soundness/completeness/Cramer over ℝ, the Woop vertex fan, and the BVH build/traversal theorems. **255 theorems are closed** with axioms limited to {`propext`, `Classical.choice`, `Quot.sound`}. That count includes 52 MiniC logic lemmas ported from tinygltf; 117 are new to this project, including the full M1 Ize slab bound (`slab_no_false_miss`, `slab_t_err`, `slab_t_err_fma`, `ize_constant_sufficient`/`_gamma3_insufficient`). The binary32 instance `Binary32.model` is now sorry-free (`rneR_rel`, `rneR_mono`, `rneR_neg`, `rneR_idem`, `rne_cast`, `mul_num_refines`), so `slab_no_false_miss` holds for real binary32 RNE. No closed theorem uses `native_decide`.
 
 ## 1. Repo layout
 
@@ -52,7 +52,7 @@ All statements below compile. A † marks a theorem that is already proved.
 **Stage 1 (ℝ³):**
 - `slabReal_iff (hd : ∀ i, r.d i ≠ 0) : slabReal r b ↔ HitsBox r b`
 - `hitsBox_parallel`†
-- `mtReal_sound`, `mtReal_complete`
+- `mtReal_sound` (needs `0 < ε`: with `ε = 0` a zero determinant is not rejected and the division by zero yields a bogus hit, so the original `0 ≤ ε` statement was false), `mtReal_complete`, `mt_cramer`
 - Helpers: `slab_axis_iff`, `mt_cramer`
 
 **Stage 2:**
@@ -139,6 +139,6 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   - c2lean was ported with f32 support, `copysignf`, scalar replacement of constant-indexed local arrays, and fixes for loop-variable ordering and enums.
 - **M1:** Woop edge antisymmetry (✅ done: `woop_edge_antisymm`, `woop_no_gap`), plus Ize's slab bound (✅ done: `slab_t_err`, `slab_t_err_fma`, `slab_no_false_miss` under `6u<1`, `InflationOK`; spec fix: `slab_axis_iff`/`slabReal_iff` needed `lo ≤ hi`).
 - **M2:** binary32 model obligations (`rneR_*`) and `slab_ref_eq_fpSlab`.
-- **M3:** ✅ `tri_slab_scalar_refines`, `tri_mt_one_refines` (all inputs, eventual-fuel form), `tri_slab_scalar_false_miss_exists` (over ℝ, `Binary32.model`), add/sub/mul/div value bridges, and the opt-in C patch `LRT_TRI_SLAB_INFLATE` (`tfar *= 0x3f800005`). `slab_ref_eq_fpSlab` ✅ (via `decode_encode_num`). Open: `tri_ray_setup_refines` (loop + struct stores).
-- **M4:** Woop vertex fan, optional C port, and `tri_mt_one_refines`. Möller–Trumbore *non*-watertightness would be shown with a cdiff witness.
-- **M5:** BVH `traverse_eq_brute` / `traverseOrdered_eq_brute`, instantiated with the Stage 3 box test.
+- **M3:** ✅ `tri_slab_scalar_refines`, `tri_mt_one_refines` (all inputs, eventual-fuel form), `tri_slab_scalar_false_miss_exists` (over ℝ, `Binary32.model`), add/sub/mul/div value bridges, and the opt-in C patch `LRT_TRI_SLAB_INFLATE` (`tfar *= 0x3f800005`). `slab_ref_eq_fpSlab` ✅ (via `decode_encode_num`). `tri_ray_setup_refines` ✅ (3-iteration loop unrolled; arbitrary initial `*rc` contents).
+- **M4:** ✅ Woop vertex fan and `tri_mt_one_refines`. Not done (no theorem stated): an optional C port of Woop, and a cdiff witness for Möller–Trumbore non-watertightness.
+- **M5:** ✅ BVH `build_prims_perm`, `traverse_eq_brute` / `traverseOrdered_eq_brute` (generic in the box test; instantiate with the Stage 3 inflated slab).
