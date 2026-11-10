@@ -15,3 +15,7 @@ lean_lib «LightRT» where
 /-- Differential-testing driver (see tools/cdiff.py). -/
 lean_exe «cdiff» where
   root := `CDiff
+
+/-- BVH validator over C-built trees (see tools/bvhdump.c). -/
+lean_exe «checkbvh» where
+  root := `CheckBVH

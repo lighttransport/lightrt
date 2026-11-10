@@ -256,3 +256,4 @@ formal:
 	sh formal/tools/count_sorry.sh --max $(FORMAL_SORRY_MAX)
 	python3 formal/tools/check_axioms.py > /dev/null
 	python3 formal/tools/cdiff.py --n 1000
+	python3 formal/tools/bvhcheck.py --rays 100 --seeds 1

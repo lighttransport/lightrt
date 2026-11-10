@@ -8,6 +8,8 @@ import LightRT.Robust.Slab
 import LightRT.Robust.SlabMissReal
 import LightRT.Robust.Woop
 import LightRT.BVH.Tree
+import LightRT.BVH.Flat
+import LightRT.BVH.Check
 import LightRT.C.Semantics
 import LightRT.C.Logic
 import LightRT.C.Hoare
@@ -19,3 +21,4 @@ import LightRT.C.Proofs.MTGap
 import LightRT.C.Proofs.WoopRefines
 import LightRT.C.Proofs.WoopWatertight
 import LightRT.C.Proofs.WoopDet
+import LightRT.C.Proofs.SlabParallel

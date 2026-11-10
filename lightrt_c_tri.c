@@ -10005,6 +10005,9 @@ static int tri_collapse_into(lrt_tri_scene *s, tri_build_ctx *bc,
     return 0;
 }
 
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+static lrt_result tri_refit_propagate(lrt_tri_scene *s);
+#endif
 static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
                                            const lrt_tri_build_options *opts,
                                            const uint32_t *morton_override,
@@ -10294,6 +10297,19 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
     s->kernel_name = layout == 4    ? "bvh4/scalar"
                      : quantized    ? "bvh8q/scalar"
                                     : "bvh8/scalar";
+#endif
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+    /* Re-derive every node box bottom-up from the stored leaf triangles (exact,
+     * outward-bracketed corners), so each child box contains the triangle the
+     * intersector actually tests. SBVH (HQ) is skipped: its clipped leaf boxes
+     * intentionally cover only part of a triangle. */
+    if (s->prim_kind == TRI_PRIM_TRI && o.quality != LRT_TRI_BUILD_HQ &&
+        (layout == 4 || (layout == 8 && !quantized && !s->qnode)) &&
+        tri_refit_propagate(s) != LRT_RESULT_OK) {
+        lrt_tri_scene_free(s);
+        tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+        return NULL;
+    }
 #endif
     tri_build_prim2slot(s);
     return s;
@@ -10984,8 +11000,38 @@ static inline void tri_leaf_verts(const float *f, int bw, int lane, float A[3],
     }
 }
 
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+/* Floats bracketing the EXACT sum a + b (TwoSum error term; no FMA/fast-math).
+ * The leaf intersector tests the triangle v0 + u*e1 + v*e2 with the STORED,
+ * rounded edges, so its corners v0 + e are generally not floats; the float
+ * fl(v0 + e) can lie inside the true corner and the plain AABB then misses the
+ * stored triangle by up to an ulp of the edge (found by the Lean BVH validator,
+ * formal/CheckBVH.lean). */
+static inline void tri_sum_bracket(float a, float b, float *lo, float *hi) {
+    volatile float s = a + b;
+    volatile float bb = s - a;
+    float err = (a - (s - bb)) + (b - bb);
+    *lo = err < 0.0f ? nextafterf(s, -INFINITY) : s;
+    *hi = err > 0.0f ? nextafterf(s, INFINITY) : s;
+}
+#endif
+
 static inline void tri_leaf_prim_aabb(const float *f, int bw, int lane,
                                       float lo[3], float hi[3]) {
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+    for (int a = 0; a < 3; a++) {
+        float v0 = f[a * bw + lane];
+        float bl, bh, cl, ch;
+        tri_sum_bracket(v0, f[(3 + a) * bw + lane], &bl, &bh);
+        tri_sum_bracket(v0, f[(6 + a) * bw + lane], &cl, &ch);
+        float mn = v0 < bl ? v0 : bl;
+        mn = mn < cl ? mn : cl;
+        float mx = v0 > bh ? v0 : bh;
+        mx = mx > ch ? mx : ch;
+        lo[a] = mn;
+        hi[a] = mx;
+    }
+#else
     float A[3], B[3], C[3];
     tri_leaf_verts(f, bw, lane, A, B, C);
     for (int a = 0; a < 3; a++) {
@@ -10996,6 +11042,7 @@ static inline void tri_leaf_prim_aabb(const float *f, int bw, int lane,
         lo[a] = mn;
         hi[a] = mx;
     }
+#endif
 }
 
 /* Distance-ordered DFS that maintains an ascending k-set of nearest primitives
