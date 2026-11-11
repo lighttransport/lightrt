@@ -61,13 +61,20 @@ $(BUILD)/node_truth.o: tests/node_truth.c | $(BUILD)
 	$(CC) $(CFLAGS) $(WARN) -c $< -o $@
 node_truth: $(TEST_DEPS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-test: node_truth
+test: node_truth white_furnace
 	./node_truth
+	./white_furnace
 
 # Lean-generated node evaluation vectors (tests/generated/mtlx-eval.inc, from
 # the materialx-conformance repository). Links only the document loader and
 # the evaluator, with a neutral texture stub, so it needs no deps/.
 LEAN_SRC = tests/lean_vectors.c tests/texture_stub.c mtlx_doc.c mtlx_xml.c mtlx_eval.c color.c
+white_furnace: tests/white_furnace.c bsdf.c bsdf.h mtlx_eval.h vecmath.h
+	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/white_furnace.c bsdf.c $(LDFLAGS)
+
+test-white-furnace: white_furnace
+	./white_furnace
+
 lean_vectors: $(LEAN_SRC) tests/generated/mtlx-eval.inc tests/generated/mtlx-eval-approx.inc mtlx_stdlib_defs.inc
 	$(CC) $(CSTD) -O2 -D_POSIX_C_SOURCE=200809L -I. -Itests -o $@ $(LEAN_SRC) -lm
 test-lean: lean_vectors
@@ -105,7 +112,7 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 clean:
-	rm -rf build build-vk mtlxrender node_truth mtlxvk lean_vectors
+	rm -rf build build-vk mtlxrender node_truth white_furnace mtlxvk lean_vectors
 
 # Cross-renderer verification against the ASF MaterialX reference (GLSL + OSL).
 # Needs the one-time setup in verify/README.md (conda env + reference builds).
@@ -114,4 +121,4 @@ VERIFY_MODE ?= all
 verify: mtlxrender
 	bash verify/run_verify.sh $(VERIFY_MODE)
 
-.PHONY: clean test check verify
+.PHONY: clean test test-white-furnace check verify

@@ -156,7 +156,9 @@ catches real correctness bugs, not just regressions. Each case feeds inputs
 through the real parse → doc → eval path (`mtlx_load_string` + a one-node graph).
 
 ```bash
-make test        # builds and runs node_truth (67 assertions, all PASS)
+make test        # node_truth plus the CPU BSDF white-furnace quadrature
+make test-white-furnace  # deterministic material/lobe energy integration
+make test-lean    # Lean-generated node vectors
 make check       # node ground-truth + golden render regression
 # or: ctest       (via CMake)
 ```
@@ -171,6 +173,16 @@ mapping** — `standard_surface` / `gltf_pbr` / `UsdPreviewSurface` /
 `disney_principled` inputs onto the OpenPBR params. Procedural noise is checked
 for spec invariants (determinism, output range). The suite is clean under
 ASan/UBSan.
+
+### CPU BSDF white-furnace integration
+
+`tests/white_furnace.c` integrates the evaluated CPU BSDF over a uniform
+hemisphere with deterministic angular quadrature. It checks total, diffuse, and
+specular energy for diffuse, no-specular, dielectric, metal, subsurface, coat,
+sheen, and colored parameter sets at normal and grazing view angles. This caught
+a grazing-angle energy excess in the diffuse-plus-specular response; the BSDF now
+uses the authored specular weight as its grazing reflectance and attenuates
+diffuse/subsurface energy by the matching Fresnel response.
 
 ### Golden reference renders
 
