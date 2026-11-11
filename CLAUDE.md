@@ -1260,15 +1260,16 @@ watertight triangle test `tri_woop_one` (Woop–Benthin–Wald; CPU quad/tetra l
 `-DLRT_TRI_WATERTIGHT`) is proved to refine `Ref.woop` and to be watertight on
 shared edges for every input. Run
 `make formal` (build + `c2lean --check` + sorry budget + axiom allowlist +
-3-way cdiff + `tools/bvhcheck.py`, which validates real C-built BVH4/BVH8 trees against the Lean flat-BVH traversal theorem in `LightRT/BVH/Flat.lean`). `-DLRT_TRI_LEAF_BOX_EXACT` (opt-in) makes node boxes contain the stored, rounded leaf triangles exactly; it is needed for the checker's `checkWF` to pass. Further opt-in robustness flags, all validated by `bvhcheck.py` and described in PLAN.md M7:
-- `-DLRT_TRI_SLAB_ROBUST`: no false miss for a ray lying exactly on a slab plane. Scalar and SSE/AVX2 only.
+3-way cdiff + `tools/bvhcheck.py`, which validates real C-built BVH4/BVH8 trees against the Lean flat-BVH traversal theorem in `LightRT/BVH/Flat.lean`). Robustness flags, all validated by `bvhcheck.py` and described in PLAN.md M7. **`LRT_TRI_LEAF_BOX_EXACT` and `LRT_TRI_SLAB_ROBUST` are on by default** (set in `lightrt_c_tri.h`; opt out with `-DLRT_TRI_NO_LEAF_BOX_EXACT` / `-DLRT_TRI_NO_SLAB_ROBUST`). Measured cost (1 thread, mandelbulb 128k): trace within noise (±3%), build +7% SAH / +29% LBVH (leaf-box TwoSum + refit pass), no memory change. The others stay opt-in:
+- `LRT_TRI_LEAF_BOX_EXACT` (default): node boxes contain the stored, rounded leaf triangles exactly; it is needed for the checker's `checkWF` to pass.
+- `LRT_TRI_SLAB_ROBUST` (default): no false miss for a ray lying exactly on a slab plane.
 - `-DLRT_TRI_BITEXACT`: the SIMD leaf and det test use scalar evaluation order. With `SLAB_ROBUST`, SIMD traversal is bit-identical to scalar.
 - `-DLRT_TRI_WATERTIGHT_TRI`: watertight Woop main triangle leaf on exact vertices, scalar kernels. Run `make c_tri_seam_test`.
 - `-DLRT_TRI_EXACT_NEAREST`: closest-hit node tests ignore the current best, so the result is exactly the brute-force nearest hit (`Flat.run_exact`). This gives up early-out pruning.
 
 `SLAB_ROBUST` covers scalar, SSE/AVX2, the NEON shim, SVE, the quantized node formats and the GPU kernels (hiprtc, CUDA, Vulkan via specialization constant 2). Run `make c_tri_parallel_test`. The HIP (resident `.hip` and hiprtc), Vulkan and CUDA kernels also run the watertight leaf when the scene carries exact vertices (`WATERTIGHT_TRI` builds). The CUDA path is compile-checked only.
 
-The hiprtc Path-A trace (`lightrt_c_hip.c` + `lightrt_hipew.c`) needs no hipcc. Run `make hip_rtc_test`; it is a separate binary because it defines the same `lrt_hip_*` engine symbols as `lightrt_c_hip.hip`. If you edit a translated C function, regenerate with
+The hiprtc Path-A trace (`lightrt_c_hip.c` + `lightrt_hipew.c`) needs no hipcc. Run `make hip_rtc_test`; it is a separate binary because it defines the same `lrt_hip_*` engine symbols as `lightrt_c_hip.hip`. c2lean emits two configurations: `C/Gen.lean` (legacy kernel, built with both opt-outs) and `C/GenRobust.lean` (default build; `tri_slab_scalar_robust_refines` proves the default slab equals `Ref.slabRobust`). If you edit a translated C function, regenerate with
 `python3 formal/tools/c2lean.py`. Plan/status: `formal/PLAN.md`.
 
 ## Code Conventions

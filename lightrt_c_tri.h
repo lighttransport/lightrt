@@ -17,6 +17,20 @@
 #ifndef LIGHTRT_C_TRI_H
 #define LIGHTRT_C_TRI_H
 
+/* Robustness defaults (see formal/PLAN.md M7). Both are on unless opted out:
+ *  LRT_TRI_SLAB_ROBUST    : no false miss for rays lying on a slab plane
+ *                           (opt out: -DLRT_TRI_NO_SLAB_ROBUST)
+ *  LRT_TRI_LEAF_BOX_EXACT : node boxes exactly contain the stored triangles
+ *                           (opt out: -DLRT_TRI_NO_LEAF_BOX_EXACT)
+ * Every backend (CPU SIMD, HIP/hiprtc, CUDA, Vulkan) includes this header, so
+ * the GPU kernels follow the same default. */
+#if !defined(LRT_TRI_NO_SLAB_ROBUST) && !defined(LRT_TRI_SLAB_ROBUST)
+#define LRT_TRI_SLAB_ROBUST 1
+#endif
+#if !defined(LRT_TRI_NO_LEAF_BOX_EXACT) && !defined(LRT_TRI_LEAF_BOX_EXACT)
+#define LRT_TRI_LEAF_BOX_EXACT 1
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 
