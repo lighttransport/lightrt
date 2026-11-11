@@ -153,5 +153,155 @@ theorem runAny_cover_root (F : Flat B α) (hw : F.WFidx) (test0 : B → Bool) (h
     (by intro r hr; simp only [List.mem_singleton] at hr; subst hr; exact hw.1) (by simp)
   simpa using this
 
+/-! ### Bounded stack (`TRI_STACK_SIZE`)
+
+`tri_occluded_scalar` returns 0 ("not occluded") when the remaining stack plus
+the popped node's children would exceed `TRI_STACK_SIZE`
+(`if (sp + nchildren > TRI_STACK_SIZE) return 0`). `runAnyB` models that. It is proved
+never to fire, so the answer is `runAny`'s, whenever the tree's
+stack requirement `need root` fits. `need` is computable (the validator
+checks it against `TRI_STACK_SIZE` on real trees) and order-independent:
+`need i = (#children - 1) + max(1, max over children of need)`. The same
+bound covers `tri_intersect_scalar`'s check, which uses the (smaller) number
+of children that pass the box test. -/
+
+/-- `tri_occluded_scalar` with the capacity check. -/
+def runAnyB (F : Flat B α) (cap : ℕ) (test0 : B → Bool) (hit : α → Bool)
+    (order : List CRef → List CRef) : ℕ → List CRef → Option Bool
+  | 0, _ => none
+  | _ + 1, [] => some false
+  | f + 1, r :: st =>
+    match r with
+    | .leaf blk n => if (F.leafPrims blk n).any hit then some true
+        else runAnyB F cap test0 hit order f st
+    | .node i =>
+      if cap < st.length + (F.children i).length then some false else
+      runAnyB F cap test0 hit order f
+        (order (((F.children i).filter fun c => test0 c.1).map Prod.snd) ++ st)
+
+/-- Stack entries needed below node `i` (itself included). -/
+def need (F : Flat B α) (i : ℕ) : ℕ :=
+  ((F.children i).length - 1) + max 1 (((F.children i).attach.map fun ⟨c, _⟩ =>
+    match c.2 with
+    | .leaf _ _ => 1
+    | .node j => if h : i < j ∧ j < F.nodes.length then F.need j else 1).foldr max 0)
+termination_by F.nodes.length - i
+
+def needRef (F : Flat B α) : CRef → ℕ
+  | .leaf _ _ => 1
+  | .node j => F.need j
+
+theorem need_eq (F : Flat B α) (i : ℕ) : F.need i =
+    ((F.children i).length - 1) + max 1 (((F.children i).map fun c =>
+      match c.2 with
+      | .leaf _ _ => 1
+      | .node j => if i < j ∧ j < F.nodes.length then F.need j else 1).foldr max 0) := by
+  rw [need]
+  congr 3
+  conv_rhs => rw [← List.attach_map_subtype_val (F.children i), List.map_map]
+  rfl
+
+theorem le_foldr_max {x : ℕ} : ∀ {l : List ℕ}, x ∈ l → x ≤ l.foldr max 0
+  | _ :: _, List.Mem.head _ => le_max_left _ _
+  | _ :: _, List.Mem.tail _ h => (le_foldr_max h).trans (le_max_right _ _)
+
+/-- A child's requirement, plus the siblings that may sit above it, fits in its
+    parent's requirement. -/
+theorem need_child (F : Flat B α) (hw : F.WFidx) {i : ℕ} (hi : i < F.nodes.length)
+    {c : B × CRef} (hc : c ∈ F.children i) :
+    ((F.children i).length - 1) + F.needRef c.2 ≤ F.need i := by
+  rw [need_eq]
+  have hv : F.needRef c.2 ∈ (F.children i).map fun c =>
+      match c.2 with
+      | .leaf _ _ => 1
+      | .node j => if i < j ∧ j < F.nodes.length then F.need j else 1 := by
+    refine List.mem_map.2 ⟨c, hc, ?_⟩
+    rcases c with ⟨b, r⟩; cases r with
+    | leaf => rfl
+    | node j => obtain ⟨h1, h2⟩ := hw.2 i hi _ hc j rfl; simp [needRef, h1, h2]
+  have := le_foldr_max hv
+  omega
+
+theorem children_le_need (F : Flat B α) (i : ℕ) : (F.children i).length ≤ F.need i := by
+  rw [need_eq]; omega
+
+/-- Stack invariant: each entry's requirement plus the entries below it fits. -/
+def Good (F : Flat B α) (cap : ℕ) : List CRef → Prop
+  | [] => True
+  | r :: st => st.length + F.needRef r ≤ cap ∧ Good F cap st
+
+theorem good_append (F : Flat B α) (cap : ℕ) (st : List CRef) (hst : F.Good cap st) :
+    ∀ (L : List CRef), (∀ x ∈ L, (L.length - 1) + st.length + F.needRef x ≤ cap) →
+      F.Good cap (L ++ st)
+  | [], _ => hst
+  | x :: L, h => by
+    refine ⟨?_, good_append F cap st hst L fun y hy => ?_⟩
+    · have := h x (by simp)
+      simp only [List.append_eq, List.length_append, List.length_cons] at this ⊢; omega
+    · have := h y (by simp [hy]); simp only [List.length_cons] at this; omega
+
+/-- **The capacity check never fires** under the invariant (in particular from
+    `[root]` when `needRef root ≤ cap`): the bounded loop equals `runAny`. -/
+theorem runAnyB_eq (F : Flat B α) (hw : F.WFidx) (cap : ℕ) (test0 : B → Bool) (hit : α → Bool)
+    (order : List CRef → List CRef) (hord : ∀ l, (order l).Perm l) :
+    ∀ f (st : List CRef), (∀ r ∈ st, ∀ j, r = .node j → j < F.nodes.length) → F.Good cap st →
+      runAnyB F cap test0 hit order f st = runAny F test0 hit order f st := by
+  intro f
+  induction f with
+  | zero => intros; rfl
+  | succ f ih =>
+    intro st hv hg
+    match st with
+    | [] => rfl
+    | r :: st =>
+      have hvst : ∀ e ∈ st, ∀ j, e = .node j → j < F.nodes.length :=
+        fun e he => hv e (by simp [he])
+      cases r with
+      | leaf blk n =>
+        simp only [runAnyB, runAny]
+        split_ifs
+        · rfl
+        · exact ih st hvst hg.2
+      | node i =>
+        have hi := hv (.node i) (by simp) i rfl
+        have hcap : ¬ cap < st.length + (F.children i).length := by
+          have := children_le_need F i; have := hg.1; simp only [needRef] at this; omega
+        simp only [runAnyB, runAny, hcap, ite_false]
+        set Y := ((F.children i).filter fun c => test0 c.1).map Prod.snd with hY
+        apply ih
+        · intro e he j hj
+          rcases List.mem_append.1 he with he | he
+          · have he' := (hord Y).mem_iff.1 he
+            rw [hY, List.mem_map] at he'
+            obtain ⟨c, hc, hce⟩ := he'
+            exact (hw.2 i hi c (List.mem_filter.1 hc).1 j (hce.trans hj)).2
+          · exact hvst e he j hj
+        · refine good_append F cap st hg.2 _ fun x hx => ?_
+          have hx' := (hord Y).mem_iff.1 hx
+          rw [hY, List.mem_map] at hx'
+          obtain ⟨c, hc, rfl⟩ := hx'
+          have hc' := (List.mem_filter.1 hc).1
+          have h1 := need_child F hw hi hc'
+          have h2 : (order Y).length ≤ (F.children i).length := by
+            rw [(hord Y).length_eq, hY, List.length_map]; exact List.length_filter_le _ _
+          have h3 := hg.1
+          simp only [needRef] at h3
+          omega
+
+/-- **Root form**: if the tree's stack requirement fits in `TRI_STACK_SIZE`, the
+    C any-hit loop (with its overflow `return 0`) answers exactly brute force. -/
+theorem runAnyB_root {inside : α → B → Prop} {sub : B → B → Prop} (F : Flat B α)
+    (hw : F.WF inside sub) (mono : ∀ p b b', inside p b' → sub b' b → inside p b)
+    (cap : ℕ) (hcap : F.needRef F.root ≤ cap)
+    (test0 : B → Bool) (hit : α → Bool)
+    (order : List CRef → List CRef) (hord : ∀ l, (order l).Perm l)
+    (C1 : ∀ p b, inside p b → hit p = true → test0 b = true) :
+    runAnyB F cap test0 hit order (F.visitsRef F.root + 1) [F.root] =
+      some ((F.denRef F.root).any hit) := by
+  rw [runAnyB_eq F hw.idx cap test0 hit order hord _ _
+    (by intro r hr; simp only [List.mem_singleton] at hr; subst hr; exact hw.1)
+    (by simp only [Good, List.length_nil, zero_add]; exact ⟨hcap, trivial⟩)]
+  exact runAny_root F hw mono test0 hit order hord C1
+
 end Flat
 end LightRT.BVH

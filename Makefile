@@ -286,6 +286,6 @@ formal:
 	$(CC) -O1 -ffp-contract=off -msse4.1 -mavx2 -mfma -w -I. -DLRT_TRI_EXACT_NEAREST -o formal/.lake/tlascheck_exn formal/tools/tlascheck.c -lm -lpthread
 	for s in 1 2; do formal/.lake/tlascheck $$s 1000 && formal/.lake/tlascheck_exn $$s 1000 || exit 1; done
 	$(CC) -O1 -ffp-contract=off -msse4.1 -mavx2 -mfma -w -I. -o formal/.lake/primboxcheck formal/tools/primboxcheck.c -lm -lpthread
-	for s in 1 2 3; do formal/.lake/primboxcheck $$s || exit 1; done
+	for s in 1 2 3; do formal/.lake/primboxcheck $$s formal/.lake > formal/.lake/primboxcheck.log || { cat formal/.lake/primboxcheck.log; exit 1; }; done; tail -n 3 formal/.lake/primboxcheck.log
 	$(CC) -O2 -ffp-contract=off -msse4.1 -mavx2 -mfma -w -I. -o formal/.lake/primhitcheck formal/tools/primhitcheck.c -lm -lpthread
 	for s in 1 2; do formal/.lake/primhitcheck $$s 2000 || exit 1; done
