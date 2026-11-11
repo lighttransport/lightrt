@@ -1478,10 +1478,76 @@ __device__ __forceinline__ bool hp_patch_box(const float *lo, const float *hi,
     }
     return true;
 }
+__device__ __forceinline__ void hp_rbez_eval(const float cp[64], float u,
+        float v, float S[3], float du[3], float dv[3]);
+/* Cell-bounded damped Newton for bicubic (RAT=0) / rational (RAT=1) patches:
+ * device mirror of tri_bezpatch_newton / tri_rbezpatch_newton (returns 1 hit,
+ * 2 converged in-domain root outside [tmin,best), 0 failed in this cell). */
+template <int RAT>
+__device__ __forceinline__ void hp_patch_ev(const float *cp, float u, float v, float S[3],
+                                            float du[3], float dv[3]) {
+    if (RAT) hp_rbez_eval(cp, u, v, S, du, dv); else hp_bezpatch_eval(cp, u, v, S, du, dv);
+}
+template <int RAT>
+__device__ __forceinline__ int hp_patch_newton2(const float *cp, const float *org,
+        const float *dir, float u, float v, float t, float tmin, float best,
+        float *t_o, float *u_o, float *v_o, float cu0, float cu1, float cv0, float cv1) {
+    const float hu = cu1 - cu0, hv = cv1 - cv0;
+    const float ulo = cu0 - 0.5f * hu, uhi = cu1 + 0.5f * hu;
+    const float vlo = cv0 - 0.5f * hv, vhi = cv1 + 0.5f * hv;
+    for (int it = 0; it < 12; it++) {
+        float S[3], du[3], dv[3];
+        hp_patch_ev<RAT>(cp, u, v, S, du, dv);
+        float R[3] = {S[0]-org[0]-t*dir[0], S[1]-org[1]-t*dir[1], S[2]-org[2]-t*dir[2]};
+        float nd[3] = {-dir[0], -dir[1], -dir[2]};
+        float rr = sqrtf(R[0]*R[0]+R[1]*R[1]+R[2]*R[2]);
+        float sl = sqrtf(S[0]*S[0]+S[1]*S[1]+S[2]*S[2]);
+        float det = hp_det3(du, dv, nd);
+        if (rr < 1e-5f*(1.0f+sl)) {
+            if (!(det > -1e-20f && det < 1e-20f)) {
+                float iv = 1.0f/det;
+                float un = u-hp_det3(R, dv, nd)*iv, vn = v-hp_det3(du, R, nd)*iv, tn = t-hp_det3(du, dv, R)*iv;
+                float S2[3], du2[3], dv2[3];
+                hp_patch_ev<RAT>(cp, un, vn, S2, du2, dv2);
+                float R2[3] = {S2[0]-org[0]-tn*dir[0], S2[1]-org[1]-tn*dir[1], S2[2]-org[2]-tn*dir[2]};
+                if (sqrtf(R2[0]*R2[0]+R2[1]*R2[1]+R2[2]*R2[2]) < rr) { u = un; v = vn; t = tn; }
+            }
+            int inwin = u >= ulo && u <= uhi && v >= vlo && v <= vhi;
+            int indom = u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f;
+            if (indom && inwin && t >= tmin && t < best) { *t_o = t; *u_o = u; *v_o = v; return 1; }
+            return (inwin && indom) ? 2 : 0;
+        }
+        if (det > -1e-20f && det < 1e-20f) return 0;
+        float inv = 1.0f/det;
+        float d0 = hp_det3(R, dv, nd)*inv, d1 = hp_det3(du, R, nd)*inv, d2 = hp_det3(du, dv, R)*inv;
+        float sc = 1.0f;
+        if (fabsf(d0) > hu) sc = hu / fabsf(d0);
+        if (fabsf(d1) * sc > hv) sc = hv / fabsf(d1);
+        u -= sc * d0; v -= sc * d1; t -= sc * d2;
+        u = u < ulo ? ulo : (u > uhi ? uhi : u);
+        v = v < vlo ? vlo : (v > vhi ? vhi : v);
+    }
+    return 0;
+}
+/* silhouette inside the cell (n.dir changes sign) -> a nearer root may exist */
+template <int RAT>
+__device__ __forceinline__ bool hp_patch_fold(const float *cp, const float *dir, float u0,
+                                              float u1, float v0, float v1) {
+    int pos = 0, neg = 0;
+    const float cu[5] = {u0, u1, u0, u1, 0.5f * (u0 + u1)};
+    const float cvv[5] = {v0, v0, v1, v1, 0.5f * (v0 + v1)};
+    for (int q = 0; q < 5; q++) {
+        float Sq[3], dq[3], eq[3];
+        hp_patch_ev<RAT>(cp, cu[q], cvv[q], Sq, dq, eq);
+        float nx = dq[1]*eq[2]-dq[2]*eq[1], ny = dq[2]*eq[0]-dq[0]*eq[2], nz = dq[0]*eq[1]-dq[1]*eq[0];
+        if (nx*dir[0]+ny*dir[1]+nz*dir[2] > 0.0f) pos = 1; else neg = 1;
+    }
+    return pos && neg;
+}
 __device__ __forceinline__ bool hp_bezpatch_one(float ox,float oy,float oz,
         float dx,float dy,float dz,float ix,float iy,float iz,const float cp[48],
         float tmin,float best_t,float *t_o,float *u_o,float *v_o) {
-    struct { float u0,u1,v0,v1; int d; } stk[20];
+    struct { float u0,u1,v0,v1; int d; } stk[4 * 7 + 4];
     int sp=0; stk[0].u0=0;stk[0].u1=1;stk[0].v0=0;stk[0].v1=1;stk[0].d=0; sp=1;
     float best=best_t; int hit=0;
     float org[3]={ox,oy,oz}, dir[3]={dx,dy,dz};
@@ -1497,10 +1563,12 @@ __device__ __forceinline__ bool hp_bezpatch_one(float ox,float oy,float oz,
             float dd=dx*dx+dy*dy+dz*dz;
             float t0=((S[0]-ox)*dx+(S[1]-oy)*dy+(S[2]-oz)*dz)/(dd>1e-20f?dd:1e-20f);
             float th,uh,vh;
-            if (hp_bezpatch_newton(cp,org,dir,uc,vc,t0,tmin,best,&th,&uh,&vh)) {
+            int nr = hp_patch_newton2<0>(cp,org,dir,uc,vc,t0,tmin,best,&th,&uh,&vh,u0,u1,v0,v1);
+            if (nr==1) {
                 best=th; *t_o=th; *u_o=uh; *v_o=vh; hit=1;
-            }
-            continue;
+                if (d>=7 || !hp_patch_fold<0>(cp,dir,u0,u1,v0,v1)) continue;
+            } else if (nr==2 || d>=7) continue;
+            /* Newton failed (or a silhouette cell): refine (mirror of the CPU) */
         }
         float um=0.5f*(u0+u1), vm=0.5f*(v0+v1);
         const float U2[2][2]={{u0,um},{um,u1}}, V2[2][2]={{v0,vm},{vm,v1}};
@@ -1570,7 +1638,7 @@ __device__ __forceinline__ bool hp_rbez_one(float ox,float oy,float oz,
         float dx,float dy,float dz,float ix,float iy,float iz,const float cp[64],
         const float dom[4], const uint32_t *toff, const float *tpts, uint32_t tnl,
         float tmin,float best_t,float *t_o,float *u_o,float *v_o) {
-    struct { float u0,u1,v0,v1; int d; } stk[20];
+    struct { float u0,u1,v0,v1; int d; } stk[4 * 7 + 4];
     int sp=0; stk[0].u0=0;stk[0].u1=1;stk[0].v0=0;stk[0].v1=1;stk[0].d=0; sp=1;
     float best=best_t; int hit=0;
     float org[3]={ox,oy,oz}, dir[3]={dx,dy,dz};
@@ -1591,11 +1659,14 @@ __device__ __forceinline__ bool hp_rbez_one(float ox,float oy,float oz,
             float dd=dx*dx+dy*dy+dz*dz;
             float t0=((S[0]-ox)*dx+(S[1]-oy)*dy+(S[2]-oz)*dz)/(dd>1e-20f?dd:1e-20f);
             float th,uh,vh;
-            if (hp_rbez_newton(cp,org,dir,uc,vc,t0,tmin,best,&th,&uh,&vh)) {
+            int nh = hp_patch_newton2<1>(cp,org,dir,uc,vc,t0,tmin,best,&th,&uh,&vh,u0,u1,v0,v1);
+            if (nh==1) {
                 float gu=dom[0]+uh*(dom[1]-dom[0]), gv=dom[2]+vh*(dom[3]-dom[2]);
                 if (hp_trim_inside(toff,tpts,tnl,gu,gv)) {best=th;*t_o=th;*u_o=gu;*v_o=gv;hit=1;}
+                if (d<7 && hp_patch_fold<1>(cp,dir,u0,u1,v0,v1)) nh = 0;
             }
-            continue;
+            if (nh==2 || nh==1 || d>=7) continue;
+            /* Newton failed (or a silhouette cell): refine (mirror of the CPU) */
         }
         float um=0.5f*(u0+u1), vm=0.5f*(v0+v1);
         const float U2[2][2]={{u0,um},{um,u1}}, V2[2][2]={{v0,vm},{vm,v1}};

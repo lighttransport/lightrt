@@ -5111,13 +5111,23 @@ static int tri_bezpatch_newton(const float cp[48], const float *cpx,
                                const float *cpy, const float *cpz,
                                const float *org, const float *dir, float u,
                                float v, float t, float tmin, float best,
-                               float *t_out, float *u_out, float *v_out) {
+                               float *t_out, float *u_out, float *v_out,
+                               float cu0, float cu1, float cv0, float cv1) {
 #if LRT_TRI_PATCH_EVAL_SVE
     (void)cp;
 #else
     (void)cpx; (void)cpy; (void)cpz;
 #endif
-    for (int it = 0; it < 8; it++) {
+    /* Cell-bounded, damped Newton: steps are limited to one cell size and the
+     * iterate is kept within the cell (+ half a cell); a root is reported only
+     * inside that window. An undamped step near a grazing root could jump far
+     * away (one test ray went from the corner cell to (0.71, -0.41)) and the
+     * cell's own root was lost; the driver refines a cell whose Newton fails
+     * (formal/tools/primhitcheck.c, exact-root adjudication). */
+    const float hu = cu1 - cu0, hv = cv1 - cv0;
+    const float ulo = cu0 - 0.5f * hu, uhi = cu1 + 0.5f * hu;
+    const float vlo = cv0 - 0.5f * hv, vhi = cv1 + 0.5f * hv;
+    for (int it = 0; it < 12; it++) {
         float S[3], du[3], dv[3];
         TRI_BEZ_EVAL(cp, cpx, cpy, cpz, u, v, S, du, dv);
         float R[3] = {S[0] - org[0] - t * dir[0], S[1] - org[1] - t * dir[1],
@@ -5145,13 +5155,19 @@ static int tri_bezpatch_newton(const float cp[48], const float *cpx,
                 }
             }
             if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f && t >= tmin &&
-                t < best) {
+                t < best && u >= ulo && u <= uhi && v >= vlo && v <= vhi) {
                 *t_out = t;
                 *u_out = u;
                 *v_out = v;
                 return 1;
             }
-            return 0;
+            /* 2: converged to a root INSIDE the patch domain and this cell's
+             * window, only outside [tmin, best): refining cannot find a nearer
+             * root there. A root of the extended surface outside [0,1]^2 is
+             * NOT settled (a different in-domain root can sit right next to
+             * it), so that returns 0 and the driver refines. */
+            return (u >= ulo && u <= uhi && v >= vlo && v <= vhi && u >= 0.0f &&
+                    u <= 1.0f && v >= 0.0f && v <= 1.0f) ? 2 : 0;
         }
         float ndir[3] = {-dir[0], -dir[1], -dir[2]};
         float det = tri_det3(du, dv, ndir);
@@ -5160,9 +5176,14 @@ static int tri_bezpatch_newton(const float cp[48], const float *cpx,
         float d0 = tri_det3(R, dv, ndir) * inv;
         float d1 = tri_det3(du, R, ndir) * inv;
         float d2 = tri_det3(du, dv, R) * inv;
-        u -= d0;
-        v -= d1;
-        t -= d2;
+        float sc = 1.0f;
+        if (fabsf(d0) > hu) sc = hu / fabsf(d0);
+        if (fabsf(d1) * sc > hv) sc = hv / fabsf(d1);
+        u -= sc * d0;
+        v -= sc * d1;
+        t -= sc * d2;
+        u = u < ulo ? ulo : (u > uhi ? uhi : u);
+        v = v < vlo ? vlo : (v > vhi ? vhi : v);
     }
     return 0;
 }
@@ -5170,11 +5191,11 @@ static int tri_bezpatch_newton(const float cp[48], const float *cpx,
 static int tri_bezpatch_isect_one(const float cp[48], const tri_ray_ctx *rc,
                                   float best_t, float *t_out, float *u_out,
                                   float *v_out) {
-    enum { BEZPATCH_MAXDEPTH = 4 };
+    enum { BEZPATCH_MAXDEPTH = 4, BEZPATCH_REFINE = 7 }; /* refine a cell whose Newton fails */
     struct {
         float u0, u1, v0, v1;
         int depth;
-    } stk[4 * BEZPATCH_MAXDEPTH + 4];
+    } stk[4 * BEZPATCH_REFINE + 4];
     int sp = 0;
     stk[sp].u0 = 0.0f; stk[sp].u1 = 1.0f; stk[sp].v0 = 0.0f; stk[sp].v1 = 1.0f;
     stk[sp].depth = 0;
@@ -5228,15 +5249,38 @@ static int tri_bezpatch_isect_one(const float cp[48], const tri_ray_ctx *rc,
                         (S[2] - rc->org[2]) * rc->dir[2]) /
                        (ddot > 1e-20f ? ddot : 1e-20f);
             float th, uh, vh;
-            if (tri_bezpatch_newton(cp, cpx, cpy, cpz, rc->org, rc->dir, uc, vc,
-                                    t0, rc->tmin, best, &th, &uh, &vh)) {
+            int nr = tri_bezpatch_newton(cp, cpx, cpy, cpz, rc->org, rc->dir, uc, vc,
+                                         t0, rc->tmin, best, &th, &uh, &vh, u0, u1, v0, v1);
+            if (nr == 1) {
                 best = th;
                 *t_out = th;
                 *u_out = uh;
                 *v_out = vh;
                 hit = 1;
+                /* A nearer second root in this cell needs the surface to fold
+                 * against the ray here (n.dir changes sign: a silhouette). Then
+                 * also search the children (with the new best) instead of
+                 * trusting whichever root Newton reached. */
+                if (depth < BEZPATCH_REFINE) {
+                    int pos = 0, neg = 0;
+                    const float cu[5] = {u0, u1, u0, u1, 0.5f * (u0 + u1)};
+                    const float cvv[5] = {v0, v0, v1, v1, 0.5f * (v0 + v1)};
+                    for (int q = 0; q < 5; q++) {
+                        float Sq[3], dq[3], eq[3];
+                        TRI_BEZ_EVAL(cp, cpx, cpy, cpz, cu[q], cvv[q], Sq, dq, eq);
+                        float nx = dq[1] * eq[2] - dq[2] * eq[1], ny = dq[2] * eq[0] - dq[0] * eq[2],
+                              nz = dq[0] * eq[1] - dq[1] * eq[0];
+                        float nd = nx * rc->dir[0] + ny * rc->dir[1] + nz * rc->dir[2];
+                        if (nd > 0.0f) pos = 1; else neg = 1;
+                    }
+                    if (!(pos && neg)) continue;
+                } else {
+                    continue;
+                }
+            } else if (nr == 2 || depth >= BEZPATCH_REFINE) {
+                continue;
             }
-            continue;
+            /* Newton failed (or a silhouette cell): refine it */
         }
         float um = 0.5f * (u0 + u1), vm = 0.5f * (v0 + v1);
         const float uu[2][2] = {{u0, um}, {um, u1}};
@@ -5387,13 +5431,23 @@ static int tri_rbezpatch_newton(const float cp[64], const float *cx,
                                 const float *cw, const float *org,
                                 const float *dir, float u, float v, float t,
                                 float tmin, float best, float *t_out,
-                                float *u_out, float *v_out) {
+                                float *u_out, float *v_out, float cu0, float cu1,
+                                float cv0, float cv1) {
 #if LRT_TRI_PATCH_EVAL_SVE
     (void)cp;
 #else
     (void)cx; (void)cy; (void)cz; (void)cw;
 #endif
-    for (int it = 0; it < 8; it++) {
+    /* Cell-bounded, damped Newton: steps are limited to one cell size and the
+     * iterate is kept within the cell (+ half a cell); a root is reported only
+     * inside that window. An undamped step near a grazing root could jump far
+     * away (one test ray went from the corner cell to (0.71, -0.41)) and the
+     * cell's own root was lost; the driver refines a cell whose Newton fails
+     * (formal/tools/primhitcheck.c, exact-root adjudication). */
+    const float hu = cu1 - cu0, hv = cv1 - cv0;
+    const float ulo = cu0 - 0.5f * hu, uhi = cu1 + 0.5f * hu;
+    const float vlo = cv0 - 0.5f * hv, vhi = cv1 + 0.5f * hv;
+    for (int it = 0; it < 12; it++) {
         float S[3], du[3], dv[3];
         TRI_RBEZ_EVAL(cp, cx, cy, cz, cw, u, v, S, du, dv);
         float R[3] = {S[0] - org[0] - t * dir[0], S[1] - org[1] - t * dir[1],
@@ -5421,19 +5475,33 @@ static int tri_rbezpatch_newton(const float cp[64], const float *cx,
                 }
             }
             if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f && t >= tmin &&
-                t < best) {
+                t < best && u >= ulo && u <= uhi && v >= vlo && v <= vhi) {
                 *t_out = t; *u_out = u; *v_out = v;
                 return 1;
             }
-            return 0;
+            /* 2: converged to a root INSIDE the patch domain and this cell's
+             * window, only outside [tmin, best): refining cannot find a nearer
+             * root there. A root of the extended surface outside [0,1]^2 is
+             * NOT settled (a different in-domain root can sit right next to
+             * it), so that returns 0 and the driver refines. */
+            return (u >= ulo && u <= uhi && v >= vlo && v <= vhi && u >= 0.0f &&
+                    u <= 1.0f && v >= 0.0f && v <= 1.0f) ? 2 : 0;
         }
         float ndir[3] = {-dir[0], -dir[1], -dir[2]};
         float det = tri_det3(du, dv, ndir);
         if (det > -1e-20f && det < 1e-20f) return 0;
         float inv = 1.0f / det;
-        u -= tri_det3(R, dv, ndir) * inv;
-        v -= tri_det3(du, R, ndir) * inv;
-        t -= tri_det3(du, dv, R) * inv;
+        float d0 = tri_det3(R, dv, ndir) * inv;
+        float d1 = tri_det3(du, R, ndir) * inv;
+        float d2 = tri_det3(du, dv, R) * inv;
+        float sc = 1.0f;
+        if (fabsf(d0) > hu) sc = hu / fabsf(d0);
+        if (fabsf(d1) * sc > hv) sc = hv / fabsf(d1);
+        u -= sc * d0;
+        v -= sc * d1;
+        t -= sc * d2;
+        u = u < ulo ? ulo : (u > uhi ? uhi : u);
+        v = v < vlo ? vlo : (v > vhi ? vhi : v);
     }
     return 0;
 }
@@ -5468,8 +5536,8 @@ static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
                                    const uint32_t *trim_off, const float *trim_pts,
                                    uint32_t trim_nloops, float *t_out,
                                    float *u_out, float *v_out) {
-    enum { RBEZ_MAXDEPTH = 4 };
-    struct { float u0, u1, v0, v1; int depth; } stk[4 * RBEZ_MAXDEPTH + 4];
+    enum { RBEZ_MAXDEPTH = 4, RBEZ_REFINE = 7 }; /* refine a cell whose Newton fails */
+    struct { float u0, u1, v0, v1; int depth; } stk[4 * RBEZ_REFINE + 4];
     int sp = 0;
     stk[sp].u0 = 0.0f; stk[sp].u1 = 1.0f; stk[sp].v0 = 0.0f; stk[sp].v1 = 1.0f;
     stk[sp].depth = 0;
@@ -5537,8 +5605,9 @@ static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
                         (S[2] - rc->org[2]) * rc->dir[2]) /
                        (ddot > 1e-20f ? ddot : 1e-20f);
             float th, uh, vh;
-            if (tri_rbezpatch_newton(cp, cx, cy, cz, cw, rc->org, rc->dir, uc, vc,
-                                     t0, rc->tmin, best, &th, &uh, &vh)) {
+            int nh = tri_rbezpatch_newton(cp, cx, cy, cz, cw, rc->org, rc->dir, uc, vc,
+                                          t0, rc->tmin, best, &th, &uh, &vh, u0, u1, v0, v1);
+            if (nh == 1) {
                 float gu = dom[0] + uh * (dom[1] - dom[0]); /* local -> global */
                 float gv = dom[2] + vh * (dom[3] - dom[2]);
                 /* trimmed hits are rejected; keep searching for the nearest
@@ -5551,7 +5620,24 @@ static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
                     hit = 1;
                 }
             }
-            continue;
+            if (nh == 1 && depth < RBEZ_REFINE) {
+                /* silhouette inside the cell -> a nearer root may exist: search
+                 * the children too (see tri_bezpatch_isect_one) */
+                int pos = 0, neg = 0;
+                const float cu[5] = {u0, u1, u0, u1, 0.5f * (u0 + u1)};
+                const float cvv[5] = {v0, v0, v1, v1, 0.5f * (v0 + v1)};
+                for (int q = 0; q < 5; q++) {
+                    float Sq[3], dq[3], eq[3];
+                    TRI_RBEZ_EVAL(cp, cx, cy, cz, cw, cu[q], cvv[q], Sq, dq, eq);
+                    float nx = dq[1] * eq[2] - dq[2] * eq[1], ny = dq[2] * eq[0] - dq[0] * eq[2],
+                          nz = dq[0] * eq[1] - dq[1] * eq[0];
+                    float nd = nx * rc->dir[0] + ny * rc->dir[1] + nz * rc->dir[2];
+                    if (nd > 0.0f) pos = 1; else neg = 1;
+                }
+                if (pos && neg) nh = 0; /* fall through to refinement */
+            }
+            if (nh == 2 || (nh == 1) || depth >= RBEZ_REFINE) continue;
+            /* Newton failed (or a silhouette cell): refine it */
         }
         float um = 0.5f * (u0 + u1), vm = 0.5f * (v0 + v1);
         const float uu[2][2] = {{u0, um}, {um, u1}};

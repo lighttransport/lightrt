@@ -762,7 +762,9 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
     exact closed-form quadratic solve (Reshetov "Cool Patches"). `TRI_PRIM_
     BILINEAR`, reuses the 208-byte `lrt_quad4` leaf.
   - `lrt_bezpatch_scene_build` — **bicubic Bézier surface** (4×4 CPs), adaptive
-    (u,v) quadtree subdivision + Newton on (u,v,t). `TRI_PRIM_BEZPATCH`,
+    (u,v) quadtree subdivision + a cell-bounded damped Newton on (u,v,t); cells whose
+    Newton fails, or that contain a silhouette after a hit, are refined to depth 7
+    (PLAN.md M15). `TRI_PRIM_BEZPATCH`,
     784-byte `lrt_bezpatch4` leaf (4 patches/block SoA).
   - `lrt_nurbs_scene_build` — **NURBS surface** (control net + 2 knot vectors +
     weights, any bidegree ≤8): build-time knot-insertion Bézier extraction
