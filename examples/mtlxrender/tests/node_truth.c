@@ -194,7 +194,7 @@ int main(void) {
                            "<input name=\"amount\" type=\"float\" value=\"90\"/></rotate2d>", "n", g), 0, 1, 0);
     chk1("ramp4_br", ev("<ramp4 name=\"n\" type=\"float\"><input name=\"valuetl\" type=\"float\" value=\"1\"/>"
                         "<input name=\"valuetr\" type=\"float\" value=\"2\"/><input name=\"valuebl\" type=\"float\" value=\"3\"/>"
-                        "<input name=\"valuebr\" type=\"float\" value=\"4\"/><input name=\"texcoord\" type=\"vector2\" value=\"1,1\"/></ramp4>", "n", g).v[0], 4.0f);
+                        "<input name=\"valuebr\" type=\"float\" value=\"4\"/><input name=\"texcoord\" type=\"vector2\" value=\"1,1\"/></ramp4>", "n", g).v[0], 2.0f);
 
     /* ---- more adjust / channel ---- */
     chk1("saturate_gray", ev("<saturate name=\"n\" type=\"color3\"><input name=\"in\" type=\"color3\" value=\"1,0,0\"/>"
