@@ -15633,8 +15633,24 @@ static void tlas_transform_aabb(const float m[12], const float olo[3],
         float w[3];
         tlas_xform_point(m, c, w);
         for (int a = 0; a < 3; a++) {
-            if (w[a] < wlo[a]) wlo[a] = w[a];
-            if (w[a] > whi[a]) whi[a] = w[a];
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+            /* fl(m0 c0 + m1 c1 + m2 c2 + m3) is within u*(sum |products| +
+             * sum |partial sums|) of the exact corner (TwoLevel.xform_point_err);
+             * cancellation makes that many ulps of w. Widen by 4u times the bound
+             * (covers the bound's own rounding and the outward subtraction),
+             * so the box contains the exact affine image of the BLAS box
+             * (TwoLevel.aff_in_corner_box; checked exactly by tlascheck). */
+            const float *r = &m[a * 4];
+            float p0 = r[0] * c[0], p1 = r[1] * c[1], p2 = r[2] * c[2];
+            float s1 = p0 + p1, s2 = s1 + p2;
+            float e = (fabsf(p0) + fabsf(p1) + fabsf(p2) + fabsf(s1) + fabsf(s2) + fabsf(w[a])) *
+                          0x1p-22f + 1e-30f;
+            float lo = w[a] - e, hi = w[a] + e;
+#else
+            float lo = w[a], hi = w[a];
+#endif
+            if (lo < wlo[a]) wlo[a] = lo;
+            if (hi > whi[a]) whi[a] = hi;
         }
     }
 }
