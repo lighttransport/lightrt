@@ -156,12 +156,27 @@ static inline int lrt_ctz(unsigned int x) { return __builtin_ctz(x); }
 /* Floats bracketing the EXACT sum a + b (TwoSum error term). The leaf
  * intersector tests the triangle v0 + u*e1 + v*e2 with the STORED, rounded
  * edges, so its corners v0 + e are generally not floats (formal/CheckBVH.lean). */
+/* Inline next float toward -inf / +inf (nextafterf is an out-of-line libm call;
+ * this runs for every rounded box bound). Finite inputs; inf/NaN pass through. */
+static inline float tri_next_down(float x) {
+    uint32_t u;
+    memcpy(&u, &x, 4);
+    if ((u & 0x7f800000u) == 0x7f800000u) return x;      /* inf / NaN */
+    if ((u & 0x7fffffffu) == 0) u = 0x80000001u;          /* +-0 -> -min subnormal */
+    else if (u & 0x80000000u) u++;                        /* negative: away from 0 */
+    else u--;                                             /* positive: toward 0 */
+    memcpy(&x, &u, 4);
+    return x;
+}
+static inline float tri_next_up(float x) { return -tri_next_down(-x); }
 static inline void tri_sum_bracket(float a, float b, float *lo, float *hi) {
-    volatile float s = a + b;
-    volatile float bb = s - a;
+    /* plain floats suffice: without -ffast-math the compiler may not
+     * reassociate, and there is no product to contract */
+    float s = a + b;
+    float bb = s - a;
     float err = (a - (s - bb)) + (b - bb);
-    *lo = err < 0.0f ? nextafterf(s, -INFINITY) : s;
-    *hi = err > 0.0f ? nextafterf(s, INFINITY) : s;
+    *lo = err < 0.0f ? tri_next_down(s) : s;
+    *hi = err > 0.0f ? tri_next_up(s) : s;
 }
 static inline float tri_box_sub(float c, float r) {
     float lo, hi;
@@ -177,11 +192,11 @@ static inline float tri_box_add(float c, float r) {
  * with x decides the rounding direction exactly. */
 static inline float tri_box_div_lo(float x, float w) {
     float q = x / w;
-    return ((double)q * (double)w > (double)x) ? nextafterf(q, -INFINITY) : q;
+    return ((double)q * (double)w > (double)x) ? tri_next_down(q) : q;
 }
 static inline float tri_box_div_hi(float x, float w) {
     float q = x / w;
-    return ((double)q * (double)w < (double)x) ? nextafterf(q, INFINITY) : q;
+    return ((double)q * (double)w < (double)x) ? tri_next_up(q) : q;
 }
 #else
 static inline float tri_box_sub(float c, float r) { return c - r; }
@@ -5228,17 +5243,27 @@ static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
         tri_rbezpatch_subpatch(cp, u0, u1, v0, v1, sub);
         float lo[3], hi[3];
         for (int a = 0; a < 3; a++) {
-            lo[a] = tri_box_div_lo(sub[a], sub[3]);
-            hi[a] = tri_box_div_hi(sub[a], sub[3]);
+            float p = sub[a] / sub[3];
+            lo[a] = hi[a] = p;
         }
         for (int k = 1; k < 16; k++) {
+            float iw = 1.0f / sub[k * 4 + 3];
             for (int a = 0; a < 3; a++) {
-                float pl = tri_box_div_lo(sub[k * 4 + a], sub[k * 4 + 3]);
-                float ph = tri_box_div_hi(sub[k * 4 + a], sub[k * 4 + 3]);
-                if (pl < lo[a]) lo[a] = pl;
-                if (ph > hi[a]) hi[a] = ph;
+                float p = sub[k * 4 + a] * iw;
+                if (p < lo[a]) lo[a] = p;
+                if (p > hi[a]) hi[a] = p;
             }
         }
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+        /* Hot path (every subdivision step), so not the exact per-point
+         * tri_box_div_lo/hi: each fl(x * fl(1/w)) is within ~2u of x/w, so
+         * widening the finished bounds by 8u of their magnitude (+ a tiny
+         * absolute term for subnormals) is conservative and costs 6 ops. */
+        for (int a = 0; a < 3; a++) {
+            lo[a] -= fabsf(lo[a]) * 0x1p-21f + 1e-30f;
+            hi[a] += fabsf(hi[a]) * 0x1p-21f + 1e-30f;
+        }
+#endif
         float tn = rc->tmin, tf = best;
         int miss = 0;
         for (int a = 0; a < 3; a++) {

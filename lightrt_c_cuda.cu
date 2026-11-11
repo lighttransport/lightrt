@@ -1239,22 +1239,6 @@ __device__ __forceinline__ void hp_rbez_eval(const float cp[64], float u,
     float w=N[3], iw=1.0f/w, iw2=iw*iw;
     for (int k=0;k<3;k++){S[k]=N[k]*iw; du[k]=(Nu[k]*w-N[k]*Nu[3])*iw2; dv[k]=(Nv[k]*w-N[k]*Nv[3])*iw2;}
 }
-/* x / w (w > 0) rounded outward under LRT_TRI_LEAF_BOX_EXACT, mirror of
- * tri_box_div_lo/hi: fmaf(q, w, -x) is the exact sign of q*w - x. */
-__device__ __forceinline__ float hp_div_lo(float x, float w) {
-    float q = x / w;
-#ifdef LRT_TRI_LEAF_BOX_EXACT
-    if (fmaf(q, w, -x) > 0.0f) q = nextafterf(q, -INFINITY);
-#endif
-    return q;
-}
-__device__ __forceinline__ float hp_div_hi(float x, float w) {
-    float q = x / w;
-#ifdef LRT_TRI_LEAF_BOX_EXACT
-    if (fmaf(q, w, -x) < 0.0f) q = nextafterf(q, INFINITY);
-#endif
-    return q;
-}
 __device__ __forceinline__ bool hp_rbez_newton(const float cp[64],
         const float *org, const float *dir, float u, float v, float t,
         float tmin, float best, float *t_o, float *u_o, float *v_o) {
@@ -1307,8 +1291,12 @@ __device__ __forceinline__ bool hp_rbez_one(float ox,float oy,float oz,
         sp--; float u0=stk[sp].u0,u1=stk[sp].u1,v0=stk[sp].v0,v1=stk[sp].v1; int d=stk[sp].d;
         float sub[64]; hp_subpatch<4>(cp,u0,u1,v0,v1,sub);
         float lo[3],hi[3];
-        for(int a=0;a<3;a++){lo[a]=hp_div_lo(sub[a],sub[3]); hi[a]=hp_div_hi(sub[a],sub[3]);}
-        for(int k=1;k<16;k++){for(int a=0;a<3;a++){float pl=hp_div_lo(sub[k*4+a],sub[k*4+3]), ph=hp_div_hi(sub[k*4+a],sub[k*4+3]); if(pl<lo[a])lo[a]=pl; if(ph>hi[a])hi[a]=ph;}}
+        for(int a=0;a<3;a++){float p=sub[a]/sub[3]; lo[a]=hi[a]=p;}
+        for(int k=1;k<16;k++){float iw=1.0f/sub[k*4+3]; for(int a=0;a<3;a++){float p=sub[k*4+a]*iw; if(p<lo[a])lo[a]=p; if(p>hi[a])hi[a]=p;}}
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+        /* conservative widening, mirror of tri_rbezpatch_isect's cull */
+        for(int a=0;a<3;a++){lo[a]-=fabsf(lo[a])*0x1p-21f+1e-30f; hi[a]+=fabsf(hi[a])*0x1p-21f+1e-30f;}
+#endif
         if (!hp_patch_box(lo,hi,ox,oy,oz,ix,iy,iz,tmin,best)) continue;
         if (d>=4) {
             float uc=0.5f*(u0+u1), vc=0.5f*(v0+v1), S[3],du[3],dv[3];
