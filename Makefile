@@ -264,12 +264,30 @@ cuda_test:
 	$(NVCC) -arch=$(CUDA_ARCH) /tmp/lrt_cuda_test.o /tmp/lrt_cuda_dev.o /tmp/lrt_cuda_c_tri.o -o lightrt_c_cuda_test -lm
 	@echo "Built lightrt_c_cuda_test (run: ./lightrt_c_cuda_test)"
 
+# Full CUDA correctness suite (needs a CUDA device; skips otherwise):
+#  - lightrt_c_cuda_test           triangles (resident/one-shot/refit)
+#  - lightrt_c_cuda_prims_test     every primitive kind + normals vs the CPU oracle
+#  - lightrt_c_cuda_parallel_test  vertical rays exactly on box faces (report);
+#    _wt: + LRT_TRI_WATERTIGHT_TRI, requires 0 misses and GPU == CPU bit for bit
+# The prims/parallel sources are generated from the HIP tests (scripts/gen_cuda_tests.sh).
+CUDA_FULL_OBJ = /tmp/lrt_cuda_full
+cuda_full_test: cuda_test
+	$(CC) $(CFLAGS) $(INCLUDES) -c tests/test_lightrt_c_cuda_prims.c -o $(CUDA_FULL_OBJ)_prims.o
+	$(NVCC) -arch=$(CUDA_ARCH) $(CUDA_FULL_OBJ)_prims.o /tmp/lrt_cuda_dev.o /tmp/lrt_cuda_c_tri.o -o lightrt_c_cuda_prims_test -lm
+	$(CC) $(CFLAGS) $(INCLUDES) -c tests/test_lightrt_c_cuda_parallel.c -o $(CUDA_FULL_OBJ)_par.o
+	$(NVCC) -arch=$(CUDA_ARCH) $(CUDA_FULL_OBJ)_par.o /tmp/lrt_cuda_dev.o /tmp/lrt_cuda_c_tri.o -o lightrt_c_cuda_parallel_test -lm
+	$(NVCC) $(CUDA_FLAGS) -DLRT_TRI_WATERTIGHT_TRI -c lightrt_c_cuda.cu -o $(CUDA_FULL_OBJ)_dev_wt.o
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_WATERTIGHT_TRI -c lightrt_c_tri.c -o $(CUDA_FULL_OBJ)_tri_wt.o
+	$(CC) $(CFLAGS) $(INCLUDES) -DLRT_TRI_WATERTIGHT_TRI -c tests/test_lightrt_c_cuda_parallel.c -o $(CUDA_FULL_OBJ)_par_wt.o
+	$(NVCC) -arch=$(CUDA_ARCH) $(CUDA_FULL_OBJ)_par_wt.o $(CUDA_FULL_OBJ)_dev_wt.o $(CUDA_FULL_OBJ)_tri_wt.o -o lightrt_c_cuda_parallel_test_wt -lm
+	./lightrt_c_cuda_test && ./lightrt_c_cuda_prims_test && ./lightrt_c_cuda_parallel_test && ./lightrt_c_cuda_parallel_test_wt
+
 info_cuda:
 	@echo "NVCC: $(NVCC)"
 	@echo "CUDA_ARCH: $(CUDA_ARCH)"
 	@echo "CUDA_FLAGS: $(CUDA_FLAGS)"
 
-.PHONY: hip_rtc_test c_tri_parallel_test c_tri_seam_test all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip cuda_test info_cuda formal
+.PHONY: cuda_full_test hip_rtc_test c_tri_parallel_test c_tri_seam_test all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip cuda_test info_cuda formal
 
 # Lean 4 formal verification (formal/): build specs+proofs, check the c2lean
 # translation is up to date, the sorry budget, the axiom allowlist, and run
