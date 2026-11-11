@@ -13932,7 +13932,7 @@ lrt_tri_scene *lrt_sdfprim_scene_build(const uint32_t *types,
             br = sqrtf(ext[0] * ext[0] + ext[1] * ext[1] + ext[2] * ext[2]);
             break;
         case TRI_SDF_TORUS: {
-            float Rr = fabsf(p[0]) + fabsf(p[1]);
+            float Rr = tri_box_add(fabsf(p[0]), fabsf(p[1])); /* outward under LEAF_BOX_EXACT */
             ext[0] = Rr; ext[1] = fabsf(p[1]); ext[2] = Rr;
             br = Rr;
             break;
@@ -13942,6 +13942,11 @@ lrt_tri_scene *lrt_sdfprim_scene_build(const uint32_t *types,
             br = fabsf(p[0]);
             break;
         }
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+        /* br clips the ray interval before sphere tracing; the box case's
+         * sqrt of a rounded sum may round inward, so widen by 4u (+tiny). */
+        br += br * 0x1p-22f + 1e-30f;
+#endif
         brad[i] = br;
         for (int a = 0; a < 3; a++) {
             bc.plo[i * 3 + a] = tri_box_sub(c[a], ext[a]);
@@ -14169,11 +14174,25 @@ static void tri_qtri_leaf_box(const lrt_tri_scene *s, uint32_t ref, float lo[3],
             if (tri_qtri_prim(s, blk, lane) == LRT_TRI_NO_HIT) continue;
             float v0[3], v1[3], v2[3];
             tri_qtri_decode_lane(s, blk, lane, v0, v1, v2);
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+            /* The intersector tests v0 + u*fl(v1-v0) + v*fl(v2-v0) (see
+             * tri_qtri_*_scalar), whose corners are not v1, v2: bracket them
+             * exactly, as tri_leaf_prim_aabb does for plain triangles. */
+            for (int a = 0; a < 3; a++) {
+                float bl, bh, cl, ch;
+                tri_sum_bracket(v0[a], v1[a] - v0[a], &bl, &bh);
+                tri_sum_bracket(v0[a], v2[a] - v0[a], &cl, &ch);
+                float mn = v0[a] < bl ? v0[a] : bl;
+                mn = mn < cl ? mn : cl;
+                float mx = v0[a] > bh ? v0[a] : bh;
+                mx = mx > ch ? mx : ch;
+#else
             for (int a = 0; a < 3; a++) {
                 float mn = v0[a] < v1[a] ? v0[a] : v1[a];
                 mn = mn < v2[a] ? mn : v2[a];
                 float mx = v0[a] > v1[a] ? v0[a] : v1[a];
                 mx = mx > v2[a] ? mx : v2[a];
+#endif
                 if (mn < lo[a]) lo[a] = mn;
                 if (mx > hi[a]) hi[a] = mx;
             }

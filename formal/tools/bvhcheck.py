@@ -63,6 +63,11 @@ def main():
                 if aC != rays:
                     print(f"FAIL seed={seed} cfg={(n,q,w,g)} {name}: any-hit Lean runAny != C scalar on {rays-aC} rays")
                     bad += 1
+                need = int(re.search(r"stack need=(\d+)", out).group(1))
+                tot["need"] = max(tot.get("need", 0), need)
+                if need > 1024:
+                    print(f"FAIL seed={seed} cfg={(n,q,w,g)} {name}: stack need {need} > TRI_STACK_SIZE")
+                    bad += 1
                 key = ("hq_" + name) if (n, q, w, g) in hq else name
                 st = tot.setdefault("any_" + key, [0, 0, 0, 0])
                 st[0] += rays; st[1] += rays - aD; st[2] += rays - aB; st[3] += unc
@@ -101,6 +106,7 @@ def main():
           f"robust+bitexact: SIMD == scalar (t,prim) on all, {tot['rob_brute']} differ from brute ({tot['rob_miss']} hit/miss); "
           f"{tot['hq']} SBVH trees: Lean traversal == C scalar; "
           f"exact-nearest: t == brute force (and SIMD == scalar) on all rays of {tot.get('exn', 0)} trees")
+    print(f"stack: max need over all trees {tot.get('need', 0)} <= TRI_STACK_SIZE 1024 (runAnyB_root hypothesis)")
     for k in ("plain", "exact", "robust", "exactn", "hq_plain", "hq_robust"):
         if "any_" + k in tot:
             r_, d_, b_, u_ = tot["any_" + k]

@@ -120,9 +120,48 @@ static void check_prim(const lrt_tri_scene *s, const void *blk, int lane, const 
         }
         break;
     }
+    case TRI_PRIM_QUAD: case TRI_PRIM_TETRA: {
+        const lrt_quad4 *q = blk;
+        const float *X[4] = {q->x0, q->x1, q->x2, q->x3}, *Y[4] = {q->y0, q->y1, q->y2, q->y3},
+                    *Z[4] = {q->z0, q->z1, q->z2, q->z3};
+        for (int k = 0; k < 4; k++) {
+            double p[3] = {X[k][lane], Y[k][lane], Z[k][lane]};
+            for (int a = 0; a < 3; a++) { need_ge(st, p[a], lo[a]); need_le(st, p[a], hi[a]); }
+        }
+        break;
+    }
+    case TRI_PRIM_SDF: {
+        /* sphere: |p0|; box: half-extents |p0..p2|; torus (axis y): R+r in x,z, r in y */
+        const lrt_sdf4 *q = blk;
+        double c[3] = {q->cx[lane], q->cy[lane], q->cz[lane]}, e[3];
+        double a0 = fabs(q->p0[lane]), a1 = fabs(q->p1[lane]), a2 = fabs(q->p2[lane]);
+        if (q->type[lane] == TRI_SDF_BOX) { e[0] = a0; e[1] = a1; e[2] = a2; }
+        else if (q->type[lane] == TRI_SDF_TORUS) { e[0] = e[2] = a0 + a1; e[1] = a1; }
+        else e[0] = e[1] = e[2] = a0;
+        for (int a = 0; a < 3; a++) { need_ge(st, c[a] - e[a], lo[a]); need_le(st, c[a] + e[a], hi[a]); }
+        /* the ray-interval clip radius must enclose the shape too */
+        double br2 = e[0] * e[0] + e[1] * e[1] + e[2] * e[2];
+        if (q->type[lane] == TRI_SDF_SPHERE) br2 = a0 * a0;
+        if (q->type[lane] == TRI_SDF_TORUS) br2 = (a0 + a1) * (a0 + a1);
+        st->checks++;
+        if (!((double)q->brad[lane] * q->brad[lane] >= br2)) st->bad++;
+        break;
+    }
+    case TRI_PRIM_QTRI: {
+        /* the intersector tests v0 + u*fl(v1-v0) + v*fl(v2-v0) on the DECODED vertices */
+        float v0[3], v1[3], v2[3];
+        tri_qtri_decode_lane(s, blk, lane, v0, v1, v2);
+        for (int a = 0; a < 3; a++) {
+            float e1 = v1[a] - v0[a], e2 = v2[a] - v0[a];
+            double c[3] = {v0[a], (double)v0[a] + e1, (double)v0[a] + e2};
+            for (int k = 0; k < 3; k++) { need_ge(st, c[k], lo[a]); need_le(st, c[k], hi[a]); }
+        }
+        break;
+    }
     case TRI_PRIM_POINT: {
         const lrt_point4 *p = blk;
         double c[3] = {p->cx[lane], p->cy[lane], p->cz[lane]}, r = fmax(p->r[lane], 0);
+        if (s->point_type == LRT_POINT_ELLIPSE) r = fmax(r, fmax(p->ry[lane], 0));
         for (int a = 0; a < 3; a++) { need_ge(st, c[a] - r, lo[a]); need_le(st, c[a] + r, hi[a]); }
         break;
     }
@@ -140,6 +179,9 @@ static uint32_t prim_of(const lrt_tri_scene *s, const void *blk, int lane) {
     case TRI_PRIM_BEZPATCH: return ((const lrt_bezpatch4 *)blk)->prim[lane];
     case TRI_PRIM_RBEZPATCH: case TRI_PRIM_TRIMNURBS: return ((const lrt_rbezpatch4 *)blk)->prim[lane];
     case TRI_PRIM_POINT: return ((const lrt_point4 *)blk)->prim[lane];
+    case TRI_PRIM_QUAD: case TRI_PRIM_TETRA: return ((const lrt_quad4 *)blk)->prim[lane];
+    case TRI_PRIM_SDF: return ((const lrt_sdf4 *)blk)->prim[lane];
+    case TRI_PRIM_QTRI: return tri_qtri_prim(s, blk, lane);
     default: return LRT_TRI_NO_HIT;
     }
 }
@@ -164,20 +206,55 @@ static void walk(const lrt_tri_scene *s, uint32_t ref, const float lo[3], const 
     }
 }
 
-static int report(const char *name, lrt_tri_scene *s) {
-    if (!s) { printf("%-10s build failed\n", name); return 1; }
+static int check1(const char *name, const lrt_tri_scene *s) {
     stat_t leaf = {0}, inner = {0};
     long np = 0;
-    if (TRI_REF_IS_LEAF(s->root)) { printf("%-10s root is a leaf (skipped)\n", name); return 0; }
+    if (TRI_REF_IS_LEAF(s->root)) { printf("%-16s root is a leaf (skipped)\n", name); return 0; }
     walk(s, s->root, NULL, NULL, &leaf, &inner, &np);
-    printf("%-10s prims=%ld hull-checks=%ld fail=%ld (worst %.2f ulp)  node-checks=%ld fail=%ld\n", name,
+    printf("%-16s prims=%ld hull-checks=%ld fail=%ld (worst %.2f ulp)  node-checks=%ld fail=%ld\n", name,
            np, leaf.checks, leaf.bad, leaf.worst, inner.checks, inner.bad);
-    lrt_tri_scene_free(s);
     return leaf.bad || inner.bad;
+}
+
+static const char *g_dir = ".";
+/* the scene as built, and as reloaded from memory and from an mmapped file */
+static int check_all(const char *name, const lrt_tri_scene *s) {
+    if (!s) { printf("%-16s build failed\n", name); return 1; }
+    int bad = check1(name, s);
+    void *buf = NULL;
+    size_t n = 0;
+    char nm[64];
+    if (lrt_tri_scene_save_to_memory(s, &buf, &n) != LRT_RESULT_OK) {
+        printf("%-16s (does not serialize: memory/mmap skipped)\n", name);
+        return bad;
+    }
+    lrt_result err;
+    lrt_tri_scene *m = lrt_tri_scene_load_from_memory(buf, n, &err);
+    snprintf(nm, sizeof nm, "%s/load", name);
+    if (!m) { printf("%-16s load_from_memory failed %d\n", nm, (int)err); bad = 1; }
+    else { bad |= check1(nm, m); lrt_tri_scene_free(m); }
+    free(buf);
+    char path[512];
+    snprintf(path, sizeof path, "%s/primboxcheck_%s.lrts", g_dir, name);
+    for (char *q = path + strlen(g_dir) + 1; *q; q++) if (*q == '/') *q = '_';
+    if (lrt_tri_scene_save(s, path) == LRT_RESULT_OK) {
+        lrt_tri_scene *mm = lrt_tri_scene_open_mmap(path, &err);
+        snprintf(nm, sizeof nm, "%s/mmap", name);
+        if (!mm) { printf("%-16s open_mmap failed %d\n", nm, (int)err); bad = 1; }
+        else { bad |= check1(nm, mm); lrt_tri_scene_free(mm); }
+        remove(path);
+    }
+    return bad;
+}
+static int report(const char *name, lrt_tri_scene *s) {
+    int bad = check_all(name, s);
+    if (s) lrt_tri_scene_free(s);
+    return bad;
 }
 
 int main(int argc, char **argv) {
     rs = argc > 1 ? (uint32_t)atoi(argv[1]) * 2654435761u + 7 : 7;
+    if (argc > 2) g_dir = argv[2];
     int bad = 0;
     lrt_result err;
     /* hair: 200 strands x 6 points, varying radii */
@@ -193,8 +270,24 @@ int main(int argc, char **argv) {
         }
     }
     lrt_hair_strands hs = {pts, rad, 0.0f, first, cnt, NS, NS * NP};
-    bad |= report("roundlin", lrt_roundcurve_scene_build(&hs, NULL, &err));
-    bad |= report("flat", lrt_flatcurve_scene_build(&hs, NULL, &err));
+    {
+        /* refit: same topology, moved points and new radii */
+        float *pts2 = malloc(sizeof pts), *rad2 = malloc(sizeof rad);
+        for (int i = 0; i < NS * NP * 3; i++) pts2[i] = pts[i] + fr(-0.2f, 0.2f);
+        for (int i = 0; i < NS * NP; i++) rad2[i] = fr(0.001f, 0.09f);
+        lrt_hair_strands hs2 = {pts2, rad2, 0.0f, first, cnt, NS, NS * NP};
+        lrt_tri_scene *sc = lrt_roundcurve_scene_build(&hs, NULL, &err);
+        bad |= check_all("roundlin", sc);
+        if (lrt_curve_refit(sc, &hs2) != LRT_RESULT_OK) { printf("roundlin refit failed\n"); bad = 1; }
+        else bad |= check_all("roundlin/refit", sc);
+        lrt_tri_scene_free(sc);
+        sc = lrt_flatcurve_scene_build(&hs, NULL, &err);
+        bad |= check_all("flat", sc);
+        if (lrt_curve_refit(sc, &hs2) != LRT_RESULT_OK) { printf("flat refit failed\n"); bad = 1; }
+        else bad |= check_all("flat/refit", sc);
+        lrt_tri_scene_free(sc);
+        free(pts2); free(rad2);
+    }
     /* cubic Bezier curves */
     enum { NB = 300 };
     float *bz = malloc(sizeof(float) * 16 * NB);
@@ -219,8 +312,62 @@ int main(int argc, char **argv) {
         for (int k = 0; k < 12; k++) bl[12 * i + k] = b[k % 3] + fr(-0.5f, 0.5f);
         for (int k = 0; k < 48; k++) bp[48 * i + k] = b[k % 3] + fr(-0.5f, 0.5f);
     }
-    bad |= report("bilinear", lrt_bilinear_scene_build(bl, NQ, NULL, &err));
-    bad |= report("bezpatch", lrt_bezpatch_scene_build(bp, NQ, NULL, &err));
+    {
+        float *bl2 = malloc(sizeof(float) * 12 * NQ), *bp2 = malloc(sizeof(float) * 48 * NQ);
+        for (int k = 0; k < 12 * NQ; k++) bl2[k] = bl[k] + fr(-0.3f, 0.3f);
+        for (int k = 0; k < 48 * NQ; k++) bp2[k] = bp[k] + fr(-0.3f, 0.3f);
+        lrt_tri_scene *sc = lrt_bilinear_scene_build(bl, NQ, NULL, &err);
+        bad |= check_all("bilinear", sc);
+        if (lrt_tri_surface_refit(sc, bl2, NQ) != LRT_RESULT_OK) { printf("bilinear refit failed\n"); bad = 1; }
+        else bad |= check_all("bilinear/refit", sc);
+        lrt_tri_scene_free(sc);
+        sc = lrt_bezpatch_scene_build(bp, NQ, NULL, &err);
+        bad |= check_all("bezpatch", sc);
+        if (lrt_tri_surface_refit(sc, bp2, NQ) != LRT_RESULT_OK) { printf("bezpatch refit failed\n"); bad = 1; }
+        else bad |= check_all("bezpatch/refit", sc);
+        lrt_tri_scene_free(sc);
+        /* planar quads and tetrahedra (lrt_quad4, 4 points each) */
+        bad |= report("quad", lrt_quad_scene_build(bl2, NQ, NULL, &err));
+        bad |= report("tetra", lrt_tetra_scene_build(bl, NQ, NULL, &err));
+        free(bl2); free(bp2);
+    }
+    /* ellipses (fixed-normal ovals) */
+    {
+        float rxy[2 * 500], nrm[3 * 500];
+        for (int i = 0; i < 500; i++) {
+            rxy[2 * i] = fr(0.01f, 0.2f); rxy[2 * i + 1] = fr(0.01f, 0.2f);
+            float n3[3] = {fr(-1, 1), fr(-1, 1), fr(0.1f, 1)}, l = sqrtf(n3[0] * n3[0] + n3[1] * n3[1] + n3[2] * n3[2]);
+            for (int a = 0; a < 3; a++) nrm[3 * i + a] = n3[a] / l;
+        }
+        bad |= report("ellipse", lrt_ellipse_scene_build(cen, rxy, nrm, 500, NULL, &err));
+    }
+    /* built-in SDF primitives: sphere / box / torus */
+    {
+        uint32_t ty[300];
+        float sc3[3 * 300], par[3 * 300];
+        for (int i = 0; i < 300; i++) {
+            ty[i] = (uint32_t)(i % 3);
+            for (int a = 0; a < 3; a++) { sc3[3 * i + a] = fr(-3, 3); par[3 * i + a] = fr(0.03f, 0.3f); }
+        }
+        bad |= report("sdf", lrt_sdfprim_scene_build(ty, sc3, par, 300, NULL, &err));
+    }
+    /* quantized triangles, every format, lossy and conservative */
+    {
+        enum { NTQ = 800 };
+        float *tv = malloc(sizeof(float) * 9 * NTQ);
+        for (int i = 0; i < NTQ; i++) {
+            float b[3] = {fr(-3, 3), fr(-3, 3), fr(-3, 3)};
+            for (int k = 0; k < 9; k++) tv[9 * i + k] = b[k % 3] + fr(-0.2f, 0.2f);
+        }
+        const char *fn[4] = {"q16", "q8", "fp8", "fp4"};
+        for (int f = 0; f < 4; f++)
+            for (unsigned fl = 0; fl < 2; fl++) {
+                char nm[32];
+                snprintf(nm, sizeof nm, "qtri-%s%s", fn[f], fl ? "-cons" : "");
+                bad |= report(nm, lrt_qtri_scene_build(tv, NTQ, (lrt_qtri_format)f, fl, NULL, &err));
+            }
+        free(tv);
+    }
     /* NURBS: 8x8 net, bicubic, clamped knots, random positive weights */
     enum { NU = 8, NV = 8 };
     float net[3 * NU * NV], w[NU * NV], ku[NU + 4], kv[NV + 4];

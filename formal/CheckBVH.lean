@@ -161,6 +161,9 @@ def main : IO Unit := do
       | some t => !(leBits tmaxR t)
       | none => false
     let anyL := (G.runAny test0 hitp List.reverse fuel [root]).getD false
+    -- the C loop's overflow check (TRI_STACK_SIZE = 1024) modelled by runAnyB
+    if (G.runAnyB 1024 test0 hitp List.reverse fuel [root]).getD false != anyL then
+      IO.eprintln s!"ray {rays+1}: runAnyB != runAny"
     let anyBr := reach.any hitp
     let oS := R.getD 14 "0" == "1"
     let oD := R.getD 15 "0" == "1"
@@ -189,4 +192,5 @@ def main : IO Unit := do
     if res.1 == 1 && cV.1 == 1 then maxUlpS := max maxUlpS (ulpd res.2.1 cV.2.1)
   IO.println s!"W={W} nodes={nN} blocks={nB} reachable={reach.length} checkWF={wf} (bad leaf={badLeaf} sub={badSub} idx={badIdx})"
   IO.println s!"rays={rays} hits={hits} lean==C-scalar(t,prim)={agreeC} t==C-dispatched={agreeS} (t,prim)==C-dispatched={fullS} dispatched-hit/miss-vs-brute={missS} t==brute={agreeBrute} hit/miss-vs-brute={missB} max-ulp(t-brute)={maxUlpB} max-ulp(scalar-dispatched)={maxUlpS}"
+  IO.println s!"stack need={G.needRef root}"
   IO.println s!"anyhit lean==C-scalar={anyC} lean==C-dispatched={anyD} lean==brute={anyB} uncovered-hits={uncovered}"
