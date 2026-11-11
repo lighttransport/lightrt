@@ -962,18 +962,37 @@ __device__ __forceinline__ float hp_bez_leaf_dist(const float cp[16], float a, f
     }
     float step = (b - a) / (float)NS;
     float lo = bu - step < a ? a : bu - step, hi = bu + step > b ? b : bu + step;
-    const float g = 0.6180339887f;
-    for (int it = 0; it < 14; it++) {
-        float m1 = hi - g * (hi - lo), m2 = lo + g * (hi - lo);
-        float P1[4], P2[4], d1[4], d2[4], e1[4], e2[4];
-        hp_bez_eval(cp, m1, P1, d1, e1);
-        hp_bez_eval(cp, m2, P2, d2, e2);
-        float a1 = x[0] - P1[0], b1 = x[1] - P1[1], c1 = x[2] - P1[2];
-        float a2 = x[0] - P2[0], b2 = x[1] - P2[1], c2 = x[2] - P2[2];
-        float f1 = sqrtf(a1 * a1 + b1 * b1 + c1 * c1) - (P1[3] > 0.0f ? P1[3] : 0.0f);
-        float f2 = sqrtf(a2 * a2 + b2 * b2 + c2 * c2) - (P2[3] > 0.0f ? P2[3] : 0.0f);
-        if (f1 < f2) { hi = m2; if (f1 < bd) { bd = f1; bu = m1; } }
-        else { lo = m1; if (f2 < bd) { bd = f2; bu = m2; } }
+    /* safeguarded Newton on phi'(u), phi = |x - C(u)| - r(u), bracketed by the
+     * samples around the best one (bisection when a step leaves the bracket);
+     * ~5 evaluations instead of 28 golden-section ones */
+    float u = bu;
+    for (int it = 0; it < 6; it++) {
+        float P[4], dP[4], ddP[4];
+        hp_bez_eval(cp, u, P, dP, ddP);
+        float wx = x[0] - P[0], wy = x[1] - P[1], wz = x[2] - P[2];
+        float wl = sqrtf(wx * wx + wy * wy + wz * wz);
+        if (!(wl > 1e-30f)) break;
+        float r = P[3] > 0.0f ? P[3] : 0.0f;
+        float dr = P[3] > 0.0f ? dP[3] : 0.0f, ddr = P[3] > 0.0f ? ddP[3] : 0.0f;
+        float d = wl - r;
+        if (d < bd) { bd = d; bu = u; }
+        float wd = wx * dP[0] + wy * dP[1] + wz * dP[2];
+        float g1 = -wd / wl - dr;
+        float g2 = (dP[0] * dP[0] + dP[1] * dP[1] + dP[2] * dP[2] -
+                    (wx * ddP[0] + wy * ddP[1] + wz * ddP[2])) / wl -
+                   wd * wd / (wl * wl * wl) - ddr;
+        if (g1 > 0.0f) hi = u; else lo = u;
+        float un = (g2 > 0.0f) ? u - g1 / g2 : 0.5f * (lo + hi);
+        if (!(un > lo && un < hi)) un = 0.5f * (lo + hi);
+        if (fabsf(un - u) < 1e-6f * (b - a)) { u = un; break; }
+        u = un;
+    }
+    {
+        float P[4], dP[4], ddP[4];
+        hp_bez_eval(cp, u, P, dP, ddP);
+        float wx = x[0] - P[0], wy = x[1] - P[1], wz = x[2] - P[2];
+        float d = sqrtf(wx * wx + wy * wy + wz * wz) - (P[3] > 0.0f ? P[3] : 0.0f);
+        if (d < bd) { bd = d; bu = u; }
     }
     *u_best = bu;
     return bd;
