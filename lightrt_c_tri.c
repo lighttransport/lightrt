@@ -4073,52 +4073,306 @@ static void tri_bez_subcurve(const float cp[16], float a, float b,
 /* 2D Newton on (u,t): f = dot(R,T) (perpendicular foot), g = dist-to-axis -
  * radius (tube surface). cp is in ray-local space (ray origin at 0), dir = ray
  * direction. Returns 1 and fills t,u on a converged in-range hit. */
+static int tri_cone_seed(const float dir[3], float tmin, float best,
+                         const float p0[3], float r0, const float p1[3],
+                         float r1, float *t_out, float *s_out);
+
+/* Round Bezier curve = union of balls B(C(u), r(u)) (the canal surface; the
+ * same model as round-linear curves). A surface point x = t*dir (ray origin at
+ * the local 0) with contact parameter u satisfies the envelope conditions
+ *   F = R.C'(u) + r(u) r'(u) = 0,   G = |R| - r(u) = 0,   R = x - C(u).
+ * (The former model, foot R.T = 0 with |R_perp| = r, is a normal-plane circle
+ * sweep; it differs from the union of balls by O(r r') and left ~1e-3 relative
+ * residuals, measured by formal/tools/primhitcheck.c.) Newton on (u, t);
+ * converged when |G| and |F|/|C'| are below eps at the point that is returned.
+ * Reports whether the contact faces the ray (front: R.dir < 0). */
 static int tri_bez_newton(const float cp[16], const float dir[3], float tmin,
                           float u, float t, float best_t, float *t_out,
-                          float *u_out) {
-    for (int it = 0; it < 9; it++) {
+                          float *u_out, int *front, float ulo, float uhi) {
+    for (int it = 0; it < 12; it++) {
         float P[4], dP[4], ddP[4];
         tri_bez_eval(cp, u, P, dP, ddP);
         float Rx = t * dir[0] - P[0], Ry = t * dir[1] - P[1],
               Rz = t * dir[2] - P[2];
+        float r = P[3] > 0.0f ? P[3] : 0.0f, dr = P[3] > 0.0f ? dP[3] : 0.0f;
+        float lenR = sqrtf(Rx * Rx + Ry * Ry + Rz * Rz);
         float dpd = dP[0] * dP[0] + dP[1] * dP[1] + dP[2] * dP[2];
-        if (dpd < 1e-20f) return 0;
-        float rcpl = 1.0f / sqrtf(dpd);
-        float Tx = dP[0] * rcpl, Ty = dP[1] * rcpl, Tz = dP[2] * rcpl;
-        float Tdd = Tx * ddP[0] + Ty * ddP[1] + Tz * ddP[2];
-        float dTx = (ddP[0] - Tx * Tdd) * rcpl, dTy = (ddP[1] - Ty * Tdd) * rcpl,
-              dTz = (ddP[2] - Tz * Tdd) * rcpl;
-        float f = Rx * Tx + Ry * Ty + Rz * Tz;
-        float dfdu = (-dP[0] * Tx - dP[1] * Ty - dP[2] * Tz) +
-                     (Rx * dTx + Ry * dTy + Rz * dTz);
-        float dfdt = dir[0] * Tx + dir[1] * Ty + dir[2] * Tz;
-        float RR = Rx * Rx + Ry * Ry + Rz * Rz;
-        float K = RR - f * f;
-        if (K < 1e-20f) K = 1e-20f;
-        float sqrtK = sqrtf(K), rsK = 1.0f / sqrtK;
-        float r = P[3] > 0.0f ? P[3] : 0.0f;
-        float g = sqrtK - r;
-        float RdRdu = -(Rx * dP[0] + Ry * dP[1] + Rz * dP[2]);
-        float RdRdt = Rx * dir[0] + Ry * dir[1] + Rz * dir[2];
-        float dgdu = (RdRdu - f * dfdu) * rsK - dP[3];
-        float dgdt = (RdRdt - f * dfdt) * rsK;
-        /* Converged on f, g at THIS (u,t), which is what is returned (the check
-         * used to follow the update; see tri_bezpatch_newton). */
-        float lenR = sqrtf(RR);
-        float eps = 1e-5f * (1.0f + lenR);
-        if (fabsf(f) < eps && fabsf(g) < eps) {
-            if (t >= tmin && t < best_t && u >= 0.0f && u <= 1.0f) {
+        if (!(lenR > 1e-30f) || !(dpd > 1e-30f)) return 0;
+        float RdP = Rx * dP[0] + Ry * dP[1] + Rz * dP[2];
+        float F = RdP + r * dr;
+        float G = lenR - r;
+        float plen = sqrtf(P[0] * P[0] + P[1] * P[1] + P[2] * P[2]);
+        float eps = 2e-7f * (1.0f + plen) + 1e-6f * r;
+        float dFdu = -dpd + (Rx * ddP[0] + Ry * ddP[1] + Rz * ddP[2]) + dr * dr +
+                     (P[3] > 0.0f ? r * ddP[3] : 0.0f);
+        /* F = 0 is only stationarity of |R|^2 - r^2 in u; a contact needs a
+         * MINIMUM (dF/du < 0), else x is at distance r(u) from C(u) but inside
+         * the tube around another u (concave side of a bend) */
+        if (fabsf(G) < eps && fabsf(F) < eps * sqrtf(dpd) && !(dFdu < 0.0f)) return 0;
+        if (fabsf(G) < eps && fabsf(F) < eps * sqrtf(dpd)) {
+            *front = (Rx * dir[0] + Ry * dir[1] + Rz * dir[2]) <= 0.0f;
+            *t_out = t;
+            *u_out = u;
+            if (t >= tmin && t < best_t && u >= 0.0f && u <= 1.0f) return 1;
+            return 2; /* converged, outside [tmin, best) or u outside [0,1] */
+        }
+        float dFdt = dir[0] * dP[0] + dir[1] * dP[1] + dir[2] * dP[2];
+        float dGdu = -RdP / lenR - dr;
+        float dGdt = (Rx * dir[0] + Ry * dir[1] + Rz * dir[2]) / lenR;
+        float det = dFdu * dGdt - dFdt * dGdu;
+        if (!(fabsf(det) > 1e-30f)) return 0;
+        float invd = 1.0f / det;
+        float du = (dGdt * F - dFdt * G) * invd, dt = (dFdu * G - dGdu * F) * invd;
+        /* float noise floor: the step itself is below eps and the residual is
+         * within 16 eps -> this point is as converged as fp32 allows */
+        if (fabsf(du) * sqrtf(dpd) + fabsf(dt) * sqrtf(dir[0] * dir[0] + dir[1] * dir[1] +
+                                                       dir[2] * dir[2]) < eps &&
+            fabsf(G) < 16.0f * eps && fabsf(F) < 16.0f * eps * sqrtf(dpd) && dFdu < 0.0f) {
+            *front = (Rx * dir[0] + Ry * dir[1] + Rz * dir[2]) <= 0.0f;
+            *t_out = t;
+            *u_out = u;
+            if (t >= tmin && t < best_t && u >= 0.0f && u <= 1.0f) return 1;
+            return 2; /* converged, outside [tmin, best) or u outside [0,1] */
+        }
+        if (!(fabsf(du) < 1.0f)) du = du > 0.0f ? 0.25f : -0.25f; /* damp wild steps */
+        u -= du;
+        t -= dt;
+        (void)ulo; (void)uhi;
+        if (u < -0.05f) u = -0.05f;
+        if (u > 1.05f) u = 1.05f;
+    }
+    return 0;
+}
+
+/* Distance from x to the union of balls over u in [a,b] (the leaf sub-arc's
+ * tube): min_u |x - C(u)| - r(u), by sampling + golden-section refinement.
+ * Returns the distance and the minimizing u. */
+static float tri_bez_leaf_dist(const float cp[16], float a, float b,
+                               const float x[3], float *u_best) {
+    enum { NS = 6 };
+    float bu = a, bd = 3.4e38f;
+    for (int i = 0; i <= NS; i++) {
+        float u = a + (b - a) * (float)i / (float)NS;
+        float P[4], dP[4], ddP[4];
+        tri_bez_eval(cp, u, P, dP, ddP);
+        float dx = x[0] - P[0], dy = x[1] - P[1], dz = x[2] - P[2];
+        float d = sqrtf(dx * dx + dy * dy + dz * dz) - (P[3] > 0.0f ? P[3] : 0.0f);
+        if (d < bd) { bd = d; bu = u; }
+    }
+    float step = (b - a) / (float)NS;
+    float lo = bu - step < a ? a : bu - step, hi = bu + step > b ? b : bu + step;
+    const float g = 0.6180339887f;
+    for (int it = 0; it < 14; it++) {
+        float m1 = hi - g * (hi - lo), m2 = lo + g * (hi - lo);
+        float P1[4], P2[4], d1[4], d2[4], e1[4], e2[4];
+        tri_bez_eval(cp, m1, P1, d1, e1);
+        tri_bez_eval(cp, m2, P2, d2, e2);
+        float a1 = x[0] - P1[0], b1 = x[1] - P1[1], c1 = x[2] - P1[2];
+        float a2 = x[0] - P2[0], b2 = x[1] - P2[1], c2 = x[2] - P2[2];
+        float f1 = sqrtf(a1 * a1 + b1 * b1 + c1 * c1) - (P1[3] > 0.0f ? P1[3] : 0.0f);
+        float f2 = sqrtf(a2 * a2 + b2 * b2 + c2 * c2) - (P2[3] > 0.0f ? P2[3] : 0.0f);
+        if (f1 < f2) { hi = m2; if (f1 < bd) { bd = f1; bu = m1; } }
+        else { lo = m1; if (f2 < bd) { bd = f2; bu = m2; } }
+    }
+    *u_best = bu;
+    return bd;
+}
+
+/* Warm-started leaf distance: 3 Gauss-Newton foot-point steps on |x - C(u)|^2
+ * from the previous u (clamped to [a,b]). A leaf sub-arc is short and nearly
+ * straight, so the foot moves little between sphere-tracing steps; the full
+ * sampled search (tri_bez_leaf_dist) seeds the first step. */
+static float tri_bez_leaf_dist_warm(const float cp[16], float a, float b,
+                                    const float x[3], float *u_io) {
+    float u = *u_io, P[4], dP[4], ddP[4];
+    for (int it = 0; it < 3; it++) {
+        tri_bez_eval(cp, u, P, dP, ddP);
+        float wx = x[0] - P[0], wy = x[1] - P[1], wz = x[2] - P[2];
+        float g = wx * dP[0] + wy * dP[1] + wz * dP[2];
+        float h = dP[0] * dP[0] + dP[1] * dP[1] + dP[2] * dP[2] -
+                  (wx * ddP[0] + wy * ddP[1] + wz * ddP[2]);
+        if (!(h > 1e-30f)) h = dP[0] * dP[0] + dP[1] * dP[1] + dP[2] * dP[2] + 1e-30f;
+        u += g / h;
+        u = u < a ? a : (u > b ? b : u);
+    }
+    float best = 3.4e38f, bu = u;
+    /* the foot minimizes |x - C|, not |x - C| - r: also try the interval ends,
+     * where the end balls give the minimum (a warm foot that slid to an
+     * interior local minimum overestimated the distance there) */
+    float cand[3] = {u, a, b};
+    for (int k = 0; k < 3; k++) {
+        tri_bez_eval(cp, cand[k], P, dP, ddP);
+        float dx = x[0] - P[0], dy = x[1] - P[1], dz = x[2] - P[2];
+        float d = sqrtf(dx * dx + dy * dy + dz * dz) - (P[3] > 0.0f ? P[3] : 0.0f);
+        if (d < best) { best = d; bu = cand[k]; }
+    }
+    *u_io = bu;
+    return best;
+}
+
+/* Nearest hit of the ray (origin 0) on the leaf sub-arc [a,b] of a round cubic
+ * Bezier, within [tmin, best). Fast path: Newton from the bounding-cone seed,
+ * accepted only if converged and front-facing. Otherwise sphere-trace the leaf
+ * tube's exact distance from the entry of a sphere that encloses it (so the
+ * first contact is found, never the exit), then polish with Newton. The cone
+ * seed itself is never reported as a hit (it lies on the inflated bounding
+ * cone, not the curve). */
+/* Slow path of tri_bez_leaf_solve: sphere-trace the exact leaf-tube distance
+ * (u restricted to [a,b], so end balls are included) from the entry of a
+ * capsule that encloses the tube, so the FIRST contact in [tmin, best) is
+ * found; polished by Newton. */
+static int tri_bez_leaf_trace(const float cp[16], const float dir[3], float tmin,
+                              float best, float a, float b, const float P0p[3],
+                              float r0c, const float P3p[3], float r3c,
+                              float *t_out, float *u_out) {
+    float th, uh;
+    int front;
+    float slack = (b - a) * (1.0f / 64.0f);
+    /* enclosing sphere of the leaf tube (chord midpoint, half chord
+     * + capsule radius), entry point */
+    float cx = 0.5f * (P0p[0] + P3p[0]), cy = 0.5f * (P0p[1] + P3p[1]),
+          cz = 0.5f * (P0p[2] + P3p[2]);
+    float hx = 0.5f * (P3p[0] - P0p[0]), hy = 0.5f * (P3p[1] - P0p[1]),
+          hz = 0.5f * (P3p[2] - P0p[2]);
+    float Rs = sqrtf(hx * hx + hy * hy + hz * hz) + (r0c > r3c ? r0c : r3c);
+    float dd = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+    float dn = sqrtf(dd);
+    float tc = (cx * dir[0] + cy * dir[1] + cz * dir[2]) / dd;
+    float qx = tc * dir[0] - cx, qy = tc * dir[1] - cy, qz = tc * dir[2] - cz;
+    float q2 = qx * qx + qy * qy + qz * qz;
+    if (q2 > Rs * Rs) return 0;
+    float half = sqrtf((Rs * Rs - q2) / dd);
+    float t = tc - half, t1 = tc + half;
+    {
+        /* tighter start: entry into the capsule of radius rcap around the chord
+         * segment (it contains the leaf tube: every point of the sub-arc is
+         * within maxperp of the segment, and r <= the max CP radius). Entry =
+         * min over the two end spheres and the cylinder part over the segment;
+         * no entry at all -> the ray misses the tube. */
+        float rcap = r0c > r3c ? r0c : r3c, rc2 = rcap * rcap;
+        float tent = 3.4e38f;
+        const float *E[2] = {P0p, P3p};
+        for (int e = 0; e < 2; e++) {
+            float pc = (E[e][0] * dir[0] + E[e][1] * dir[1] + E[e][2] * dir[2]) / dd;
+            float wx = pc * dir[0] - E[e][0], wy = pc * dir[1] - E[e][1], wz = pc * dir[2] - E[e][2];
+            float w2 = wx * wx + wy * wy + wz * wz;
+            if (w2 <= rc2) {
+                float te = pc - sqrtf((rc2 - w2) / dd);
+                if (te < tent) tent = te;
+            }
+        }
+        float ax = P3p[0] - P0p[0], ay = P3p[1] - P0p[1], az = P3p[2] - P0p[2];
+        float aa = ax * ax + ay * ay + az * az;
+        if (aa > 1e-30f) {
+            /* |(t d - P0) x A|^2 = rcap^2 |A|^2 : quadratic in t */
+            float dxa[3] = {dir[1] * az - dir[2] * ay, dir[2] * ax - dir[0] * az, dir[0] * ay - dir[1] * ax};
+            float pxa[3] = {P0p[1] * az - P0p[2] * ay, P0p[2] * ax - P0p[0] * az, P0p[0] * ay - P0p[1] * ax};
+            float qa = dxa[0] * dxa[0] + dxa[1] * dxa[1] + dxa[2] * dxa[2];
+            float qb = -2.0f * (dxa[0] * pxa[0] + dxa[1] * pxa[1] + dxa[2] * pxa[2]);
+            float qc = pxa[0] * pxa[0] + pxa[1] * pxa[1] + pxa[2] * pxa[2] - rc2 * aa;
+            float disc = qb * qb - 4.0f * qa * qc;
+            if (qa > 1e-30f && disc >= 0.0f) {
+                float te = (-qb - sqrtf(disc)) / (2.0f * qa);
+                float sx = te * dir[0] - P0p[0], sy = te * dir[1] - P0p[1], sz = te * dir[2] - P0p[2];
+                float sp = (sx * ax + sy * ay + sz * az) / aa;
+                if (sp >= 0.0f && sp <= 1.0f && te < tent) tent = te;
+            }
+        }
+        if (tent == 3.4e38f) return 0;
+        /* fp guard: back off a little (the trace only needs to start outside) */
+        tent -= (rcap + 1e-6f * (1.0f + sqrtf(cx * cx + cy * cy + cz * cz))) / dn * 1e-3f;
+        if (tent > t) t = tent;
+    }
+    if (t < tmin) t = tmin;
+    if (t1 > best) t1 = best;
+    float plen = sqrtf(cx * cx + cy * cy + cz * cz);
+    float u = 0.5f * (a + b), tprev = t, tsafe = t; /* tsafe: verified outside */
+    float eps = 2e-7f * (1.0f + plen) + 1e-6f * (r0c > r3c ? r0c : r3c);
+    for (int it = 0; it < 160 && t < t1; it++) {
+        float x[3] = {t * dir[0], t * dir[1], t * dir[2]};
+        /* full search on the first step and every 8th (guards against a wrong
+         * local foot); warm Gauss-Newton foot otherwise */
+        float d = (it & 7) == 0 ? tri_bez_leaf_dist(cp, a, b, x, &u)
+                                : tri_bez_leaf_dist_warm(cp, a, b, x, &u);
+        if (d < eps && (it & 7) != 0) {
+            /* about to accept on a warm (possibly overestimating) distance:
+             * confirm with the full search, which also catches having marched
+             * inside the tube unnoticed */
+            d = tri_bez_leaf_dist(cp, a, b, x, &u);
+        }
+        if (d < -eps && it > 0) {
+            /* overshot into the tube (the warm foot can overestimate the
+             * distance): bisect back to the sign change with the full search,
+             * from the last point a FULL search verified to be outside */
+            float lo = tsafe, hi = t;
+            (void)tprev;
+            for (int k = 0; k < 32; k++) {
+                float mid = 0.5f * (lo + hi), xm[3] = {mid * dir[0], mid * dir[1], mid * dir[2]};
+                float um, dm = tri_bez_leaf_dist(cp, a, b, xm, &um);
+                if (dm < 0.0f) { hi = mid; u = um; } else lo = mid;
+            }
+            t = hi;
+            float xh[3] = {t * dir[0], t * dir[1], t * dir[2]};
+            d = tri_bez_leaf_dist(cp, a, b, xh, &u);
+        }
+        if (d < eps) {
+            if (tri_bez_newton(cp, dir, tmin, u, t, best, &th, &uh, &front, a - slack,
+                               b + slack) == 1 &&
+                fabsf(th - t) * dn < 4.0f * (eps + fabsf(d))) {
+                *t_out = th;
+                *u_out = uh;
+            } else {
                 *t_out = t;
                 *u_out = u;
-                return 1;
             }
-            return 0;
+            return *t_out >= tmin && *t_out < best;
         }
-        float det = dfdu * dgdt - dfdt * dgdu;
-        if (fabsf(det) < 1e-20f) return 0;
-        float invd = 1.0f / det;
-        u -= (dgdt * f - dfdt * g) * invd;
-        t -= (dfdu * g - dgdu * f) * invd;
+        tprev = t;
+        if ((it & 7) == 0 && d > 0.0f) tsafe = t + 0.9f * d / dn; /* full-search step: safe */
+        t += 0.9f * d / dn;
+    }
+    return 0;
+    return 0;
+}
+
+static int tri_bez_leaf_solve(const float cp[16], const float dir[3], float tmin,
+                              float best, float a, float b, const float P0p[3],
+                              float r0c, const float P3p[3], float r3c,
+                              float *t_out, float *u_out) {
+    float tseg, s;
+    if (!tri_cone_seed(dir, tmin, best, P0p, r0c, P3p, r3c, &tseg, &s)) return 0;
+    float th, uh;
+    int front;
+    float slack = (b - a) * (1.0f / 64.0f);
+    int nr = tri_bez_newton(cp, dir, tmin, a + s * (b - a), tseg, best, &th, &uh, &front,
+                            a - slack, b + slack);
+    /* The fast path speaks for THIS leaf only if Newton's contact stays inside
+     * [a,b] (slack 1/64 of the leaf): a contact elsewhere on the curve is a
+     * valid surface point but not this leaf's nearest, and contacts on the
+     * leaf's end balls (u pinned at a or b, where F != 0) are only found by the
+     * u-restricted sphere trace below. */
+    int inleaf = uh >= a - slack && uh <= b + slack;
+    if (nr == 1 && front && inleaf) {
+        *t_out = th;
+        *u_out = uh;
+        return 1;
+    }
+    /* converged to this leaf's ENTRY contact (front-facing) but beyond the
+     * current best: a short leaf tube is entered once, so nothing nearer here
+     * (checked: primhitcheck "C farther" stays 0) */
+    if (nr == 2 && front && inleaf && th >= best && uh >= 0.0f && uh <= 1.0f) return 0;
+    /* a valid front contact elsewhere on the curve: keep it as a candidate and
+     * only search this leaf for something nearer (the final answer is the
+     * minimum over every leaf's own nearest, so this stays exact) */
+    int cand = (nr == 1 && front);
+    float ct = th, cu = uh;
+    if (cand) best = ct;
+    if (tri_bez_leaf_trace(cp, dir, tmin, best, a, b, P0p, r0c, P3p, r3c, t_out, u_out))
+        return 1;
+    if (cand) {
+        *t_out = ct;
+        *u_out = cu;
+        return 1;
     }
     return 0;
 }
@@ -4253,6 +4507,11 @@ static int tri_bez_isect_one(const float cp_in[16], const tri_ray_ctx *rc,
                 float wx = mid[m][0] - Pa[0], wy = mid[m][1] - Pa[1],
                       wz = mid[m][2] - Pa[2];
                 float tt = (wx * cxd + wy * cyd + wz * czd) * inv;
+                /* distance to the chord SEGMENT (clamped), not its line: the cull
+                 * below measures the ray against the segment, and distance to a
+                 * segment is convex, so its max over the control hull is at a
+                 * control point (a line distance missed overshooting sub-arcs) */
+                tt = tt < 0.0f ? 0.0f : (tt > 1.0f ? 1.0f : tt);
                 float dx = wx - tt * cxd, dy = wy - tt * cyd, dz = wz - tt * czd;
                 float d2 = dx * dx + dy * dy + dz * dz;
                 if (d2 > maxperp) maxperp = d2;
@@ -4293,20 +4552,12 @@ static int tri_bez_isect_one(const float cp_in[16], const tri_ray_ctx *rc,
             if (r0c > 0.0f || r3c > 0.0f) {
                 float P0p[3] = {Pa[0], Pa[1], Pa[2]},
                       P3p[3] = {Pb[0], Pb[1], Pb[2]};
-                float tseg, s;
-                if (tri_cone_seed(dir, tmin, best, P0p, r0c, P3p, r3c, &tseg,
-                                  &s)) {
-                    float th, uh;
-                    if (tri_bez_newton(cp, dir, tmin, a + s * h, tseg, best, &th,
-                                       &uh)) {
-                        best = th;
-                        bu = uh;
-                        hit = 1;
-                    } else {
-                        best = tseg;
-                        bu = a + s * h;
-                        hit = 1;
-                    }
+                float th, uh;
+                if (tri_bez_leaf_solve(cp, dir, tmin, best, a, b, P0p, r0c, P3p,
+                                       r3c, &th, &uh)) {
+                    best = th;
+                    bu = uh;
+                    hit = 1;
                 }
             }
         } else {
@@ -7382,6 +7633,7 @@ static int tri_bez_sweep_sse(const float cp_world[16], const tri_ray_ctx *rc,
             __m128 wx = _mm_sub_ps(mxp, PA[0]), wy = _mm_sub_ps(myp, PA[1]),
                    wz = _mm_sub_ps(mzp, PA[2]);
             __m128 tt = _mm_mul_ps(rlc_dot4(wx, wy, wz, cx, cy, cz), invcl);
+            tt = _mm_min_ps(ONE, _mm_max_ps(Z, tt)); /* segment, not line (see scalar) */
             __m128 px = _mm_sub_ps(wx, _mm_mul_ps(tt, cx));
             __m128 py = _mm_sub_ps(wy, _mm_mul_ps(tt, cy));
             __m128 pz = _mm_sub_ps(wz, _mm_mul_ps(tt, cz));
@@ -7442,20 +7694,13 @@ static int tri_bez_sweep_sse(const float cp_world[16], const tri_ray_ctx *rc,
                 r0c = (r0c > 0.0f ? r0c : 0.0f) + mpa[L];
                 r3c = (r3c > 0.0f ? r3c : 0.0f) + mpa[L];
                 if (r0c > 0.0f || r3c > 0.0f) {
-                    float tseg, s;
-                    if (tri_cone_seed(dir, tmin, best, P0p, r0c, P3p, r3c, &tseg,
-                                      &s)) {
-                        float th, uh;
-                        if (tri_bez_newton(cpl, dir, tmin, u0 + s * hL, tseg,
-                                           best, &th, &uh)) {
-                            best = th;
-                            bu = uh;
-                            hit = 1;
-                        } else {
-                            best = tseg;
-                            bu = u0 + s * hL;
-                            hit = 1;
-                        }
+                    float th, uh;
+                    (void)hL;
+                    if (tri_bez_leaf_solve(cpl, dir, tmin, best, u0, u1, P0p, r0c,
+                                           P3p, r3c, &th, &uh)) {
+                        best = th;
+                        bu = uh;
+                        hit = 1;
                     }
                 }
             } else {

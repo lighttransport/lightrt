@@ -701,10 +701,15 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
 - `lrt_bezcurve_scene_build` — **true higher-order round cubic-Bézier curves**
   (not tessellation): a port of Embree's sweep intersector
   (`curve_intersector_sweep.h`, `RTC_GEOMETRY_TYPE_ROUND_BEZIER_CURVE`). Each
-  sub-interval seeds a 2D Newton/Jacobian iteration (`tri_bez_newton`: `f =
-  dot(R,T)` foot, `g = dist−radius` surface) that converges to the exact tube;
-  the seed comes from a round-linear cone, with a cone fallback when Newton is
-  ill-conditioned (grazing). Build-time de Casteljau **pre-subdivision**
+  sub-interval is solved by `tri_bez_leaf_solve` on the exact round curve = union of
+  balls B(C(u), r(u)) (canal surface): a fast 2D Newton on the envelope conditions
+  (`R·C′ + r r′ = 0`, `|R| = r`, minimum along u) from a cone seed, accepted only when
+  converged, front-facing and inside the leaf's u-range; otherwise a sphere trace of the
+  exact leaf-tube distance from the entry of an enclosing capsule (first contact, end
+  balls included), polished by Newton. No approximate cone hit is ever reported.
+  Measured vs a double reference (`tools/primhitcheck.c`, 24 seeds × 2000 rays): 0
+  hit/miss and 0 farther-than-nearest hits, residual ≤ 4e-6 (was up to 9e-3); trace
+  ~22% slower than the old sweep (see PLAN.md M14). Build-time de Casteljau **pre-subdivision**
   (`TRI_BEZ_BUILD_SPLIT=4`) gives tight AABBs so the BVH culls well; the sub-arcs
   are computed on the fly (no materialized temp array — low build memory), and
   the leaf keeps the original segment id (`seg = sub/K`). `TRI_PRIM_BEZCURVE`,
