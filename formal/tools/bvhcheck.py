@@ -42,7 +42,7 @@ def main():
     for seed in range(1, a.seeds + 1):
         for (n, q, w, g) in cfgs + hq:
             for name in ("plain", "exact", "robust", "exactn"):
-                if (n, q, w, g) in hq and name != "plain":
+                if (n, q, w, g) in hq and name not in ("plain", "robust"):
                     continue
                 dump = subprocess.run([exe[name], str(seed), str(n), str(a.rays), str(q), str(w), str(g)],
                                       check=True, capture_output=True).stdout
@@ -58,6 +58,18 @@ def main():
                     print(f"FAIL seed={seed} cfg={(n,q,w,g)} {name}: Lean mirror != C on {rays-same} rays")
                     bad += 1
                 full = int(re.search(r"\(t,prim\)==C-dispatched=(\d+)", out).group(1))
+                aC, aD, aB, unc = map(int, re.search(
+                    r"anyhit lean==C-scalar=(\d+) lean==C-dispatched=(\d+) lean==brute=(\d+) uncovered-hits=(\d+)", out).groups())
+                if aC != rays:
+                    print(f"FAIL seed={seed} cfg={(n,q,w,g)} {name}: any-hit Lean runAny != C scalar on {rays-aC} rays")
+                    bad += 1
+                key = ("hq_" + name) if (n, q, w, g) in hq else name
+                st = tot.setdefault("any_" + key, [0, 0, 0, 0])
+                st[0] += rays; st[1] += rays - aD; st[2] += rays - aB; st[3] += unc
+                if name in ("robust", "exactn") and (aB != rays or aD != rays or unc):
+                    print(f"FAIL seed={seed} cfg={(n,q,w,g)} {name}: any-hit vs brute {rays-aB}, "
+                          f"vs SIMD {rays-aD}, uncovered hits {unc}")
+                    bad += 1
                 if (n, q, w, g) in hq:
                     tot["hq"] += 1
                     continue
@@ -89,6 +101,11 @@ def main():
           f"robust+bitexact: SIMD == scalar (t,prim) on all, {tot['rob_brute']} differ from brute ({tot['rob_miss']} hit/miss); "
           f"{tot['hq']} SBVH trees: Lean traversal == C scalar; "
           f"exact-nearest: t == brute force (and SIMD == scalar) on all rays of {tot.get('exn', 0)} trees")
+    for k in ("plain", "exact", "robust", "exactn", "hq_plain", "hq_robust"):
+        if "any_" + k in tot:
+            r_, d_, b_, u_ = tot["any_" + k]
+            print(f"any-hit [{k}]: {r_} rays, Lean runAny == C scalar on all; != SIMD {d_}, != brute {b_}, "
+                  f"hits without a covering box path {u_}")
     sys.exit(1 if bad else 0)
 
 if __name__ == "__main__":

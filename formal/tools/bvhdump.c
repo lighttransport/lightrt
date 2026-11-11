@@ -111,10 +111,11 @@ int main(int argc, char **argv) {
         lrt_hit h1, h2;
         int k1 = tri_intersect_scalar(s, &ray, &h1);
         int k2 = lrt_tri_intersect1(s, &ray, &h2);
-        printf("R %08x %08x %08x %08x %08x %08x %08x %08x %d %08x %08x %d %08x %08x\n",
+        int o1 = tri_occluded_scalar(s, &ray), o2 = lrt_tri_occluded1(s, &ray);
+        printf("R %08x %08x %08x %08x %08x %08x %08x %08x %d %08x %08x %d %08x %08x %d %d\n",
                fb(ray.org[0]), fb(ray.org[1]), fb(ray.org[2]), fb(ray.tmin),
                fb(ray.dir[0]), fb(ray.dir[1]), fb(ray.dir[2]), fb(ray.tmax),
-               k1, fb(h1.t), h1.prim_id, k2, fb(h2.t), h2.prim_id);
+               k1, fb(h1.t), h1.prim_id, k2, fb(h2.t), h2.prim_id, o1, o2);
         tri_ray_ctx rc; tri_ray_setup(&ray, &rc);
         printf("T");
         for (uint32_t b = 0; b < s->block_count; b++) {
