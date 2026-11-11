@@ -31,6 +31,7 @@ macro_rules
       | (apply EvE.f32div <;> ev) | (apply EvE.f32le <;> ev) | (apply EvE.f32lt <;> ev)
       | (apply EvE.f32gt <;> ev) | (apply EvE.f32ge <;> ev)
       | (apply EvE.land' <;> ev) | (apply EvE.lor' <;> ev) | (apply EvE.fneg' <;> ev)
+      | (apply EvE.lnot' <;> ev)
       | (apply EvE.constF; norm_num)
       | (apply EvE.callMin <;> ev) | (apply EvE.callMax <;> ev)
       | (apply EvE.loadAt

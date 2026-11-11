@@ -75,10 +75,6 @@ theorem store_rcI (M : Mem) (b : Nat) (ws : List Nat) (o w : Nat) (hm : M b = so
 section
 variable {p : Prog} {s : State}
 
-theorem EvE.lnot' {a} {b : Bool} (ha : EvE p s a (boolVal b)) :
-    EvE p s (.un .lnot ⟨32, true⟩ a) (boolVal (!b)) :=
-  EvE.un ha (by simp [evalUn, truthy_boolVal])
-
 theorem EvE.copysign' {a b} {x y : UInt32} (ha : EvE p s a (.f32 x.toNat)) (hb : EvE p s b (.f32 y.toNat)) :
     EvE p s (.copysign a b) (.f32 (Ref.copysign x y).toNat) := by
   obtain ⟨K1, h1⟩ := ha

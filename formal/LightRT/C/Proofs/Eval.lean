@@ -147,6 +147,10 @@ theorem EvE.lor' {a b} {x y : Bool} (ha : EvE p s a (boolVal x)) (hb : EvE p s b
   · exact EvE.lor_false ha (truthy_boolVal _) hb (truthy_boolVal _)
   · exact EvE.lor_true ha (truthy_boolVal _)
 
+theorem EvE.lnot' {a} {b : Bool} (ha : EvE p s a (boolVal b)) :
+    EvE p s (.un .lnot ⟨32, true⟩ a) (boolVal (!b)) :=
+  EvE.un ha (by simp [evalUn, truthy_boolVal])
+
 theorem EvE.constF (n : Nat) (h : n < 2 ^ 32) :
     EvE p s (.const (.f32 n)) (.f32 (n.toUInt32).toNat) := by
   have : (n.toUInt32).toNat = n := by simp [Nat.toUInt32]; omega

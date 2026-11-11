@@ -111,14 +111,17 @@ def mtT (o d v0 v1 v2 : Fin 3 → F) : F :=
     (mulBits (mtE2 v0 v2 2) (mtQz o v0 v1))) (mtInv d v0 v1 v2)
 
 /-- The four rejection tests of `tri_mt_one`, in order. -/
+/- The rejection tests are NaN-safe: `!(det <= -eps || det >= eps)`,
+   `!(u >= 0 && u <= 1)`, `!(v >= 0 && u + v <= 1)`, `!(t >= tmin && t < tbest)`.
+   For numbers they equal the plain `<` / `>` forms; a NaN anywhere rejects. -/
 def mtRej1 (d v0 v1 v2 : Fin 3 → F) : Bool :=
-  ltBits (neg detEps) (mtDet d v0 v1 v2) && ltBits (mtDet d v0 v1 v2) detEps
+  !(leBits (mtDet d v0 v1 v2) (neg detEps) || leBits detEps (mtDet d v0 v1 v2))
 def mtRej2 (o d v0 v1 v2 : Fin 3 → F) : Bool :=
-  ltBits (mtU o d v0 v1 v2) zero || ltBits one (mtU o d v0 v1 v2)
+  !(leBits zero (mtU o d v0 v1 v2) && leBits (mtU o d v0 v1 v2) one)
 def mtRej3 (o d v0 v1 v2 : Fin 3 → F) : Bool :=
-  ltBits (mtV o d v0 v1 v2) zero || ltBits one (addBits (mtU o d v0 v1 v2) (mtV o d v0 v1 v2))
+  !(leBits zero (mtV o d v0 v1 v2) && leBits (addBits (mtU o d v0 v1 v2) (mtV o d v0 v1 v2)) one)
 def mtRej4 (o d v0 v1 v2 : Fin 3 → F) (tmin tbest : F) : Bool :=
-  ltBits (mtT o d v0 v1 v2) tmin || leBits tbest (mtT o d v0 v1 v2)
+  !(leBits tmin (mtT o d v0 v1 v2) && ltBits (mtT o d v0 v1 v2) tbest)
 
 /-- `tri_mt_one`: `some (t, u, v)` on a hit. -/
 def mt (o d v0 v1 v2 : Fin 3 → F) (tmin tbest : F) : Option (F × F × F) :=

@@ -2,7 +2,7 @@
  *
  * Includes lightrt_c_tri.c to reach the internal node/leaf arrays and the
  * scalar traversal `tri_intersect_scalar`. All floats are hex bit patterns.
- *   usage: bvhdump <seed> <ntris> <nrays> <quality 0|1|2> <layout 4|8> <scene 0=soup|1=grid>
+ *   usage: bvhdump <seed> <ntris> <nrays> <quality 0|1|2> <layout 4|8> <scene 0=soup|1=grid|2=all vertices identical|3=coplanar overlap>
  * Output:
  *   W <width> ROOT <ref> NODES <n> BLOCKS <b>
  *   N <nchildren> {lo0 lo1 lo2 hi0 hi1 hi2 ref}*           (per node)
@@ -25,7 +25,22 @@ int main(int argc, char **argv) {
     int nrays = atoi(argv[3]), quality = atoi(argv[4]), layout = atoi(argv[5]);
     int grid = atoi(argv[6]);
     float *v;
-    if (grid) { /* g x g heightfield: triangles sharing edges, jittered */
+    int hf = grid == 1 || grid == 3; /* rays come from above a y = const layer */
+    if (grid == 2) { /* pathological: every vertex at one point (all degenerate) */
+        v = malloc(sizeof(float) * 9 * n);
+        for (size_t i = 0; i < 9 * n; i++) v[i] = 0.5f;
+    } else if (grid == 3) { /* pathological: n distinct triangles overlapping in one plane */
+        v = malloc(sizeof(float) * 9 * n);
+        for (size_t i = 0; i < n; i++) {
+            float ox = 0.02f * frand(), oz = 0.02f * frand();
+            float T[3][2] = {{0.1f, 0.1f}, {0.9f, 0.15f}, {0.3f, 0.9f}};
+            for (int j = 0; j < 3; j++) {
+                v[9 * i + 3 * j + 0] = T[j][0] + ox;
+                v[9 * i + 3 * j + 1] = 0.15f;
+                v[9 * i + 3 * j + 2] = T[j][1] + oz;
+            }
+        }
+    } else if (grid) { /* g x g heightfield: triangles sharing edges, jittered */
         int g = 1; while (2 * g * g < (int)n) g++;
         n = (size_t)(2 * g * g);
         float *h = malloc(sizeof(float) * (g + 1) * (g + 1));
@@ -97,13 +112,14 @@ int main(int argc, char **argv) {
     }
     for (int r = 0; r < nrays; r++) {
         lrt_ray ray;
-        float tgt[3] = {frand(), grid ? 0.15f : frand(), frand()};
-        if (grid && (r & 1)) { /* aim exactly at a grid vertex/edge */
+        float tgt[3] = {frand(), hf ? 0.15f : frand(), frand()};
+        if (grid == 2) tgt[0] = tgt[1] = tgt[2] = 0.5f;
+        if (grid == 1 && (r & 1)) { /* aim exactly at a grid vertex/edge */
             int g = 1; while (2 * g * g < (int)n) g++;
             tgt[0] = (float)(rnd() % (g + 1)) / g; tgt[2] = (float)(rnd() % (g + 1)) / g;
         }
         for (int a = 0; a < 3; a++) ray.org[a] = tgt[a] + 2.0f * (frand() - 0.5f) * 2.0f;
-        if (grid) ray.org[1] = 2.0f + frand();
+        if (hf) ray.org[1] = 2.0f + frand();
         for (int a = 0; a < 3; a++) ray.dir[a] = tgt[a] - ray.org[a];
         if (r % 7 == 3) { ray.dir[0] = 0.0f; ray.org[0] = tgt[0]; }
         if (r % 11 == 5) { ray.dir[0] = 0.0f; ray.dir[2] = 0.0f; ray.org[0] = tgt[0]; ray.org[2] = tgt[2]; }

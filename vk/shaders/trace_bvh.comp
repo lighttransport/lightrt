@@ -170,7 +170,7 @@ void main() {
                         if (abs(div) <= 1e-20) continue;
                         vec3 center = vec3(cx, cy, cz);
                         float tt = dot(center - org, n) / div;
-                        if (tt < tmin || tt >= best_t) continue;
+                        if (!(tt >= tmin && tt < best_t)) continue;
                         vec3 hp = org + tt * dir - center;
                         float pu = dot(hp, uaxis) / rx;
                         float pv = dot(hp, vaxis) / ry;
@@ -205,20 +205,20 @@ void main() {
                     float py = dir.z * e2x - dir.x * e2z;
                     float pz = dir.x * e2y - dir.y * e2x;
                     float det = e1x * px + e1y * py + e1z * pz;
-                    if (det > -1e-12 && det < 1e-12) continue;
+                    if (!(det <= -1e-12 || det >= 1e-12)) continue;
                     float inv_det = 1.0 / det;
                     float tvx = org.x - v0x;
                     float tvy = org.y - v0y;
                     float tvz = org.z - v0z;
                     float uu = (tvx * px + tvy * py + tvz * pz) * inv_det;
-                    if (uu < 0.0 || uu > 1.0) continue;
+                    if (!(uu >= 0.0 && uu <= 1.0)) continue;
                     float qx = tvy * e1z - tvz * e1y;
                     float qy = tvz * e1x - tvx * e1z;
                     float qz = tvx * e1y - tvy * e1x;
                     float vv = (dir.x * qx + dir.y * qy + dir.z * qz) * inv_det;
-                    if (vv < 0.0 || uu + vv > 1.0) continue;
+                    if (!(vv >= 0.0 && uu + vv <= 1.0)) continue;
                     float tt = (e2x * qx + e2y * qy + e2z * qz) * inv_det;
-                    if (tt < tmin || tt >= best_t) continue;
+                    if (!(tt >= tmin && tt < best_t)) continue;
                     best_t = tt; best_u = uu; best_v = vv; best_prim = prim;
                 }
             }
