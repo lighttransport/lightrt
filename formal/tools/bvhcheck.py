@@ -18,6 +18,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rays", type=int, default=200)
     ap.add_argument("--seeds", type=int, default=3)
+    ap.add_argument("--only-patho", action="store_true", help="run only the pathological scenes")
     a = ap.parse_args()
     tmp = tempfile.mkdtemp()
     exe = {}
@@ -35,7 +36,12 @@ def main():
     chk = os.path.join(FORMAL, ".lake", "build", "bin", "checkbvh")
     # (ntris, quality, layout, scene): LBVH/SAH x BVH4/BVH8 x soup/heightfield
     cfgs = [(400, 0, 4, 0), (500, 1, 4, 0), (1000, 1, 4, 1), (800, 0, 8, 1), (800, 1, 8, 0)]
-    hq = [(600, 2, 4, 1), (600, 2, 4, 0)]  # SBVH: clipped boxes, coverage (run_cover) not WF
+    hq = [(600, 2, 4, 1), (600, 2, 4, 0)]
+    # pathological scenes: all vertices identical (2), coplanar overlap (3)
+    patho = [(2000, 1, 4, 2), (2000, 1, 8, 2), (500, 1, 4, 3), (500, 0, 8, 3)]
+    cfgs = patho if a.only_patho else cfgs + patho
+    if a.only_patho:
+        hq = []  # SBVH: clipped boxes, coverage (run_cover) not WF
     bad = 0
     tot = {"rays": 0, "brute": 0, "miss": 0, "wf_plain_fail": 0, "trees": 0,
            "rob_miss": 0, "rob_brute": 0, "rob_simd": 0, "hq": 0}

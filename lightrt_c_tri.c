@@ -3445,7 +3445,7 @@ static inline int tri_isect_det_parallel(float e1x, float e1y, float e1z,
     float rel_thresh = TRI_ISECT_DET_EPS_SCALE * scale * scale;
     if (rel_thresh < TRI_ISECT_DET_EPS_MIN) rel_thresh = TRI_ISECT_DET_EPS_MIN;
     if (rel_thresh > TRI_ISECT_DET_EPS_MAX) rel_thresh = TRI_ISECT_DET_EPS_MAX;
-    return (det > -rel_thresh && det < rel_thresh);
+    return !(det <= -rel_thresh || det >= rel_thresh); /* NaN det: parallel */
 }
 
 #if LRT_TRI_HAS_SSE4
@@ -3527,14 +3527,14 @@ static inline int tri_isect_lane(const float *f, int bw, int lane,
     float tvy = rc->org[1] - f[1 * bw + lane];
     float tvz = rc->org[2] - f[2 * bw + lane];
     float uu = (tvx * px + tvy * py + tvz * pz) * inv_det;
-    if (uu < 0.0f || uu > 1.0f) return 0;
+    if (!(uu >= 0.0f && uu <= 1.0f)) return 0;
     float qx = tvy * e1z - tvz * e1y;
     float qy = tvz * e1x - tvx * e1z;
     float qz = tvx * e1y - tvy * e1x;
     float vv = (rc->dir[0] * qx + rc->dir[1] * qy + rc->dir[2] * qz) * inv_det;
-    if (vv < 0.0f || uu + vv > 1.0f) return 0;
+    if (!(vv >= 0.0f && uu + vv <= 1.0f)) return 0;
     float tt = (e2x * qx + e2y * qy + e2z * qz) * inv_det;
-    if (tt < rc->tmin || tt >= t_best) return 0;
+    if (!(tt >= rc->tmin && tt < t_best)) return 0;
     *t = tt;
     *u = uu;
     *v = vv;
@@ -3573,7 +3573,7 @@ static int tri_capsule_isect(float p0x, float p0y, float p0z, float dx,
                 float inv_a = 1.0f / A;
                 for (int k = 0; k < 2; k++) {
                     float t = (k == 0 ? (-B - sq) : (-B + sq)) * inv_a;
-                    if (t < rc->tmin || t >= best) continue;
+                    if (!(t >= rc->tmin && t < best)) continue;
                     float s = md + t * nd;
                     if (s >= 0.0f && s <= 1.0f) {
                         best = t;
@@ -3869,7 +3869,7 @@ static int tri_point_isect_one(const tri_ray_ctx *rc, float best_t, float cx,
         float divisor = dx * nx + dy * ny + dz * nz;
         if (fabsf(divisor) <= 1.0e-20f) return 0;
         float t = (c0x * nx + c0y * ny + c0z * nz) / divisor;
-        if (t < tmin || t >= best_t) return 0;
+        if (!(t >= tmin && t < best_t)) return 0;
         float hx = rc->org[0] + t * dx - cx, hy = rc->org[1] + t * dy - cy,
               hz = rc->org[2] + t * dz - cz;
         float pu = (hx * ux + hy * uy + hz * uz) / r;
@@ -3883,7 +3883,7 @@ static int tri_point_isect_one(const tri_ray_ctx *rc, float best_t, float cx,
         float divisor = dx * nx + dy * ny + dz * nz;
         if (divisor == 0.0f) return 0; /* ray parallel to disc plane */
         float t = (c0x * nx + c0y * ny + c0z * nz) / divisor;
-        if (t < tmin || t >= best_t) return 0;
+        if (!(t >= tmin && t < best_t)) return 0;
         float hx = rc->org[0] + t * dx - cx, hy = rc->org[1] + t * dy - cy,
               hz = rc->org[2] + t * dz - cz;
         if (hx * hx + hy * hy + hz * hz >= r * r) return 0;
@@ -3901,7 +3901,7 @@ static int tri_point_isect_one(const tri_ray_ctx *rc, float best_t, float cx,
     if (l2 > r2) return 0;
 
     if (point_type == TRI_POINT_DISC) { /* ray-facing disc */
-        if (projC0 < tmin || projC0 >= best_t) return 0;
+        if (!(projC0 >= tmin && projC0 < best_t)) return 0;
         *t_out = projC0;
         *u_out = 0.0f;
         return 1;
@@ -3980,13 +3980,13 @@ static int tri_flat_isect_one(const tri_ray_ctx *rc, float best_t,
         float tvx = rc->org[0] - a[0], tvy = rc->org[1] - a[1],
               tvz = rc->org[2] - a[2];
         float u = (tvx * px + tvy * py + tvz * pz) * inv;
-        if (u < 0.0f || u > 1.0f) continue;
+        if (!(u >= 0.0f && u <= 1.0f)) continue;
         float qx = tvy * e1z - tvz * e1y, qy = tvz * e1x - tvx * e1z,
               qz = tvx * e1y - tvy * e1x;
         float v = (dx * qx + dy * qy + dz * qz) * inv;
-        if (v < 0.0f || u + v > 1.0f) continue;
+        if (!(v >= 0.0f && u + v <= 1.0f)) continue;
         float t = (e2x * qx + e2y * qy + e2z * qz) * inv;
-        if (t < rc->tmin || t >= best) continue;
+        if (!(t >= rc->tmin && t < best)) continue;
         best = t;
         hit = 1;
         float hpx = rc->org[0] + t * dx, hpy = rc->org[1] + t * dy,
@@ -4371,9 +4371,9 @@ static inline int tri_sph_isect_lane(const float *f, int bw, int lane,
     float sq = sqrtf(disc);
     float inv_a = 1.0f / a;
     float tt = (-b - sq) * inv_a;
-    if (tt < rc->tmin || tt >= t_best) {
+    if (!(tt >= rc->tmin && tt < t_best)) {
         tt = (-b + sq) * inv_a; /* near root behind tmin: try the far root */
-        if (tt < rc->tmin || tt >= t_best) return 0;
+        if (!(tt >= rc->tmin && tt < t_best)) return 0;
     }
     float nx = (ocx + tt * rc->dir[0]) / r;
     float ny = (ocy + tt * rc->dir[1]) / r;
@@ -4480,18 +4480,18 @@ static inline int tri_mt_one(const float *o, const float *d, const float *v0,
     float py = d[2] * e2[0] - d[0] * e2[2];
     float pz = d[0] * e2[1] - d[1] * e2[0];
     float det = e1[0] * px + e1[1] * py + e1[2] * pz;
-    if (det > -1e-12f && det < 1e-12f) return 0;
+    if (!(det <= -1e-12f || det >= 1e-12f)) return 0;
     float inv = 1.0f / det;
     float tvx = o[0] - v0[0], tvy = o[1] - v0[1], tvz = o[2] - v0[2];
     float uu = (tvx * px + tvy * py + tvz * pz) * inv;
-    if (uu < 0.0f || uu > 1.0f) return 0;
+    if (!(uu >= 0.0f && uu <= 1.0f)) return 0;
     float qx = tvy * e1[2] - tvz * e1[1];
     float qy = tvz * e1[0] - tvx * e1[2];
     float qz = tvx * e1[1] - tvy * e1[0];
     float vv = (d[0] * qx + d[1] * qy + d[2] * qz) * inv;
-    if (vv < 0.0f || uu + vv > 1.0f) return 0;
+    if (!(vv >= 0.0f && uu + vv <= 1.0f)) return 0;
     float tt = (e2[0] * qx + e2[1] * qy + e2[2] * qz) * inv;
-    if (tt < tmin || tt >= tbest) return 0;
+    if (!(tt >= tmin && tt < tbest)) return 0;
     *t = tt;
     *u = uu;
     *v = vv;
@@ -4666,7 +4666,7 @@ static inline int tri_bilin_one(const float *o, const float *d,
     int hit = 0;
     for (int i = 0; i < nr; i++) {
         float u = roots[i];
-        if (u < 0.0f || u > 1.0f) continue;
+        if (!(u >= 0.0f && u <= 1.0f)) continue;
         float pa[3] = {Q0[0] + u * e10[0], Q0[1] + u * e10[1],
                        Q0[2] + u * e10[2]};
         float D[3] = {e00[0] + u * dd[0], e00[1] + u * dd[1], e00[2] + u * dd[2]};
@@ -4679,8 +4679,8 @@ static inline int tri_bilin_one(const float *o, const float *d,
         CROSS(paxd, pa, d);
         float t = DOT(paxD, n) / den;
         float v = DOT(paxd, n) / den;
-        if (v < 0.0f || v > 1.0f) continue;
-        if (t < tmin || t >= best) continue;
+        if (!(v >= 0.0f && v <= 1.0f)) continue;
+        if (!(t >= tmin && t < best)) continue;
         best = t;
         *t_out = t;
         *u_out = u;
@@ -5903,14 +5903,14 @@ static inline int tri_mt_scalar(const float v0[3], const float e1[3],
     float tvx = rc->org[0] - v0[0], tvy = rc->org[1] - v0[1],
           tvz = rc->org[2] - v0[2];
     float uu = (tvx * px + tvy * py + tvz * pz) * inv;
-    if (uu < 0.0f || uu > 1.0f) return 0;
+    if (!(uu >= 0.0f && uu <= 1.0f)) return 0;
     float qx = tvy * e1[2] - tvz * e1[1];
     float qy = tvz * e1[0] - tvx * e1[2];
     float qz = tvx * e1[1] - tvy * e1[0];
     float vv = (rc->dir[0] * qx + rc->dir[1] * qy + rc->dir[2] * qz) * inv;
-    if (vv < 0.0f || uu + vv > 1.0f) return 0;
+    if (!(vv >= 0.0f && uu + vv <= 1.0f)) return 0;
     float tt = (e2[0] * qx + e2[1] * qy + e2[2] * qz) * inv;
-    if (tt < rc->tmin || tt >= t_best) return 0;
+    if (!(tt >= rc->tmin && tt < t_best)) return 0;
     *t = tt;
     *u = uu;
     *v = vv;
@@ -6341,7 +6341,10 @@ static inline int tri_block_occluded_sse(const lrt_tri4 *blk,
                    _mm_mul_ps(e2z, qz)),
         inv_det);
     valid = _mm_and_ps(valid, _mm_cmpge_ps(t, sc->tmin));
-    valid = _mm_and_ps(valid, _mm_cmple_ps(t, tmax));
+    /* half-open [tmin, tmax), like the scalar leaf (tri_isect_lane: tt >= t_best
+     * rejects) and every closest-hit / GPU path; this was <= (closed), so SIMD
+     * any-hit counted a blocker exactly at tmax (found by bvhcheck). */
+    valid = _mm_and_ps(valid, _mm_cmplt_ps(t, tmax));
     return _mm_movemask_ps(valid) != 0;
 }
 
@@ -8488,7 +8491,10 @@ static inline int tri_block_occluded_avx(const lrt_tri8 *blk,
         TRI_DOT8(e2x, qx, e2y, qy, e2z, qz),
         inv_det);
     valid = _mm256_and_ps(valid, _mm256_cmp_ps(t, ac->tmin, _CMP_GE_OQ));
-    valid = _mm256_and_ps(valid, _mm256_cmp_ps(t, tmax, _CMP_LE_OQ));
+    /* half-open [tmin, tmax), like the scalar leaf (tri_isect_lane: tt >= t_best
+     * rejects) and every closest-hit / GPU path; this was <= (closed), so SIMD
+     * any-hit counted a blocker exactly at tmax (found by bvhcheck). */
+    valid = _mm256_and_ps(valid, _mm256_cmp_ps(t, tmax, _CMP_LT_OQ));
     return _mm256_movemask_ps(valid) != 0;
 }
 
@@ -9446,7 +9452,7 @@ static inline int tri_block_occluded_sve(const lrt_tri8 *blk,
                         e2z, qz),
         inv_det);
     valid = svand_b_z(pg, valid, svcmpge_f32(pg, t, svdup_f32(rc->tmin)));
-    valid = svand_b_z(pg, valid, svcmple_f32(pg, t, svdup_f32(tmax)));
+    valid = svand_b_z(pg, valid, svcmplt_f32(pg, t, svdup_f32(tmax))); /* half-open, as scalar */
     return svptest_any(pg, valid);
 }
 
@@ -9684,7 +9690,7 @@ static inline int tri_block_occluded_sve16(const lrt_tri16 *blk,
                         e2z, qz),
         inv_det);
     valid = svand_b_z(pg, valid, svcmpge_f32(pg, t, svdup_f32(rc->tmin)));
-    valid = svand_b_z(pg, valid, svcmple_f32(pg, t, svdup_f32(tmax)));
+    valid = svand_b_z(pg, valid, svcmplt_f32(pg, t, svdup_f32(tmax))); /* half-open, as scalar */
     return svptest_any(pg, valid);
 }
 
@@ -10181,12 +10187,12 @@ static inline void tri_block_isect_hp(const float *f, int bw,
         double tvx = rc->org[0] - v0x[l], tvy = rc->org[1] - v0y[l],
                tvz = rc->org[2] - v0z[l];
         double uu = (tvx * px + tvy * py + tvz * pz) * inv;
-        if (uu < 0.0 || uu > 1.0) continue;
+        if (!(uu >= 0.0 && uu <= 1.0)) continue;
         double qx = tvy * e1z[l] - tvz * e1y[l];
         double qy = tvz * e1x[l] - tvx * e1z[l];
         double qz = tvx * e1y[l] - tvy * e1x[l];
         double vv = (rc->dir[0] * qx + rc->dir[1] * qy + rc->dir[2] * qz) * inv;
-        if (vv < 0.0 || uu + vv > 1.0) continue;
+        if (!(vv >= 0.0 && uu + vv <= 1.0)) continue;
         double tt = (e2x[l] * qx + e2y[l] * qy + e2z[l] * qz) * inv;
         if (tt < rc->tmin) continue;
         ta[l] = tt;

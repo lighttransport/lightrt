@@ -306,20 +306,20 @@ __launch_bounds__(64) __global__
                     float py = dirz * e2x - dirx * e2z;
                     float pz = dirx * e2y - diry * e2x;
                     float det = e1x * px + e1y * py + e1z * pz;
-                    if (det > -1e-12f && det < 1e-12f) continue;
+                    if (!(det <= -1e-12f || det >= 1e-12f)) continue;
                     float inv_det = 1.0f / det;
                     float tvx = orgx - v0x;
                     float tvy = orgy - v0y;
                     float tvz = orgz - v0z;
                     float uu = (tvx * px + tvy * py + tvz * pz) * inv_det;
-                    if (uu < 0.0f || uu > 1.0f) continue;
+                    if (!(uu >= 0.0f && uu <= 1.0f)) continue;
                     float qx = tvy * e1z - tvz * e1y;
                     float qy = tvz * e1x - tvx * e1z;
                     float qz = tvx * e1y - tvy * e1x;
                     float vv = (dirx * qx + diry * qy + dirz * qz) * inv_det;
-                    if (vv < 0.0f || uu + vv > 1.0f) continue;
+                    if (!(vv >= 0.0f && uu + vv <= 1.0f)) continue;
                     float tt = (e2x * qx + e2y * qy + e2z * qz) * inv_det;
-                    if (tt < tmin || tt >= best_t) continue;
+                    if (!(tt >= tmin && tt < best_t)) continue;
                     best_t = tt;
                     best_u = uu;
                     best_v = vv;
@@ -469,20 +469,20 @@ __launch_bounds__(64) __global__
                     float py = dirz * e2x - dirx * e2z;
                     float pz = dirx * e2y - diry * e2x;
                     float det = e1x * px + e1y * py + e1z * pz;
-                    if (det > -1e-12f && det < 1e-12f) continue;
+                    if (!(det <= -1e-12f || det >= 1e-12f)) continue;
                     float inv_det = 1.0f / det;
                     float tvx = orgx - v0x;
                     float tvy = orgy - v0y;
                     float tvz = orgz - v0z;
                     float uu = (tvx * px + tvy * py + tvz * pz) * inv_det;
-                    if (uu < 0.0f || uu > 1.0f) continue;
+                    if (!(uu >= 0.0f && uu <= 1.0f)) continue;
                     float qx = tvy * e1z - tvz * e1y;
                     float qy = tvz * e1x - tvx * e1z;
                     float qz = tvx * e1y - tvy * e1x;
                     float vv = (dirx * qx + diry * qy + dirz * qz) * inv_det;
-                    if (vv < 0.0f || uu + vv > 1.0f) continue;
+                    if (!(vv >= 0.0f && uu + vv <= 1.0f)) continue;
                     float tt = (e2x * qx + e2y * qy + e2z * qz) * inv_det;
-                    if (tt < tmin || tt >= tmax) continue;
+                    if (!(tt >= tmin && tt < tmax)) continue;
                     hit = 1u;
                     break;
                 }
@@ -547,17 +547,17 @@ __device__ __forceinline__ bool hp_mt(float ox, float oy, float oz, float dx,
     float px = dy * e2z - dz * e2y, py = dz * e2x - dx * e2z,
           pz = dx * e2y - dy * e2x;
     float det = e1x * px + e1y * py + e1z * pz;
-    if (det > -1e-12f && det < 1e-12f) return false;
+    if (!(det <= -1e-12f || det >= 1e-12f)) return false;
     float inv = 1.0f / det;
     float tvx = ox - v0x, tvy = oy - v0y, tvz = oz - v0z;
     float uu = (tvx * px + tvy * py + tvz * pz) * inv;
-    if (uu < 0.0f || uu > 1.0f) return false;
+    if (!(uu >= 0.0f && uu <= 1.0f)) return false;
     float qx = tvy * e1z - tvz * e1y, qy = tvz * e1x - tvx * e1z,
           qz = tvx * e1y - tvy * e1x;
     float vv = (dx * qx + dy * qy + dz * qz) * inv;
-    if (vv < 0.0f || uu + vv > 1.0f) return false;
+    if (!(vv >= 0.0f && uu + vv <= 1.0f)) return false;
     float tt = (e2x * qx + e2y * qy + e2z * qz) * inv;
-    if (tt < tmin || tt >= tbest) return false;
+    if (!(tt >= tmin && tt < tbest)) return false;
     *t = tt; *u = uu; *v = vv;
     return true;
 }
@@ -592,17 +592,17 @@ __device__ __forceinline__ bool hp_flat_one(float ox, float oy, float oz,
         float px = dy * e2z - dz * e2y, py = dz * e2x - dx * e2z,
               pz = dx * e2y - dy * e2x;
         float det = e1x * px + e1y * py + e1z * pz;
-        if (det > -1e-12f && det < 1e-12f) continue;
+        if (!(det <= -1e-12f || det >= 1e-12f)) continue;
         float inv = 1.0f / det;
         float tvx = ox - a[0], tvy = oy - a[1], tvz = oz - a[2];
         float uu = (tvx * px + tvy * py + tvz * pz) * inv;
-        if (uu < 0.0f || uu > 1.0f) continue;
+        if (!(uu >= 0.0f && uu <= 1.0f)) continue;
         float qx = tvy * e1z - tvz * e1y, qy = tvz * e1x - tvx * e1z,
               qz = tvx * e1y - tvy * e1x;
         float vv = (dx * qx + dy * qy + dz * qz) * inv;
-        if (vv < 0.0f || uu + vv > 1.0f) continue;
+        if (!(vv >= 0.0f && uu + vv <= 1.0f)) continue;
         float tt = (e2x * qx + e2y * qy + e2z * qz) * inv;
-        if (tt < tmin || tt >= best) continue;
+        if (!(tt >= tmin && tt < best)) continue;
         best = tt;
         hit = 1;
         float hpx = ox + tt * dx, hpy = oy + tt * dy, hpz = oz + tt * dz;
@@ -1062,7 +1062,7 @@ __device__ __forceinline__ bool hp_bilin_one(float ox, float oy, float oz,
     int hit = 0;
     for (int i = 0; i < nr; i++) {
         float u = roots[i];
-        if (u < 0.0f || u > 1.0f) continue;
+        if (!(u >= 0.0f && u <= 1.0f)) continue;
         float pa[3] = {Q0[0]+u*e10[0], Q0[1]+u*e10[1], Q0[2]+u*e10[2]};
         float D[3] = {e00[0]+u*dd[0], e00[1]+u*dd[1], e00[2]+u*dd[2]};
         float n[3]; HX(n, d, D);
@@ -1070,8 +1070,8 @@ __device__ __forceinline__ bool hp_bilin_one(float ox, float oy, float oz,
         if (den < 1e-30f) continue;
         float paxD[3], paxd[3]; HX(paxD, pa, D); HX(paxd, pa, d);
         float t = HD(paxD, n)/den, v = HD(paxd, n)/den;
-        if (v < 0.0f || v > 1.0f) continue;
-        if (t < tmin || t >= best) continue;
+        if (!(v >= 0.0f && v <= 1.0f)) continue;
+        if (!(t >= tmin && t < best)) continue;
         best = t; *t_out = t; *u_out = u; *v_out = v; hit = 1;
     }
 #undef HX
@@ -1340,9 +1340,9 @@ __device__ __forceinline__ void hp_leaf(const uint32_t *__restrict__ blocks,
             if (disc < 0.0f) continue;
             float sq = sqrtf(disc), inv_a = 1.0f / a;
             float tt = (-b - sq) * inv_a;
-            if (tt < tmin || tt >= *best_t) {
+            if (!(tt >= tmin && tt < *best_t)) {
                 tt = (-b + sq) * inv_a;
-                if (tt < tmin || tt >= *best_t) continue;
+                if (!(tt >= tmin && tt < *best_t)) continue;
             }
             float nx = (ocx + tt * dx) / r, ny = (ocy + tt * dy) / r,
                   nz = (ocz + tt * dz) / r;
@@ -1368,7 +1368,7 @@ __device__ __forceinline__ void hp_leaf(const uint32_t *__restrict__ blocks,
                 float div = dx * nx + dy * ny + dz * nz;
                 if (div == 0.0f) continue;
                 float t = (c0x * nx + c0y * ny + c0z * nz) / div;
-                if (t < tmin || t >= *best_t) continue;
+                if (!(t >= tmin && t < *best_t)) continue;
                 float hx = ox + t * dx - cx, hy = oy + t * dy - cy,
                       hz = oz + t * dz - cz;
                 if (hx * hx + hy * hy + hz * hz >= r * r) continue;
@@ -1383,7 +1383,7 @@ __device__ __forceinline__ void hp_leaf(const uint32_t *__restrict__ blocks,
             float r2 = r * r;
             if (l2 > r2) continue;
             if (point_type == HIP_POINT_DISC) {
-                if (projC0 < tmin || projC0 >= *best_t) continue;
+                if (!(projC0 >= tmin && projC0 < *best_t)) continue;
                 *best_t = projC0; *best_u = 0.0f; *best_v = 0.0f;
                 *best_prim = prim;
                 continue;

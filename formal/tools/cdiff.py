@@ -86,6 +86,22 @@ def vec_woop(r):
     return "woop" + vec_mt(r)[2:]
 
 
+def vec_degenerate(r):
+    """MT with v1 = v0 or v2 = v0 (zero edge), Woop with any two vertices equal:
+    both must MISS (Robust/Degenerate.lean). Copies are numerically equal; a
+    zero component may flip sign (+0 vs -0 still gives a zero edge)."""
+    kind = r.choice(["mt", "woop"])
+    w = vec_mt(r).split()[1:]
+    pairs = [(6, 9), (6, 12)] + ([(9, 12)] if kind == "woop" else [])
+    src, dst = r.choice(pairs)
+    for k in range(3):
+        x = w[src + k]
+        if x in ("00000000", "80000000") and r.random() < 0.5:
+            x = "80000000" if x == "00000000" else "00000000"
+        w[dst + k] = x
+    return "deg" + kind + " " + " ".join(w)
+
+
 def norm(line):
     out = []
     for w in line.split():
@@ -199,8 +215,10 @@ def main():
         if args.search_miss:
             return search_miss(args, cexe, lexe)
         r = random.Random(args.seed)
-        gens = [vec_slab, vec_mt, vec_woop, vec_slabr]
-        lines = [gens[k % 4](r) for k in range(args.n)]
+        gens = [vec_slab, vec_mt, vec_woop, vec_slabr, vec_degenerate]
+        tagged = [gens[k % 5](r) for k in range(args.n)]
+        deg = [l.startswith("deg") for l in tagged]
+        lines = [l[3:] if d else l for l, d in zip(tagged, deg)]
         inp = "\n".join(lines) + "\n"
         rob = [l.startswith("slabr ") for l in lines]
         leg_out = iter(run([cexe], "\n".join(l for l, x in zip(lines, rob) if not x) + "\n"))
@@ -216,8 +234,16 @@ def main():
                 bad += 1
                 if bad <= 5:
                     print("MISMATCH\n  in:   ", line, "\n  C:    ", c, "\n  MiniC:", l)
-        hits = sum(1 for c in cout if c.startswith("1 "))
-        print(f"{len(lines)} vectors ({sum(rob)} default-build robust slab), {bad} mismatches, {hits} MT/Woop hits")
+        degbad = 0
+        for line, c, d in zip(lines, cout, deg):
+            if d and norm(c) != "0":
+                degbad += 1
+                if degbad <= 5:
+                    print("DEGENERATE HIT\n  in:", line, "\n  C: ", c)
+        bad += degbad
+        hits = sum(1 for c, d in zip(cout, deg) if c.startswith("1 ") and not d)
+        print(f"{len(lines)} vectors ({sum(rob)} default-build robust slab, {sum(deg)} degenerate: "
+              f"{sum(deg) - degbad} miss as proved), {bad} mismatches, {hits} MT/Woop hits")
         return 1 if bad else 0
 
 
