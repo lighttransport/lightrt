@@ -64,6 +64,15 @@ node_truth: $(TEST_DEPS)
 test: node_truth
 	./node_truth
 
+# Lean-generated node evaluation vectors (tests/generated/mtlx-eval.inc, from
+# the materialx-conformance repository). Links only the document loader and
+# the evaluator, with a neutral texture stub, so it needs no deps/.
+LEAN_SRC = tests/lean_vectors.c tests/texture_stub.c mtlx_doc.c mtlx_xml.c mtlx_eval.c color.c
+lean_vectors: $(LEAN_SRC) tests/generated/mtlx-eval.inc mtlx_stdlib_defs.inc
+	$(CC) $(CSTD) -O2 -D_POSIX_C_SOURCE=200809L -I. -Itests -o $@ $(LEAN_SRC) -lm
+test-lean: lean_vectors
+	./lean_vectors
+
 # MaterialX -> GPU shading bridge (bakes per-material OpenPBR params and shades
 # one sphere per material on the GPU via the Vulkan backend). Needs the vk
 # sources from the repo root + libdl for the runtime Vulkan loader.
@@ -96,7 +105,7 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 clean:
-	rm -rf build build-vk mtlxrender node_truth mtlxvk
+	rm -rf build build-vk mtlxrender node_truth mtlxvk lean_vectors
 
 # Cross-renderer verification against the ASF MaterialX reference (GLSL + OSL).
 # Needs the one-time setup in verify/README.md (conda env + reference builds).
