@@ -12,6 +12,7 @@ import LightRT.BVH.Flat
 import LightRT.BVH.Check
 import LightRT.BVH.AnyHit
 import LightRT.BVH.TwoLevel
+import LightRT.Geom.Hull
 import LightRT.C.Semantics
 import LightRT.C.Logic
 import LightRT.C.Hoare

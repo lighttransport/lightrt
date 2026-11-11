@@ -144,6 +144,52 @@ static inline int lrt_ctz(unsigned int x) { return __builtin_ctz(x); }
 #endif
 #endif /* LRT_TRI_FORCE_SCALAR */
 
+
+/* ---- Conservative primitive-box arithmetic (LRT_TRI_LEAF_BOX_EXACT) -------
+ * A box bound computed as fl(c - r), fl(c + r) or fl(x / w) can round INWARD
+ * and miss the stored primitive by up to 1/2 ulp (more for x*fl(1/w)); found
+ * by formal/tools/primboxcheck.c. Under LEAF_BOX_EXACT (default) these return
+ * floats that bracket the exact value; the hull theorems of
+ * formal/LightRT/Geom/Hull.lean then give containment of the stored curve /
+ * patch / point. TwoSum needs no FMA contraction or fast-math. */
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+/* Floats bracketing the EXACT sum a + b (TwoSum error term). The leaf
+ * intersector tests the triangle v0 + u*e1 + v*e2 with the STORED, rounded
+ * edges, so its corners v0 + e are generally not floats (formal/CheckBVH.lean). */
+static inline void tri_sum_bracket(float a, float b, float *lo, float *hi) {
+    volatile float s = a + b;
+    volatile float bb = s - a;
+    float err = (a - (s - bb)) + (b - bb);
+    *lo = err < 0.0f ? nextafterf(s, -INFINITY) : s;
+    *hi = err > 0.0f ? nextafterf(s, INFINITY) : s;
+}
+static inline float tri_box_sub(float c, float r) {
+    float lo, hi;
+    tri_sum_bracket(c, -r, &lo, &hi);
+    return lo;
+}
+static inline float tri_box_add(float c, float r) {
+    float lo, hi;
+    tri_sum_bracket(c, r, &lo, &hi);
+    return hi;
+}
+/* x / w for w > 0: q*w is exact in double (24+24 bits), so the comparison
+ * with x decides the rounding direction exactly. */
+static inline float tri_box_div_lo(float x, float w) {
+    float q = x / w;
+    return ((double)q * (double)w > (double)x) ? nextafterf(q, -INFINITY) : q;
+}
+static inline float tri_box_div_hi(float x, float w) {
+    float q = x / w;
+    return ((double)q * (double)w < (double)x) ? nextafterf(q, INFINITY) : q;
+}
+#else
+static inline float tri_box_sub(float c, float r) { return c - r; }
+static inline float tri_box_add(float c, float r) { return c + r; }
+static inline float tri_box_div_lo(float x, float w) { return x / w; }
+static inline float tri_box_div_hi(float x, float w) { return x / w; }
+#endif
+
 /* Portable T0 prefetch (x86 _mm_prefetch vs the GCC/clang builtin on ARM). */
 #if LRT_TRI_HAS_SSE4
 #define TRI_PREFETCH_T0(p) _mm_prefetch((const char *)(p), _MM_HINT_T0)
@@ -4015,7 +4061,7 @@ static void tri_bez_subcurve(const float cp[16], float a, float b,
 static int tri_bez_newton(const float cp[16], const float dir[3], float tmin,
                           float u, float t, float best_t, float *t_out,
                           float *u_out) {
-    for (int it = 0; it < 8; it++) {
+    for (int it = 0; it < 9; it++) {
         float P[4], dP[4], ddP[4];
         tri_bez_eval(cp, u, P, dP, ddP);
         float Rx = t * dir[0] - P[0], Ry = t * dir[1] - P[1],
@@ -4041,11 +4087,8 @@ static int tri_bez_newton(const float cp[16], const float dir[3], float tmin,
         float RdRdt = Rx * dir[0] + Ry * dir[1] + Rz * dir[2];
         float dgdu = (RdRdu - f * dfdu) * rsK - dP[3];
         float dgdt = (RdRdt - f * dfdt) * rsK;
-        float det = dfdu * dgdt - dfdt * dgdu;
-        if (fabsf(det) < 1e-20f) return 0;
-        float invd = 1.0f / det;
-        u -= (dgdt * f - dfdt * g) * invd;
-        t -= (dfdu * g - dgdu * f) * invd;
+        /* Converged on f, g at THIS (u,t), which is what is returned (the check
+         * used to follow the update; see tri_bezpatch_newton). */
         float lenR = sqrtf(RR);
         float eps = 1e-5f * (1.0f + lenR);
         if (fabsf(f) < eps && fabsf(g) < eps) {
@@ -4056,6 +4099,11 @@ static int tri_bez_newton(const float cp[16], const float dir[3], float tmin,
             }
             return 0;
         }
+        float det = dfdu * dgdt - dfdt * dgdu;
+        if (fabsf(det) < 1e-20f) return 0;
+        float invd = 1.0f / det;
+        u -= (dgdt * f - dfdt * g) * invd;
+        t -= (dfdu * g - dgdu * f) * invd;
     }
     return 0;
 }
@@ -4808,6 +4856,37 @@ static int tri_bezpatch_newton(const float cp[48], const float *cpx,
         TRI_BEZ_EVAL(cp, cpx, cpy, cpz, u, v, S, du, dv);
         float R[3] = {S[0] - org[0] - t * dir[0], S[1] - org[1] - t * dir[1],
                       S[2] - org[2] - t * dir[2]};
+        /* Converged on the residual of THIS (u,v,t), which is what is returned. (The
+         * check used to follow the update and return the post-step point: an
+         * ill-conditioned step from a small residual then produced a false hit
+         * far off the surface; found by formal/tools/primhitcheck.c.) */
+        float rr = sqrtf(R[0] * R[0] + R[1] * R[1] + R[2] * R[2]);
+        float sl = sqrtf(S[0] * S[0] + S[1] * S[1] + S[2] * S[2]);
+        if (rr < 1e-5f * (1.0f + sl)) {
+            /* one more step, kept only if its own residual is smaller */
+            float nd0[3] = {-dir[0], -dir[1], -dir[2]};
+            float dt0 = tri_det3(du, dv, nd0);
+            if (!(dt0 > -1e-20f && dt0 < 1e-20f)) {
+                float iv = 1.0f / dt0;
+                float un = u - tri_det3(R, dv, nd0) * iv, vn = v - tri_det3(du, R, nd0) * iv,
+                      tn = t - tri_det3(du, dv, R) * iv;
+                float S2[3], du2[3], dv2[3];
+                TRI_BEZ_EVAL(cp, cpx, cpy, cpz, un, vn, S2, du2, dv2);
+                float R2[3] = {S2[0] - org[0] - tn * dir[0], S2[1] - org[1] - tn * dir[1],
+                               S2[2] - org[2] - tn * dir[2]};
+                if (sqrtf(R2[0] * R2[0] + R2[1] * R2[1] + R2[2] * R2[2]) < rr) {
+                    u = un; v = vn; t = tn;
+                }
+            }
+            if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f && t >= tmin &&
+                t < best) {
+                *t_out = t;
+                *u_out = u;
+                *v_out = v;
+                return 1;
+            }
+            return 0;
+        }
         float ndir[3] = {-dir[0], -dir[1], -dir[2]};
         float det = tri_det3(du, dv, ndir);
         if (det > -1e-20f && det < 1e-20f) return 0;
@@ -4818,18 +4897,6 @@ static int tri_bezpatch_newton(const float cp[48], const float *cpx,
         u -= d0;
         v -= d1;
         t -= d2;
-        float rr = sqrtf(R[0] * R[0] + R[1] * R[1] + R[2] * R[2]);
-        float sl = sqrtf(S[0] * S[0] + S[1] * S[1] + S[2] * S[2]);
-        if (rr < 1e-5f * (1.0f + sl)) {
-            if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f && t >= tmin &&
-                t < best) {
-                *t_out = t;
-                *u_out = u;
-                *v_out = v;
-                return 1;
-            }
-            return 0;
-        }
     }
     return 0;
 }
@@ -5065,16 +5132,28 @@ static int tri_rbezpatch_newton(const float cp[64], const float *cx,
         TRI_RBEZ_EVAL(cp, cx, cy, cz, cw, u, v, S, du, dv);
         float R[3] = {S[0] - org[0] - t * dir[0], S[1] - org[1] - t * dir[1],
                       S[2] - org[2] - t * dir[2]};
-        float ndir[3] = {-dir[0], -dir[1], -dir[2]};
-        float det = tri_det3(du, dv, ndir);
-        if (det > -1e-20f && det < 1e-20f) return 0;
-        float inv = 1.0f / det;
-        u -= tri_det3(R, dv, ndir) * inv;
-        v -= tri_det3(du, R, ndir) * inv;
-        t -= tri_det3(du, dv, R) * inv;
+        /* Converged on the residual of THIS (u,v,t), which is what is returned. (The
+         * check used to follow the update and return the post-step point: an
+         * ill-conditioned step from a small residual then produced a false hit
+         * far off the surface; found by formal/tools/primhitcheck.c.) */
         float rr = sqrtf(R[0] * R[0] + R[1] * R[1] + R[2] * R[2]);
         float sl = sqrtf(S[0] * S[0] + S[1] * S[1] + S[2] * S[2]);
         if (rr < 1e-5f * (1.0f + sl)) {
+            /* one more step, kept only if its own residual is smaller */
+            float nd0[3] = {-dir[0], -dir[1], -dir[2]};
+            float dt0 = tri_det3(du, dv, nd0);
+            if (!(dt0 > -1e-20f && dt0 < 1e-20f)) {
+                float iv = 1.0f / dt0;
+                float un = u - tri_det3(R, dv, nd0) * iv, vn = v - tri_det3(du, R, nd0) * iv,
+                      tn = t - tri_det3(du, dv, R) * iv;
+                float S2[3], du2[3], dv2[3];
+                TRI_RBEZ_EVAL(cp, cx, cy, cz, cw, un, vn, S2, du2, dv2);
+                float R2[3] = {S2[0] - org[0] - tn * dir[0], S2[1] - org[1] - tn * dir[1],
+                               S2[2] - org[2] - tn * dir[2]};
+                if (sqrtf(R2[0] * R2[0] + R2[1] * R2[1] + R2[2] * R2[2]) < rr) {
+                    u = un; v = vn; t = tn;
+                }
+            }
             if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f && t >= tmin &&
                 t < best) {
                 *t_out = t; *u_out = u; *v_out = v;
@@ -5082,6 +5161,13 @@ static int tri_rbezpatch_newton(const float cp[64], const float *cx,
             }
             return 0;
         }
+        float ndir[3] = {-dir[0], -dir[1], -dir[2]};
+        float det = tri_det3(du, dv, ndir);
+        if (det > -1e-20f && det < 1e-20f) return 0;
+        float inv = 1.0f / det;
+        u -= tri_det3(R, dv, ndir) * inv;
+        v -= tri_det3(du, R, ndir) * inv;
+        t -= tri_det3(du, dv, R) * inv;
     }
     return 0;
 }
@@ -5142,15 +5228,15 @@ static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
         tri_rbezpatch_subpatch(cp, u0, u1, v0, v1, sub);
         float lo[3], hi[3];
         for (int a = 0; a < 3; a++) {
-            float p = sub[a] / sub[3];
-            lo[a] = hi[a] = p;
+            lo[a] = tri_box_div_lo(sub[a], sub[3]);
+            hi[a] = tri_box_div_hi(sub[a], sub[3]);
         }
         for (int k = 1; k < 16; k++) {
-            float iw = 1.0f / sub[k * 4 + 3];
             for (int a = 0; a < 3; a++) {
-                float p = sub[k * 4 + a] * iw;
-                if (p < lo[a]) lo[a] = p;
-                if (p > hi[a]) hi[a] = p;
+                float pl = tri_box_div_lo(sub[k * 4 + a], sub[k * 4 + 3]);
+                float ph = tri_box_div_hi(sub[k * 4 + a], sub[k * 4 + 3]);
+                if (pl < lo[a]) lo[a] = pl;
+                if (ph > hi[a]) hi[a] = ph;
             }
         }
         float tn = rc->tmin, tf = best;
@@ -10921,16 +11007,28 @@ static int tri_patch_newton_hp(const float *cp, int rational, const double org[3
         else tri_bezpatch_eval_hp(cp, u, v, S, du, dv);
         double R[3] = {S[0] - org[0] - t * dir[0], S[1] - org[1] - t * dir[1],
                        S[2] - org[2] - t * dir[2]};
-        double nd[3] = {-dir[0], -dir[1], -dir[2]};
-        double det = tri_det3_hp(du, dv, nd);
-        if (det > -1e-300 && det < 1e-300) return 0;
-        double inv = 1.0 / det;
-        u -= tri_det3_hp(R, dv, nd) * inv;
-        v -= tri_det3_hp(du, R, nd) * inv;
-        t -= tri_det3_hp(du, dv, R) * inv;
+        /* Converged on the residual of THIS (u,v,t), which is what is returned. (The
+         * check used to follow the update and return the post-step point: an
+         * ill-conditioned step from a small residual then produced a false hit
+         * far off the surface; found by formal/tools/primhitcheck.c.) */
         double rr = sqrt(R[0] * R[0] + R[1] * R[1] + R[2] * R[2]);
         double sl = sqrt(S[0] * S[0] + S[1] * S[1] + S[2] * S[2]);
         if (rr < 1e-12 * (1.0 + sl)) {
+            double nd0[3] = {-dir[0], -dir[1], -dir[2]};
+            double dt0 = tri_det3_hp(du, dv, nd0);
+            if (!(dt0 > -1e-300 && dt0 < 1e-300)) {
+                double iv = 1.0 / dt0;
+                double un = u - tri_det3_hp(R, dv, nd0) * iv, vn = v - tri_det3_hp(du, R, nd0) * iv,
+                       tn = t - tri_det3_hp(du, dv, R) * iv;
+                double S2[3], du2[3], dv2[3];
+                if (rational) tri_rbezpatch_eval_hp(cp, un, vn, S2, du2, dv2);
+                else tri_bezpatch_eval_hp(cp, un, vn, S2, du2, dv2);
+                double R2[3] = {S2[0] - org[0] - tn * dir[0], S2[1] - org[1] - tn * dir[1],
+                                S2[2] - org[2] - tn * dir[2]};
+                if (sqrt(R2[0] * R2[0] + R2[1] * R2[1] + R2[2] * R2[2]) < rr) {
+                    u = un; v = vn; t = tn;
+                }
+            }
             if (u >= -1e-6 && u <= 1.0 + 1e-6 && v >= -1e-6 && v <= 1.0 + 1e-6 &&
                 t >= tmin && t < best) {
                 *t_out = t; *u_out = u; *v_out = v;
@@ -10938,6 +11036,13 @@ static int tri_patch_newton_hp(const float *cp, int rational, const double org[3
             }
             return 0;
         }
+        double nd[3] = {-dir[0], -dir[1], -dir[2]};
+        double det = tri_det3_hp(du, dv, nd);
+        if (det > -1e-300 && det < 1e-300) return 0;
+        double inv = 1.0 / det;
+        u -= tri_det3_hp(R, dv, nd) * inv;
+        v -= tri_det3_hp(du, R, nd) * inv;
+        t -= tri_det3_hp(du, dv, R) * inv;
     }
     return 0;
 }
@@ -11312,21 +11417,6 @@ static inline void tri_leaf_verts(const float *f, int bw, int lane, float A[3],
     }
 }
 
-#ifdef LRT_TRI_LEAF_BOX_EXACT
-/* Floats bracketing the EXACT sum a + b (TwoSum error term; no FMA/fast-math).
- * The leaf intersector tests the triangle v0 + u*e1 + v*e2 with the STORED,
- * rounded edges, so its corners v0 + e are generally not floats; the float
- * fl(v0 + e) can lie inside the true corner and the plain AABB then misses the
- * stored triangle by up to an ulp of the edge (found by the Lean BVH validator,
- * formal/CheckBVH.lean). */
-static inline void tri_sum_bracket(float a, float b, float *lo, float *hi) {
-    volatile float s = a + b;
-    volatile float bb = s - a;
-    float err = (a - (s - bb)) + (b - bb);
-    *lo = err < 0.0f ? nextafterf(s, -INFINITY) : s;
-    *hi = err > 0.0f ? nextafterf(s, INFINITY) : s;
-}
-#endif
 
 static inline void tri_leaf_prim_aabb(const float *f, int bw, int lane,
                                       float lo[3], float hi[3]) {
@@ -11800,8 +11890,8 @@ lrt_tri_scene *lrt_curve_scene_build(const float *segments, const float *radii,
             ss->u1 = f1;
             ss->prim = (uint32_t)i;
             for (int a = 0; a < 3; a++) {
-                float lo = tri_minf(ss->p0[a], ss->p1[a]) - r;
-                float hi = tri_maxf(ss->p0[a], ss->p1[a]) + r;
+                float lo = tri_box_sub(tri_minf(ss->p0[a], ss->p1[a]), r);
+                float hi = tri_box_add(tri_maxf(ss->p0[a], ss->p1[a]), r);
                 bc.plo[w * 3 + a] = lo;
                 bc.phi[w * 3 + a] = hi;
                 bc.cen[w * 3 + a] = 0.5f * (lo + hi);
@@ -12023,8 +12113,8 @@ lrt_tri_scene *lrt_roundcurve_scene_build(const lrt_hair_strands *strands,
                 bad_input = 1;
             float r0v = r0 > 0.0f ? r0 : 0.0f, r1v = r1 > 0.0f ? r1 : 0.0f;
             for (int a = 0; a < 3; a++) {
-                float lo = tri_minf(rs->p0[a] - r0v, rs->p1[a] - r1v);
-                float hi = tri_maxf(rs->p0[a] + r0v, rs->p1[a] + r1v);
+                float lo = tri_minf(tri_box_sub(rs->p0[a], r0v), tri_box_sub(rs->p1[a], r1v));
+                float hi = tri_maxf(tri_box_add(rs->p0[a], r0v), tri_box_add(rs->p1[a], r1v));
                 bc.plo[w * 3 + a] = lo;
                 bc.phi[w * 3 + a] = hi;
                 bc.cen[w * 3 + a] = 0.5f * (lo + hi);
@@ -12257,8 +12347,8 @@ lrt_tri_scene *lrt_flatcurve_scene_build(const lrt_hair_strands *strands,
                 bad_input = 1;
             float r0v = r0 > 0.0f ? r0 : 0.0f, r1v = r1 > 0.0f ? r1 : 0.0f;
             for (int a = 0; a < 3; a++) {
-                float lo = tri_minf(rs->p0[a] - r0v, rs->p1[a] - r1v);
-                float hi = tri_maxf(rs->p0[a] + r0v, rs->p1[a] + r1v);
+                float lo = tri_minf(tri_box_sub(rs->p0[a], r0v), tri_box_sub(rs->p1[a], r1v));
+                float hi = tri_maxf(tri_box_add(rs->p0[a], r0v), tri_box_add(rs->p1[a], r1v));
                 bc.plo[w * 3 + a] = lo;
                 bc.phi[w * 3 + a] = hi;
                 bc.cen[w * 3 + a] = 0.5f * (lo + hi);
@@ -12379,8 +12469,9 @@ lrt_tri_scene *lrt_bezcurve_scene_build(const float *cps, size_t nseg,
             for (int a = 0; a < 3; a++) {
                 float c = cp[k * 4 + a];
                 if (!isfinite(c)) bad = 1;
-                if (c - rr < lo[a]) lo[a] = c - rr;
-                if (c + rr > hi[a]) hi[a] = c + rr;
+                float cl = tri_box_sub(c, rr), ch = tri_box_add(c, rr);
+                if (cl < lo[a]) lo[a] = cl;
+                if (ch > hi[a]) hi[a] = ch;
             }
             if (!isfinite(cp[k * 4 + 3])) bad = 1;
         }
@@ -12640,8 +12731,8 @@ lrt_tri_scene *lrt_sphere_scene_build(const float *spheres, size_t nprims,
             if (!isfinite(sp[k])) bad = 1;
         float rr = sp[3] > 0.0f ? sp[3] : 0.0f; /* r<=0: degenerate point box */
         for (int a = 0; a < 3; a++) {
-            bc.plo[i * 3 + a] = sp[a] - rr;
-            bc.phi[i * 3 + a] = sp[a] + rr;
+            bc.plo[i * 3 + a] = tri_box_sub(sp[a], rr);
+            bc.phi[i * 3 + a] = tri_box_add(sp[a], rr);
             bc.cen[i * 3 + a] = sp[a];
         }
         bc.indices[i] = (uint32_t)i;
@@ -13087,15 +13178,15 @@ lrt_tri_scene *lrt_nurbs_scene_build(const float *net, int nu, int nv,
         const float *cp = &rbez[i * 64];
         float lo[3], hi[3];
         for (int a = 0; a < 3; a++) {
-            float p = cp[a] / cp[3];
-            lo[a] = hi[a] = p;
+            lo[a] = tri_box_div_lo(cp[a], cp[3]);
+            hi[a] = tri_box_div_hi(cp[a], cp[3]);
         }
         for (int k = 1; k < 16; k++) {
-            float iw = 1.0f / cp[k * 4 + 3];
             for (int a = 0; a < 3; a++) {
-                float p = cp[k * 4 + a] * iw;
-                if (p < lo[a]) lo[a] = p;
-                if (p > hi[a]) hi[a] = p;
+                float pl = tri_box_div_lo(cp[k * 4 + a], cp[k * 4 + 3]);
+                float ph = tri_box_div_hi(cp[k * 4 + a], cp[k * 4 + 3]);
+                if (pl < lo[a]) lo[a] = pl;
+                if (ph > hi[a]) hi[a] = ph;
             }
         }
         for (int a = 0; a < 3; a++) {
@@ -13828,8 +13919,8 @@ lrt_tri_scene *lrt_sdfprim_scene_build(const uint32_t *types,
         }
         brad[i] = br;
         for (int a = 0; a < 3; a++) {
-            bc.plo[i * 3 + a] = c[a] - ext[a];
-            bc.phi[i * 3 + a] = c[a] + ext[a];
+            bc.plo[i * 3 + a] = tri_box_sub(c[a], ext[a]);
+            bc.phi[i * 3 + a] = tri_box_add(c[a], ext[a]);
             bc.cen[i * 3 + a] = c[a];
         }
         bc.indices[i] = (uint32_t)i;
@@ -13892,8 +13983,8 @@ lrt_tri_scene *lrt_points_scene_build(const float *centers, const float *radii,
             bad = 1;
         float rr = r > 0.0f ? r : 0.0f;
         for (int a = 0; a < 3; a++) {
-            bc.plo[i * 3 + a] = c[a] - rr;
-            bc.phi[i * 3 + a] = c[a] + rr;
+            bc.plo[i * 3 + a] = tri_box_sub(c[a], rr);
+            bc.phi[i * 3 + a] = tri_box_add(c[a], rr);
             bc.cen[i * 3 + a] = c[a];
         }
         bc.indices[i] = (uint32_t)i;
@@ -13966,8 +14057,8 @@ static lrt_tri_scene *lrt_ellipse_scene_build_impl(
             bad = 1;
         const float r = fmaxf(rx, ry);
         for (int a = 0; a < 3; a++) {
-            bc.plo[i * 3 + a] = c[a] - r;
-            bc.phi[i * 3 + a] = c[a] + r;
+            bc.plo[i * 3 + a] = tri_box_sub(c[a], r);
+            bc.phi[i * 3 + a] = tri_box_add(c[a], r);
             bc.cen[i * 3 + a] = c[a];
         }
         if (major_axes) {
@@ -15073,8 +15164,10 @@ static void tri_leaf_box(const lrt_tri_scene *s, uint32_t ref, float lo[3],
                 if (pid == LRT_TRI_NO_HIT) continue;
                 float a0 = r0 > 0.0f ? r0 : 0.0f, a1 = r1 > 0.0f ? r1 : 0.0f;
                 for (int a = 0; a < 3; a++) {
-                    float plo = (p0[a] - a0 < p1[a] - a1) ? p0[a] - a0 : p1[a] - a1;
-                    float phi = (p0[a] + a0 > p1[a] + a1) ? p0[a] + a0 : p1[a] + a1;
+                    float l0 = tri_box_sub(p0[a], a0), l1 = tri_box_sub(p1[a], a1);
+                    float h0 = tri_box_add(p0[a], a0), h1 = tri_box_add(p1[a], a1);
+                    float plo = l0 < l1 ? l0 : l1;
+                    float phi = h0 > h1 ? h0 : h1;
                     if (plo < lo[a]) lo[a] = plo;
                     if (phi > hi[a]) hi[a] = phi;
                 }

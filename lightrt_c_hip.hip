@@ -777,7 +777,7 @@ __device__ __forceinline__ bool hp_bez_newton(const float cp[16],
                                               const float dir[3], float tmin,
                                               float u, float t, float best_t,
                                               float *t_out, float *u_out) {
-    for (int it = 0; it < 8; it++) {
+    for (int it = 0; it < 9; it++) {
         float P[4], dP[4], ddP[4];
         hp_bez_eval(cp, u, P, dP, ddP);
         float Rx = t * dir[0] - P[0], Ry = t * dir[1] - P[1],
@@ -803,11 +803,7 @@ __device__ __forceinline__ bool hp_bez_newton(const float cp[16],
         float RdRdt = Rx * dir[0] + Ry * dir[1] + Rz * dir[2];
         float dgdu = (RdRdu - f * dfdu) * rsK - dP[3];
         float dgdt = (RdRdt - f * dfdt) * rsK;
-        float det = dfdu * dgdt - dfdt * dgdu;
-        if (fabsf(det) < 1e-20f) return false;
-        float invd = 1.0f / det;
-        u -= (dgdt * f - dfdt * g) * invd;
-        t -= (dfdu * g - dgdu * f) * invd;
+        /* converged on f, g at THIS (u,t) (mirror of tri_bez_newton) */
         float lenR = sqrtf(RR);
         float eps = 1e-5f * (1.0f + lenR);
         if (fabsf(f) < eps && fabsf(g) < eps) {
@@ -816,6 +812,11 @@ __device__ __forceinline__ bool hp_bez_newton(const float cp[16],
             }
             return false;
         }
+        float det = dfdu * dgdt - dfdt * dgdu;
+        if (fabsf(det) < 1e-20f) return false;
+        float invd = 1.0f / det;
+        u -= (dgdt * f - dfdt * g) * invd;
+        t -= (dfdu * g - dgdu * f) * invd;
     }
     return false;
 }
@@ -1151,16 +1152,26 @@ __device__ __forceinline__ bool hp_bezpatch_newton(const float cp[48],
         hp_bezpatch_eval(cp, u, v, S, du, dv);
         float R[3] = {S[0]-org[0]-t*dir[0], S[1]-org[1]-t*dir[1], S[2]-org[2]-t*dir[2]};
         float nd[3] = {-dir[0],-dir[1],-dir[2]};
-        float det = hp_det3(du, dv, nd);
-        if (det > -1e-20f && det < 1e-20f) return false;
-        float inv = 1.0f/det;
-        u -= hp_det3(R, dv, nd)*inv; v -= hp_det3(du, R, nd)*inv; t -= hp_det3(du, dv, R)*inv;
         float rr = sqrtf(R[0]*R[0]+R[1]*R[1]+R[2]*R[2]);
         float sl = sqrtf(S[0]*S[0]+S[1]*S[1]+S[2]*S[2]);
+        float det = hp_det3(du, dv, nd);
+        /* converged on the residual of THIS point; one more step is kept only
+         * if its own residual is smaller (mirror of tri_bezpatch_newton) */
         if (rr < 1e-5f*(1.0f+sl)) {
+            if (!(det > -1e-20f && det < 1e-20f)) {
+                float iv = 1.0f/det;
+                float un = u-hp_det3(R, dv, nd)*iv, vn = v-hp_det3(du, R, nd)*iv, tn = t-hp_det3(du, dv, R)*iv;
+                float S2[3], du2[3], dv2[3];
+                hp_bezpatch_eval(cp, un, vn, S2, du2, dv2);
+                float R2[3] = {S2[0]-org[0]-tn*dir[0], S2[1]-org[1]-tn*dir[1], S2[2]-org[2]-tn*dir[2]};
+                if (sqrtf(R2[0]*R2[0]+R2[1]*R2[1]+R2[2]*R2[2]) < rr) { u = un; v = vn; t = tn; }
+            }
             if (u>=0.0f&&u<=1.0f&&v>=0.0f&&v<=1.0f&&t>=tmin&&t<best) {*t_o=t;*u_o=u;*v_o=v;return true;}
             return false;
         }
+        if (det > -1e-20f && det < 1e-20f) return false;
+        float inv = 1.0f/det;
+        u -= hp_det3(R, dv, nd)*inv; v -= hp_det3(du, R, nd)*inv; t -= hp_det3(du, dv, R)*inv;
     }
     return false;
 }
@@ -1224,6 +1235,22 @@ __device__ __forceinline__ void hp_rbez_eval(const float cp[64], float u,
     float w=N[3], iw=1.0f/w, iw2=iw*iw;
     for (int k=0;k<3;k++){S[k]=N[k]*iw; du[k]=(Nu[k]*w-N[k]*Nu[3])*iw2; dv[k]=(Nv[k]*w-N[k]*Nv[3])*iw2;}
 }
+/* x / w (w > 0) rounded outward under LRT_TRI_LEAF_BOX_EXACT, mirror of
+ * tri_box_div_lo/hi: fmaf(q, w, -x) is the exact sign of q*w - x. */
+__device__ __forceinline__ float hp_div_lo(float x, float w) {
+    float q = x / w;
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+    if (fmaf(q, w, -x) > 0.0f) q = nextafterf(q, -INFINITY);
+#endif
+    return q;
+}
+__device__ __forceinline__ float hp_div_hi(float x, float w) {
+    float q = x / w;
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+    if (fmaf(q, w, -x) < 0.0f) q = nextafterf(q, INFINITY);
+#endif
+    return q;
+}
 __device__ __forceinline__ bool hp_rbez_newton(const float cp[64],
         const float *org, const float *dir, float u, float v, float t,
         float tmin, float best, float *t_o, float *u_o, float *v_o) {
@@ -1231,13 +1258,21 @@ __device__ __forceinline__ bool hp_rbez_newton(const float cp[64],
         float S[3],du[3],dv[3]; hp_rbez_eval(cp,u,v,S,du,dv);
         float R[3]={S[0]-org[0]-t*dir[0],S[1]-org[1]-t*dir[1],S[2]-org[2]-t*dir[2]};
         float nd[3]={-dir[0],-dir[1],-dir[2]};
+        float rr=sqrtf(R[0]*R[0]+R[1]*R[1]+R[2]*R[2]);
+        float sl=sqrtf(S[0]*S[0]+S[1]*S[1]+S[2]*S[2]);
         float det=hp_det3(du,dv,nd);
+        if (rr<1e-5f*(1.0f+sl)){ /* mirror of tri_rbezpatch_newton */
+            if (!(det>-1e-20f&&det<1e-20f)) {
+                float iv=1.0f/det;
+                float un=u-hp_det3(R,dv,nd)*iv, vn=v-hp_det3(du,R,nd)*iv, tn=t-hp_det3(du,dv,R)*iv;
+                float S2[3],du2[3],dv2[3]; hp_rbez_eval(cp,un,vn,S2,du2,dv2);
+                float R2[3]={S2[0]-org[0]-tn*dir[0],S2[1]-org[1]-tn*dir[1],S2[2]-org[2]-tn*dir[2]};
+                if (sqrtf(R2[0]*R2[0]+R2[1]*R2[1]+R2[2]*R2[2])<rr){u=un;v=vn;t=tn;}
+            }
+            if(u>=0.0f&&u<=1.0f&&v>=0.0f&&v<=1.0f&&t>=tmin&&t<best){*t_o=t;*u_o=u;*v_o=v;return true;}return false;}
         if (det>-1e-20f&&det<1e-20f) return false;
         float inv=1.0f/det;
         u-=hp_det3(R,dv,nd)*inv; v-=hp_det3(du,R,nd)*inv; t-=hp_det3(du,dv,R)*inv;
-        float rr=sqrtf(R[0]*R[0]+R[1]*R[1]+R[2]*R[2]);
-        float sl=sqrtf(S[0]*S[0]+S[1]*S[1]+S[2]*S[2]);
-        if (rr<1e-5f*(1.0f+sl)){if(u>=0.0f&&u<=1.0f&&v>=0.0f&&v<=1.0f&&t>=tmin&&t<best){*t_o=t;*u_o=u;*v_o=v;return true;}return false;}
     }
     return false;
 }
@@ -1268,8 +1303,8 @@ __device__ __forceinline__ bool hp_rbez_one(float ox,float oy,float oz,
         sp--; float u0=stk[sp].u0,u1=stk[sp].u1,v0=stk[sp].v0,v1=stk[sp].v1; int d=stk[sp].d;
         float sub[64]; hp_subpatch<4>(cp,u0,u1,v0,v1,sub);
         float lo[3],hi[3];
-        for(int a=0;a<3;a++){float p=sub[a]/sub[3]; lo[a]=hi[a]=p;}
-        for(int k=1;k<16;k++){float iw=1.0f/sub[k*4+3]; for(int a=0;a<3;a++){float p=sub[k*4+a]*iw; if(p<lo[a])lo[a]=p; if(p>hi[a])hi[a]=p;}}
+        for(int a=0;a<3;a++){lo[a]=hp_div_lo(sub[a],sub[3]); hi[a]=hp_div_hi(sub[a],sub[3]);}
+        for(int k=1;k<16;k++){for(int a=0;a<3;a++){float pl=hp_div_lo(sub[k*4+a],sub[k*4+3]), ph=hp_div_hi(sub[k*4+a],sub[k*4+3]); if(pl<lo[a])lo[a]=pl; if(ph>hi[a])hi[a]=ph;}}
         if (!hp_patch_box(lo,hi,ox,oy,oz,ix,iy,iz,tmin,best)) continue;
         if (d>=4) {
             float uc=0.5f*(u0+u1), vc=0.5f*(v0+v1), S[3],du[3],dv[3];
