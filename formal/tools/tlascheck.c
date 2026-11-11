@@ -41,6 +41,56 @@ static int mt64(const double o[3], const double d[3], const double a[3], const d
     return 1;
 }
 
+/* Exact (double) world image of each instance's BLAS root box must lie in the
+ * TLAS slot box holding it (TwoLevel.aff_in_corner_box + this check = the
+ * instance boxes contain the transformed BLAS geometry); inner boxes nest.
+ * Corner coordinates m0*x + m1*y + m2*z + m3: each product is exact in double;
+ * the 3 additions round at 2^-53, far below the float ulps checked. */
+static long box_bad, box_checks;
+static double box_worst;
+static void chk_ge(double x, float lo) {
+    box_checks++;
+    if (!(x >= (double)lo)) {
+        box_bad++;
+        double e = ((double)lo - x) / (double)(nextafterf(lo, INFINITY) - lo);
+        if (e > box_worst) box_worst = e;
+    }
+}
+static void chk_le(double x, float hi) {
+    box_checks++;
+    if (!(x <= (double)hi)) {
+        box_bad++;
+        double e = (x - (double)hi) / (double)(hi - nextafterf(hi, -INFINITY));
+        if (e > box_worst) box_worst = e;
+    }
+}
+static void tlas_walk(const lrt_tlas *T, uint32_t ref, const float *lo, const float *hi) {
+    if (TRI_REF_IS_LEAF(ref)) {
+        uint32_t first = TRI_REF_BLOCK(ref), count = TRI_REF_NBLOCKS(ref);
+        for (uint32_t k = 0; k < count; k++) {
+            const lrt_instance_int *in = &T->insts[T->inst_refs[first + k]];
+            if (in->degenerate) continue;
+            const lrt_tri_scene *b = T->blas[in->blas_id];
+            for (int c = 0; c < 8; c++) {
+                double p[3] = {(c & 1) ? b->root_hi[0] : b->root_lo[0], (c & 2) ? b->root_hi[1] : b->root_lo[1],
+                               (c & 4) ? b->root_hi[2] : b->root_lo[2]};
+                for (int a = 0; a < 3; a++) {
+                    const float *m = &in->obj2world[4 * a];
+                    double w = (double)m[0] * p[0] + (double)m[1] * p[1] + (double)m[2] * p[2] + (double)m[3];
+                    chk_ge(w, lo[a]); chk_le(w, hi[a]);
+                }
+            }
+        }
+        return;
+    }
+    const lrt_bvh4_node *n = &T->nodes[TRI_REF_NODE(ref)];
+    for (int i = 0; i < (int)n->nchildren; i++) {
+        float clo[3] = {n->lo_x[i], n->lo_y[i], n->lo_z[i]}, chi[3] = {n->hi_x[i], n->hi_y[i], n->hi_z[i]};
+        if (lo) for (int a = 0; a < 3; a++) { chk_ge(clo[a], lo[a]); chk_le(chi[a], hi[a]); }
+        tlas_walk(T, n->child[i], clo, chi);
+    }
+}
+
 int main(int argc, char **argv) {
     rs = argc > 1 ? (uint32_t)atoi(argv[1]) * 2654435761u + 1 : 1;
     int nrays = argc > 2 ? atoi(argv[2]) : 2000;
@@ -85,6 +135,9 @@ int main(int argc, char **argv) {
     lrt_tlas *T = lrt_tlas_build(blas, NB, inst, NI, NULL, &err);
     if (!T) { fprintf(stderr, "tlas build failed\n"); return 1; }
 
+    if (!TRI_REF_IS_LEAF(T->root)) tlas_walk(T, T->root, NULL, NULL);
+    printf("tlas boxes: %ld exact containment checks, %ld fail (worst %.2f ulp)\n", box_checks, box_bad,
+           box_worst);
     int bad_t = 0, bad_any = 0, approx_t = 0, miss64 = 0, n64 = 0;
     double max_rel = 0;
     for (int r = 0; r < nrays; r++) {
@@ -161,5 +214,5 @@ int main(int argc, char **argv) {
            max_rel, n64);
     lrt_tlas_free(T);
     for (int b = 0; b < NB; b++) { lrt_tri_scene_free(blas[b]); free(verts[b]); }
-    return (bad_t || bad_any) ? 1 : 0;
+    return (bad_t || bad_any || box_bad) ? 1 : 0;
 }

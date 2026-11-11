@@ -207,6 +207,63 @@ theorem hit_iff (W O : Aff) (hOW : ∀ p, O.app (W.app p) = p) (hWO : ∀ p, W.a
       HitsTriangleAt o d (O.app v0) (O.app v1) (O.app v2) tmin tb t :=
   ⟨hit_world_of_obj W O hOW, hit_obj_of_world W O hWO⟩
 
+/-- Corner `b` of the box `[lo, hi]` (`b j`: take `hi` on axis `j`). -/
+def corner (lo hi : Vec3) (b : Fin 3 → Bool) : Vec3 := fun j => if b j then hi j else lo j
+
+theorem term_lower (L lo hi x : ℝ) (h1 : lo ≤ x) (h2 : x ≤ hi) :
+    (if L * hi < L * lo then L * hi else L * lo) ≤ L * x := by
+  split_ifs with h
+  · rcases le_or_gt 0 L with hL | hL
+    · nlinarith
+    · nlinarith
+  · rcases le_or_gt 0 L with hL | hL
+    · nlinarith
+    · nlinarith
+
+theorem term_upper (L lo hi x : ℝ) (h1 : lo ≤ x) (h2 : x ≤ hi) :
+    L * x ≤ (if L * lo < L * hi then L * hi else L * lo) := by
+  split_ifs with h
+  · rcases le_or_gt 0 L with hL | hL
+    · nlinarith
+    · nlinarith
+  · rcases le_or_gt 0 L with hL | hL
+    · nlinarith
+    · nlinarith
+
+/-- **Affine image of a box ⊆ the min/max box of its 8 transformed corners**
+    (`tlas_transform_aabb`): per axis, if every transformed corner lies in
+    `[wlo, whi]`, so does the image of every point of the box. Each coordinate
+    of `A p` is affine, so its minimum over the box is attained at the corner
+    that takes, per input axis, whichever bound makes `L a j * p j` smaller. -/
+theorem aff_in_corner_box (A : Aff) (lo hi p : Vec3) (hp : ∀ j, lo j ≤ p j ∧ p j ≤ hi j)
+    (a : Fin 3) (wlo whi : ℝ)
+    (hc : ∀ b : Fin 3 → Bool, wlo ≤ A.app (corner lo hi b) a ∧ A.app (corner lo hi b) a ≤ whi) :
+    wlo ≤ A.app p a ∧ A.app p a ≤ whi := by
+  have expand : ∀ q : Vec3, A.app q a = A.L a 0 * q 0 + A.L a 1 * q 1 + A.L a 2 * q 2 + A.c a := by
+    intro q
+    simp [Aff.app, Matrix.mulVec, dotProduct, Fin.sum_univ_three]
+  constructor
+  · let b : Fin 3 → Bool := fun j => decide (A.L a j * hi j < A.L a j * lo j)
+    have hb : ∀ j, A.L a j * corner lo hi b j = if A.L a j * hi j < A.L a j * lo j
+        then A.L a j * hi j else A.L a j * lo j := by
+      intro j; simp only [corner, b]; split_ifs <;> simp_all
+    refine (hc b).1.trans ?_
+    rw [expand, expand, hb 0, hb 1, hb 2]
+    have := term_lower (A.L a 0) (lo 0) (hi 0) (p 0) (hp 0).1 (hp 0).2
+    have := term_lower (A.L a 1) (lo 1) (hi 1) (p 1) (hp 1).1 (hp 1).2
+    have := term_lower (A.L a 2) (lo 2) (hi 2) (p 2) (hp 2).1 (hp 2).2
+    linarith
+  · let b : Fin 3 → Bool := fun j => decide (A.L a j * lo j < A.L a j * hi j)
+    have hb : ∀ j, A.L a j * corner lo hi b j = if A.L a j * lo j < A.L a j * hi j
+        then A.L a j * hi j else A.L a j * lo j := by
+      intro j; simp only [corner, b]; split_ifs <;> simp_all
+    refine le_trans ?_ (hc b).2
+    rw [expand, expand, hb 0, hb 1, hb 2]
+    have := term_upper (A.L a 0) (lo 0) (hi 0) (p 0) (hp 0).1 (hp 0).2
+    have := term_upper (A.L a 1) (lo 1) (hi 1) (p 1) (hp 1).1 (hp 1).2
+    have := term_upper (A.L a 2) (lo 2) (hi 2) (p 2) (hp 2).1 (hp 2).2
+    linarith
+
 end TwoLevel
 
 /-! ### Rounding of the instance ray transform -/
