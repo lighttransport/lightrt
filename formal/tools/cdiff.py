@@ -65,6 +65,17 @@ def vec_slab(r):
     return "slab " + " ".join(f"{bits(fl(v)):08x}" for v in vals)
 
 
+def vec_slabr(r):
+    """Default-build robust slab; half the vectors put the ray parallel to and
+    exactly ON a face plane (d = +-0, o = lo or hi), the `sinv = +inf` case."""
+    w = vec_slab(r).split()[1:]
+    if r.random() < 0.5:
+        k = r.randrange(3)
+        w[4 + k] = r.choice(["00000000", "80000000"])
+        w[k] = w[8 + k] if r.random() < 0.5 else w[11 + k]
+    return "slabr " + " ".join(w)
+
+
 def vec_mt(r):
     vals = [rnd(r) for _ in range(15)]
     vals += [abs(rnd(r, 0.05)) if r.random() < 0.8 else 0.0, r.choice([float("inf"), abs(rnd(r))])]
@@ -86,9 +97,14 @@ def norm(line):
     return " ".join(out)
 
 
-def build_c(tmp):
-    exe = os.path.join(tmp, "cdiff_c")
-    subprocess.check_call([CC, "-std=c11", "-O0", "-ffp-contract=off", "-w",
+LEGACY = ["-DLRT_TRI_NO_SLAB_ROBUST", "-DLRT_TRI_NO_LEAF_BOX_EXACT"]
+
+
+def build_c(tmp, flags=LEGACY, name="cdiff_c"):
+    """`slab`/`mt`/`woop` lines go to the legacy build (model `Gen`); `slabr`
+    lines to the default build (robust slab, model `GenRobust`)."""
+    exe = os.path.join(tmp, name)
+    subprocess.check_call([CC, "-std=c11", "-O0", "-ffp-contract=off", "-w", *flags,
                            "-fsanitize=address,undefined", "-fno-sanitize-recover=undefined",
                            f"-I{ROOT}", "-o", exe, os.path.join(HERE, "cdiff_c.c"),
                            "-lm", "-lpthread"])
@@ -178,14 +194,18 @@ def main():
     args = ap.parse_args()
     with tempfile.TemporaryDirectory() as tmp:
         cexe = build_c(tmp)
+        rexe = build_c(tmp, [], "cdiff_c_default")
         lexe = lean_exe()
         if args.search_miss:
             return search_miss(args, cexe, lexe)
         r = random.Random(args.seed)
-        gens = [vec_slab, vec_mt, vec_woop]
-        lines = [gens[k % 3](r) for k in range(args.n)]
+        gens = [vec_slab, vec_mt, vec_woop, vec_slabr]
+        lines = [gens[k % 4](r) for k in range(args.n)]
         inp = "\n".join(lines) + "\n"
-        cout = run([cexe], inp)
+        rob = [l.startswith("slabr ") for l in lines]
+        leg_out = iter(run([cexe], "\n".join(l for l, x in zip(lines, rob) if not x) + "\n"))
+        rob_out = iter(run([rexe], "\n".join(l for l, x in zip(lines, rob) if x) + "\n"))
+        cout = [next(rob_out) if x else next(leg_out) for x in rob]
         lout = run(lexe, inp)
         if len(cout) != len(lines) or len(lout) != len(lines):
             print(f"output length mismatch: C={len(cout)} MiniC={len(lout)} n={len(lines)}")
@@ -197,7 +217,7 @@ def main():
                 if bad <= 5:
                     print("MISMATCH\n  in:   ", line, "\n  C:    ", c, "\n  MiniC:", l)
         hits = sum(1 for c in cout if c.startswith("1 "))
-        print(f"{len(lines)} vectors, {bad} mismatches, {hits} MT/Woop hits")
+        print(f"{len(lines)} vectors ({sum(rob)} default-build robust slab), {bad} mismatches, {hits} MT/Woop hits")
         return 1 if bad else 0
 
 

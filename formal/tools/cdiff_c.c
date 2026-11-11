@@ -13,7 +13,7 @@ static unsigned b(float x) { unsigned r; memcpy(&r, &x, 4); return r; }
 int main(void) {
     char kind[16];
     while (scanf("%15s", kind) == 1) {
-        if (strcmp(kind, "slab") == 0) {
+        if (strcmp(kind, "slab") == 0 || strcmp(kind, "slabr") == 0) {
             unsigned w[15];
             for (int k = 0; k < 15; k++) if (scanf("%x", &w[k]) != 1) return 1;
             lrt_ray ray;
@@ -23,9 +23,16 @@ int main(void) {
             tri_ray_ctx rc;
             memset(&rc, 0, sizeof rc);
             tri_ray_setup(&ray, &rc);
-            unsigned words[13];
-            memcpy(words, &rc, sizeof words);
-            for (int k = 0; k < 13; k++) printf("%08x ", words[k]);
+            unsigned words[16]; /* 13 legacy words; + sinv[3] in the default build */
+            int nw = 13;
+#ifdef LRT_TRI_SLAB_ROBUST
+            nw = 16;
+            memcpy(words, &rc, 52);
+            memcpy(words + 13, rc.sinv, 12);
+#else
+            memcpy(words, &rc, 52);
+#endif
+            for (int k = 0; k < nw; k++) printf("%08x ", words[k]);
             float lo[3] = {f(w[8]), f(w[9]), f(w[10])}, hi[3] = {f(w[11]), f(w[12]), f(w[13])};
             float tnear = 0.0f;
             int r = tri_slab_scalar(&lo[0], &lo[1], &lo[2], &hi[0], &hi[1], &hi[2], 0, &rc,

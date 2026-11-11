@@ -168,7 +168,7 @@ c_tri_seam_test: tests/test_lightrt_c_tri_seam.c lightrt_c_tri.c
 # Axis-parallel rays exactly on box faces, all node formats; the _rb build
 # (robust slab + exact leaf boxes + watertight leaf) requires 0 misses.
 c_tri_parallel_test: tests/test_lightrt_c_tri_parallel.c lightrt_c_tri.c
-	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -o lightrt_c_tri_parallel_test $^ -lm -lpthread
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_NO_SLAB_ROBUST -DLRT_TRI_NO_LEAF_BOX_EXACT -o lightrt_c_tri_parallel_test $^ -lm -lpthread
 	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_SLAB_ROBUST -DLRT_TRI_LEAF_BOX_EXACT -DLRT_TRI_WATERTIGHT_TRI -o lightrt_c_tri_parallel_test_rb $^ -lm -lpthread
 	./lightrt_c_tri_parallel_test && ./lightrt_c_tri_parallel_test_rb
 
