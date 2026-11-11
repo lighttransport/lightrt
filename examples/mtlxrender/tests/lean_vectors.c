@@ -50,8 +50,10 @@ static int parse_payload(const char *s, double *out, int cap) {
     return n;
 }
 
+static double g_tol = 1e-5;
+
 static int close_enough(double got, double want) {
-    double tol = 1e-5 * fmax(1.0, fabs(want));
+    double tol = g_tol * fmax(1.0, fabs(want));
     return fabs(got - want) <= tol;
 }
 
@@ -141,6 +143,14 @@ int main(int argc, char **argv) {
     check_eval(id, body, node, defined, kind, payload);
 #include "generated/mtlx-eval.inc"
 #undef MTLX_EVAL
+    /* Nodes defined over the reals: the payload is a binary64 evaluation of
+     * the formula; binary32 library functions get a wider tolerance. Ids are
+     * offset so the xfail list can name them. */
+    g_tol = 1e-4;
+#define MTLX_EVAL_APPROX(id, body, node, payload) \
+    check_eval(100000 + id, body, node, 1, strchr(payload, ',') ? "agg" : "num", payload);
+#include "generated/mtlx-eval-approx.inc"
+#undef MTLX_EVAL_APPROX
     printf("lean_vectors: %d vectors, %d failures, %d known differences, %d unexpected passes\n",
            g_total, g_fail, g_xfail, g_xpass);
     return (g_fail || g_xpass) ? 1 : 0;

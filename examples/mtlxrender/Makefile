@@ -68,7 +68,7 @@ test: node_truth
 # the materialx-conformance repository). Links only the document loader and
 # the evaluator, with a neutral texture stub, so it needs no deps/.
 LEAN_SRC = tests/lean_vectors.c tests/texture_stub.c mtlx_doc.c mtlx_xml.c mtlx_eval.c color.c
-lean_vectors: $(LEAN_SRC) tests/generated/mtlx-eval.inc mtlx_stdlib_defs.inc
+lean_vectors: $(LEAN_SRC) tests/generated/mtlx-eval.inc tests/generated/mtlx-eval-approx.inc mtlx_stdlib_defs.inc
 	$(CC) $(CSTD) -O2 -D_POSIX_C_SOURCE=200809L -I. -Itests -o $@ $(LEAN_SRC) -lm
 test-lean: lean_vectors
 	./lean_vectors
