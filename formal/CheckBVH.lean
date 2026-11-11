@@ -59,6 +59,12 @@ def runC (robust exactn : Bool) (tmax : UInt32) (G : Flat Box6 ℕ) (ids : ℕ �
         if ok then insRev acc (c.2, if exactn then rc.tmin else tnear) else acc) []
       runC robust exactn tmax G ids tab rc f (hits.reverse ++ st) best prim
 
+/-- Every (slot, box path from the root) pair: the SBVH coverage witness. -/
+def paths (G : Flat Box6 ℕ) : ℕ → CRef → List Box6 → List (ℕ × List Box6)
+  | 0, _, _ => []
+  | _ + 1, .leaf blk n, bs => (G.leafPrims blk n).map (·, bs)
+  | f + 1, .node i, bs => (G.children i).flatMap fun c => paths G f c.2 (c.1 :: bs)
+
 def main : IO Unit := do
   let stdin ← IO.getStdin
   let mut lines : Array (List String) := #[]
@@ -107,6 +113,7 @@ def main : IO Unit := do
         if !(decide (i < j) && decide (j < nN)) then badIdx := badIdx + 1
         for c' in G.children j do if !subQ c'.1 c.1 then badSub := badSub + 1
   let reach := G.denRef root
+  let pths := paths G (nN + 2) root []
   let mut rays := 0
   let mut agreeC := 0
   let mut agreeS := 0
@@ -117,6 +124,10 @@ def main : IO Unit := do
   let mut maxUlpS := 0
   let mut fullS := 0
   let mut missS := 0
+  let mut anyC := 0
+  let mut anyD := 0
+  let mut anyB := 0
+  let mut uncovered := 0
   let mut i := 1 + nN + nB
   let fuel := G.visitsRef root + 1
   while i + 1 < lines.size do
@@ -140,6 +151,27 @@ def main : IO Unit := do
       | some t => if !(leBits b t) then (t, ids s) else (b, p)
       | none => (b, p)) (w[7]!, (0xffffffff : UInt32))
     let resB : Nat × UInt32 := if bpB == 0xffffffff then (0, 0) else (1, btB)
+    -- any-hit: the proven `Flat.runAny` itself, with the C box test vs `tmax`
+    let tmaxR := w[7]!
+    let test0 : Box6 → Bool := fun b =>
+      let lo : Fin 3 → Ref.F := fun k => b[k.val]!
+      let hi : Fin 3 → Ref.F := fun k => b[k.val + 3]!
+      (if robust then Ref.slabRobust rc lo hi tmaxR else Ref.slab rc lo hi tmaxR).1
+    let hitp : ℕ → Bool := fun s => match tab s with
+      | some t => !(leBits tmaxR t)
+      | none => false
+    let anyL := (G.runAny test0 hitp List.reverse fuel [root]).getD false
+    let anyBr := reach.any hitp
+    let oS := R.getD 14 "0" == "1"
+    let oD := R.getD 15 "0" == "1"
+    if anyL == oS then anyC := anyC + 1 else IO.eprintln s!"ray {rays+1}: any-hit lean {anyL} C {oS}"
+    if anyL == oD then anyD := anyD + 1
+    if anyL == anyBr then anyB := anyB + 1
+    -- coverage hypothesis of `runAny_cover_root`/`run_cover`: each hitting primitive
+    -- has a reference whose whole box path passes the test
+    for P in (reach.filter hitp).map ids |>.eraseDups do
+      if !(pths.any fun (s, bs) => ids s == P && hitp s && bs.all test0) then
+        uncovered := uncovered + 1
     rays := rays + 1
     if res == cS then agreeC := agreeC + 1
     else IO.eprintln s!"ray {rays}: lean {res} C {cS}"
@@ -157,3 +189,4 @@ def main : IO Unit := do
     if res.1 == 1 && cV.1 == 1 then maxUlpS := max maxUlpS (ulpd res.2.1 cV.2.1)
   IO.println s!"W={W} nodes={nN} blocks={nB} reachable={reach.length} checkWF={wf} (bad leaf={badLeaf} sub={badSub} idx={badIdx})"
   IO.println s!"rays={rays} hits={hits} lean==C-scalar(t,prim)={agreeC} t==C-dispatched={agreeS} (t,prim)==C-dispatched={fullS} dispatched-hit/miss-vs-brute={missS} t==brute={agreeBrute} hit/miss-vs-brute={missB} max-ulp(t-brute)={maxUlpB} max-ulp(scalar-dispatched)={maxUlpS}"
+  IO.println s!"anyhit lean==C-scalar={anyC} lean==C-dispatched={anyD} lean==brute={anyB} uncovered-hits={uncovered}"

@@ -282,3 +282,6 @@ formal:
 	python3 formal/tools/check_axioms.py > /dev/null
 	python3 formal/tools/cdiff.py --n 1000
 	python3 formal/tools/bvhcheck.py --rays 100 --seeds 2
+	$(CC) -O1 -ffp-contract=off -msse4.1 -mavx2 -mfma -w -I. -o formal/.lake/tlascheck formal/tools/tlascheck.c -lm -lpthread
+	$(CC) -O1 -ffp-contract=off -msse4.1 -mavx2 -mfma -w -I. -DLRT_TRI_EXACT_NEAREST -o formal/.lake/tlascheck_exn formal/tools/tlascheck.c -lm -lpthread
+	for s in 1 2; do formal/.lake/tlascheck $$s 1000 && formal/.lake/tlascheck_exn $$s 1000 || exit 1; done
