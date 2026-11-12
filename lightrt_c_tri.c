@@ -10967,7 +10967,9 @@ static int tri_occluded_bvh8q_sve(const lrt_tri_scene *s, const lrt_ray *ray) {
 /* scalar double elsewhere. Triangle vertices are the build's fp32 values.    */
 /* ========================================================================= */
 typedef struct tri_ray_ctx_hp {
-    double org[3], dir[3], invd[3], tmin;
+    double org[3], dir[3], invd[3];
+    double sinv[3]; /* +inf for d == 0: the robust-slab NaN-drop semantics */
+    double tmin;
 } tri_ray_ctx_hp;
 
 #define TRI_INVD_MAX_HP 1e300
@@ -10980,6 +10982,7 @@ static inline void tri_ray_setup_hp(const lrt_ray_hp *ray, tri_ray_ctx_hp *rc) {
         if (!(inv >= -TRI_INVD_MAX_HP && inv <= TRI_INVD_MAX_HP))
             inv = copysign(TRI_INVD_MAX_HP, ray->dir[k] == 0.0 ? 1.0 : ray->dir[k]);
         rc->invd[k] = inv;
+        rc->sinv[k] = ray->dir[k] == 0.0 ? INFINITY : inv;
     }
     rc->tmin = ray->tmin;
 }
@@ -10993,18 +10996,62 @@ static inline int tri_slab_hp(const float *lo_x, const float *lo_y,
                               const float *hi_y, const float *hi_z, int i,
                               const tri_ray_ctx_hp *rc, double t_best,
                               double *tnear_out) {
-    double tlx = ((double)lo_x[i] - rc->org[0]) * rc->invd[0];
-    double thx = ((double)hi_x[i] - rc->org[0]) * rc->invd[0];
-    double tly = ((double)lo_y[i] - rc->org[1]) * rc->invd[1];
-    double thy = ((double)hi_y[i] - rc->org[1]) * rc->invd[1];
-    double tlz = ((double)lo_z[i] - rc->org[2]) * rc->invd[2];
-    double thz = ((double)hi_z[i] - rc->org[2]) * rc->invd[2];
-    double tnear = tri_maxd(tri_maxd(tri_mind(tlx, thx), tri_mind(tly, thy)),
-                            tri_maxd(tri_mind(tlz, thz), rc->tmin));
-    double tfar = tri_mind(tri_mind(tri_maxd(tlx, thx), tri_maxd(tly, thy)),
-                           tri_mind(tri_maxd(tlz, thz), t_best));
+    double tlx = ((double)lo_x[i] - rc->org[0]) * rc->sinv[0];
+    double thx = ((double)hi_x[i] - rc->org[0]) * rc->sinv[0];
+    double tly = ((double)lo_y[i] - rc->org[1]) * rc->sinv[1];
+    double thy = ((double)hi_y[i] - rc->org[1]) * rc->sinv[1];
+    double tlz = ((double)lo_z[i] - rc->org[2]) * rc->sinv[2];
+    double thz = ((double)hi_z[i] - rc->org[2]) * rc->sinv[2];
+    double tnx = tri_mind(thx, tlx), tfx = tri_maxd(tlx, thx);
+    double tny = tri_mind(thy, tly), tfy = tri_maxd(tly, thy);
+    double tnz = tri_mind(thz, tlz), tfz = tri_maxd(tlz, thz);
+    double tnear = tri_maxd(tri_maxd(tnx, tny), tri_maxd(tnz, rc->tmin));
+    double tfar = tri_mind(tri_mind(tfx, tfy), tri_mind(tfz, t_best));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = tfar * (double)TRI_SLAB_K;
+#endif
     *tnear_out = tnear;
     return tnear <= tfar;
+}
+
+/* fp64 Woop leaf: the scalar `tri_woop_one` sheared-space test in double, on
+ * the exact stored vertices of a vertex-format block. It is the fp64
+ * counterpart of the fp32 SIMD leaf: no det epsilon, and on a shared edge the
+ * two triangles evaluate the same double expression up to sign, so the test
+ * is watertight whenever the fp64 ray itself meets the surface. */
+static inline int tri_woop_one_hp(const double o[3], const double d[3],
+                                  const double v0[3], const double v1[3],
+                                  const double v2[3], double tmin, double tbest,
+                                  double *t, double *u, double *v) {
+    double a0 = fabs(d[0]), a1 = fabs(d[1]), a2 = fabs(d[2]);
+    int kz = 0;
+    if (a1 > a0) kz = 1;
+    if (a2 > a0 && a2 > a1) kz = 2;
+    int kx = kz + 1;
+    if (kx == 3) kx = 0;
+    int ky = kx + 1;
+    if (ky == 3) ky = 0;
+    if (d[kz] < 0.0) { int tmp = kx; kx = ky; ky = tmp; }
+    double sx = d[kx] / d[kz], sy = d[ky] / d[kz], sz = 1.0 / d[kz];
+    double ax = v0[kx] - o[kx], ay = v0[ky] - o[ky], az = v0[kz] - o[kz];
+    double bx = v1[kx] - o[kx], by = v1[ky] - o[ky], bz = v1[kz] - o[kz];
+    double cx = v2[kx] - o[kx], cy = v2[ky] - o[ky], cz = v2[kz] - o[kz];
+    ax = ax - sx * az; ay = ay - sy * az;
+    bx = bx - sx * bz; by = by - sy * bz;
+    cx = cx - sx * cz; cy = cy - sy * cz;
+    double ue = cx * by - cy * bx;
+    double ve = ax * cy - ay * cx;
+    double we = bx * ay - by * ax;
+    if ((ue < 0.0 || ve < 0.0 || we < 0.0) &&
+        (ue > 0.0 || ve > 0.0 || we > 0.0)) return 0;
+    double det = ue + ve + we;
+    if (det == 0.0) return 0;
+    double tt = (ue * (sz * az) + ve * (sz * bz) + we * (sz * cz)) / det;
+    if (!(tt >= tmin && tt < tbest)) return 0;
+    *t = tt;
+    *u = ve / det;
+    *v = we / det;
+    return 1;
 }
 
 /* fp64 leaf Moller-Trumbore over a generic-width block (f = 9 float arrays of
@@ -11029,6 +11076,26 @@ static inline void tri_block_isect_hp(const float *f, int bw,
         e2x[l] = c0; e2y[l] = c1; e2z[l] = c2;
     }
     double ta[8], ua[8], va[8];
+    if (vf) {
+        /* Watertight fp64 leaf on the exact vertices. */
+        for (int l = 0; l < bw; l++) {
+            if (prim[l] == LRT_TRI_NO_HIT) continue;
+            double w0[3] = {v0x[l], v0y[l], v0z[l]};
+            double w1[3] = {(double)f[3 * bw + l], (double)f[4 * bw + l],
+                            (double)f[5 * bw + l]};
+            double w2[3] = {(double)f[6 * bw + l], (double)f[7 * bw + l],
+                            (double)f[8 * bw + l]};
+            double tt, uu, vv;
+            if (tri_woop_one_hp(rc->org, rc->dir, w0, w1, w2, rc->tmin, *best_t,
+                                &tt, &uu, &vv)) {
+                *best_t = tt;
+                *best_u = uu;
+                *best_v = vv;
+                *best_prim = prim[l];
+            }
+        }
+        return;
+    }
 #if LRT_TRI_HAS_SVE
     svbool_t pg = svwhilelt_b64((uint64_t)0, (uint64_t)bw);
     svfloat64_t dx = svdup_f64(rc->dir[0]), dy = svdup_f64(rc->dir[1]),

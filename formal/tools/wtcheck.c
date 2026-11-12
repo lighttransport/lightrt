@@ -380,7 +380,7 @@ int main(int argc, char **argv) {
     printf("wtcheck save/load + refit: != scalar %ld\n", persist_bad);
     printf("wtcheck hits != tri_woop_one on the input vertices (build, load, refit): %ld\n", src_bad);
     printf("wtcheck readers: get_verts != input or intersect_n hit/miss != intersect1: %ld; "
-           "fp64 path (MT on the same leaves) hit/miss != watertight %ld of %ld (report only)\n",
+           "fp64 path (Woop on vertex format, MT otherwise) hit/miss != watertight %ld of %ld (report only)\n",
            reader_bad, hp_diff, hp_rays);
     printf("  (get_verts part: %ld; intersect_n[0].t != intersect1 t on %ld rays, max %ld ulp: the pruning slack\n"
            "   of both searches, Flat.run_approx; exact only under LRT_TRI_EXACT_NEAREST; report only)\n",
