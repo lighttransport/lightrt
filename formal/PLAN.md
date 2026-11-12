@@ -40,6 +40,8 @@ Each library was cloned and read on 2026-11-10. The `sorry` counts are real toke
 
 **Decision: a minimal custom model.** `FP/Model.lean` defines an abstract `RoundingModel`: one fresh δ per operation, monotone, odd, idempotent, with an explicit `InRange` predicate. `FP/Binary32.lean` is a computable RNE with subnormals, ±0, ±∞ and x86 NaN propagation. One generic `rne` definition serves both ℚ (executed) and ℝ (`model`).
 
+**Range-free binary32 error (resume-lean item 3, first step).** `FP/TotalErr.lean` proves `|rneR x − x| ≤ u |x| + 2⁻¹⁵⁰` for **every** `x` (subnormals, zero, and values beyond the finite range), from the per-rounding `q/2` bound and the quantum clamp at `2⁻¹⁴⁹`; `model_abs_err_total` exposes it for the model. The abstract slab/MT/Woop bounds still carry `InRange`; re-deriving them with the absolute `η` terms is the remaining part. Each rounding then gains `η`, so a `t` bound gains `η·(#roundings)/|D|`, informative only when the denominator is not tiny — which is the expected degradation, not a contradiction.
+
 Reasons:
 1. MiniC needs an executable, bit-exact semantics that agrees with compiled C. None of the theorems need Flocq-scale generality.
 2. No toolchain lag: FloatSpec and Flean pin older Lean versions.
