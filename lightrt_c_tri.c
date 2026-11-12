@@ -5072,51 +5072,8 @@ static inline void tri_bezpatch_eval_sve(const float *cpx, const float *cpy,
 #endif
 
 /* de Casteljau split/restrict of a cubic over 4 points × 3 floats. */
-static void tri_bez_split3(const float c[12], float t, float L[12],
-                           float R[12]) {
-    for (int k = 0; k < 3; k++) {
-        float P0 = c[k], P1 = c[3 + k], P2 = c[6 + k], P3 = c[9 + k];
-        float ab = P0 + (P1 - P0) * t, bc = P1 + (P2 - P1) * t,
-              cd = P2 + (P3 - P2) * t;
-        float abc = ab + (bc - ab) * t, bcd = bc + (cd - bc) * t;
-        float abcd = abc + (bcd - abc) * t;
-        L[k] = P0; L[3 + k] = ab; L[6 + k] = abc; L[9 + k] = abcd;
-        R[k] = abcd; R[3 + k] = bcd; R[6 + k] = cd; R[9 + k] = P3;
-    }
-}
-static void tri_bez_subcurve3(const float c[12], float a, float b,
-                              float out[12]) {
-    float L[12], R[12];
-    tri_bez_split3(c, b, L, R);
-    if (a > 0.0f) {
-        float L2[12];
-        tri_bez_split3(L, a / b, L2, out);
-    } else {
-        memcpy(out, L, 12 * sizeof(float));
-    }
-}
 
 /* Control points of the sub-patch over [umin,umax]×[vmin,vmax]. */
-static void tri_bezpatch_subpatch(const float cp[48], float umin, float umax,
-                                  float vmin, float vmax, float out[48]) {
-    float tmp[48];
-    for (int j = 0; j < 4; j++) {
-        float row[12], sub[12];
-        for (int i = 0; i < 4; i++)
-            for (int k = 0; k < 3; k++) row[i * 3 + k] = cp[(j * 4 + i) * 3 + k];
-        tri_bez_subcurve3(row, umin, umax, sub);
-        for (int i = 0; i < 4; i++)
-            for (int k = 0; k < 3; k++) tmp[(j * 4 + i) * 3 + k] = sub[i * 3 + k];
-    }
-    for (int i = 0; i < 4; i++) {
-        float col[12], sub[12];
-        for (int j = 0; j < 4; j++)
-            for (int k = 0; k < 3; k++) col[j * 3 + k] = tmp[(j * 4 + i) * 3 + k];
-        tri_bez_subcurve3(col, vmin, vmax, sub);
-        for (int j = 0; j < 4; j++)
-            for (int k = 0; k < 3; k++) out[(j * 4 + i) * 3 + k] = sub[j * 3 + k];
-    }
-}
 
 static inline float tri_det3(const float a[3], const float b[3],
                              const float c[3]) {
@@ -5207,6 +5164,41 @@ static int tri_bezpatch_newton(const float cp[48], const float *cpx,
     return 0;
 }
 
+/* Split a bicubic (nc = 3) or homogeneous rational (nc = 4) Bezier patch at
+ * the parameter midpoint in u and in v (de Casteljau, t = 1/2): out[2a+b] is
+ * the child over u-half a, v-half b. The adaptive patch drivers carry each
+ * cell's control net on their stack and split it, instead of re-deriving every
+ * cell from the root net (that re-derivation was ~55% of patch trace time). */
+static void tri_patch_split4(const float *cp, int nc, float out[4][64]) {
+    float L[64], R[64];
+    for (int j = 0; j < 4; j++) /* rows: split in u */
+        for (int c = 0; c < nc; c++) {
+            float P0 = cp[(j * 4 + 0) * nc + c], P1 = cp[(j * 4 + 1) * nc + c],
+                  P2 = cp[(j * 4 + 2) * nc + c], P3 = cp[(j * 4 + 3) * nc + c];
+            float ab = 0.5f * (P0 + P1), bc = 0.5f * (P1 + P2), cd = 0.5f * (P2 + P3);
+            float abc = 0.5f * (ab + bc), bcd = 0.5f * (bc + cd), m = 0.5f * (abc + bcd);
+            L[(j * 4 + 0) * nc + c] = P0; L[(j * 4 + 1) * nc + c] = ab;
+            L[(j * 4 + 2) * nc + c] = abc; L[(j * 4 + 3) * nc + c] = m;
+            R[(j * 4 + 0) * nc + c] = m; R[(j * 4 + 1) * nc + c] = bcd;
+            R[(j * 4 + 2) * nc + c] = cd; R[(j * 4 + 3) * nc + c] = P3;
+        }
+    for (int a = 0; a < 2; a++) {
+        const float *H = a ? R : L;
+        for (int i = 0; i < 4; i++) /* columns: split in v */
+            for (int c = 0; c < nc; c++) {
+                float P0 = H[(0 * 4 + i) * nc + c], P1 = H[(1 * 4 + i) * nc + c],
+                      P2 = H[(2 * 4 + i) * nc + c], P3 = H[(3 * 4 + i) * nc + c];
+                float ab = 0.5f * (P0 + P1), bc = 0.5f * (P1 + P2), cd = 0.5f * (P2 + P3);
+                float abc = 0.5f * (ab + bc), bcd = 0.5f * (bc + cd), m = 0.5f * (abc + bcd);
+                float *B0 = out[2 * a + 0], *B1 = out[2 * a + 1];
+                B0[(0 * 4 + i) * nc + c] = P0; B0[(1 * 4 + i) * nc + c] = ab;
+                B0[(2 * 4 + i) * nc + c] = abc; B0[(3 * 4 + i) * nc + c] = m;
+                B1[(0 * 4 + i) * nc + c] = m; B1[(1 * 4 + i) * nc + c] = bcd;
+                B1[(2 * 4 + i) * nc + c] = cd; B1[(3 * 4 + i) * nc + c] = P3;
+            }
+    }
+}
+
 static int tri_bezpatch_isect_one(const float cp[48], const tri_ray_ctx *rc,
                                   float best_t, float *t_out, float *u_out,
                                   float *v_out) {
@@ -5214,10 +5206,12 @@ static int tri_bezpatch_isect_one(const float cp[48], const tri_ray_ctx *rc,
     struct {
         float u0, u1, v0, v1;
         int depth;
+        float sub[48]; /* this cell's control net */
     } stk[4 * BEZPATCH_REFINE + 4];
     int sp = 0;
     stk[sp].u0 = 0.0f; stk[sp].u1 = 1.0f; stk[sp].v0 = 0.0f; stk[sp].v1 = 1.0f;
     stk[sp].depth = 0;
+    memcpy(stk[sp].sub, cp, sizeof(float) * 48);
     sp++;
     float best = best_t;
     int hit = 0;
@@ -5236,8 +5230,9 @@ static int tri_bezpatch_isect_one(const float cp[48], const tri_ray_ctx *rc,
         float u0 = stk[sp].u0, u1 = stk[sp].u1, v0 = stk[sp].v0, v1 = stk[sp].v1;
         int depth = stk[sp].depth;
         float sub[48];
-        tri_bezpatch_subpatch(cp, u0, u1, v0, v1, sub);
-        /* conservative AABB = control hull of the sub-patch */
+        memcpy(sub, stk[sp].sub, sizeof sub);
+        /* conservative AABB = control hull of the sub-patch, widened by 16u
+         * for the rounding of the repeated midpoint splits */
         float lo[3] = {sub[0], sub[1], sub[2]}, hi[3] = {sub[0], sub[1], sub[2]};
         for (int k = 1; k < 16; k++)
             for (int a = 0; a < 3; a++) {
@@ -5245,6 +5240,10 @@ static int tri_bezpatch_isect_one(const float cp[48], const tri_ray_ctx *rc,
                 if (c < lo[a]) lo[a] = c;
                 if (c > hi[a]) hi[a] = c;
             }
+        for (int a = 0; a < 3; a++) {
+            lo[a] -= fabsf(lo[a]) * 0x1p-20f + 1e-30f;
+            hi[a] += fabsf(hi[a]) * 0x1p-20f + 1e-30f;
+        }
         /* ray/AABB slab test (clamped to [tmin, best]) */
         float tn = rc->tmin, tf = best;
         int miss = 0;
@@ -5304,11 +5303,14 @@ static int tri_bezpatch_isect_one(const float cp[48], const tri_ray_ctx *rc,
         float um = 0.5f * (u0 + u1), vm = 0.5f * (v0 + v1);
         const float uu[2][2] = {{u0, um}, {um, u1}};
         const float vv[2][2] = {{v0, vm}, {vm, v1}};
+        float kids[4][64];
+        tri_patch_split4(sub, 3, kids);
         for (int a = 0; a < 2; a++)
             for (int b = 0; b < 2; b++) {
                 stk[sp].u0 = uu[a][0]; stk[sp].u1 = uu[a][1];
                 stk[sp].v0 = vv[b][0]; stk[sp].v1 = vv[b][1];
                 stk[sp].depth = depth + 1;
+                memcpy(stk[sp].sub, kids[2 * a + b], sizeof(float) * 48);
                 sp++;
             }
     }
@@ -5336,49 +5338,6 @@ static inline void tri_bezpatch4_isect(const lrt_bezpatch4 *blk,
 /* ---- Rational bicubic Bézier (NURBS) patch ------------------------------
  * cp[64] = 16 homogeneous control points, point k = j*4+i, components
  * cp[k*4 + 0..3] = (w*x, w*y, w*z, w). */
-static void tri_bez_split4(const float c[16], float t, float L[16],
-                           float R[16]) {
-    for (int k = 0; k < 4; k++) {
-        float P0 = c[k], P1 = c[4 + k], P2 = c[8 + k], P3 = c[12 + k];
-        float ab = P0 + (P1 - P0) * t, bc = P1 + (P2 - P1) * t,
-              cd = P2 + (P3 - P2) * t;
-        float abc = ab + (bc - ab) * t, bcd = bc + (cd - bc) * t;
-        float abcd = abc + (bcd - abc) * t;
-        L[k] = P0; L[4 + k] = ab; L[8 + k] = abc; L[12 + k] = abcd;
-        R[k] = abcd; R[4 + k] = bcd; R[8 + k] = cd; R[12 + k] = P3;
-    }
-}
-static void tri_bez_subcurve4(const float c[16], float a, float b,
-                              float out[16]) {
-    float L[16], R[16];
-    tri_bez_split4(c, b, L, R);
-    if (a > 0.0f) {
-        float L2[16];
-        tri_bez_split4(L, a / b, L2, out);
-    } else {
-        memcpy(out, L, 16 * sizeof(float));
-    }
-}
-static void tri_rbezpatch_subpatch(const float cp[64], float umin, float umax,
-                                   float vmin, float vmax, float out[64]) {
-    float tmp[64];
-    for (int j = 0; j < 4; j++) {
-        float row[16], sub[16];
-        for (int i = 0; i < 4; i++)
-            for (int k = 0; k < 4; k++) row[i * 4 + k] = cp[(j * 4 + i) * 4 + k];
-        tri_bez_subcurve4(row, umin, umax, sub);
-        for (int i = 0; i < 4; i++)
-            for (int k = 0; k < 4; k++) tmp[(j * 4 + i) * 4 + k] = sub[i * 4 + k];
-    }
-    for (int i = 0; i < 4; i++) {
-        float col[16], sub[16];
-        for (int j = 0; j < 4; j++)
-            for (int k = 0; k < 4; k++) col[j * 4 + k] = tmp[(j * 4 + i) * 4 + k];
-        tri_bez_subcurve4(col, vmin, vmax, sub);
-        for (int j = 0; j < 4; j++)
-            for (int k = 0; k < 4; k++) out[(j * 4 + i) * 4 + k] = sub[j * 4 + k];
-    }
-}
 
 /* S(u,v) + partials via perspective divide of the homogeneous bicubic. */
 static inline void tri_rbezpatch_eval(const float cp[64], float u, float v,
@@ -5556,10 +5515,11 @@ static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
                                    uint32_t trim_nloops, float *t_out,
                                    float *u_out, float *v_out) {
     enum { RBEZ_MAXDEPTH = 4, RBEZ_REFINE = 7 }; /* refine a cell whose Newton fails */
-    struct { float u0, u1, v0, v1; int depth; } stk[4 * RBEZ_REFINE + 4];
+    struct { float u0, u1, v0, v1; int depth; float sub[64]; } stk[4 * RBEZ_REFINE + 4];
     int sp = 0;
     stk[sp].u0 = 0.0f; stk[sp].u1 = 1.0f; stk[sp].v0 = 0.0f; stk[sp].v1 = 1.0f;
     stk[sp].depth = 0;
+    memcpy(stk[sp].sub, cp, sizeof(float) * 64);
     sp++;
     float best = best_t;
     int hit = 0;
@@ -5578,7 +5538,7 @@ static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
         float u0 = stk[sp].u0, u1 = stk[sp].u1, v0 = stk[sp].v0, v1 = stk[sp].v1;
         int depth = stk[sp].depth;
         float sub[64];
-        tri_rbezpatch_subpatch(cp, u0, u1, v0, v1, sub);
+        memcpy(sub, stk[sp].sub, sizeof sub);
         float lo[3], hi[3];
         for (int a = 0; a < 3; a++) {
             float p = sub[a] / sub[3];
@@ -5598,8 +5558,8 @@ static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
          * widening the finished bounds by 8u of their magnitude (+ a tiny
          * absolute term for subnormals) is conservative and costs 6 ops. */
         for (int a = 0; a < 3; a++) {
-            lo[a] -= fabsf(lo[a]) * 0x1p-21f + 1e-30f;
-            hi[a] += fabsf(hi[a]) * 0x1p-21f + 1e-30f;
+            lo[a] -= fabsf(lo[a]) * 0x1p-20f + 1e-30f;
+            hi[a] += fabsf(hi[a]) * 0x1p-20f + 1e-30f;
         }
 #endif
         float tn = rc->tmin, tf = best;
@@ -5661,11 +5621,14 @@ static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
         float um = 0.5f * (u0 + u1), vm = 0.5f * (v0 + v1);
         const float uu[2][2] = {{u0, um}, {um, u1}};
         const float vv[2][2] = {{v0, vm}, {vm, v1}};
+        float kids[4][64];
+        tri_patch_split4(sub, 4, kids);
         for (int a = 0; a < 2; a++)
             for (int b = 0; b < 2; b++) {
                 stk[sp].u0 = uu[a][0]; stk[sp].u1 = uu[a][1];
                 stk[sp].v0 = vv[b][0]; stk[sp].v1 = vv[b][1];
                 stk[sp].depth = depth + 1;
+                memcpy(stk[sp].sub, kids[2 * a + b], sizeof(float) * 64);
                 sp++;
             }
     }
