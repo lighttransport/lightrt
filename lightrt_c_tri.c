@@ -4357,7 +4357,7 @@ static int tri_bez_leaf_trace(const float cp[16], const float dir[3], float tmin
 static int tri_bez_leaf_solve(const float cp[16], const float dir[3], float tmin,
                               float best, float a, float b, const float P0p[3],
                               float r0c, const float P3p[3], float r3c,
-                              float *t_out, float *u_out) {
+                              float *t_out, float *u_out, int anyhit) {
     float tseg, s;
     if (!tri_cone_seed(dir, tmin, best, P0p, r0c, P3p, r3c, &tseg, &s)) return 0;
     float th, uh;
@@ -4371,6 +4371,13 @@ static int tri_bez_leaf_solve(const float cp[16], const float dir[3], float tmin
      * leaf's end balls (u pinned at a or b, where F != 0) are only found by the
      * u-restricted sphere trace below. */
     int inleaf = uh >= a - slack && uh <= b + slack;
+    /* any-hit (shadow rays): any converged, residual-verified surface point in
+     * [tmin, best) with u in [0,1] proves occlusion; nearest-ness is moot */
+    if (anyhit && nr == 1) {
+        *t_out = th;
+        *u_out = uh;
+        return 1;
+    }
     if (nr == 1 && front && inleaf) {
         *t_out = th;
         *u_out = uh;
@@ -4472,7 +4479,7 @@ static int tri_cone_seed(const float dir[3], float tmin, float best,
 }
 
 static int tri_bez_isect_one(const float cp_in[16], const tri_ray_ctx *rc,
-                             float best_t, float *t_out, float *u_out) {
+                             float best_t, float *t_out, float *u_out, int anyhit) {
     /* translate control points to ray-local space (ray origin at 0) */
     float cp[16];
     for (int k = 0; k < 4; k++) {
@@ -4573,10 +4580,11 @@ static int tri_bez_isect_one(const float cp_in[16], const tri_ray_ctx *rc,
                       P3p[3] = {Pb[0], Pb[1], Pb[2]};
                 float th, uh;
                 if (tri_bez_leaf_solve(cp, dir, tmin, best, a, b, P0p, r0c, P3p,
-                                       r3c, &th, &uh)) {
+                                       r3c, &th, &uh, anyhit)) {
                     best = th;
                     bu = uh;
                     hit = 1;
+                    if (anyhit) break;
                 }
             }
         } else {
@@ -4600,7 +4608,7 @@ static int tri_bez_isect_one(const float cp_in[16], const tri_ray_ctx *rc,
 
 static inline void tri_bez4_isect(const lrt_bez4 *blk, const tri_ray_ctx *rc,
                                   float *best_t, float *best_u,
-                                  uint32_t *best_prim) {
+                                  uint32_t *best_prim, int anyhit) {
     for (int lane = 0; lane < 4; lane++) {
         if (blk->prim[lane] == LRT_TRI_NO_HIT) continue;
         float cp[16] = {
@@ -4609,10 +4617,11 @@ static inline void tri_bez4_isect(const lrt_bez4 *blk, const tri_ray_ctx *rc,
             blk->b2x[lane], blk->b2y[lane], blk->b2z[lane], blk->b2r[lane],
             blk->b3x[lane], blk->b3y[lane], blk->b3z[lane], blk->b3r[lane]};
         float t, u;
-        if (tri_bez_isect_one(cp, rc, *best_t, &t, &u)) {
+        if (tri_bez_isect_one(cp, rc, *best_t, &t, &u, anyhit)) {
             *best_t = t;
             *best_u = u;
             *best_prim = blk->prim[lane];
+            if (anyhit) return;
         }
     }
 }
@@ -5784,7 +5793,7 @@ static int tri_intersect_scalar(const lrt_tri_scene *s, const lrt_ray *ray,
                 const lrt_bez4 *blocks = (const lrt_bez4 *)s->blocks;
                 for (uint32_t b = 0; b < nblk; b++) {
                     tri_bez4_isect(&blocks[blk0 + b], &rc, &best_t, &best_u,
-                                   &best_prim);
+                                   &best_prim, 0);
                 }
                 continue;
             }
@@ -6034,7 +6043,7 @@ static int tri_occluded_scalar(const lrt_tri_scene *s, const lrt_ray *ray) {
                 for (uint32_t b = 0; b < nblk; b++) {
                     float t = t_max, u = 0.0f;
                     uint32_t prim = LRT_TRI_NO_HIT;
-                    tri_bez4_isect(&blocks[blk0 + b], &rc, &t, &u, &prim);
+                    tri_bez4_isect(&blocks[blk0 + b], &rc, &t, &u, &prim, 1);
                     if (prim != LRT_TRI_NO_HIT) return 1;
                 }
                 continue;
@@ -7646,7 +7655,7 @@ static inline void tri_bez_eval4u(const __m128 C[16], __m128 u, __m128 P[4],
  * This vectorizes the broad phase that the scalar tri_bez_isect_one does one
  * interval at a time, so low pre-subdivision (K small) stays fast. */
 static int tri_bez_sweep_sse(const float cp_world[16], const tri_ray_ctx *rc,
-                             float best_t, float *t_out, float *u_out) {
+                             float best_t, float *t_out, float *u_out, int anyhit) {
     const __m128 Z = _mm_setzero_ps(), ONE = _mm_set1_ps(1.0f);
     float cpl[16];
     __m128 C[16];
@@ -7765,10 +7774,11 @@ static int tri_bez_sweep_sse(const float cp_world[16], const tri_ray_ctx *rc,
                     float th, uh;
                     (void)hL;
                     if (tri_bez_leaf_solve(cpl, dir, tmin, best, u0, u1, P0p, r0c,
-                                           P3p, r3c, &th, &uh)) {
+                                           P3p, r3c, &th, &uh, anyhit)) {
                         best = th;
                         bu = uh;
                         hit = 1;
+                        if (anyhit) { sp = 0; break; }
                     }
                 }
             } else {
@@ -7794,7 +7804,7 @@ static int tri_bez_sweep_sse(const float cp_world[16], const tri_ray_ctx *rc,
 
 static inline void tri_bez4_isect_sse(const lrt_bez4 *blk, const tri_ray_ctx *rc,
                                       const tri_sse_ctx *sc, float *best_t,
-                                      float *best_u, uint32_t *best_prim) {
+                                      float *best_u, uint32_t *best_prim, int anyhit) {
     const __m128 Z = _mm_setzero_ps();
     const __m128 ONE = _mm_set1_ps(1.0f);
     __m128 dirx = sc->dirx, diry = sc->diry, dirz = sc->dirz;
@@ -7910,10 +7920,11 @@ static inline void tri_bez4_isect_sse(const lrt_bez4 *blk, const tri_ray_ctx *rc
         float cp[16];
         for (int k = 0; k < 16; k++) cp[k] = src[k][lane];
         float t, u;
-        if (tri_bez_sweep_sse(cp, rc, *best_t, &t, &u)) {
+        if (tri_bez_sweep_sse(cp, rc, *best_t, &t, &u, anyhit)) {
             *best_t = t;
             *best_u = u;
             *best_prim = blk->prim[lane];
+            if (anyhit) return;
         }
     }
 }
@@ -7941,7 +7952,7 @@ static int tri_bezcurve_intersect_bvh4(const lrt_tri_scene *s,
             const lrt_bez4 *blocks = (const lrt_bez4 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++)
                 tri_bez4_isect_sse(&blocks[blk0 + b], &rc, &sc, &best_t, &best_u,
-                                   &best_prim);
+                                   &best_prim, 0);
             continue;
         }
         const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(e.ref)];
@@ -7986,7 +7997,7 @@ static int tri_bezcurve_occluded_bvh4(const lrt_tri_scene *s,
             for (uint32_t b = 0; b < nblk; b++) {
                 float t = t_max, u = 0.0f;
                 uint32_t prim = LRT_TRI_NO_HIT;
-                tri_bez4_isect_sse(&blocks[blk0 + b], &rc, &sc, &t, &u, &prim);
+                tri_bez4_isect_sse(&blocks[blk0 + b], &rc, &sc, &t, &u, &prim, 1);
                 if (prim != LRT_TRI_NO_HIT) return 1;
             }
             continue;

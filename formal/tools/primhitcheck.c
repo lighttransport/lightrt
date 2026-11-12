@@ -226,7 +226,7 @@ static int tess_trace(const double (*g)[3], const double o[3], const double d[3]
 /* ---------- per-kind driver ---------- */
 typedef struct {
     const char *name;
-    int hits, rays, mism, mism_graze, tdiff_bad, c_farther, ref_artifact;
+    int hits, rays, mism, mism_graze, tdiff_bad, c_farther, ref_artifact, occ_bad;
     double max_dt, max_res, res[1 << 16];
     int nres;
 } stat_t;
@@ -245,15 +245,16 @@ static int finish(stat_t *st, double res_tol, int loose) {
     for (int i = 0; i < st->nres; i++) nbig += st->res[i] > res_tol;
     /* loose: the documented cone fallback (ill-conditioned Newton) is approximate */
     int fail = loose ? nbig > 0.002 * st->hits : st->max_res > res_tol;
+    fail |= st->occ_bad > 0; /* occluded1 disagrees with both C closest-hit and the reference */
     if (loose) fail |= st->c_farther > 0.005 * st->hits || nongraze > 0.005 * st->rays;
     /* strict: C never returns a FARTHER hit than the reference. A NEARER one
      * with a tiny residual is a reference limitation (the 128x128 patch
      * tessellation can miss a silhouette sliver), not a C error. */
     else fail |= st->c_farther > 0 || nongraze > 0.002 * st->rays;
     printf("%-9s rays=%d hits=%d hit/miss-vs-ref=%d (grazing %d) t>tol=%d (C farther %d) max|dt|=%.2e "
-           "residual max=%.2e p99.9=%.2e (>%.0e: %d) tess-artifacts=%d%s\n",
+           "residual max=%.2e p99.9=%.2e (>%.0e: %d) tess-artifacts=%d occ-bad=%d%s\n",
            st->name, st->rays, st->hits, st->mism, st->mism_graze, st->tdiff_bad, st->c_farther, st->max_dt,
-           st->max_res, p999, res_tol, nbig, st->ref_artifact, fail ? "  FAIL" : "");
+           st->max_res, p999, res_tol, nbig, st->ref_artifact, st->occ_bad, fail ? "  FAIL" : "");
     return fail;
 }
 
@@ -294,6 +295,10 @@ static int run_tubes(const char *name, lrt_tri_scene *s, tube_t *tub, int n, int
             if (!slab64(o, d, lo, hi, 0, best, &t0, &t1)) continue;
             if (tube_trace(&tub[p], o, d, t0, fmin(t1, best), &th)) { best = th; hk = 1; }
         }
+        /* any-hit must agree with the exact reference on existence (a grazing
+         * disagreement is tolerated like the closest-hit one, below) */
+        int occ = lrt_tri_occluded1(s, &ray);
+        if (occ != hk && occ != k) st.occ_bad++;
         /* grazing: closest approach of the ray to the surface near the C/ref answer */
         st.rays++;
         if (k) {
