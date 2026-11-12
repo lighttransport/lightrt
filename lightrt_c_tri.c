@@ -12479,7 +12479,11 @@ void lrt_tri_occluded1N(const lrt_tri_scene *s, const lrt_ray *rays,
         return;
     }
 #if LRT_TRI_HAS_AVX2
-    if (s->layout == 8 && hint != LRT_TRI_BATCH_COHERENT) {
+    /* The interleaved any-hit pipeline wins only once the BVH is cache-cold:
+     * measured crossover ~250k-500k triangles (bench_occ; per-ray is 11-14%
+     * faster below it). Explicit LRT_TRI_BATCH_INCOHERENT always interleaves. */
+    if (s->layout == 8 && hint != LRT_TRI_BATCH_COHERENT &&
+        (hint == LRT_TRI_BATCH_INCOHERENT || s->original_ntris >= 300000u)) {
         tri_occluded1N_bvh8_avx2(s, rays, occluded, n);
         return;
     }
