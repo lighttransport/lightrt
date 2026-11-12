@@ -230,7 +230,7 @@ int main(int argc, char **argv) {
     return fail("sRGB decode", sample);
   }
 
-  char xml[4096];
+  char xml[8192];
   snprintf(xml, sizeof(xml),
       "<materialx version=\"1.39\">"
       "<image name=\"sample\" type=\"color3\">"
@@ -253,7 +253,15 @@ int main(int argc, char **argv) {
       "<input name=\"file\" type=\"filename\" value=\"%s\"/>"
       "<input name=\"default\" type=\"color3\" value=\"0.1, 0.2, 0.3\"/>"
       "<input name=\"realworldimagesize\" type=\"vector2\" value=\"0, 2\"/>"
-      "</tiledimage></materialx>", filename, filename, filename);
+      "</tiledimage>"
+      "<transformmatrix name=\"acescg_to_rec709\" type=\"vector3\">"
+      "<input name=\"in\" type=\"vector3\" value=\"0.25, 0.5, 0.75\"/>"
+      "<input name=\"mat\" type=\"matrix33\" value=\"1.705050992658, -0.130256417507, -0.024003356805, -0.621792120657, 1.140804736575, -0.128968976065, -0.083258872001, -0.010548319068, 1.15297233287\"/>"
+      "</transformmatrix>"
+      "<transformmatrix name=\"linear_adobergb_to_rec709\" type=\"vector3\">"
+      "<input name=\"in\" type=\"vector3\" value=\"0.25, 0.5, 0.75\"/>"
+      "<input name=\"mat\" type=\"matrix33\" value=\"1.39835574e+00, -2.50233861e-16, 2.77555756e-17, -3.98355744e-01, 1.00000000e+00, -4.29289893e-02, 0.00000000e+00, 0.00000000e+00, 1.04292899e+00\"/>"
+      "</transformmatrix></materialx>", filename, filename, filename);
   MtlxDoc *doc = mtlx_load_string(xml);
   if (!doc) {
     texcache_free(cache);
@@ -264,9 +272,12 @@ int main(int argc, char **argv) {
   const int node = mtlx_find_node(doc, -1, "sample");
   const int tiled_node = mtlx_find_node(doc, -1, "tiled");
   const int tiled_zero_node = mtlx_find_node(doc, -1, "tiled_zero");
+  const int aces_matrix_node = mtlx_find_node(doc, -1, "acescg_to_rec709");
+  const int adobe_matrix_node = mtlx_find_node(doc, -1, "linear_adobergb_to_rec709");
   MtlxValue *memo = (MtlxValue *)calloc((size_t)doc->nnode, sizeof(MtlxValue));
   char *memo_done = (char *)calloc((size_t)doc->nnode, sizeof(char));
-  if (node < 0 || tiled_node < 0 || tiled_zero_node < 0 || !memo || !memo_done) {
+  if (node < 0 || tiled_node < 0 || tiled_zero_node < 0 ||
+      aces_matrix_node < 0 || adobe_matrix_node < 0 || !memo || !memo_done) {
     free(memo);
     free(memo_done);
     mtlx_free(doc);
@@ -283,6 +294,32 @@ int main(int argc, char **argv) {
   context.uv[1] = 0.75f;
   context.memo = memo;
   context.memo_done = memo_done;
+  const MtlxValue aces_matrix =
+      mtlx_eval_node_test(&context, aces_matrix_node);
+  memset(memo_done, 0, (size_t)doc->nnode * sizeof(char));
+  const MtlxValue adobe_matrix =
+      mtlx_eval_node_test(&context, adobe_matrix_node);
+  const int matrix_ok =
+      aces_matrix.type == MV_VEC3 &&
+      near(aces_matrix.v[0], 0.052922534f, 2e-6f) &&
+      near(aces_matrix.v[1], 0.529927025f, 2e-6f) &&
+      near(aces_matrix.v[2], 0.794243922f, 2e-6f) &&
+      adobe_matrix.type == MV_VEC3 &&
+      near(adobe_matrix.v[0], 0.150411063f, 2e-6f) &&
+      near(adobe_matrix.v[1], 0.5f, 2e-6f) &&
+      near(adobe_matrix.v[2], 0.760732248f, 2e-6f);
+  if (!matrix_ok) {
+    fprintf(stderr, "FAIL: cmlib color-space matrix result (ACES %.7f %.7f %.7f; Adobe %.7f %.7f %.7f)\n",
+            aces_matrix.v[0], aces_matrix.v[1], aces_matrix.v[2],
+            adobe_matrix.v[0], adobe_matrix.v[1], adobe_matrix.v[2]);
+    free(memo);
+    free(memo_done);
+    mtlx_free(doc);
+    texcache_free(cache);
+    remove(argv[1]);
+    return 1;
+  }
+  memset(memo_done, 0, (size_t)doc->nnode * sizeof(char));
   const MtlxValue fallback = mtlx_eval_node_test(&context, node);
   const int fallback_ok = fallback.type == MV_COLOR3 &&
       near(fallback.v[0], 0.1f, 1e-6f) &&
@@ -320,7 +357,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  char odd_path[1024], odd_filename[1024];
+  char odd_path[1032], odd_filename[1032];
   snprintf(odd_path, sizeof(odd_path), "%s.odd.ppm", argv[1]);
   snprintf(odd_filename, sizeof(odd_filename), "%s.odd.ppm", filename);
   FILE *odd_image = fopen(odd_path, "wb");
@@ -363,6 +400,6 @@ int main(int argc, char **argv) {
   texcache_free(cache);
   remove(odd_path);
   remove(argv[1]);
-  puts("PASS: nearest/bilinear/cubic, derivative footprint, mip generation/LOD, UV orientation, addressing, and sRGB sampling");
+  puts("PASS: nearest/bilinear/cubic, derivative footprint, mip generation/LOD, color matrices, UV orientation, addressing, and sRGB sampling");
   return 0;
 }
