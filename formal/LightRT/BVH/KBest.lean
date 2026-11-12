@@ -5,10 +5,13 @@
   * `ins` / `kbest`: the sorted insertion buffer and the list-level k-best fold;
   * `runN` / `pruneOf`: the loop shape (buffer threaded through the stack,
     pruning by the k-th buffer value), with `runN` mirroring the C loop;
-  * `runN_sound`: every hit the loop reports is a real primitive hit.
-
-  Completeness (every hit strictly below the returned k-th is reported) and the
-  k-best specification of `kbest` are the remaining pieces.
+  * `runN_sound`: every hit the loop reports is a real primitive hit;
+  * `kbest_omitted` / `KInv`: the k-best-by-value specification (the k-th
+    buffer value is nonincreasing under insertion; an omitted element is at
+    least the k-th kept value);
+  * `runN_complete`: every hit of the root's primitives strictly below the
+    returned k-th value is reported (no false misses), under the same C1/C2
+    and `WF` hypotheses as `Flat.run_root`.
 -/
 import LightRT.BVH.Flat
 
@@ -626,6 +629,233 @@ theorem runN_sound {B : Type} (F : Flat B α) (test : B → T → Option T) (ise
       · cases r with
         | leaf blk n => exact ih st tmax _ (foldBInv isect k tmax (F.leafPrims blk n) buf hb)
         | node i => exact ih _ tmax buf hb
+
+theorem hitList_filterMap (isect : α → Option T) (ps : List α) :
+    hitList isect ps = ps.filterMap (fun p => (isect p).map (p, ·)) := by
+  induction ps with
+  | nil => rfl
+  | cons p ps ih =>
+    simp only [hitList, List.filterMap_cons]
+    cases hp : isect p <;> simp [hp, ih]
+
+theorem hitList_perm {isect : α → Option T} {l₁ l₂ : List α} (h : l₁.Perm l₂) :
+    (hitList isect l₁).Perm (hitList isect l₂) := by
+  rw [hitList_filterMap, hitList_filterMap]
+  exact List.Perm.filterMap _ h
+
+theorem runN_KInv {B : Type} (F : Flat B α) (test : B → T → Option T)
+    (isect : α → Option T) (order : List (CRef × T) → List (CRef × T))
+    (k : ℕ) (h0 : 0 < k) (tmax : T) (hits : ∀ p t, isect p = some t → t < tmax)
+    {inside : α → B → Prop} {sub : B → B → Prop} (hw : F.WF inside sub)
+    (mono : ∀ p b b', inside p b' → sub b' b → inside p b)
+    (C1 : ∀ p b t best, inside p b → isect p = some t → t < best → (test b best).isSome)
+    (C2 : ∀ p b t best tn, test b best = some tn → inside p b → isect p = some t → t < best → tn ≤ t)
+    (hord : ∀ l, (order l).Perm l) :
+    ∀ (f : ℕ) (st : List (CRef × T)) (buf seen : List (α × T)),
+      KInv k tmax seen buf → (∀ z ∈ buf, z.2 < tmax) →
+      (∀ e ∈ st, (∀ j, e.1 = .node j → j < F.nodes.length) ∧
+        ∀ p ∈ F.denRef e.1, ∀ t, isect p = some t → t < pruneOf k buf tmax → e.2 ≤ t) →
+      (st.map (F.visitsRef ∘ Prod.fst)).sum < f →
+      KInv k tmax (hitList isect (st.flatMap (F.denRef ∘ Prod.fst)) ++ seen)
+        (runN F test isect order k f st tmax buf) := by
+  intro f
+  induction f with
+  | zero => intro st buf seen _ _ _ hf; omega
+  | succ f ih =>
+    intro st buf seen hK hv hvi hf
+    match st with
+    | [] => simpa [runN, hitList] using hK
+    | (r, tn) :: st =>
+      have hr := hvi (r, tn) (by simp)
+      have hvi_st : ∀ e ∈ st, (∀ j, e.1 = .node j → j < F.nodes.length) ∧
+          ∀ p ∈ F.denRef e.1, ∀ t, isect p = some t → t < pruneOf k buf tmax → e.2 ≤ t :=
+        fun e he => hvi e (by simp [he])
+      simp only [runN]
+      split_ifs with hskip
+      · rw [List.flatMap_cons, hitList_append, List.append_assoc]
+        -- skipped entry: its hits are all >= prune
+        have hge : ∀ z ∈ hitList isect (F.denRef r), pruneOf k buf tmax ≤ z.2 := by
+          intro z hz
+          obtain ⟨h1, h2⟩ := mem_hitList.1 hz
+          by_contra hlt
+          have hlt' : z.2 < pruneOf k buf tmax := lt_of_not_ge hlt
+          exact absurd (hr.2 z.1 h1 z.2 h2 hlt') (not_le.2 (lt_of_lt_of_le hlt' hskip))
+        have hs := hK.1; have hl := hK.2.1
+        have hpr := runN_prune_le F test isect order k tmax hits f st buf hs hl hv
+        have ih' := ih st buf seen hK hv hvi_st (by
+          have := F.visitsRef_pos r
+          simp only [List.map_cons, List.sum_cons, Function.comp] at hf ⊢; omega)
+        refine KInv_perm ?_ (List.Perm.refl _)
+        refine KInv_add_ge ih' ?_
+        intro z hz hzb
+        obtain ⟨h1, h2⟩ := mem_hitList.1 hz
+        have hzlt : z.2 < tmax := hits z.1 z.2 h2
+        have hfull : (runN F test isect order k f st tmax buf).length = k := by
+          by_contra hne
+          have hlt : (runN F test isect order k f st tmax buf).length < k := by
+            have := ih'.2.1; omega
+          have hpru : pruneOf k (runN F test isect order k f st tmax buf) tmax = tmax := by
+            unfold pruneOf; rw [if_neg (by omega)]
+          rw [hpru] at hpr
+          have hgz := hge z hz
+          exact absurd (le_trans hpr hgz) (not_le.2 hzlt)
+        exact ⟨hfull, le_trans hpr (hge z hz)⟩
+      · cases r with
+        | leaf blk n =>
+          have hK' : KInv k tmax (hitList isect (F.leafPrims blk n) ++ seen)
+              ((F.leafPrims blk n).foldl (stepN isect k tmax) buf) :=
+            foldN_KInv h0 isect tmax (F.leafPrims blk n) hits seen buf hK
+          have hv' := fold_valuesN isect k tmax (F.leafPrims blk n) hits buf hv
+          have hpr := fold_prune_le isect k tmax (F.leafPrims blk n) buf hK.1 hK.2.1 hv hits
+          have ih' := ih st _ (hitList isect (F.leafPrims blk n) ++ seen) hK' hv'
+            (fun e he => ⟨(hvi_st e he).1, fun p hp t ht hlt =>
+              (hvi_st e he).2 p hp t ht (lt_of_lt_of_le hlt hpr)⟩)
+            (by simp only [List.map_cons, List.sum_cons, Function.comp, Flat.visitsRef] at hf ⊢; omega)
+          rw [List.flatMap_cons, hitList_append, List.append_assoc]
+          refine KInv_perm ih' ?_
+          show (hitList isect (st.flatMap (F.denRef ∘ Prod.fst)) ++
+                  (hitList isect (F.leafPrims blk n) ++ seen)).Perm
+                (hitList isect (F.leafPrims blk n) ++
+                  (hitList isect (st.flatMap (F.denRef ∘ Prod.fst)) ++ seen))
+          exact (List.Perm.of_eq (List.append_assoc _ _ _).symm).trans
+            ((List.perm_append_comm.append_right seen).trans
+              (List.Perm.of_eq (List.append_assoc _ _ _)))
+        | node i =>
+          have hi : i < F.nodes.length := hr.1 i rfl
+          dsimp only
+          set prune := pruneOf k buf tmax with hprune
+          set X := (F.children i).filterMap
+            (fun c => (test c.1 prune).map (c.2, ·)) with hX
+          obtain ⟨hX1, hX2⟩ := Flat.filterMap_facts F test prune (F.children i)
+          rw [← hX] at hX1 hX2
+          set P : B × CRef → Bool := fun c => (test c.1 prune).isSome with hP
+          have hviX : ∀ e ∈ order X ++ st,
+              (∀ j, e.1 = .node j → j < F.nodes.length) ∧
+                ∀ p ∈ F.denRef e.1, ∀ t, isect p = some t →
+                  t < pruneOf k buf tmax → e.2 ≤ t := by
+            intro e he
+            rcases List.mem_append.1 he with he | he
+            · have he' := (hord X).mem_iff.1 he
+              rw [hX, List.mem_filterMap] at he'
+              obtain ⟨c, hc, hce⟩ := he'
+              cases htc : test c.1 prune with
+              | none => simp [htc] at hce
+              | some tn' =>
+                simp only [htc, Option.map_some, Option.some.injEq] at hce
+                subst hce
+                refine ⟨fun j hj => ?_, fun p hp t ht hlt =>
+                  C2 p c.1 t prune tn' htc (Flat.den_inside hw mono i hi c hc p hp) ht
+                    (by simpa [hprune] using hlt)⟩
+                have hw2 := hw.2 i hi c hc
+                rcases c with ⟨b, r⟩; simp only at hj; subst hj
+                exact hw2.2.1
+            · exact hvi_st e he
+          have hdrop : ∀ z ∈ hitList isect
+                (((F.children i).filter fun c => !P c).flatMap
+                  (F.denRef ∘ Prod.snd)), prune ≤ z.2 := by
+            intro z hz
+            obtain ⟨h1, h2⟩ := mem_hitList.1 hz
+            rw [List.mem_flatMap] at h1
+            obtain ⟨c, hc, hcc⟩ := h1
+            rw [List.mem_filter] at hc
+            by_contra hlt
+            have hlt' : z.2 < prune := lt_of_not_ge hlt
+            have hc1 := C1 z.1 c.1 z.2 prune
+              (Flat.den_inside hw mono i hi c hc.1 z.1 hcc) h2 (by simpa [hprune] using hlt')
+            simp [hP, hc1] at hc
+          have hdropSeen : KInv k tmax
+              (hitList isect (((F.children i).filter fun c => !P c).flatMap
+                (F.denRef ∘ Prod.snd)) ++ seen) buf := by
+            refine KInv_add_ge hK ?_
+            intro z hz hzb
+            obtain ⟨h1, h2⟩ := mem_hitList.1 hz
+            have hzlt : z.2 < tmax := hits z.1 z.2 h2
+            have hge := hdrop z hz
+            have hfull : buf.length = k := by
+              by_contra hne
+              have hlt : buf.length < k := by have := hK.2.1; omega
+              have hpru : pruneOf k buf tmax = tmax := by
+                unfold pruneOf; rw [if_neg (by omega)]
+              have hpru' : prune = tmax := by rw [hprune]; exact hpru
+              rw [hpru'] at hge
+              exact absurd hge (not_le.2 hzlt)
+            exact ⟨hfull, hge⟩
+          have ih' := ih (order X ++ st) buf
+            (hitList isect (((F.children i).filter fun c => !P c).flatMap
+              (F.denRef ∘ Prod.snd)) ++ seen) hdropSeen hv hviX (by
+              have hvi : F.visitsRef (.node i) =
+                  1 + ((F.children i).map (F.visitsRef ∘ Prod.snd)).sum := by
+                show F.visits i = _
+                rw [Flat.visits_wf hw hi]
+                rfl
+              simp only [Function.comp_apply, List.map_cons, List.sum_cons] at hf hX2 ⊢
+              rw [hvi] at hf
+              rw [List.map_append, List.sum_append, ((hord X).map _).sum_eq]
+              omega)
+          rw [List.flatMap_cons, hitList_append, List.append_assoc]
+          rw [Function.comp_apply]
+          dsimp only
+          rw [show F.denRef (.node i) = (F.children i).flatMap (F.denRef ∘ Prod.snd) from by
+            rw [show F.denRef (.node i) = F.den i from rfl, Flat.den_wf hw hi]; rfl]
+          set A := hitList isect (((F.children i).filter P).flatMap (F.denRef ∘ Prod.snd)) with hA
+          set B := hitList isect
+            (((F.children i).filter fun c => !P c).flatMap (F.denRef ∘ Prod.snd)) with hB
+          set C := hitList isect (st.flatMap (F.denRef ∘ Prod.fst)) with hC
+          set D := seen with hD
+          set O := hitList isect (order X |>.flatMap (F.denRef ∘ Prod.fst)) with hO
+          rw [List.flatMap_append, hitList_append] at ih'
+          change KInv k tmax ((O ++ C) ++ (B ++ D))
+            (runN F test isect order k f (order X ++ st) tmax buf) at ih'
+          have hordX : O.Perm A := by
+            have h := hitList_perm (α := α) (T := T) (isect := isect) ((hord X).flatMap_right (F.denRef ∘ Prod.fst))
+            rw [hX1] at h
+            exact h
+          have hsplitHits : (hitList isect ((F.children i).flatMap (F.denRef ∘ Prod.snd))).Perm (A ++ B) := by
+            have h := hitList_perm (α := α) (T := T) (isect := isect) ((List.filter_append_perm P (F.children i)).symm.flatMap_right
+              (F.denRef ∘ Prod.snd))
+            rw [List.flatMap_append, hitList_append] at h
+            exact h
+          have hswap : (C ++ (B ++ D)).Perm (B ++ (C ++ D)) :=
+            (List.Perm.of_eq (List.append_assoc C B D).symm).trans
+              ((List.perm_append_comm.append_right D).trans
+                (List.Perm.of_eq (List.append_assoc B C D)))
+          have ihP : ((O ++ C) ++ (B ++ D)).Perm (((A ++ B) ++ C) ++ D) := by
+            have h1 : ((O ++ C) ++ (B ++ D)).Perm ((A ++ C) ++ (B ++ D)) :=
+              (hordX.append_right C).append_right (B ++ D)
+            have h2 : ((A ++ C) ++ (B ++ D)).Perm (((A ++ B) ++ C) ++ D) := by
+              simpa [List.append_assoc] using (List.Perm.append_left A hswap)
+            exact h1.trans h2
+          have goalP : ((hitList isect ((F.children i).flatMap (F.denRef ∘ Prod.snd)) ++ C) ++ D).Perm
+              (((A ++ B) ++ C) ++ D) :=
+            (hsplitHits.append_right C).append_right D
+          refine KInv_perm ih' ?_
+          simpa only [List.append_assoc] using ihP.trans goalP.symm
+
+theorem runN_complete {B : Type} (F : Flat B α) (test : B → T → Option T)
+    (isect : α → Option T) (order : List (CRef × T) → List (CRef × T))
+    (k : ℕ) (h0 : 0 < k) (tmax : T) (hits : ∀ p t, isect p = some t → t < tmax)
+    {inside : α → B → Prop} {sub : B → B → Prop} (hw : F.WF inside sub)
+    (mono : ∀ p b b', inside p b' → sub b' b → inside p b)
+    (C1 : ∀ p b t best, inside p b → isect p = some t → t < best → (test b best).isSome)
+    (C2 : ∀ p b t best tn, test b best = some tn → inside p b → isect p = some t → t < best → tn ≤ t)
+    (hord : ∀ l, (order l).Perm l)
+    (tmin : T) (htmin : ∀ p ∈ F.denRef F.root, ∀ t, isect p = some t → tmin ≤ t) :
+    ∀ p ∈ F.denRef F.root, ∀ t, isect p = some t → t < pruneOf k
+        (runN F test isect order k (F.visitsRef F.root + 1) [(F.root, tmin)] tmax []) tmax →
+      (p, t) ∈ runN F test isect order k (F.visitsRef F.root + 1) [(F.root, tmin)] tmax [] := by
+  intro p hp t ht hpr
+  have h := runN_KInv F test isect order k h0 tmax hits hw mono C1 C2 hord
+    (F.visitsRef F.root + 1) [(F.root, tmin)] [] [] (kInv_nil (α := α) k tmax) (by simp)
+    (fun e he => by
+      rw [List.mem_singleton] at he; subst he
+      refine ⟨fun j hj => ?_, fun q hq u hu _ => htmin q hq u hu⟩
+      exact hw.1 j (by simpa using hj))
+    (by simp)
+  have hm : (p, t) ∈ hitList isect (F.denRef F.root) :=
+    (mem_hitList (isect := isect)).2 ⟨hp, ht⟩
+  by_contra hnot
+  have hc := h.2.2 (p, t) (by simpa using hm) hnot
+  exact absurd hc.2 (not_le.2 hpr)
 
 end KBest
 end LightRT.BVH
