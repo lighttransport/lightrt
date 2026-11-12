@@ -1227,23 +1227,10 @@ static v3 eval_edf(ShadeContext *ctx, const MtlxNode *n, int depth) {
         return v3_lerp(bg, fg, amount);
     }
     if (!strcmp(cat, "multiply")) {
-        const MtlxNode *a = input_node(ctx, n, "in1");
-        const MtlxNode *b = input_node(ctx, n, "in2");
-        const MtlxInput *a_input = find_input(n, "in1");
-        const MtlxInput *b_input = find_input(n, "in2");
-        if (a && b && a_input && b_input && a_input->src_node >= 0 &&
-            b_input->src_node >= 0) {
-            return v3_mul(eval_edf(ctx, a, depth + 1),
-                          eval_edf(ctx, b, depth + 1));
-        }
-        const MtlxInput *scalar = a ? b_input : a_input;
-        if (scalar) {
-            MtlxValue value = eval_input(ctx, scalar);
-            return v3_mul(eval_edf(ctx, a ? a : b, depth + 1),
-                          mv_as_v3(&value));
-        }
-        return v3_mul(eval_edf(ctx, a, depth + 1),
-                      eval_edf(ctx, b, depth + 1));
+        const MtlxInput *weight = find_input(n, "in2");
+        const MtlxValue value = weight ? eval_input(ctx, weight) : mv_float(1.0f);
+        return v3_mul(eval_edf(ctx, input_node(ctx, n, "in1"), depth + 1),
+                      mv_as_v3(&value));
     }
     if (!strcmp(cat, "light")) {
         const v3 edf = eval_edf(ctx, input_node(ctx, n, "edf"), depth + 1);
@@ -1314,9 +1301,102 @@ static float in_component0(ShadeContext *ctx, const MtlxNode *n,
 static void apply_normal_input(ShadeContext *ctx, const MtlxNode *n,
                                const char *name, OpenPBRParams *out);
 
-static void eval_vdf(ShadeContext *ctx, const MtlxNode *n, float scale,
+/* Volume closure parameters must not use the unknown-node fallback. */
+static int supported_volume_value(ShadeContext *ctx, const MtlxNode *n,
+                                  int depth, size_t *budget) {
+    if (!n) return 1;
+    if (depth > 32 || !*budget) return 0;
+    --*budget;
+    if (strcmp(n->category, "input") && classify(n->category) == OP_UNKNOWN)
+        return 0;
+    for (int i = 0; i < n->ninput; ++i) {
+        if (!*budget) return 0;
+        --*budget;
+        const int src = n->inputs[i].src_node;
+        if (n->inputs[i].has_connection && src < 0) return 0;
+        if (src >= ctx->doc->nnode) return 0;
+        if (src >= 0 && !supported_volume_value(ctx, &ctx->doc->nodes[src],
+                                                 depth + 1, budget)) return 0;
+    }
+    return 1;
+}
+
+static int supported_closure_values(ShadeContext *ctx, const MtlxNode *n,
+                                    int depth, size_t *budget) {
+    for (int i = 0; i < n->ninput; ++i) {
+        if (!*budget) return 0;
+        --*budget;
+        const MtlxInput *in = &n->inputs[i];
+        if (in->has_connection && in->src_node < 0) return 0;
+        if (in->type == MV_NONE || in->src_node < 0) continue;
+        if (in->src_node >= ctx->doc->nnode ||
+            !supported_volume_value(ctx, &ctx->doc->nodes[in->src_node],
+                                    depth + 1, budget)) return 0;
+    }
+    return 1;
+}
+
+/* Validate the closure branches consumed by eval_edf for volume emission. */
+static int supported_edf(ShadeContext *ctx, const MtlxNode *n, int depth,
+                         size_t *budget) {
+    if (!n) return 1;
+    if (depth > 32 || !*budget) return 0;
+    --*budget;
+    if (!supported_closure_values(ctx, n, depth, budget)) return 0;
+    const char *cat = n->category;
+    /* Measured EDF needs IES evaluation; eval_edf's color fallback is not a
+     * faithful volume emission result. */
+    if (!strcmp(cat, "measured_edf")) return 0;
+    if (!strcmp(cat, "uniform_edf") || !strcmp(cat, "conical_edf")) return 1;
+    if (!strcmp(cat, "add") || !strcmp(cat, "layer")) {
+        const char *a = !strcmp(cat, "layer") ? "base" : "in1";
+        const char *b = !strcmp(cat, "layer") ? "top" : "in2";
+        return supported_edf(ctx, input_node(ctx, n, a), depth + 1, budget) &&
+               supported_edf(ctx, input_node(ctx, n, b), depth + 1, budget);
+    }
+    if (!strcmp(cat, "mix"))
+        return supported_edf(ctx, input_node(ctx, n, "bg"), depth + 1, budget) &&
+               supported_edf(ctx, input_node(ctx, n, "fg"), depth + 1, budget);
+    if (!strcmp(cat, "multiply")) {
+        return supported_edf(ctx, input_node(ctx, n, "in1"), depth + 1, budget);
+    }
+    if (!strcmp(cat, "light"))
+        return supported_edf(ctx, input_node(ctx, n, "edf"), depth + 1, budget);
+    if (!strcmp(cat, "generalized_schlick_edf"))
+        return supported_edf(ctx, input_node(ctx, n, "base"), depth + 1, budget);
+    return 0;
+}
+
+/* Check the same VDF branches that eval_vdf traverses.  Unknown closures and
+ * cycles must not silently turn into a transparent medium. */
+static int supported_vdf(ShadeContext *ctx, const MtlxNode *n, int depth,
+                         size_t *budget) {
+    if (!n) return 1;
+    if (depth > 32 || !*budget) return 0;
+    --*budget;
+    if (!supported_closure_values(ctx, n, depth, budget)) return 0;
+    const char *cat = n->category;
+    if (!strcmp(cat, "absorption_vdf") || !strcmp(cat, "anisotropic_vdf") ||
+        !strcmp(cat, "subsurface_vdf")) return 1;
+    if (!strcmp(cat, "add") || !strcmp(cat, "layer")) {
+        const char *a = !strcmp(cat, "layer") ? "base" : "in1";
+        const char *b = !strcmp(cat, "layer") ? "top" : "in2";
+        return supported_vdf(ctx, input_node(ctx, n, a), depth + 1, budget) &&
+               supported_vdf(ctx, input_node(ctx, n, b), depth + 1, budget);
+    }
+    if (!strcmp(cat, "mix"))
+        return supported_vdf(ctx, input_node(ctx, n, "bg"), depth + 1, budget) &&
+               supported_vdf(ctx, input_node(ctx, n, "fg"), depth + 1, budget);
+    if (!strcmp(cat, "multiply")) {
+        return supported_vdf(ctx, input_node(ctx, n, "in1"), depth + 1, budget);
+    }
+    return 0;
+}
+
+static void eval_vdf(ShadeContext *ctx, const MtlxNode *n, v3 scale,
                      MtlxVolumeParams *out, int depth) {
-    if (!n || depth > 32 || scale <= 0.0f) return;
+    if (!n || depth > 32 ||
+        (scale.x == 0.0f && scale.y == 0.0f && scale.z == 0.0f)) return;
     const char *cat = n->category;
     if (!strcmp(cat, "add") || !strcmp(cat, "layer")) {
         const char *a_name = !strcmp(cat, "layer") ? "base" : "in1";
@@ -1328,30 +1408,42 @@ static void eval_vdf(ShadeContext *ctx, const MtlxNode *n, float scale,
     if (!strcmp(cat, "mix")) {
         const float amount = fmaxf(0.0f, fminf(1.0f,
             in_float(ctx, n, "mix", in_float(ctx, n, "amount", 0.5f))));
-        eval_vdf(ctx, input_node(ctx, n, "bg"), scale * (1.0f - amount),
+        eval_vdf(ctx, input_node(ctx, n, "bg"), v3_scale(scale, 1.0f - amount),
                  out, depth + 1);
-        eval_vdf(ctx, input_node(ctx, n, "fg"), scale * amount, out,
+        eval_vdf(ctx, input_node(ctx, n, "fg"), v3_scale(scale, amount), out,
                  depth + 1);
         return;
     }
     if (!strcmp(cat, "multiply")) {
-        const MtlxNode *a = input_node(ctx, n, "in1");
-        const MtlxNode *b = input_node(ctx, n, "in2");
-        const MtlxInput *factor = find_input(n, a ? "in2" : "in1");
-        MtlxValue factor_value;
-        const float f = factor ? (factor_value = eval_input(ctx, factor),
-                                  fmaxf(0.0f, mv_as_float(&factor_value))) : 1.0f;
-        eval_vdf(ctx, a ? a : b, scale * f, out, depth + 1);
+        const MtlxInput *factor = find_input(n, "in2");
+        const MtlxValue factor_value = factor ? eval_input(ctx, factor) : mv_float(1.0f);
+        const v3 weight = mv_as_v3(&factor_value);
+        eval_vdf(ctx, input_node(ctx, n, "in1"), v3_mul(scale, weight), out, depth + 1);
         return;
     }
     if (!strcmp(cat, "absorption_vdf") || !strcmp(cat, "anisotropic_vdf") ||
         !strcmp(cat, "subsurface_vdf")) {
         out->absorption = v3_add(out->absorption,
-            v3_scale(in_color(ctx, n, "absorption", v3_splat(0.0f)), scale));
+            v3_mul(in_color(ctx, n, "absorption", v3_splat(0.0f)), scale));
         if (!strcmp(cat, "anisotropic_vdf") || !strcmp(cat, "subsurface_vdf")) {
-            out->scattering = v3_add(out->scattering,
-                v3_scale(in_color(ctx, n, "scattering", v3_splat(0.0f)), scale));
-            out->anisotropy = in_float(ctx, n, "anisotropy", out->anisotropy);
+            const v3 scattering = v3_mul(in_color(ctx, n, "scattering", v3_splat(0.0f)), scale);
+            const float anisotropy = in_float(ctx, n, "anisotropy", 0.0f);
+            out->scattering = v3_add(out->scattering, scattering);
+            out->anisotropy = anisotropy;
+            if (scattering.x != 0.0f || scattering.y != 0.0f || scattering.z != 0.0f) {
+                int i;
+                for (i = 0; i < out->lobe_count; ++i)
+                    if (out->lobes[i].anisotropy == anisotropy) break;
+                if (i == out->lobe_count) {
+                    if (i >= MTLX_MAX_VOLUME_SCATTERING_LOBES) {
+                        out->lobe_overflow = 1;
+                        return;
+                    }
+                    ++out->lobe_count;
+                    out->lobes[i].anisotropy = anisotropy;
+                }
+                out->lobes[i].scattering = v3_add(out->lobes[i].scattering, scattering);
+            }
         }
     }
 }
@@ -1503,15 +1595,22 @@ static void apply_bsdf(ShadeContext *ctx, const MtlxNode *n, float scale,
 
 int mtlx_eval_volume(ShadeContext *ctx, int volume_node,
                      MtlxVolumeParams *out) {
-    if (!ctx || !ctx->doc || !out || volume_node < 0 ||
+    if (!ctx || !ctx->doc || !ctx->memo || !ctx->memo_done || !out || volume_node < 0 ||
         volume_node >= ctx->doc->nnode) return 1;
     memset(out, 0, sizeof(*out));
     memset(ctx->memo_done, 0, (size_t)ctx->doc->nnode);
     const MtlxNode *volume = &ctx->doc->nodes[volume_node];
     if (strcmp(volume->category, "volume")) return 1;
+    /* Bound traversal of shared DAGs before the recursive closure evaluator. */
+    size_t budget = 100000;
+    if (!supported_closure_values(ctx, volume, 0, &budget)) return 1;
     const MtlxNode *vdf = input_node(ctx, volume, "vdf");
-    eval_vdf(ctx, vdf, 1.0f, out, 0);
-    out->emission = eval_edf(ctx, input_node(ctx, volume, "edf"), 0);
+    const MtlxNode *edf = input_node(ctx, volume, "edf");
+    if (!supported_vdf(ctx, vdf, 0, &budget) ||
+        !supported_edf(ctx, edf, 0, &budget)) return 1;
+    eval_vdf(ctx, vdf, v3_splat(1.0f), out, 0);
+    if (out->lobe_overflow) return 1;
+    out->emission = eval_edf(ctx, edf, 0);
     return 0;
 }
 

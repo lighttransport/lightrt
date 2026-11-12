@@ -61,11 +61,12 @@ $(BUILD)/node_truth.o: tests/node_truth.c | $(BUILD)
 	$(CC) $(CFLAGS) $(WARN) -c $< -o $@
 node_truth: $(TEST_DEPS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-test: node_truth white_furnace bsdf_response texture_sampling
+test: node_truth white_furnace bsdf_response texture_sampling volume_lobes
 	./node_truth
 	./white_furnace
 	./bsdf_response
 	./texture_sampling texture-sampling.ppm
+	./volume_lobes
 
 # Lean-generated node evaluation vectors (tests/generated/mtlx-eval.inc, from
 # the materialx-conformance repository). Links only the document loader and
@@ -95,6 +96,9 @@ lean_vectors: $(LEAN_SRC) tests/generated/mtlx-eval.inc tests/generated/mtlx-eva
 	$(CC) $(CSTD) -O2 -D_POSIX_C_SOURCE=200809L -I. -Itests -o $@ $(LEAN_SRC) -lm
 test-lean: lean_vectors
 	./lean_vectors
+
+volume_lobes: tests/volume_lobes.c tests/texture_stub.c mtlx_doc.c mtlx_xml.c mtlx_eval.c color.c mtlx_eval.h mtlx_doc.h
+	$(CC) $(CSTD) -O2 -D_POSIX_C_SOURCE=200809L -I. -Itests -o $@ tests/volume_lobes.c tests/texture_stub.c mtlx_doc.c mtlx_xml.c mtlx_eval.c color.c -lm
 
 # MaterialX -> GPU shading bridge (bakes per-material OpenPBR params and shades
 # one sphere per material on the GPU via the Vulkan backend). Needs the vk
