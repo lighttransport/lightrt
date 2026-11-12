@@ -81,6 +81,7 @@ All statements below compile. A † marks a theorem that is already proved.
 - `build_contains`† holds for every split strategy.
 - `build_prims_perm`.
 - `refit_contains`: the bottom-up refit (`tri_refit_propagate`) re-establishes containment for any new primitive bounds, `refit_prims` keeps the primitive lists, and `refit_traverse_eq_brute` re-derives traversal = brute force after a refit. This is the algorithm-level counterpart of `tri_leaf_prim_aabb(vf = 1)` (exact vertex min/max) plus the parent union; the C function's translation is not part of c2lean.
+- `KBest` (`BVH/KBest.lean`): the multi-hit (`lrt_tri_intersect_n`) model. `ins`/`kbest` are the sorted insertion buffer and its fold (`kbest_sorted`, `kbest_length_le`, `kbest_mem`); `runN` mirrors the C loop (best-first stack, prune by the k-th buffer value, leaf fold) and `runN_sound` proves every reported hit is a real hit. *Remaining:* completeness (every hit strictly below the returned k-th is reported) and the k best-by-value specification, which need the monotonicity of the k-th buffer value under insertion.
 - `traverse_eq_brute (hcons : Conservative …)` and `traverseOrdered_eq_brute`, which models the LightRT loop with t_best culling.
 - Stage 3 discharges `Conservative`: the box test receives a box that encloses a hit primitive's bound, so `HitsBox` holds.
 
