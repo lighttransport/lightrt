@@ -88,7 +88,7 @@ static void leaf_fuzz(int W, int iters) {
         uint32_t spid = LRT_TRI_NO_HIT;
         int socc;
         if (W == 4) {
-#if LRT_TRI_HAS_SSE4 && !LRT_TRI_NEON_SHIM
+#if LRT_TRI_HAS_SSE4
             tri_woop4_ctx wc;
             tri_woop4_setup(&rc, &wc);
             tri_woop4_block(wb, ids, &wc, &st, &su, &sv, &spid);
@@ -173,7 +173,7 @@ static void trav(int seed, int n, int q, int w, int g, int nrays) {
     o.quality = (lrt_tri_quality)q;
     o.layout = (lrt_tri_layout)w;
     lrt_tri_scene *s = lrt_tri_scene_build(v, (size_t)n, &o, NULL);
-#if LRT_TRI_HAS_SSE4 && !LRT_TRI_NEON_SHIM
+#if LRT_TRI_HAS_SSE4
     int need_simd = 1;
 #else
     int need_simd = 0; /* scalar-only build: scalar watertight kernels */
@@ -360,7 +360,7 @@ int main(int argc, char **argv) {
     int nrays = argc > 2 ? atoi(argv[2]) : 3000;
     for (int seed = 1; seed <= seeds; seed++) {
         rs = (uint32_t)seed * 2654435761u + 7;
-#if LRT_TRI_HAS_SSE4 && !LRT_TRI_NEON_SHIM
+#if LRT_TRI_HAS_SSE4
         leaf_fuzz(4, 200000);
 #endif
 #if LRT_TRI_HAS_AVX2

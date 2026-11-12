@@ -698,7 +698,7 @@ static inline int tri_vfmt(const lrt_tri_scene *s) {
  * quantized nodes); otherwise the watertight build runs the scalar kernels. */
 #if LRT_TRI_HAS_AVX2
 #define TRI_WBLK_SIMD(s) ((s)->wblk && !(s)->quantized && ((s)->layout == 4 || (s)->layout == 8))
-#elif LRT_TRI_HAS_SSE4 && !LRT_TRI_NEON_SHIM
+#elif LRT_TRI_HAS_SSE4
 #define TRI_WBLK_SIMD(s) ((s)->wblk && !(s)->quantized && (s)->layout == 4)
 #else
 #define TRI_WBLK_SIMD(s) 0
@@ -6592,7 +6592,7 @@ static inline int tri_bvh4_slab_sse(const lrt_bvh4_node *n,
 }
 
 /* 4-wide SoA Moller-Trumbore over one block. Updates best hit in place. */
-#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+#if defined(LRT_TRI_WATERTIGHT_TRI)
 #define TWLT(a, b) _mm_cmplt_ps(a, b)
 #define TWGT(a, b) _mm_cmpgt_ps(a, b)
 #define TWGE(a, b) _mm_cmpge_ps(a, b)
@@ -6962,7 +6962,7 @@ static int tri_intersect_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray,
 #endif
     tri_sse_ctx sc;
     tri_sse_setup(&rc, &sc);
-#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+#if defined(LRT_TRI_WATERTIGHT_TRI)
     tri_woop4_ctx wc;
     int wc_ready = 0; /* lazy: rays that reach no leaf skip the setup */
 #endif
@@ -6985,7 +6985,7 @@ static int tri_intersect_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray,
             uint32_t nblk = TRI_REF_NBLOCKS(e.ref);
             const lrt_tri4 *blocks = (const lrt_tri4 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++) {
-#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+#if defined(LRT_TRI_WATERTIGHT_TRI)
                 if (s->wblk) {
                     if (!wc_ready) {
                         tri_woop4_setup(&rc, &wc);
@@ -7068,7 +7068,7 @@ static int tri_occluded_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray) {
     tri_sse_ctx sc;
     tri_sse_setup(&rc, &sc);
     __m128 tmax4 = _mm_set1_ps(ray->tmax);
-#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+#if defined(LRT_TRI_WATERTIGHT_TRI)
     tri_woop4_ctx wc;
     int wc_ready = 0; /* lazy: rays that reach no leaf skip the setup */
 #endif
@@ -7084,7 +7084,7 @@ static int tri_occluded_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray) {
             uint32_t nblk = TRI_REF_NBLOCKS(ref);
             const lrt_tri4 *blocks = (const lrt_tri4 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++) {
-#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+#if defined(LRT_TRI_WATERTIGHT_TRI)
                 if (s->wblk) {
                     if (!wc_ready) {
                         tri_woop4_setup(&rc, &wc);
@@ -8783,7 +8783,7 @@ typedef struct tri_pipe4_state {
     lrt_hit *hit;
     int sp;
     tri_stack_entry stack[TRI_STACK_SIZE];
-#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+#if defined(LRT_TRI_WATERTIGHT_TRI)
     tri_woop4_ctx wc;
     int wc_ready;
 #endif
@@ -8794,7 +8794,7 @@ static inline void tri_pipe4_init(const lrt_tri_scene *s, tri_pipe4_state *st,
     (void)s;
     tri_ray_setup(ray, &st->rc);
     tri_sse_setup(&st->rc, &st->sc);
-#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+#if defined(LRT_TRI_WATERTIGHT_TRI)
     st->wc_ready = 0; /* lazy: set up at the first leaf */
 #endif
     st->best_t = ray->tmax;
@@ -8817,7 +8817,7 @@ static inline int tri_pipe4_step(const lrt_tri_scene *s, tri_pipe4_state *st) {
             uint32_t nblk = TRI_REF_NBLOCKS(e.ref);
             const lrt_tri4 *blocks = (const lrt_tri4 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++) {
-#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+#if defined(LRT_TRI_WATERTIGHT_TRI)
                 if (s->wblk) {
                     if (!st->wc_ready) {
                         tri_woop4_setup(&st->rc, &st->wc);
@@ -8917,7 +8917,7 @@ typedef struct tri_pipeocc4_state {
     uint8_t *out;
     int sp;
     uint32_t stack[TRI_STACK_SIZE];
-#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+#if defined(LRT_TRI_WATERTIGHT_TRI)
     tri_woop4_ctx wc;
     int wc_ready;
 #endif
@@ -8928,7 +8928,7 @@ static inline void tri_pipeocc4_init(const lrt_tri_scene *s,
                                      const lrt_ray *ray, uint8_t *out) {
     tri_ray_setup(ray, &st->rc);
     tri_sse_setup(&st->rc, &st->sc);
-#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+#if defined(LRT_TRI_WATERTIGHT_TRI)
     st->wc_ready = 0; /* lazy: set up at the first leaf */
 #endif
     st->tmax4 = _mm_set1_ps(ray->tmax);
@@ -8950,7 +8950,7 @@ static inline int tri_pipeocc4_step(const lrt_tri_scene *s,
         uint32_t nblk = TRI_REF_NBLOCKS(ref);
         const lrt_tri4 *blocks = (const lrt_tri4 *)s->blocks;
         for (uint32_t b = 0; b < nblk; b++) {
-#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+#if defined(LRT_TRI_WATERTIGHT_TRI)
         if (s->wblk) {
             if (!st->wc_ready) {
                 tri_woop4_setup(&st->rc, &st->wc);
