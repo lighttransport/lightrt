@@ -148,6 +148,20 @@ static void scene_verts(int g, int n, float *v) {
     }
 }
 
+/* A reported hit must be exactly tri_woop_one on the caller's input vertices
+ * of that prim (independent of the scene's internal vertex copy). */
+static long src_bad;
+static void check_src(const float *v, const lrt_ray *ray, const lrt_hit *h) {
+    if (h->prim_id == LRT_TRI_NO_HIT) return;
+    tri_ray_ctx rc;
+    tri_ray_setup(ray, &rc);
+    const float *w = &v[(size_t)h->prim_id * 9];
+    float t, u, vv;
+    if (!tri_woop_one(rc.org, rc.dir, w, w + 3, w + 6, rc.tmin, ray->tmax, &t, &u, &vv) ||
+        !same(t, h->t) || !same(u, h->u) || !same(vv, h->v))
+        src_bad++;
+}
+
 static void trav(int seed, int n, int q, int w, int g, int nrays) {
     float *v = malloc(sizeof(float) * 9 * n);
     scene_verts(g, n, v);
@@ -183,6 +197,7 @@ static void trav(int seed, int n, int q, int w, int g, int nrays) {
         ray.tmax = (r % 6 == 1) ? 2.0f : 1e30f;
         lrt_hit a, b;
         int ka = lrt_tri_intersect1(s, &ray, &a);
+        check_src(v, &ray, &a);
         int kb = tri_intersect_scalar(s, &ray, &b);
         trav_rays++;
         if (kb) trav_hits++;
@@ -239,6 +254,7 @@ static void trav(int seed, int n, int q, int w, int g, int nrays) {
             for (int r = 0; r < nrays; r++) {
                 lrt_hit a;
                 lrt_tri_intersect1(L, &R[r], &a);
+                check_src(v, &R[r], &a);
                 if (a.prim_id != H[r].prim_id ||
                     (H[r].prim_id != LRT_TRI_NO_HIT && !same(a.t, H[r].t)))
                     persist_bad++;
@@ -256,6 +272,7 @@ static void trav(int seed, int n, int q, int w, int g, int nrays) {
     for (int r = 0; r < nrays; r++) {
         lrt_hit a, b;
         int ka = lrt_tri_intersect1(s, &R[r], &a), kb = tri_intersect_scalar(s, &R[r], &b);
+        check_src(v, &R[r], &a);
         if (ka != kb || a.prim_id != b.prim_id || (kb && !same(a.t, b.t))) persist_bad++;
         if (lrt_tri_occluded1(s, &R[r]) != tri_occluded_scalar(s, &R[r])) persist_bad++;
     }
@@ -285,7 +302,8 @@ int main(int argc, char **argv) {
            trav_rays, trav_hits, trav_bad, occ_bad);
     printf("wtcheck batch (intersect1N/occluded1N x 2 hints, intersect4): != scalar %ld\n", batch_bad);
     printf("wtcheck save/load + refit: != scalar %ld\n", persist_bad);
-    int bad = leaf_bad_blk || trav_bad || occ_bad || batch_bad || persist_bad;
+    printf("wtcheck hits != tri_woop_one on the input vertices (build, load, refit): %ld\n", src_bad);
+    int bad = leaf_bad_blk || trav_bad || occ_bad || batch_bad || persist_bad || src_bad;
     printf("RESULT: %s\n", bad ? "FAIL" : "PASS");
     return bad;
 }
