@@ -115,7 +115,7 @@ static void leaf_fuzz(int W, int iters) {
     (void)leaf_bad;
 }
 
-static long trav_rays, trav_bad, occ_bad, trav_hits, batch_bad, persist_bad;
+static long trav_rays, trav_bad, occ_bad, trav_hits, batch_bad, persist_bad, reader_bad, hp_rays, hp_diff, gv_bad, mh_slack, mh_maxulp;
 
 static void scene_verts(int g, int n, float *v) {
     if (g == 0) { /* soup */
@@ -242,6 +242,45 @@ static void trav(int seed, int n, int q, int w, int g, int nrays) {
                 (H[r + k].prim_id != LRT_TRI_NO_HIT && !same(h4.t[k], H[r + k].t)))
                 batch_bad++;
     }
+    /* readers of the leaf blocks other than the traversal leaves */
+    for (int p = 0; p < n; p++) { /* exact vertices back (vertex-format leaves) */
+        float A[3], Bv[3], C[3];
+        if (lrt_tri_get_verts(s, (uint32_t)p, A, Bv, C) &&
+            (memcmp(A, &v[9 * p], 12) || memcmp(Bv, &v[9 * p + 3], 12) || memcmp(C, &v[9 * p + 6], 12)))
+            reader_bad++, gv_bad++;
+    }
+    for (int r = 0; r < nrays; r++) {
+        lrt_hit mh[4];
+        size_t k = lrt_tri_intersect_n(s, &R[r], mh, 4);
+        if (k > 0 && H[r].prim_id != LRT_TRI_NO_HIT && !same(mh[0].t, H[r].t)) mh_slack++;
+        if (k > 0 && H[r].prim_id != LRT_TRI_NO_HIT) {
+            int32_t ia, ib;
+            memcpy(&ia, &mh[0].t, 4);
+            memcpy(&ib, &H[r].t, 4);
+            long d = labs((long)ia - (long)ib);
+            if (d > mh_maxulp) mh_maxulp = d;
+        }
+        if ((k > 0) != (H[r].prim_id != LRT_TRI_NO_HIT)) {
+            /* both searches prune nodes by a rounded tnear against a running
+             * bound (intersect1: the best hit; intersect_n: its max_hits-th),
+             * so either may miss the true nearest by the pruning slack
+             * (Flat.run_approx, <= 4 ulp measured); ties at a shared edge may
+             * also pick another prim with the same t. Exact only under
+             * LRT_TRI_EXACT_NEAREST. */
+            if (reader_bad - gv_bad < 6)
+                fprintf(stderr, "cfg (%d %d %d %d) ray %d: n=%zu first %u t=%.9g | closest %u t=%.9g tmax %g\n",
+                        n, q, w, g, r, k, k ? mh[0].prim_id : 0u, k ? mh[0].t : 0.f, H[r].prim_id, H[r].t, R[r].tmax);
+            reader_bad++;
+        }
+        lrt_ray_hp rh;
+        for (int a2 = 0; a2 < 3; a2++) { rh.org[a2] = R[r].org[a2]; rh.dir[a2] = R[r].dir[a2]; }
+        rh.tmin = R[r].tmin;
+        rh.tmax = R[r].tmax;
+        lrt_hit_hp hh;
+        int kh = lrt_tri_intersect1_hp(s, &rh, &hh);
+        hp_rays++;
+        if (kh != (H[r].prim_id != LRT_TRI_NO_HIT)) hp_diff++;
+    }
     /* serialization: the loaded scene rebuilds wblk from the stored exact
      * vertices; its SIMD answers must equal the original's scalar ones */
     void *buf = NULL;
@@ -303,7 +342,13 @@ int main(int argc, char **argv) {
     printf("wtcheck batch (intersect1N/occluded1N x 2 hints, intersect4): != scalar %ld\n", batch_bad);
     printf("wtcheck save/load + refit: != scalar %ld\n", persist_bad);
     printf("wtcheck hits != tri_woop_one on the input vertices (build, load, refit): %ld\n", src_bad);
-    int bad = leaf_bad_blk || trav_bad || occ_bad || batch_bad || persist_bad || src_bad;
+    printf("wtcheck readers: get_verts != input or intersect_n hit/miss != intersect1: %ld; "
+           "fp64 path (MT on the same leaves) hit/miss != watertight %ld of %ld (report only)\n",
+           reader_bad, hp_diff, hp_rays);
+    printf("  (get_verts part: %ld; intersect_n[0].t != intersect1 t on %ld rays, max %ld ulp: the pruning slack\n"
+           "   of both searches, Flat.run_approx; exact only under LRT_TRI_EXACT_NEAREST; report only)\n",
+           gv_bad, mh_slack, mh_maxulp);
+    int bad = leaf_bad_blk || trav_bad || occ_bad || batch_bad || persist_bad || src_bad || reader_bad;
     printf("RESULT: %s\n", bad ? "FAIL" : "PASS");
     return bad;
 }
