@@ -31,7 +31,8 @@ OUT = os.path.join(ROOT, "formal", "LightRT", "C", "Gen.lean")
 # legacy kernel (robust defaults opted out; the slab false-miss witness and the
 # original refinement proofs are about it); `GenRobust` is the default build.
 CONFIGS = [("Gen", ["-DLRT_TRI_NO_SLAB_ROBUST", "-DLRT_TRI_NO_LEAF_BOX_EXACT", "-DLRT_TRI_NO_BITEXACT", "-DLRT_TRI_NO_WATERTIGHT_TRI"]),
-           ("GenRobust", [])]
+           ("GenRobust", []),
+           ("GenExn", ["-DLRT_TRI_EXACT_NEAREST"])]
 DEFINES = []
 MODULE = "Gen"
 CLANG = os.environ.get("CLANG", "clang")
@@ -46,6 +47,12 @@ FUNCTIONS = [
     "tri_ray_setup",
     "tri_woop_one",
 ]
+
+# Extra functions that exist only in a particular configuration's preprocessor
+# build. Appended after FUNCTIONS so the base function ids are unchanged.
+CONFIG_FUNCTIONS = {
+    "GenExn": ["tri_exn_key"],
+}
 
 # String literals live in one read-only block at this index.
 LIT_BLOCK = 4096
@@ -394,6 +401,11 @@ class FnTranslator:
             if len(args) != 2:
                 die("copysignf arity", n)
             return f"(.copysign {args[0]} {args[1]})"
+        if name in ("fabsf", "__builtin_fabsf"):
+            if len(args) != 1:
+                die("fabsf arity", n)
+            # fabsf(x) == copysignf(x, +1.0f), exact at the bit level.
+            return f"(.copysign {args[0]} (.const (.f32 1065353216)))"
         if name in ("__builtin_inff",):  # INFINITY (robust slab reciprocal)
             if args:
                 die("__builtin_inff arity", n)
@@ -707,23 +719,24 @@ def collect_records(ast):
 
 def generate():
     ast = load_ast()
+    functions = FUNCTIONS + CONFIG_FUNCTIONS.get(MODULE, [])
     collect_records(ast)
     enums = collect_enums(ast)
     fns = {}
     for n in ast["inner"]:
-        if n.get("kind") == "FunctionDecl" and n.get("name") in FUNCTIONS and "inner" in n:
+        if n.get("kind") == "FunctionDecl" and n.get("name") in functions and "inner" in n:
             if any(x["kind"] == "CompoundStmt" for x in n["inner"]):
                 fns[n["name"]] = n
-    missing = [f for f in FUNCTIONS if f not in fns]
+    missing = [f for f in functions if f not in fns]
     if missing:
         die(f"functions not found: {missing}")
-    fids = {name: i for i, name in enumerate(FUNCTIONS)}
+    fids = {name: i for i, name in enumerate(functions)}
     layout = Layout()
     ctx = Ctx(enums, layout)
     # Two passes: collect layout queries, probe, then emit with real numbers.
     for _ in range(2):
         out = []
-        for name in FUNCTIONS:
+        for name in functions:
             tr = FnTranslator(ctx, fns[name], fids)
             pids, body = tr.translate()
             out.append((name, pids, body, tr.names, tr.loops))
