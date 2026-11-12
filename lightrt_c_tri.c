@@ -631,6 +631,10 @@ struct lrt_tri_scene {
      * keep a separate wblk next to edge blocks. */
     float *wblk;
 #endif
+    /* Node boxes are the exact min/max of the exact (vertex-format) leaf
+     * vertices (LEAF_BOX_EXACT, not SBVH-clipped, not quantized nodes): the
+     * precondition of the pruning EXACT_NEAREST key (ExactPrune.woop_key_le_t). */
+    int wbox_exact;
     uint32_t block_stride; /* bytes per leaf block (varies for quantized leaves) */
     lrt_tri_stats stats;
     const char *kernel_name;
@@ -943,6 +947,7 @@ static inline float tri_maxf(float a, float b) { return a > b ? a : b; }
 #define TRI_CULL_T(best, tmax) (best)
 #define TRI_PUSH_TN(tn, tmin) (tn)
 #endif
+#define TRI_SLAB_K 0x1.00000ap+0f /* 1 + 10u: Robust/Slab.lean ize_constant_sufficient */
 /* Per-axis slab entry: min(tl, th); under LRT_TRI_SLAB_ROBUST the operands are
  * swapped so a NaN plane (parallel ray on it) is dropped (see tri_slab_scalar). */
 #ifdef LRT_TRI_SLAB_ROBUST
@@ -3443,6 +3448,49 @@ typedef struct tri_ray_ctx {
 #endif
 } tri_ray_ctx;
 
+#ifdef LRT_TRI_EXACT_NEAREST
+/* Pruning key for watertight scenes (formal: ExactPrune.woop_key_le_t). The
+ * Woop leaf's t is a weighted mean of the vertex depths
+ * z = fl(sz * fl(v[kz] - o[kz])) along the ray's dominant axis, so every
+ * accepted triangle with its exact vertices in the node box has
+ * t >= m - 16u M, m / M the min depth / max |depth| of the box's two kz faces
+ * (rounding is monotone). The float key fl(m - fl(2^-19 M)) is below that
+ * (key_le), so pushing max(key, tmin) satisfies Flat.run_root's C2 and the
+ * traversal returns exactly the brute-force nearest t while still pruning by
+ * the best hit. The box test itself runs against the fixed tmax (C1, as for
+ * run_exact). Scenes without wbox_exact (MT leaves, SBVH, quantized nodes)
+ * keep pushing tmin (no pruning). */
+typedef struct tri_exn_ctx {
+    int on, kz;
+    float sz, oz;
+} tri_exn_ctx;
+static inline void tri_exn_setup(const lrt_tri_scene *s, const tri_ray_ctx *rc, tri_exn_ctx *x) {
+    const float *d = rc->dir;
+    float a0 = copysignf(d[0], 1.0f), a1 = copysignf(d[1], 1.0f), a2 = copysignf(d[2], 1.0f);
+    int kz = 0;
+    if (a1 > a0) kz = 1;
+    if (a2 > a0 && a2 > a1) kz = 2;
+    x->kz = kz;
+    x->sz = 1.0f / d[kz];
+    x->oz = rc->org[kz];
+    x->on = s->wbox_exact;
+}
+static inline float tri_exn_key(const tri_exn_ctx *x, float lo, float hi, float tmin) {
+    if (!x->on) return tmin;
+    float dl = lo - x->oz, dh = hi - x->oz;
+    float za = x->sz * dl, zb = x->sz * dh;
+    float m = za < zb ? za : zb;
+    float aa = fabsf(za), ab = fabsf(zb);
+    float M = aa > ab ? aa : ab;
+    float key = m - 0x1p-19f * M; /* c = 32u, u = 2^-24 */
+    return key > tmin ? key : tmin; /* NaN key: tmin (no pruning) */
+}
+#define TRI_EXN_KEY(x, lx, ly, lz, hx, hy, hz, i, tmin)                        \
+    tri_exn_key((x), (x)->kz == 0 ? (lx)[i] : (x)->kz == 1 ? (ly)[i] : (lz)[i], \
+                (x)->kz == 0 ? (hx)[i] : (x)->kz == 1 ? (hy)[i] : (hz)[i], (tmin))
+#endif
+
+
 /* Degenerate direction components get a finite huge inverse instead of inf.
  * 1e18 (not FLT_MAX) so that the quantized-node decode, which multiplies
  * invd by a node-local scale, cannot overflow to inf and produce 0 * inf
@@ -4830,9 +4878,10 @@ static inline int tri_slab_scalar(const float *lo_x, const float *lo_y,
      * formal/LightRT/Robust/Slab.lean proves that a factor K with
      * 1 + g3 <= (1 - g3)(1 - u) K (e.g. 1 + 2 g4 <= 1 + 10u) rules out false
      * misses of this scalar test; without it, false misses exist
-     * (Robust/SlabMissReal.lean, C/Proofs/SlabMiss.lean). Opt-in: it changes
-     * hit sets at the ulp level and is not mirrored in the SIMD/GPU kernels. */
-    tfar *= 0x1.00000ap+0f;
+     * (Robust/SlabMissReal.lean, C/Proofs/SlabMiss.lean). On by default with
+     * SLAB_ROBUST; mirrored in every CPU node slab (SSE/AVX2/quantized/SVE/
+     * packets/TLAS) and the HIP/CUDA/Vulkan kernels (PLAN.md M21). */
+    tfar = tfar * TRI_SLAB_K;
 #endif
     *tnear_out = tnear;
     return tnear <= tfar;
@@ -5834,6 +5883,10 @@ static int tri_intersect_scalar(const lrt_tri_scene *s, const lrt_ray *ray,
                                 lrt_hit *hit) {
     tri_ray_ctx rc;
     tri_ray_setup(ray, &rc);
+#ifdef LRT_TRI_EXACT_NEAREST
+    tri_exn_ctx xc;
+    tri_exn_setup(s, &rc, &xc);
+#endif
     float best_t = ray->tmax;
     float best_u = 0.0f, best_v = 0.0f;
     uint32_t best_prim = LRT_TRI_NO_HIT;
@@ -6047,7 +6100,11 @@ static int tri_intersect_scalar(const lrt_tri_scene *s, const lrt_ray *ray,
             float tnear;
             if (tri_slab_scalar(lo_x, lo_y, lo_z, hi_x, hi_y, hi_z, i, &rc,
                                 TRI_CULL_T(best_t, ray->tmax), &tnear)) {
+#ifdef LRT_TRI_EXACT_NEAREST
+                tnear = TRI_EXN_KEY(&xc, lo_x, lo_y, lo_z, hi_x, hi_y, hi_z, i, rc.tmin);
+#else
                 tnear = TRI_PUSH_TN(tnear, rc.tmin);
+#endif
                 /* insertion: keep ascending tnear */
                 int j = nhit++;
                 while (j > 0 && hit_tnear[j - 1] > tnear) {
@@ -6527,6 +6584,9 @@ static inline int tri_bvh4_slab_sse(const lrt_bvh4_node *n,
     __m128 tfar = _mm_min_ps(
         _mm_min_ps(_mm_max_ps(tlx, thx), _mm_max_ps(tly, thy)),
         _mm_min_ps(_mm_max_ps(tlz, thz), t_best));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = _mm_mul_ps(tfar, _mm_set1_ps(TRI_SLAB_K));
+#endif
     _mm_store_ps(tnear_out, tnear);
     return _mm_movemask_ps(_mm_cmple_ps(tnear, tfar));
 }
@@ -6896,6 +6956,10 @@ static int tri_intersect_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray,
                                   lrt_hit *hit) {
     tri_ray_ctx rc;
     tri_ray_setup(ray, &rc);
+#ifdef LRT_TRI_EXACT_NEAREST
+    tri_exn_ctx xc;
+    tri_exn_setup(s, &rc, &xc);
+#endif
     tri_sse_ctx sc;
     tri_sse_setup(&rc, &sc);
 #if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
@@ -6941,7 +7005,12 @@ static int tri_intersect_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray,
         const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(e.ref)];
         _Alignas(16) float tnear[4];
         int mask = tri_bvh4_slab_sse(n, &sc, _mm_set1_ps(TRI_CULL_T(best_t, ray->tmax)), tnear);
+#ifdef LRT_TRI_EXACT_NEAREST
+        for (int k = 0; k < 4; k++)
+            tnear[k] = TRI_EXN_KEY(&xc, n->lo_x, n->lo_y, n->lo_z, n->hi_x, n->hi_y, n->hi_z, k, rc.tmin);
+#else
         for (int k = 0; k < 4; k++) tnear[k] = TRI_PUSH_TN(tnear[k], rc.tmin);
+#endif
         mask &= (1 << n->nchildren) - 1;
 #ifdef LRT_TRI_BITEXACT
         /* tri_intersect_scalar's order: insertion-sort hits by tnear (stable,
@@ -9255,6 +9324,9 @@ static inline int tri_bvh8_slab_avx(const lrt_bvh8_node *n,
     __m256 tfar = _mm256_min_ps(
         _mm256_min_ps(_mm256_max_ps(tlx, thx), _mm256_max_ps(tly, thy)),
         _mm256_min_ps(_mm256_max_ps(tlz, thz), t_best));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = _mm256_mul_ps(tfar, _mm256_set1_ps(TRI_SLAB_K));
+#endif
     _mm256_store_ps(tnear_out, tnear);
     return _mm256_movemask_ps(_mm256_cmp_ps(tnear, tfar, _CMP_LE_OQ));
 }
@@ -9263,6 +9335,10 @@ static int tri_intersect_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray,
                                    lrt_hit *hit) {
     tri_ray_ctx rc;
     tri_ray_setup(ray, &rc);
+#ifdef LRT_TRI_EXACT_NEAREST
+    tri_exn_ctx xc;
+    tri_exn_setup(s, &rc, &xc);
+#endif
     tri_avx_ctx ac;
     tri_avx_setup(&rc, &ac);
 #ifdef LRT_TRI_WATERTIGHT_TRI
@@ -9308,7 +9384,12 @@ static int tri_intersect_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray,
         const lrt_bvh8_node *n = &s->nodes8[TRI_REF_NODE(e.ref)];
         _Alignas(32) float tnear[8];
         int mask = tri_bvh8_slab_avx(n, &ac, _mm256_set1_ps(TRI_CULL_T(best_t, ray->tmax)), tnear);
+#ifdef LRT_TRI_EXACT_NEAREST
+        for (int k = 0; k < 8; k++)
+            tnear[k] = TRI_EXN_KEY(&xc, n->lo_x, n->lo_y, n->lo_z, n->hi_x, n->hi_y, n->hi_z, k, rc.tmin);
+#else
         for (int k = 0; k < 8; k++) tnear[k] = TRI_PUSH_TN(tnear[k], rc.tmin);
+#endif
         mask &= (1 << n->nchildren) - 1;
         uint32_t hit_ref[8];
         float hit_tn[8];
@@ -9420,6 +9501,9 @@ static inline int tri_slab8_robust_q(const float org3[3], const float scale3[3],
     __m256 tfar = _mm256_min_ps(
         _mm256_min_ps(_mm256_max_ps(tlx, thx), _mm256_max_ps(tly, thy)),
         _mm256_min_ps(_mm256_max_ps(tlz, thz), t_best));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = _mm256_mul_ps(tfar, _mm256_set1_ps(TRI_SLAB_K));
+#endif
     _mm256_store_ps(tnear_out, tnear);
     return _mm256_movemask_ps(_mm256_cmp_ps(tnear, tfar, _CMP_LE_OQ));
 }
@@ -9459,6 +9543,9 @@ static inline int tri_bvh8q_slab_avx(const lrt_bvh8q_node *n,
     __m256 tfar = _mm256_min_ps(
         _mm256_min_ps(_mm256_max_ps(tlx, thx), _mm256_max_ps(tly, thy)),
         _mm256_min_ps(_mm256_max_ps(tlz, thz), t_best));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = _mm256_mul_ps(tfar, _mm256_set1_ps(TRI_SLAB_K));
+#endif
     _mm256_store_ps(tnear_out, tnear);
     return _mm256_movemask_ps(_mm256_cmp_ps(tnear, tfar, _CMP_LE_OQ));
 }
@@ -9622,6 +9709,9 @@ static inline int tri_bvh8qf8_slab_avx(const lrt_bvh8q_node *n,
     __m256 tfar = _mm256_min_ps(
         _mm256_min_ps(_mm256_max_ps(tlx, thx), _mm256_max_ps(tly, thy)),
         _mm256_min_ps(_mm256_max_ps(tlz, thz), t_best));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = _mm256_mul_ps(tfar, _mm256_set1_ps(TRI_SLAB_K));
+#endif
     _mm256_store_ps(tnear_out, tnear);
     return _mm256_movemask_ps(_mm256_cmp_ps(tnear, tfar, _CMP_LE_OQ));
 }
@@ -9650,6 +9740,9 @@ static inline int tri_bvh8q4_slab_avx(const lrt_bvh8q4_node *n,
     __m256 tfar = _mm256_min_ps(
         _mm256_min_ps(_mm256_max_ps(tlx, thx), _mm256_max_ps(tly, thy)),
         _mm256_min_ps(_mm256_max_ps(tlz, thz), t_best));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = _mm256_mul_ps(tfar, _mm256_set1_ps(TRI_SLAB_K));
+#endif
     _mm256_store_ps(tnear_out, tnear);
     return _mm256_movemask_ps(_mm256_cmp_ps(tnear, tfar, _CMP_LE_OQ));
 }
@@ -10281,6 +10374,9 @@ static inline void tri_bvh8_slab_sve(const lrt_bvh8_node *n,
     svfloat32_t tfar = TRI_SVMIN(
         pg, TRI_SVMIN(pg, TRI_SVMAX(pg, tlx, thx), TRI_SVMAX(pg, tly, thy)),
         TRI_SVMIN(pg, TRI_SVMAX(pg, tlz, thz), svdup_f32(best_t)));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = svmul_n_f32_x(pg, tfar, TRI_SLAB_K);
+#endif
     svst1_f32(pg, tnear_out, tnear);
     svst1_f32(pg, tfar_out, tfar);
 }
@@ -10519,6 +10615,9 @@ static inline void tri_bvh16_slab_sve(const lrt_bvh16_node *n,
     svfloat32_t tfar = TRI_SVMIN(
         pg, TRI_SVMIN(pg, TRI_SVMAX(pg, tlx, thx), TRI_SVMAX(pg, tly, thy)),
         TRI_SVMIN(pg, TRI_SVMAX(pg, tlz, thz), svdup_f32(best_t)));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = svmul_n_f32_x(pg, tfar, TRI_SLAB_K);
+#endif
     svst1_f32(pg, tnear_out, tnear);
     svst1_f32(pg, tfar_out, tfar);
 }
@@ -10638,6 +10737,9 @@ static inline void tri_bvh8q_slab_sve(const lrt_bvh8q_node *n,
     svfloat32_t tfar = svmin_f32_x(
         pg, svmin_f32_x(pg, svmax_f32_x(pg, tlx, thx), svmax_f32_x(pg, tly, thy)),
         svmin_f32_x(pg, svmax_f32_x(pg, tlz, thz), svdup_f32(best_t)));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = svmul_n_f32_x(pg, tfar, TRI_SLAB_K);
+#endif
     svst1_f32(pg, tnear_out, tnear);
     svst1_f32(pg, tfar_out, tfar);
 }
@@ -10806,6 +10908,9 @@ static void tri_intersect16_sve(const lrt_tri_scene *s, const lrt_ray *rays,
             svfloat32_t thz = svmul_f32_x(pg, svsub_f32_x(pg, svdup_f32(nv.hi_z[i]), orgz), invdz);
             svfloat32_t tnear = svmax_f32_x(pg, svmax_f32_x(pg, svmin_f32_x(pg, tlx, thx), svmin_f32_x(pg, tly, thy)), svmax_f32_x(pg, svmin_f32_x(pg, tlz, thz), tmin));
             svfloat32_t tfar = svmin_f32_x(pg, svmin_f32_x(pg, svmax_f32_x(pg, tlx, thx), svmax_f32_x(pg, tly, thy)), svmin_f32_x(pg, svmax_f32_x(pg, tlz, thz), best_t));
+#ifdef LRT_TRI_SLAB_INFLATE
+            tfar = svmul_n_f32_x(pg, tfar, TRI_SLAB_K);
+#endif
             if (svptest_any(pg, svcmple_f32(pg, tnear, tfar))) stack[sp++] = nv.child[i];
         }
     }
@@ -11533,11 +11638,13 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
      * intersector actually tests. SBVH (HQ) is skipped: its clipped leaf boxes
      * intentionally cover only part of a triangle. */
     if (s->prim_kind == TRI_PRIM_TRI && o.quality != LRT_TRI_BUILD_HQ &&
-        (layout == 4 || (layout == 8 && !quantized && !s->qnode)) &&
-        tri_refit_propagate(s) != LRT_RESULT_OK) {
-        lrt_tri_scene_free(s);
-        tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
-        return NULL;
+        (layout == 4 || (layout == 8 && !quantized && !s->qnode))) {
+        if (tri_refit_propagate(s) != LRT_RESULT_OK) {
+            lrt_tri_scene_free(s);
+            tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+            return NULL;
+        }
+        s->wbox_exact = tri_vfmt(s); /* boxes = exact min/max of exact vertices */
     }
 #endif
     tri_build_prim2slot(s);
@@ -12037,6 +12144,12 @@ void lrt_tri_intersect1N(const lrt_tri_scene *s, const lrt_ray *rays,
                          lrt_hit *hits, size_t n, lrt_tri_batch_hint hint) {
     if (!s || !rays || !hits) return;
     (void)hint; /* unused in scalar-only builds */
+#ifdef LRT_TRI_EXACT_NEAREST
+    /* The interleaved pipelines and ray packets prune by the running best and
+     * do not implement the exact-nearest node rule; run the per-ray kernels. */
+    for (size_t i = 0; i < n; i++) lrt_tri_intersect1(s, &rays[i], &hits[i]);
+    return;
+#endif
     /* The interleaved/packet pipelines are plain-triangle-only; every other
      * prim_kind (and qnode-quantized triangle nodes) must loop per ray. */
     if (s->prim_kind != TRI_PRIM_TRI || s->qnode != 0
@@ -15653,7 +15766,8 @@ lrt_result lrt_tri_scene_save_to_memory(const lrt_tri_scene *s, void **buf,
     h.endian = 0x01020304u;
     h.flags = (s->prim_kind == TRI_PRIM_CURVE ? 1u : 0u) |
               (s->quantized ? 2u : 0u) |
-              (tri_vfmt(s) ? 4u : 0u) /* leaf blocks hold v0 v1 v2 (watertight) */;
+              (tri_vfmt(s) ? 4u : 0u) /* leaf blocks hold v0 v1 v2 (watertight) */ |
+              (s->wbox_exact ? 8u : 0u) /* boxes exact on those vertices */;
     h.layout = (uint32_t)s->layout;
     h.prim_kind = (uint32_t)s->prim_kind;
     h.node_count = s->node_count;
@@ -15868,6 +15982,7 @@ static lrt_tri_scene *tri_scene_from_buffer(const void *buf, size_t n, int copy,
      * file is treated as having none. */
     if (s->prim_kind == TRI_PRIM_TRI && (h->flags & 4u)) {
         s->wblk = (float *)s->blocks;
+        s->wbox_exact = (h->flags & 8u) != 0;
     } else if (s->prim_kind == TRI_PRIM_TRI && (s->layout == 4 || s->layout == 8) &&
         h->aux_size >= sizeof(lrt_tri_aux_header)) {
         const unsigned char *ap = (const unsigned char *)buf + h->aux_offset;
@@ -16135,6 +16250,10 @@ lrt_result lrt_tri_scene_refit(lrt_tri_scene *s, const float *vertices,
 
 #ifdef LRT_TRI_WATERTIGHT_TRI
     if (s->wblk && !tri_build_wblk(s, vertices, ntris)) return LRT_RESULT_OUT_OF_MEMORY;
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+    /* the propagate below recomputes every box from the exact vertices */
+    if (tri_vfmt(s) && !s->quantized && !s->qnode) s->wbox_exact = 1;
+#endif
 #endif
     /* 2. Recompute node bounds bottom-up (children have higher indices). */
     return tri_refit_propagate(s);
@@ -16607,6 +16726,9 @@ static inline int tlas_slab_dil(const lrt_bvh4_node *n, int i, const tri_ray_ctx
 #endif
     float tnear = tri_maxf(tri_maxf(tnx, tny), tri_maxf(tnz, rc->tmin));
     float tfar = tri_minf(tri_minf(tfx, tfy), tri_minf(tfz, t_best));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = tfar * TRI_SLAB_K;
+#endif
     *tnear_out = tnear;
     return tnear <= tfar;
 }
@@ -17222,6 +17344,9 @@ static inline __m128 tri_packet4_slab(const tri_packet4 *p, float lo_x,
     __m128 tfar = _mm_min_ps(
         _mm_min_ps(_mm_max_ps(tlx, thx), _mm_max_ps(tly, thy)),
         _mm_min_ps(_mm_max_ps(tlz, thz), tmax4));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = _mm_mul_ps(tfar, _mm_set1_ps(TRI_SLAB_K));
+#endif
     return _mm_cmple_ps(tnear, tfar);
 }
 
@@ -17394,7 +17519,7 @@ static void tri_occluded4_sse(const lrt_tri_scene *s, const lrt_ray4 *r,
 void lrt_tri_intersect4(const lrt_tri_scene *s, const lrt_ray4 *r,
                         lrt_hit4 *h) {
     if (!s || !r || !h) return;
-#if LRT_TRI_HAS_SSE4
+#if LRT_TRI_HAS_SSE4 && !defined(LRT_TRI_EXACT_NEAREST) /* packets prune by best */
     /* The packet kernel runs Moller-Trumbore on the edge blocks; a watertight
      * scene (exact vertices) runs per ray so every query uses the watertight leaf. */
     if (s->prim_kind == TRI_PRIM_TRI

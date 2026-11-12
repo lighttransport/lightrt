@@ -250,6 +250,7 @@ void main() {
             float tnz = stn(tlz, thz), tfz = smax(tlz, thz);
             float tnear = smax(smax(tnx, tny), smax(tnz, tmin));
             float tfar  = smin(smin(tfx, tfy), smin(tfz, best_t));
+            if ((ROBUST & 2u) != 0u) tfar *= uintBitsToFloat(0x3f800005u); // 1 + 10u (Robust/Slab)
             if (tnear <= tfar) {
                 int j = nhit++;
                 while (j > 0 && hit_tn[j - 1] > tnear) {

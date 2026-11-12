@@ -358,6 +358,9 @@ __launch_bounds__(64) __global__
             float tnz = HP_TN(tlz, thz), tfz = HP_MAX(tlz, thz);
             float tnear = HP_MAX(HP_MAX(tnx, tny), HP_MAX(tnz, tmin));
             float tfar = HP_MIN(HP_MIN(tfx, tfy), HP_MIN(tfz, best_t));
+#ifdef LRT_TRI_SLAB_INFLATE
+            tfar *= 0x1.00000ap+0f; /* 1 + 10u, as the CPU slab (Robust/Slab) */
+#endif
             if (tnear <= tfar) {
                 int j = nhit++;
                 while (j > 0 && hit_tn[j - 1] > tnear) {
@@ -513,6 +516,9 @@ __launch_bounds__(64) __global__
                                 HP_MAX(HP_TN(tlz, thz), tmin));
             float tfar = HP_MIN(HP_MIN(HP_MAX(tlx, thx), HP_MAX(tly, thy)),
                                HP_MIN(HP_MAX(tlz, thz), tmax));
+#ifdef LRT_TRI_SLAB_INFLATE
+            tfar *= 0x1.00000ap+0f; /* 1 + 10u, as the CPU slab (Robust/Slab) */
+#endif
             if (tnear <= tfar) {
                 /* Stack would overflow (unreachable for scenes accepted by
                  * trace_stack_for). Degrade conservatively: report occluded so
@@ -2057,6 +2063,9 @@ __launch_bounds__(64) __global__
                                 HP_MAX(HP_TN(tlz, thz), tmin));
             float tfar = HP_MIN(HP_MIN(HP_MAX(tlx, thx), HP_MAX(tly, thy)),
                                HP_MIN(HP_MAX(tlz, thz), best_t));
+#ifdef LRT_TRI_SLAB_INFLATE
+            tfar *= 0x1.00000ap+0f; /* 1 + 10u, as the CPU slab (Robust/Slab) */
+#endif
             if (tnear <= tfar) {
                 int j = nhit++;
                 while (j > 0 && hit_tn[j - 1] > tnear) {
@@ -2147,6 +2156,9 @@ __launch_bounds__(64) __global__
                                 HP_MAX(HP_TN(tlz, thz), tmin));
             float tfar = HP_MIN(HP_MIN(HP_MAX(tlx, thx), HP_MAX(tly, thy)),
                                HP_MIN(HP_MAX(tlz, thz), tmax));
+#ifdef LRT_TRI_SLAB_INFLATE
+            tfar *= 0x1.00000ap+0f; /* 1 + 10u, as the CPU slab (Robust/Slab) */
+#endif
             if (tnear <= tfar) {
                 if ((uint32_t)sp >= STACK) { hit = 1u; break; }
                 stk_ref[sp++] = nodes[nb + 6u * W + i];

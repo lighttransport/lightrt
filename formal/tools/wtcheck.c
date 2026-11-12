@@ -88,10 +88,14 @@ static void leaf_fuzz(int W, int iters) {
         uint32_t spid = LRT_TRI_NO_HIT;
         int socc;
         if (W == 4) {
+#if LRT_TRI_HAS_SSE4 && !LRT_TRI_NEON_SHIM
             tri_woop4_ctx wc;
             tri_woop4_setup(&rc, &wc);
             tri_woop4_block(wb, ids, &wc, &st, &su, &sv, &spid);
             socc = tri_woop4_block_occ(wb, ids, &wc, ray.tmax);
+#else
+            continue;
+#endif
         } else {
 #if LRT_TRI_HAS_AVX2
             tri_woop8_ctx wc;
@@ -150,7 +154,7 @@ static void scene_verts(int g, int n, float *v) {
 
 /* A reported hit must be exactly tri_woop_one on the caller's input vertices
  * of that prim (independent of the scene's internal vertex copy). */
-static long src_bad;
+static long src_bad, exn_diff, exn_maxulp, exn_miss;
 static void check_src(const float *v, const lrt_ray *ray, const lrt_hit *h) {
     if (h->prim_id == LRT_TRI_NO_HIT) return;
     tri_ray_ctx rc;
@@ -169,7 +173,12 @@ static void trav(int seed, int n, int q, int w, int g, int nrays) {
     o.quality = (lrt_tri_quality)q;
     o.layout = (lrt_tri_layout)w;
     lrt_tri_scene *s = lrt_tri_scene_build(v, (size_t)n, &o, NULL);
-    if (!s || !TRI_WBLK_SIMD(s)) {
+#if LRT_TRI_HAS_SSE4 && !LRT_TRI_NEON_SHIM
+    int need_simd = 1;
+#else
+    int need_simd = 0; /* scalar-only build: scalar watertight kernels */
+#endif
+    if (!s || (need_simd && !TRI_WBLK_SIMD(s)) || !s->wblk) {
         fprintf(stderr, "seed %d cfg (%d %d %d %d): no SIMD watertight leaf\n", seed, n, q, w, g);
         trav_bad++;
         lrt_tri_scene_free(s);
@@ -198,6 +207,32 @@ static void trav(int seed, int n, int q, int w, int g, int nrays) {
         lrt_hit a, b;
         int ka = lrt_tri_intersect1(s, &ray, &a);
         check_src(v, &ray, &a);
+        { /* brute force over the input triangles with the same watertight test */
+            tri_ray_ctx brc;
+            tri_ray_setup(&ray, &brc);
+            float bt = ray.tmax;
+            int bk = 0;
+            for (int p = 0; p < n; p++) {
+                float t, u, vv;
+                const float *w = &v[9 * p];
+                if (tri_woop_one(brc.org, brc.dir, w, w + 3, w + 6, brc.tmin, bt, &t, &u, &vv)) {
+                    bt = t;
+                    bk = 1;
+                }
+            }
+            if (bk != ka || (bk && !same(bt, a.t))) {
+                if (exn_diff < 8)
+                    fprintf(stderr, "exn cfg (%d %d %d %d) ray %d: brute %d %.9g  C %d %u %.9g  dir %g %g %g\n",
+                            n, q, w, g, r, bk, bt, ka, a.prim_id, a.t, ray.dir[0], ray.dir[1], ray.dir[2]);
+                exn_diff++;
+                if (bk && !ka) exn_miss++;
+                int32_t ia, ib;
+                memcpy(&ia, &bt, 4);
+                memcpy(&ib, &a.t, 4);
+                long d = (bk && ka) ? labs((long)ia - (long)ib) : 1000000;
+                if (d > exn_maxulp) exn_maxulp = d;
+            }
+        }
         int kb = tri_intersect_scalar(s, &ray, &b);
         trav_rays++;
         if (kb) trav_hits++;
@@ -287,7 +322,7 @@ static void trav(int seed, int n, int q, int w, int g, int nrays) {
     size_t nb = 0;
     if (lrt_tri_scene_save_to_memory(s, &buf, &nb) == LRT_RESULT_OK) {
         lrt_tri_scene *L = lrt_tri_scene_load_from_memory(buf, nb, NULL);
-        if (!L || !TRI_WBLK_SIMD(L)) {
+        if (!L || (need_simd && !TRI_WBLK_SIMD(L)) || !L->wblk) {
             persist_bad++;
         } else {
             for (int r = 0; r < nrays; r++) {
@@ -325,13 +360,15 @@ int main(int argc, char **argv) {
     int nrays = argc > 2 ? atoi(argv[2]) : 3000;
     for (int seed = 1; seed <= seeds; seed++) {
         rs = (uint32_t)seed * 2654435761u + 7;
+#if LRT_TRI_HAS_SSE4 && !LRT_TRI_NEON_SHIM
         leaf_fuzz(4, 200000);
+#endif
 #if LRT_TRI_HAS_AVX2
         leaf_fuzz(8, 200000);
 #endif
         const int cfg[][4] = {{400, 0, 4, 0}, {600, 1, 4, 1}, {500, 1, 4, 2},
                               {800, 1, 8, 0}, {1200, 0, 8, 1}, {500, 1, 8, 2}};
-        unsigned ncfg = LRT_TRI_HAS_AVX2 ? 6u : 3u; /* BVH8 SIMD leaf needs AVX2 */
+        unsigned ncfg = (LRT_TRI_HAS_AVX2 || !LRT_TRI_HAS_SSE4) ? 6u : 3u; /* SSE-only: no BVH8 SIMD leaf */
         for (unsigned c = 0; c < ncfg; c++)
             trav(seed, cfg[c][0], cfg[c][1], cfg[c][2], cfg[c][3], nrays);
     }
@@ -348,7 +385,15 @@ int main(int argc, char **argv) {
     printf("  (get_verts part: %ld; intersect_n[0].t != intersect1 t on %ld rays, max %ld ulp: the pruning slack\n"
            "   of both searches, Flat.run_approx; exact only under LRT_TRI_EXACT_NEAREST; report only)\n",
            gv_bad, mh_slack, mh_maxulp);
-    int bad = leaf_bad_blk || trav_bad || occ_bad || batch_bad || persist_bad || src_bad || reader_bad;
+#ifdef LRT_TRI_EXACT_NEAREST
+    printf("wtcheck EXACT_NEAREST (pruning key): intersect1 t != brute-force watertight t: %ld\n", exn_diff);
+    int exn_bad = exn_diff != 0;
+#else
+    printf("wtcheck intersect1 t != brute force: %ld rays (%ld misses, must be 0), max %ld ulp (t: report only)\n",
+           exn_diff, exn_miss, exn_maxulp);
+    int exn_bad = exn_miss != 0; /* a miss where brute force hits = a slab false miss */
+#endif
+    int bad = leaf_bad_blk || trav_bad || occ_bad || batch_bad || persist_bad || src_bad || reader_bad || exn_bad;
     printf("RESULT: %s\n", bad ? "FAIL" : "PASS");
     return bad;
 }

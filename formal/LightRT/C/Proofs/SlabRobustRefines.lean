@@ -3,7 +3,8 @@ import LightRT.C.GenRobust
 
 /-!
 Refinement for the **default** build's `tri_slab_scalar` (`LRT_TRI_SLAB_ROBUST`
-on, translated into `GenRobust`): the C function computes `Ref.slabRobust`.
+on, `LRT_TRI_SLAB_INFLATE` on, translated into `GenRobust`): the C function
+computes `Ref.slabRobust` (inflated far value).
 `tri_ray_ctx` gains `sinv[3]` at byte 56; the theorem takes the stored `sinv`
 as a parameter, and `tri_slab_scalar_robust_refines` instantiates it with the
 value `tri_ray_setup` stores (`+∞` for `d = ±0`, else `invd`).
@@ -39,6 +40,7 @@ macro_rules
       | (apply EvE.f32mul <;> evR) | (apply EvE.f32sub <;> evR)
       | (apply EvE.f32le <;> evR)
       | (apply EvE.callMinR <;> evR) | (apply EvE.callMaxR <;> evR)
+      | (apply EvE.constF; norm_num)
       | (apply EvE.loadAt
          · evptr
          · assumption
@@ -57,7 +59,8 @@ def slabS (rc : Ref.RayCtx) (s : Fin 3 → Ref.F) (lo hi : Fin 3 → Ref.F) (tbe
   let tn := fun k => Ref.fmin (t (hi k) k) (t (lo k) k)
   let tf := fun k => Ref.fmax (t (lo k) k) (t (hi k) k)
   let tnear := Ref.fmax (Ref.fmax (tn 0) (tn 1)) (Ref.fmax (tn 2) rc.tmin)
-  let tfar := Ref.fmin (Ref.fmin (tf 0) (tf 1)) (Ref.fmin (tf 2) tbest)
+  let tfar := LightRT.FP.Binary32.mulBits (Ref.fmin (Ref.fmin (tf 0) (tf 1)) (Ref.fmin (tf 2) tbest))
+    Ref.slabK
   (LightRT.FP.Binary32.leBits tnear tfar, tnear)
 
 /-- What `tri_ray_setup` stores in `rc->sinv` under `LRT_TRI_SLAB_ROBUST`. -/
