@@ -624,6 +624,13 @@ struct lrt_tri_scene {
      * triangles would not see a shared vertex identically. Built scenes only
      * (serialized/mmapped scenes have NULL and fall back to Moller-Trumbore). */
     float *wverts;
+    /* The same exact vertices re-swizzled SoA per leaf block (10*width words:
+     * v0x[w] v0y[w] v0z[w] v1x.. v2z, then the w prim ids), for the SIMD
+     * watertight leaves (tri_woop4/8_block); self-contained, so the leaf reads
+     * one stream instead of the edge block plus the vertices. Padding lanes
+     * are zero with prim id LRT_TRI_NO_HIT. Derived from wverts by
+     * tri_build_wblk after build, load and refit. */
+    float *wblk;
 #endif
     uint32_t block_stride; /* bytes per leaf block (varies for quantized leaves) */
     lrt_tri_stats stats;
@@ -672,6 +679,47 @@ static inline const float *tri_block_floats(const void *blocks, uint32_t idx,
     return (const float *)((const char *)blocks +
                            (size_t)idx * tri_block_size(width));
 }
+
+#ifdef LRT_TRI_WATERTIGHT_TRI
+/* Scene has a SIMD watertight leaf for its layout (BVH4 SSE / BVH8 AVX2, not
+ * quantized nodes); otherwise the watertight build runs the scalar kernels. */
+#if LRT_TRI_HAS_AVX2
+#define TRI_WBLK_SIMD(s) ((s)->wblk && !(s)->quantized && ((s)->layout == 4 || (s)->layout == 8))
+#elif LRT_TRI_HAS_SSE4 && !LRT_TRI_NEON_SHIM
+#define TRI_WBLK_SIMD(s) ((s)->wblk && !(s)->quantized && (s)->layout == 4)
+#else
+#define TRI_WBLK_SIMD(s) 0
+#endif
+/* (Re)derive s->wblk from s->wverts and the leaf blocks' prim ids. Plain
+ * BVH4/BVH8 (incl. BVH8Q) triangle scenes only; returns 0 on OOM. */
+static int tri_build_wblk(lrt_tri_scene *s) {
+#if !(LRT_TRI_HAS_SSE4 && !LRT_TRI_NEON_SHIM)
+    (void)s;
+    return 1; /* no SIMD watertight leaf on this target: scalar kernels */
+#endif
+    if (!s->wverts || s->prim_kind != TRI_PRIM_TRI || s->qnode != 0 ||
+        (s->layout != 4 && s->layout != 8))
+        return 1;
+    int w = s->layout;
+    size_t n = (size_t)s->block_count * 10 * (size_t)w;
+    if (!s->wblk) {
+        s->wblk = (float *)malloc(n * sizeof(float) + 64);
+        if (!s->wblk) return 0;
+    }
+    for (uint32_t b = 0; b < s->block_count; b++) {
+        const float *f = tri_block_floats(s->blocks, b, w);
+        const uint32_t *ids = (const uint32_t *)(f + 9 * w);
+        float *o = &s->wblk[(size_t)b * 10 * w];
+        for (int l = 0; l < w; l++) {
+            for (int c = 0; c < 9; c++)
+                o[c * w + l] = ids[l] == LRT_TRI_NO_HIT ? 0.0f
+                                                        : s->wverts[(size_t)ids[l] * 9 + c];
+            memcpy(&o[9 * w + l], &ids[l], 4);
+        }
+    }
+    return 1;
+}
+#endif
 
 /* Build the prim_id -> leaf-slot map for a plain triangle scene, so
  * lrt_tri_get_verts can recover object-space vertices from the swizzled leaves.
@@ -3403,6 +3451,14 @@ static inline void tri_prefetch_ref(const lrt_tri_scene *s, uint32_t ref,
                                     int width) {
     (void)width;
     if (TRI_REF_IS_LEAF(ref)) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+        if (s->wblk) { /* the SIMD watertight leaf reads only the wblk block */
+            const char *w = (const char *)&s->wblk[(size_t)TRI_REF_BLOCK(ref) * 10 * s->layout];
+            TRI_PREFETCH_T0(w);
+            TRI_PREFETCH_T0(w + 64);
+            return;
+        }
+#endif
         const char *b = (const char *)tri_block_ptr(
             s->blocks, TRI_REF_BLOCK(ref), s->block_stride);
         TRI_PREFETCH_T0(b);
@@ -6438,6 +6494,119 @@ static inline int tri_bvh4_slab_sse(const lrt_bvh4_node *n,
 }
 
 /* 4-wide SoA Moller-Trumbore over one block. Updates best hit in place. */
+#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+#define TWLT(a, b) _mm_cmplt_ps(a, b)
+#define TWGT(a, b) _mm_cmpgt_ps(a, b)
+#define TWGE(a, b) _mm_cmpge_ps(a, b)
+#define TWNEQ(a, b) _mm_cmpneq_ps(a, b)
+/* SIMD watertight leaf (4 lanes): tri_woop_one's operations in its order (no
+ * FMA, same association), so every lane is bit-identical to the scalar test
+ * and the formal results (tri_woop_one_refines, woop_no_gap_bits) carry over.
+ * Comparisons keep the scalar NaN behaviour: ordered <, >, >=, and an
+ * unordered != for `det == 0 -> reject`. The closest lane is the minimum t,
+ * lowest lane on ties, which is what the scalar lane loop with a strict
+ * `t < best` update returns. */
+typedef struct tri_woop4_ctx {
+    __m128 sx, sy, sz, ox, oy, oz, tmin;
+    int kx, ky, kz;
+} tri_woop4_ctx;
+static inline void tri_woop4_setup(const tri_ray_ctx *rc, tri_woop4_ctx *w) {
+    const float *d = rc->dir, *o = rc->org;
+    float a0 = copysignf(d[0], 1.0f), a1 = copysignf(d[1], 1.0f), a2 = copysignf(d[2], 1.0f);
+    int kz = 0;
+    if (a1 > a0) kz = 1;
+    if (a2 > a0 && a2 > a1) kz = 2;
+    int kx = kz + 1;
+    if (kx == 3) kx = 0;
+    int ky = kx + 1;
+    if (ky == 3) ky = 0;
+    if (d[kz] < 0.0f) {
+        int t = kx;
+        kx = ky;
+        ky = t;
+    }
+    w->kx = kx;
+    w->ky = ky;
+    w->kz = kz;
+    w->sx = _mm_set1_ps(d[kx] / d[kz]);
+    w->sy = _mm_set1_ps(d[ky] / d[kz]);
+    w->sz = _mm_set1_ps(1.0f / d[kz]);
+    w->ox = _mm_set1_ps(o[kx]);
+    w->oy = _mm_set1_ps(o[ky]);
+    w->oz = _mm_set1_ps(o[kz]);
+    w->tmin = _mm_set1_ps(rc->tmin);
+}
+/* Lane mask of accepted hits in [tmin, best). */
+static inline int tri_woop4_lanes(const float *wb, const uint32_t *ids,
+                                  const tri_woop4_ctx *w, float best, __m128 *tt_o,
+                                  __m128 *ve_o, __m128 *we_o, __m128 *det_o) {
+    const int kx = w->kx, ky = w->ky, kz = w->kz;
+    __m128 ax = _mm_sub_ps(_mm_loadu_ps(wb + (0 + kx) * 4), w->ox), ay = _mm_sub_ps(_mm_loadu_ps(wb + (0 + ky) * 4), w->oy),
+       az = _mm_sub_ps(_mm_loadu_ps(wb + (0 + kz) * 4), w->oz);
+    __m128 bx = _mm_sub_ps(_mm_loadu_ps(wb + (3 + kx) * 4), w->ox), by = _mm_sub_ps(_mm_loadu_ps(wb + (3 + ky) * 4), w->oy),
+       bz = _mm_sub_ps(_mm_loadu_ps(wb + (3 + kz) * 4), w->oz);
+    __m128 cx = _mm_sub_ps(_mm_loadu_ps(wb + (6 + kx) * 4), w->ox), cy = _mm_sub_ps(_mm_loadu_ps(wb + (6 + ky) * 4), w->oy),
+       cz = _mm_sub_ps(_mm_loadu_ps(wb + (6 + kz) * 4), w->oz);
+    ax = _mm_sub_ps(ax, _mm_mul_ps(w->sx, az));
+    ay = _mm_sub_ps(ay, _mm_mul_ps(w->sy, az));
+    bx = _mm_sub_ps(bx, _mm_mul_ps(w->sx, bz));
+    by = _mm_sub_ps(by, _mm_mul_ps(w->sy, bz));
+    cx = _mm_sub_ps(cx, _mm_mul_ps(w->sx, cz));
+    cy = _mm_sub_ps(cy, _mm_mul_ps(w->sy, cz));
+    __m128 ue = _mm_sub_ps(_mm_mul_ps(cx, by), _mm_mul_ps(cy, bx));
+    __m128 ve = _mm_sub_ps(_mm_mul_ps(ax, cy), _mm_mul_ps(ay, cx));
+    __m128 we = _mm_sub_ps(_mm_mul_ps(bx, ay), _mm_mul_ps(by, ax));
+    __m128 z = _mm_setzero_ps();
+    __m128 neg = _mm_or_ps(_mm_or_ps(TWLT(ue, z), TWLT(ve, z)), TWLT(we, z));
+    __m128 pos = _mm_or_ps(_mm_or_ps(TWGT(ue, z), TWGT(ve, z)), TWGT(we, z));
+    __m128 det = _mm_add_ps(_mm_add_ps(ue, ve), we);
+    __m128 num = _mm_add_ps(_mm_add_ps(_mm_mul_ps(ue, _mm_mul_ps(w->sz, az)), _mm_mul_ps(ve, _mm_mul_ps(w->sz, bz))), _mm_mul_ps(we, _mm_mul_ps(w->sz, cz)));
+    __m128 tt = _mm_div_ps(num, det);
+    __m128 ok = _mm_andnot_ps(_mm_and_ps(neg, pos), TWNEQ(det, z));
+    ok = _mm_and_ps(ok, _mm_and_ps(TWGE(tt, w->tmin), TWLT(tt, _mm_set1_ps(best))));
+    int m = _mm_movemask_ps(ok);
+    for (int l = 0; l < 4; l++)
+        if (ids[l] == LRT_TRI_NO_HIT) m &= ~(1 << l);
+    *tt_o = tt;
+    *ve_o = ve;
+    *we_o = we;
+    *det_o = det;
+    return m;
+}
+static inline void tri_woop4_block(const float *wb, const uint32_t *ids,
+                                   const tri_woop4_ctx *w, float *best_t,
+                                   float *best_u, float *best_v, uint32_t *best_prim) {
+    __m128 tt, ve, we, det;
+    int m = tri_woop4_lanes(wb, ids, w, *best_t, &tt, &ve, &we, &det);
+    if (!m) return;
+    _Alignas(32) float T[4], V[4], WW[4], D[4];
+    _mm_store_ps(T, tt);
+    _mm_store_ps(V, ve);
+    _mm_store_ps(WW, we);
+    _mm_store_ps(D, det);
+    int bl = -1;
+    float bt = *best_t;
+    for (int l = 0; l < 4; l++)
+        if (((m >> l) & 1) && T[l] < bt) {
+            bt = T[l];
+            bl = l;
+        }
+    *best_t = bt;
+    *best_u = V[bl] / D[bl];
+    *best_v = WW[bl] / D[bl];
+    *best_prim = ids[bl];
+}
+static inline int tri_woop4_block_occ(const float *wb, const uint32_t *ids,
+                                      const tri_woop4_ctx *w, float tmax) {
+    __m128 tt, ve, we, det;
+    return tri_woop4_lanes(wb, ids, w, tmax, &tt, &ve, &we, &det) != 0;
+}
+#undef TWLT
+#undef TWGT
+#undef TWGE
+#undef TWNEQ
+#endif
+
 static inline void tri_block_isect_sse(const lrt_tri4 *blk,
                                        const tri_sse_ctx *sc, float *best_t,
                                        float *best_u, float *best_v,
@@ -6682,6 +6851,10 @@ static int tri_intersect_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray,
     tri_ray_setup(ray, &rc);
     tri_sse_ctx sc;
     tri_sse_setup(&rc, &sc);
+#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+    tri_woop4_ctx wc;
+    if (s->wblk) tri_woop4_setup(&rc, &wc);
+#endif
 
     float best_t = ray->tmax;
     float best_u = 0.0f, best_v = 0.0f;
@@ -6701,6 +6874,13 @@ static int tri_intersect_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray,
             uint32_t nblk = TRI_REF_NBLOCKS(e.ref);
             const lrt_tri4 *blocks = (const lrt_tri4 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++) {
+#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+                if (s->wblk) {
+                    tri_woop4_block(s->wblk + (size_t)(blk0 + b) * 40, (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 40 + 36),
+                                    &wc, &best_t, &best_u, &best_v, &best_prim);
+                    continue;
+                }
+#endif
                 tri_block_isect_sse(&blocks[blk0 + b], &sc, &best_t, &best_u,
                                     &best_v, &best_prim);
             }
@@ -6768,6 +6948,10 @@ static int tri_occluded_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray) {
     tri_sse_ctx sc;
     tri_sse_setup(&rc, &sc);
     __m128 tmax4 = _mm_set1_ps(ray->tmax);
+#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+    tri_woop4_ctx wc;
+    if (s->wblk) tri_woop4_setup(&rc, &wc);
+#endif
 
     uint32_t stack[TRI_STACK_SIZE];
     int sp = 0;
@@ -6780,6 +6964,15 @@ static int tri_occluded_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray) {
             uint32_t nblk = TRI_REF_NBLOCKS(ref);
             const lrt_tri4 *blocks = (const lrt_tri4 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++) {
+#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+                if (s->wblk) {
+                    if (tri_woop4_block_occ(s->wblk + (size_t)(blk0 + b) * 40,
+                                            (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 40 + 36),
+                                            &wc, ray->tmax))
+                        return 1;
+                    continue;
+                }
+#endif
                 if (tri_block_occluded_sse(&blocks[blk0 + b], &sc, tmax4)) {
                     return 1;
                 }
@@ -8466,6 +8659,9 @@ typedef struct tri_pipe4_state {
     lrt_hit *hit;
     int sp;
     tri_stack_entry stack[TRI_STACK_SIZE];
+#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+    tri_woop4_ctx wc;
+#endif
 } tri_pipe4_state;
 
 static inline void tri_pipe4_init(const lrt_tri_scene *s, tri_pipe4_state *st,
@@ -8473,6 +8669,9 @@ static inline void tri_pipe4_init(const lrt_tri_scene *s, tri_pipe4_state *st,
     (void)s;
     tri_ray_setup(ray, &st->rc);
     tri_sse_setup(&st->rc, &st->sc);
+#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+    if (s->wblk) tri_woop4_setup(&st->rc, &st->wc);
+#endif
     st->best_t = ray->tmax;
     st->best_u = 0.0f;
     st->best_v = 0.0f;
@@ -8493,6 +8692,13 @@ static inline int tri_pipe4_step(const lrt_tri_scene *s, tri_pipe4_state *st) {
             uint32_t nblk = TRI_REF_NBLOCKS(e.ref);
             const lrt_tri4 *blocks = (const lrt_tri4 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++) {
+#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+                if (s->wblk) {
+                    tri_woop4_block(s->wblk + (size_t)(blk0 + b) * 40, (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 40 + 36),
+                                    &st->wc, &st->best_t, &st->best_u, &st->best_v, &st->best_prim);
+                    continue;
+                }
+#endif
                 tri_block_isect_sse(&blocks[blk0 + b], &st->sc, &st->best_t,
                                     &st->best_u, &st->best_v, &st->best_prim);
             }
@@ -8582,6 +8788,9 @@ typedef struct tri_pipeocc4_state {
     uint8_t *out;
     int sp;
     uint32_t stack[TRI_STACK_SIZE];
+#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+    tri_woop4_ctx wc;
+#endif
 } tri_pipeocc4_state;
 
 static inline void tri_pipeocc4_init(const lrt_tri_scene *s,
@@ -8589,6 +8798,9 @@ static inline void tri_pipeocc4_init(const lrt_tri_scene *s,
                                      const lrt_ray *ray, uint8_t *out) {
     tri_ray_setup(ray, &st->rc);
     tri_sse_setup(&st->rc, &st->sc);
+#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+    if (s->wblk) tri_woop4_setup(&st->rc, &st->wc);
+#endif
     st->tmax4 = _mm_set1_ps(ray->tmax);
     st->out = out;
     st->stack[0] = s->root;
@@ -8608,6 +8820,16 @@ static inline int tri_pipeocc4_step(const lrt_tri_scene *s,
         uint32_t nblk = TRI_REF_NBLOCKS(ref);
         const lrt_tri4 *blocks = (const lrt_tri4 *)s->blocks;
         for (uint32_t b = 0; b < nblk; b++) {
+#if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
+        if (s->wblk) {
+            if (tri_woop4_block_occ(s->wblk + (size_t)(blk0 + b) * 40, (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 40 + 36), &st->wc,
+                                    _mm_cvtss_f32(st->tmax4))) {
+                *st->out = 1;
+                return 0;
+            }
+            continue;
+        }
+#endif
             if (tri_block_occluded_sse(&blocks[blk0 + b], &st->sc, st->tmax4)) {
                 *st->out = 1;
                 return 0;
@@ -8708,6 +8930,119 @@ static inline void tri_avx_setup(const tri_ray_ctx *rc, tri_avx_ctx *ac) {
 #define TRI_X8(a, b, c, d) _mm256_fmsub_ps(a, b, _mm256_mul_ps(c, d))
 #define TRI_DOT8(a1, b1, a2, b2, a3, b3) \
     _mm256_fmadd_ps(a1, b1, _mm256_fmadd_ps(a2, b2, _mm256_mul_ps(a3, b3)))
+#endif
+
+#ifdef LRT_TRI_WATERTIGHT_TRI
+#define TWLT(a, b) _mm256_cmp_ps(a, b, _CMP_LT_OQ)
+#define TWGT(a, b) _mm256_cmp_ps(a, b, _CMP_GT_OQ)
+#define TWGE(a, b) _mm256_cmp_ps(a, b, _CMP_GE_OQ)
+#define TWNEQ(a, b) _mm256_cmp_ps(a, b, _CMP_NEQ_UQ)
+/* SIMD watertight leaf (8 lanes): tri_woop_one's operations in its order (no
+ * FMA, same association), so every lane is bit-identical to the scalar test
+ * and the formal results (tri_woop_one_refines, woop_no_gap_bits) carry over.
+ * Comparisons keep the scalar NaN behaviour: ordered <, >, >=, and an
+ * unordered != for `det == 0 -> reject`. The closest lane is the minimum t,
+ * lowest lane on ties, which is what the scalar lane loop with a strict
+ * `t < best` update returns. */
+typedef struct tri_woop8_ctx {
+    __m256 sx, sy, sz, ox, oy, oz, tmin;
+    int kx, ky, kz;
+} tri_woop8_ctx;
+static inline void tri_woop8_setup(const tri_ray_ctx *rc, tri_woop8_ctx *w) {
+    const float *d = rc->dir, *o = rc->org;
+    float a0 = copysignf(d[0], 1.0f), a1 = copysignf(d[1], 1.0f), a2 = copysignf(d[2], 1.0f);
+    int kz = 0;
+    if (a1 > a0) kz = 1;
+    if (a2 > a0 && a2 > a1) kz = 2;
+    int kx = kz + 1;
+    if (kx == 3) kx = 0;
+    int ky = kx + 1;
+    if (ky == 3) ky = 0;
+    if (d[kz] < 0.0f) {
+        int t = kx;
+        kx = ky;
+        ky = t;
+    }
+    w->kx = kx;
+    w->ky = ky;
+    w->kz = kz;
+    w->sx = _mm256_set1_ps(d[kx] / d[kz]);
+    w->sy = _mm256_set1_ps(d[ky] / d[kz]);
+    w->sz = _mm256_set1_ps(1.0f / d[kz]);
+    w->ox = _mm256_set1_ps(o[kx]);
+    w->oy = _mm256_set1_ps(o[ky]);
+    w->oz = _mm256_set1_ps(o[kz]);
+    w->tmin = _mm256_set1_ps(rc->tmin);
+}
+/* Lane mask of accepted hits in [tmin, best). */
+static inline int tri_woop8_lanes(const float *wb, const uint32_t *ids,
+                                  const tri_woop8_ctx *w, float best, __m256 *tt_o,
+                                  __m256 *ve_o, __m256 *we_o, __m256 *det_o) {
+    const int kx = w->kx, ky = w->ky, kz = w->kz;
+    __m256 ax = _mm256_sub_ps(_mm256_loadu_ps(wb + (0 + kx) * 8), w->ox), ay = _mm256_sub_ps(_mm256_loadu_ps(wb + (0 + ky) * 8), w->oy),
+       az = _mm256_sub_ps(_mm256_loadu_ps(wb + (0 + kz) * 8), w->oz);
+    __m256 bx = _mm256_sub_ps(_mm256_loadu_ps(wb + (3 + kx) * 8), w->ox), by = _mm256_sub_ps(_mm256_loadu_ps(wb + (3 + ky) * 8), w->oy),
+       bz = _mm256_sub_ps(_mm256_loadu_ps(wb + (3 + kz) * 8), w->oz);
+    __m256 cx = _mm256_sub_ps(_mm256_loadu_ps(wb + (6 + kx) * 8), w->ox), cy = _mm256_sub_ps(_mm256_loadu_ps(wb + (6 + ky) * 8), w->oy),
+       cz = _mm256_sub_ps(_mm256_loadu_ps(wb + (6 + kz) * 8), w->oz);
+    ax = _mm256_sub_ps(ax, _mm256_mul_ps(w->sx, az));
+    ay = _mm256_sub_ps(ay, _mm256_mul_ps(w->sy, az));
+    bx = _mm256_sub_ps(bx, _mm256_mul_ps(w->sx, bz));
+    by = _mm256_sub_ps(by, _mm256_mul_ps(w->sy, bz));
+    cx = _mm256_sub_ps(cx, _mm256_mul_ps(w->sx, cz));
+    cy = _mm256_sub_ps(cy, _mm256_mul_ps(w->sy, cz));
+    __m256 ue = _mm256_sub_ps(_mm256_mul_ps(cx, by), _mm256_mul_ps(cy, bx));
+    __m256 ve = _mm256_sub_ps(_mm256_mul_ps(ax, cy), _mm256_mul_ps(ay, cx));
+    __m256 we = _mm256_sub_ps(_mm256_mul_ps(bx, ay), _mm256_mul_ps(by, ax));
+    __m256 z = _mm256_setzero_ps();
+    __m256 neg = _mm256_or_ps(_mm256_or_ps(TWLT(ue, z), TWLT(ve, z)), TWLT(we, z));
+    __m256 pos = _mm256_or_ps(_mm256_or_ps(TWGT(ue, z), TWGT(ve, z)), TWGT(we, z));
+    __m256 det = _mm256_add_ps(_mm256_add_ps(ue, ve), we);
+    __m256 num = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(ue, _mm256_mul_ps(w->sz, az)), _mm256_mul_ps(ve, _mm256_mul_ps(w->sz, bz))), _mm256_mul_ps(we, _mm256_mul_ps(w->sz, cz)));
+    __m256 tt = _mm256_div_ps(num, det);
+    __m256 ok = _mm256_andnot_ps(_mm256_and_ps(neg, pos), TWNEQ(det, z));
+    ok = _mm256_and_ps(ok, _mm256_and_ps(TWGE(tt, w->tmin), TWLT(tt, _mm256_set1_ps(best))));
+    int m = _mm256_movemask_ps(ok);
+    for (int l = 0; l < 8; l++)
+        if (ids[l] == LRT_TRI_NO_HIT) m &= ~(1 << l);
+    *tt_o = tt;
+    *ve_o = ve;
+    *we_o = we;
+    *det_o = det;
+    return m;
+}
+static inline void tri_woop8_block(const float *wb, const uint32_t *ids,
+                                   const tri_woop8_ctx *w, float *best_t,
+                                   float *best_u, float *best_v, uint32_t *best_prim) {
+    __m256 tt, ve, we, det;
+    int m = tri_woop8_lanes(wb, ids, w, *best_t, &tt, &ve, &we, &det);
+    if (!m) return;
+    _Alignas(32) float T[8], V[8], WW[8], D[8];
+    _mm256_store_ps(T, tt);
+    _mm256_store_ps(V, ve);
+    _mm256_store_ps(WW, we);
+    _mm256_store_ps(D, det);
+    int bl = -1;
+    float bt = *best_t;
+    for (int l = 0; l < 8; l++)
+        if (((m >> l) & 1) && T[l] < bt) {
+            bt = T[l];
+            bl = l;
+        }
+    *best_t = bt;
+    *best_u = V[bl] / D[bl];
+    *best_v = WW[bl] / D[bl];
+    *best_prim = ids[bl];
+}
+static inline int tri_woop8_block_occ(const float *wb, const uint32_t *ids,
+                                      const tri_woop8_ctx *w, float tmax) {
+    __m256 tt, ve, we, det;
+    return tri_woop8_lanes(wb, ids, w, tmax, &tt, &ve, &we, &det) != 0;
+}
+#undef TWLT
+#undef TWGT
+#undef TWGE
+#undef TWNEQ
 #endif
 
 /* 8-wide SoA Moller-Trumbore over one lrt_tri8 block. Updates best in place. */
@@ -8856,6 +9191,10 @@ static int tri_intersect_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray,
     tri_ray_setup(ray, &rc);
     tri_avx_ctx ac;
     tri_avx_setup(&rc, &ac);
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    tri_woop8_ctx wc;
+    if (s->wblk) tri_woop8_setup(&rc, &wc);
+#endif
 
     float best_t = ray->tmax;
     float best_u = 0.0f, best_v = 0.0f;
@@ -8875,6 +9214,13 @@ static int tri_intersect_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray,
             uint32_t nblk = TRI_REF_NBLOCKS(e.ref);
             const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+                if (s->wblk) {
+                    tri_woop8_block(s->wblk + (size_t)(blk0 + b) * 80, (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 80 + 72),
+                                    &wc, &best_t, &best_u, &best_v, &best_prim);
+                    continue;
+                }
+#endif
                 tri_block_isect_avx(&blocks[blk0 + b], &ac, &best_t, &best_u,
                                     &best_v, &best_prim);
             }
@@ -8924,6 +9270,10 @@ static int tri_occluded_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray) {
     tri_avx_ctx ac;
     tri_avx_setup(&rc, &ac);
     __m256 tmax8 = _mm256_set1_ps(ray->tmax);
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    tri_woop8_ctx wc;
+    if (s->wblk) tri_woop8_setup(&rc, &wc);
+#endif
 
     uint32_t stack[TRI_STACK_SIZE];
     int sp = 0;
@@ -8936,6 +9286,15 @@ static int tri_occluded_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray) {
             uint32_t nblk = TRI_REF_NBLOCKS(ref);
             const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+                if (s->wblk) {
+                    if (tri_woop8_block_occ(s->wblk + (size_t)(blk0 + b) * 80,
+                                            (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 80 + 72),
+                                            &wc, ray->tmax))
+                        return 1;
+                    continue;
+                }
+#endif
                 if (tri_block_occluded_avx(&blocks[blk0 + b], &ac, tmax8)) {
                     return 1;
                 }
@@ -9370,12 +9729,18 @@ typedef struct tri_pipe8_state {
     lrt_hit *hit;
     int sp;
     tri_stack_entry stack[TRI_STACK_SIZE];
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    tri_woop8_ctx wc;
+#endif
 } tri_pipe8_state;
 
 static inline void tri_pipe8_init(const lrt_tri_scene *s, tri_pipe8_state *st,
                                   const lrt_ray *ray, lrt_hit *hit) {
     tri_ray_setup(ray, &st->rc);
     tri_avx_setup(&st->rc, &st->ac);
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    if (s->wblk) tri_woop8_setup(&st->rc, &st->wc);
+#endif
     st->best_t = ray->tmax;
     st->best_u = 0.0f;
     st->best_v = 0.0f;
@@ -9395,6 +9760,13 @@ static inline int tri_pipe8_step(const lrt_tri_scene *s, tri_pipe8_state *st) {
             uint32_t nblk = TRI_REF_NBLOCKS(e.ref);
             const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+                if (s->wblk) {
+                    tri_woop8_block(s->wblk + (size_t)(blk0 + b) * 80, (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 80 + 72),
+                                    &st->wc, &st->best_t, &st->best_u, &st->best_v, &st->best_prim);
+                    continue;
+                }
+#endif
                 tri_block_isect_avx(&blocks[blk0 + b], &st->ac, &st->best_t,
                                     &st->best_u, &st->best_v, &st->best_prim);
             }
@@ -9495,6 +9867,9 @@ typedef struct tri_pipeocc8_state {
     uint8_t *out;
     int sp;
     uint32_t stack[TRI_STACK_SIZE];
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    tri_woop8_ctx wc;
+#endif
 } tri_pipeocc8_state;
 
 static inline void tri_pipeocc8_init(const lrt_tri_scene *s,
@@ -9502,6 +9877,9 @@ static inline void tri_pipeocc8_init(const lrt_tri_scene *s,
                                      const lrt_ray *ray, uint8_t *out) {
     tri_ray_setup(ray, &st->rc);
     tri_avx_setup(&st->rc, &st->ac);
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    if (s->wblk) tri_woop8_setup(&st->rc, &st->wc);
+#endif
     st->tmax8 = _mm256_set1_ps(ray->tmax);
     st->out = out;
     st->stack[0] = s->root;
@@ -9520,6 +9898,16 @@ static inline int tri_pipeocc8_step(const lrt_tri_scene *s,
         uint32_t nblk = TRI_REF_NBLOCKS(ref);
         const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
         for (uint32_t b = 0; b < nblk; b++) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+            if (s->wblk) {
+                if (tri_woop8_block_occ(s->wblk + (size_t)(blk0 + b) * 80, (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 80 + 72), &st->wc,
+                                        _mm256_cvtss_f32(st->tmax8))) {
+                    *st->out = 1;
+                    return 0;
+                }
+                continue;
+            }
+#endif
             if (tri_block_occluded_avx(&blocks[blk0 + b], &st->ac, st->tmax8)) {
                 *st->out = 1;
                 return 0;
@@ -11030,6 +11418,11 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
             float buf[9];
             memcpy(&s->wverts[i * 9], tri_fetch9(vertices, vidx, i, buf), 9 * sizeof(float));
         }
+        if (!tri_build_wblk(s)) {
+            lrt_tri_scene_free(s);
+            tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+            return NULL;
+        }
     }
 #endif
 #ifdef LRT_TRI_LEAF_BOX_EXACT
@@ -11215,6 +11608,7 @@ void lrt_tri_scene_free(lrt_tri_scene *s) {
     free(s->shade_dom);
 #ifdef LRT_TRI_WATERTIGHT_TRI
     free(s->wverts);
+    free(s->wblk);
 #endif
     free(s);
 }
@@ -11225,7 +11619,7 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
         return 0;
     }
 #ifdef LRT_TRI_WATERTIGHT_TRI
-    if (s->prim_kind == TRI_PRIM_TRI && s->wverts && s->layout != 16 && s->qnode == 0)
+    if (s->prim_kind == TRI_PRIM_TRI && s->wverts && !TRI_WBLK_SIMD(s) && s->layout != 16 && s->qnode == 0)
         return tri_intersect_scalar(s, ray, hit); /* watertight leaf is scalar */
 #endif
     if (s->prim_kind == TRI_PRIM_QTRI) {
@@ -11473,7 +11867,7 @@ int lrt_tri_intersect1_hp(const lrt_tri_scene *s, const lrt_ray_hp *ray,
 int lrt_tri_occluded1(const lrt_tri_scene *s, const lrt_ray *ray) {
     if (!s || !ray) return 0;
 #ifdef LRT_TRI_WATERTIGHT_TRI
-    if (s->prim_kind == TRI_PRIM_TRI && s->wverts && s->layout != 16 && s->qnode == 0)
+    if (s->prim_kind == TRI_PRIM_TRI && s->wverts && !TRI_WBLK_SIMD(s) && s->layout != 16 && s->qnode == 0)
         return tri_occluded_scalar(s, ray);
 #endif
     if (s->prim_kind == TRI_PRIM_QTRI) {
@@ -11546,7 +11940,9 @@ void lrt_tri_intersect1N(const lrt_tri_scene *s, const lrt_ray *rays,
      * prim_kind (and qnode-quantized triangle nodes) must loop per ray. */
     if (s->prim_kind != TRI_PRIM_TRI || s->qnode != 0
 #ifdef LRT_TRI_WATERTIGHT_TRI
-        || s->wverts /* qnode != 0 is already per-ray above */
+        /* watertight: the interleaved pipeline pays off only for BVH4 closest
+         * hit (measured, PLAN.md M17); otherwise the per-ray SIMD kernels */
+        || (s->wverts && !(TRI_WBLK_SIMD(s) && s->layout == 4))
 #endif
         ) {
         for (size_t i = 0; i < n; i++) lrt_tri_intersect1(s, &rays[i], &hits[i]);
@@ -11620,7 +12016,7 @@ void lrt_tri_occluded1N(const lrt_tri_scene *s, const lrt_ray *rays,
     /* Plain-triangle-only pipelines; loop per ray for every other prim_kind. */
     if (s->prim_kind != TRI_PRIM_TRI || s->qnode != 0
 #ifdef LRT_TRI_WATERTIGHT_TRI
-        || s->wverts /* qnode != 0 is already per-ray above */
+        || s->wverts /* watertight any-hit: per-ray SIMD kernels measured faster */
 #endif
         ) {
         for (size_t i = 0; i < n; i++) {
@@ -15363,6 +15759,10 @@ static lrt_tri_scene *tri_scene_from_buffer(const void *buf, size_t n, int copy,
                 memcpy(wv, ap + sizeof(ah), vbytes);
                 s->wverts = wv;
                 if (!s->original_ntris) s->original_ntris = ah.npts;
+                if (!tri_build_wblk(s)) {
+                    free(s->wverts);
+                    s->wverts = NULL;
+                }
             }
         }
     }
@@ -15606,7 +16006,10 @@ lrt_result lrt_tri_scene_refit(lrt_tri_scene *s, const float *vertices,
     }
 
 #ifdef LRT_TRI_WATERTIGHT_TRI
-    if (s->wverts) memcpy(s->wverts, vertices, ntris * 9 * sizeof(float));
+    if (s->wverts) {
+        memcpy(s->wverts, vertices, ntris * 9 * sizeof(float));
+        if (!tri_build_wblk(s)) return LRT_RESULT_OUT_OF_MEMORY;
+    }
 #endif
     /* 2. Recompute node bounds bottom-up (children have higher indices). */
     return tri_refit_propagate(s);
@@ -16867,7 +17270,13 @@ void lrt_tri_intersect4(const lrt_tri_scene *s, const lrt_ray4 *r,
                         lrt_hit4 *h) {
     if (!s || !r || !h) return;
 #if LRT_TRI_HAS_SSE4
-    if (s->prim_kind == TRI_PRIM_TRI) {
+    /* The packet kernel runs Moller-Trumbore on the edge blocks; a watertight
+     * scene (exact vertices) runs per ray so every query uses the watertight leaf. */
+    if (s->prim_kind == TRI_PRIM_TRI
+#ifdef LRT_TRI_WATERTIGHT_TRI
+        && !s->wverts
+#endif
+    ) {
         tri_intersect4_sse(s, r, h);
         return;
     }
@@ -16890,7 +17299,13 @@ void lrt_tri_occluded4(const lrt_tri_scene *s, const lrt_ray4 *r,
                        uint8_t occ[4]) {
     if (!s || !r || !occ) return;
 #if LRT_TRI_HAS_SSE4
-    if (s->prim_kind == TRI_PRIM_TRI) {
+    /* The packet kernel runs Moller-Trumbore on the edge blocks; a watertight
+     * scene (exact vertices) runs per ray so every query uses the watertight leaf. */
+    if (s->prim_kind == TRI_PRIM_TRI
+#ifdef LRT_TRI_WATERTIGHT_TRI
+        && !s->wverts
+#endif
+    ) {
         tri_occluded4_sse(s, r, occ);
         return;
     }

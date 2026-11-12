@@ -221,3 +221,22 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   - *Still open:* the world hit point itself (`o + t d` at the reported, rounded `t`) is not proved to lie in the box. It inherits the BLAS's grazing-ray `t` error, which is unbounded in general. The closest-hit result is still covered: C1/C2 use the BLAS's exact parameter, as in the single-level `run_cover`.
 
   - *GPU patch drivers, negative result:* porting the CPU's stack-carried cell nets (`tri_patch_split4`) to `hp_bezpatch_one` / `hp_rbez_one` kept agreement at 100% but was about 2× slower on an RX 9070 XT (`bench_hip --normals`, 20k bicubic patches): primary 6.4 → 3.8 Mray/s, incoherent 0.7 → 0.3. 32 stack entries × 192–256 B per thread spill to local memory, which costs more than recomputing each cell's net from the root in registers. The GPU keeps `hp_subpatch`.
+- **M17 (SIMD watertight leaf):**
+  - *Leaf:* `tri_woop4_block` (SSE, BVH4) and `tri_woop8_block` (AVX2, BVH8) are generated from one template. They perform `tri_woop_one`'s operations in its order, with no FMA and the same association. Comparisons keep the scalar NaN behaviour: ordered `<`, `>`, `>=`, and an unordered `!=` for the `det == 0` reject. The closest lane is the minimum `t`, lowest lane on ties, which is what the scalar lane loop with a strict `t < best` update returns. So every lane equals `tri_woop_one` bit for bit, and `tri_woop_one_refines` / `woop_no_gap_bits` carry over unchanged. Exact vertices sit in a self-contained SoA side block `wblk` (`10·W` words per leaf block: v0, v1, v2, then the prim ids). It is derived from `wverts` by `tri_build_wblk` after build, load and refit, and prefetched in place of the edge block.
+  - *Dispatch:* `lrt_tri_intersect1` / `occluded1` now run the SIMD kernels when the leaf exists (`TRI_WBLK_SIMD`: BVH4 on SSE, BVH4/BVH8 on AVX2, not quantized nodes). The interleaved `intersect1N` pipeline is used only for BVH4 closest-hit; elsewhere it measured slower than per-ray with this leaf. *Found:* the Ray4/Ray8 packet kernels (`lrt_tri_intersect4/8`, `occluded4/8`, and the coherent `intersect1N` that calls them) ran Möller–Trumbore even in watertight builds. They now fall back per ray when the scene carries exact vertices. NEON-shim, SVE and BVH8Q builds keep the scalar watertight kernels, and skip `wblk`.
+  - *Validation* (`tools/wtcheck.c`, in `make formal`):
+    - Leaf fuzz: 1.2M blocks, a third with special values (±0, ±inf, NaN, subnormal, 1e30) and a third with rays through vertices/edges and lanes sharing edges. Every lane and the chosen hit equal the scalar test: 0 differences.
+    - Traversal: BVH4/BVH8 × LBVH/SAH × soup / shared-edge heightfield / coplanar, 54k rays. Dispatched `intersect1` / `occluded1` == `tri_intersect_scalar` / `tri_occluded_scalar` bit for bit (t, u, v, prim).
+    - Also checked: `intersect1N` / `occluded1N` (both hints), `intersect4`, and the scene after save → load and after refit: 0 differences.
+    - SSE-only build: same, 0 differences.
+    - `c_tri_seam_test_wt`: 0 leaks. The full C suite passes when built watertight.
+  - *Cost* (1 thread, 131k-tri bumpy sphere, 400k rays), against the default MT build. Before this change the watertight build was 1.5–2.4× slower everywhere.
+
+    | | BVH4 | BVH8 |
+    |---|---|---|
+    | Primary | +24% | −3% |
+    | Incoherent | −9% | +3% |
+    | Shadow | −8% | −2% |
+
+    Memory is now the obstacle to making it the default: exact vertices `wverts` (36 B/tri) plus `wblk` (40 B per lane slot) add 145–155% to nodes + leaves on this mesh. The MT edge blocks are still kept, for the GPU upload, shading reconstruction and serialization. Dropping one copy (leaf blocks storing exact vertices, or `wverts` reconstructed from `wblk`) is the next step before a default switch.
+
