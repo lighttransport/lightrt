@@ -103,4 +103,87 @@ theorem model_abs_err_total (x : ℝ) :
     |model.fl x - x| ≤ model.u * |x| + (2:ℝ)^(-150:ℤ) :=
   rneR_abs_err_total x
 
+/-- **The `1e-37` dilation floor is enough.** For the C's
+    `tlas_dil_origins` margin `mk = (m + 2⁻²³|o| + 1e-37)(1 + 2⁻²⁰)`,
+    `o + m ≤ fl(o + fl mk)` and (by oddness) `fl(o - fl mk) ≤ o - m`.
+    The `2⁻²³|o|` term covers the float add with `o`, the `1 + 2⁻²⁰` factor
+    covers the double→float conversion plus that add, and `1e-37` covers the
+    subnormal absolute error `η = 2⁻¹⁵⁰`. No overflow is assumed: the model
+    has an unbounded exponent, and the C guards `mk < 1e38`, falling back to
+    the conservative infinite-origin box otherwise. -/
+theorem fl_add_margin_ge (o m : ℝ) (hm : 0 ≤ m) :
+    o + m ≤ model.fl (o + model.fl ((m + (2:ℝ)^(-23:ℤ) * |o| + (10:ℝ)^(-37:ℤ)) *
+      (1 + (2:ℝ)^(-20:ℤ)))) := by
+  set u : ℝ := model.u with hu
+  have hu' : u = (2:ℝ)^(-24:ℤ) := rfl
+  have u0 : 0 < u := model.u_pos
+  have hu1 : u ≤ 1 := le_of_lt (lt_of_lt_of_le model.u_lt_one (by norm_num))
+  set eta : ℝ := (2:ℝ)^(-150:ℤ) with heta
+  have en : 0 < eta := by rw [heta]; positivity
+  set mk : ℝ := (m + (2:ℝ)^(-23:ℤ) * |o| + (10:ℝ)^(-37:ℤ)) * (1 + (2:ℝ)^(-20:ℤ)) with hmk
+  have hmk0 : 0 ≤ mk := by rw [hmk]; positivity
+  have h2u : (2:ℝ)^(-23:ℤ) = 2 * u := by
+    rw [hu', show (-23:ℤ) = -24 + 1 by norm_num, zpow_add₀ (by norm_num : (2:ℝ) ≠ 0)]
+    ring
+  -- float error bounds (total, no InRange)
+  obtain ⟨h1lo, h1hi⟩ := abs_le.1 (model_abs_err_total mk)
+  rw [abs_of_nonneg hmk0] at h1lo h1hi
+  obtain ⟨h2lo, h2hi⟩ := abs_le.1 (model_abs_err_total (o + model.fl mk))
+  obtain ⟨h3lo, h3hi⟩ := abs_le.1 (model_abs_err_total mk)
+  rw [abs_of_nonneg hmk0] at h3lo h3hi
+  have h3 : |model.fl mk| ≤ (1 + u) * mk + eta := by
+    rw [abs_le]
+    constructor <;> linarith
+  have h4 : |o + model.fl mk| ≤ |o| + (1 + u) * mk + eta := by
+    have := abs_add_le o (model.fl mk)
+    linarith
+  -- numeric core: mk (1-u)^2 ≥ m + u|o| + 5η
+  have hc : 1 ≤ (1 + (2:ℝ)^(-20:ℤ)) * (1 - 2*u - u^2) := by
+    rw [hu']
+    have h20 : (2:ℝ)^(-20:ℤ) = 1/1048576 := by norm_num [zpow_neg]
+    have h24 : (2:ℝ)^(-24:ℤ) = 1/16777216 := by norm_num [zpow_neg]
+    rw [h20, h24]; norm_num
+  have hfloor : ((10:ℝ)^(-37:ℤ) : ℝ) ≥ 5 * eta := by
+    rw [heta]
+    have h150 : (2:ℝ)^(-150:ℤ) = 1/(2:ℝ)^150 := by rw [zpow_neg]; norm_num
+    rw [h150]; norm_num
+  have hA : 0 ≤ m + 2 * u * |o| + (10:ℝ)^(-37:ℤ) := by positivity
+  have key : mk * (1 - 2*u - u^2) ≥ m + u * |o| + 5 * eta := by
+    have hmk' : mk = (m + 2 * u * |o| + (10:ℝ)^(-37:ℤ)) * (1 + (2:ℝ)^(-20:ℤ)) := by
+      rw [hmk, h2u]
+    rw [hmk']
+    have hcast : (m + 2 * u * |o| + (10:ℝ)^(-37:ℤ)) * (1 + (2:ℝ)^(-20:ℤ)) * (1 - 2*u - u^2) =
+        (m + 2 * u * |o| + (10:ℝ)^(-37:ℤ)) * ((1 + (2:ℝ)^(-20:ℤ)) * (1 - 2*u - u^2)) := by ring
+    rw [hcast]
+    have := mul_le_mul_of_nonneg_left hc hA
+    nlinarith [hfloor, abs_nonneg o]
+  -- assemble
+  have h2' : model.fl (o + model.fl mk) ≥
+      o + model.fl mk - u * (|o| + (1 + u) * mk + eta) - eta := by
+    have := h2lo
+    have hneg : -(|o + model.fl mk|) ≤ -(0:ℝ) := by
+      have := abs_nonneg (o + model.fl mk); linarith
+    have : u * |o + model.fl mk| ≤ u * (|o| + (1 + u) * mk + eta) :=
+      mul_le_mul_of_nonneg_left h4 u0.le
+    linarith
+  have h1' : model.fl mk ≥ mk * (1 - u) - eta := by linarith
+  have hexp : mk * (1 - u) - u * (1 + u) * mk = mk * (1 - 2*u - u^2) := by ring
+  nlinarith [h2', h1', key, hu1, u0, en, abs_nonneg o, hm, hmk0, hexp]
+
+/-- The symmetric half: the lower shifted origin is never above `o - m`. -/
+theorem fl_sub_margin_le (o m : ℝ) (hm : 0 ≤ m) :
+    model.fl (o - model.fl ((m + (2:ℝ)^(-23:ℤ) * |o| + (10:ℝ)^(-37:ℤ)) *
+      (1 + (2:ℝ)^(-20:ℤ)))) ≤ o - m := by
+  have := fl_add_margin_ge (-o) m hm
+  have hneg : |(-o : ℝ)| = |o| := abs_neg o
+  rw [hneg] at this
+  -- fl(-a) = -fl(a), fl(-x) = -fl(x)
+  have h1 : model.fl (-(o - model.fl ((m + (2:ℝ)^(-23:ℤ) * |o| + (10:ℝ)^(-37:ℤ)) *
+      (1 + (2:ℝ)^(-20:ℤ))))) = -model.fl (o - model.fl ((m + (2:ℝ)^(-23:ℤ) * |o| + (10:ℝ)^(-37:ℤ)) *
+      (1 + (2:ℝ)^(-20:ℤ)))) := model.neg _
+  have h2 : (-o + model.fl ((m + (2:ℝ)^(-23:ℤ) * |o| + (10:ℝ)^(-37:ℤ)) * (1 + (2:ℝ)^(-20:ℤ)))) =
+      -(o - model.fl ((m + (2:ℝ)^(-23:ℤ) * |o| + (10:ℝ)^(-37:ℤ)) * (1 + (2:ℝ)^(-20:ℤ)))) := by ring
+  rw [h2, h1] at this
+  linarith
+
 end LightRT.FP.Binary32
