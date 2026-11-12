@@ -397,6 +397,70 @@ theorem plane_t_perturb_abs (n o d o' d' : Vec3) (h t1 t2 : ℝ)
         abs_add_le (n 1 * (o 1 - o' 1)) (t1 * (n 1 * (d 1 - d' 1))),
         abs_add_le (n 2 * (o 2 - o' 2)) (t1 * (n 2 * (d 2 - d' 2)))]
 
+/-- The `plane_t_perturb_abs` numerator (the ray perturbation weighted by the
+    plane normal): `Σⱼ |nⱼ| (|oⱼ − o'ⱼ| + |t₁| |dⱼ − d'ⱼ|)`. -/
+def planePerturb (n o d o' d' : Vec3) (t1 : ℝ) : ℝ :=
+  |n 0| * (|o 0 - o' 0| + |t1| * |d 0 - d' 0|) +
+  |n 1| * (|o 1 - o' 1| + |t1| * |d 1 - d' 1|) +
+  |n 2| * (|o 2 - o' 2| + |t1| * |d 2 - d' 2|)
+
+/-- **Plane-parameter difference under incidence.** Two rays meeting the same
+    plane `n · x = h` at parameters `t₁`, `t₂`. If the second ray's direction
+    is not grazing, `0 < c ≤ |n ⬝ᵥ d'|`, the parameters differ by at most the
+    ray perturbation (`plane_t_perturb_abs`' numerator) divided by `c`. -/
+theorem plane_t_incidence (n o d o' d' : Vec3) (h t1 t2 c : ℝ)
+    (h1 : n ⬝ᵥ (o + t1 • d) = h) (h2 : n ⬝ᵥ (o' + t2 • d') = h)
+    (hc0 : 0 < c) (hc : c ≤ |n ⬝ᵥ d'|) :
+    |t2 - t1| ≤ planePerturb n o d o' d' t1 / c := by
+  unfold planePerturb
+  have hnd : n ⬝ᵥ d' ≠ 0 := abs_pos.1 (lt_of_lt_of_le hc0 hc)
+  have h := plane_t_perturb_abs n o d o' d' h t1 t2 h1 h2 hnd
+  exact h.trans (div_le_div_of_nonneg_left (by positivity) hc0 hc)
+
+/-- **Parameter error moves the point at most `δ |dⱼ|` per axis.** If the exact
+    point `o + t*·d` is in the box `[lo, hi]` dilated by a per-axis margin
+    `m` (e.g. the `world_in_dilated_box` transform margin), and the reported
+    parameter differs by at most `δ`, then the reported point `o + t·d` is in
+    the box dilated by `m j + δ |d j|`. -/
+theorem hit_point_in_dilated_box (o d lo hi m : Vec3) (t tstar δ : ℝ)
+    (hin : ∀ j, lo j - m j ≤ (o + tstar • d) j ∧ (o + tstar • d) j ≤ hi j + m j)
+    (hδ : |t - tstar| ≤ δ) :
+    ∀ j, lo j - (m j + δ * |d j|) ≤ (o + t • d) j ∧
+      (o + t • d) j ≤ hi j + (m j + δ * |d j|) := by
+  intro j
+  have h : |(o + t • d) j - (o + tstar • d) j| ≤ δ * |d j| := by
+    have e : (o + t • d) j - (o + tstar • d) j = (t - tstar) * d j := by
+      simp only [Pi.add_apply, Pi.smul_apply, smul_eq_mul]; ring
+    rw [e, abs_mul]
+    exact mul_le_mul_of_nonneg_right hδ (abs_nonneg _)
+  have := abs_le.1 h
+  have := hin j
+  constructor <;> linarith [this.1, this.2, abs_nonneg ((o + t • d) j - (o + tstar • d) j)]
+
+/-- **TLAS world hit containment, conditioned on incidence.** `n · x = h` is the
+    plane of the instance's world triangle; the exact world hit at `t*` lies in
+    the instance box `[lo, hi]` dilated by the per-axis transform margin `m`
+    (from `world_in_dilated_box`). The BLAS traces the mapped-back rounded
+    object ray `o' + s·d'` (the image of `A(oo + s·dd)`), meeting the same plane
+    at `s`; `0 < c ≤ |n ⬝ᵥ d'|` bounds the incidence, and the reported
+    (object-space) parameter `t` satisfies `|t − s| ≤ ε` (the BLAS's own `t`
+    error, e.g. `ExactPrune.woop_t_err`). Then the reported world point
+    `o + t·d` is in the box dilated by `m j + (planePerturb … / c + ε) |d j|`. -/
+theorem tlas_hit_point_in_box_incidence
+    (o d o' d' : Vec3) (n : Vec3) (h tstar s t c ε : ℝ)
+    (h1 : n ⬝ᵥ (o + tstar • d) = h) (h2 : n ⬝ᵥ (o' + s • d') = h)
+    (hc0 : 0 < c) (hc : c ≤ |n ⬝ᵥ d'|) (hε : |t - s| ≤ ε)
+    (lo hi m : Vec3)
+    (hin : ∀ j, lo j - m j ≤ (o + tstar • d) j ∧ (o + tstar • d) j ≤ hi j + m j) :
+    ∀ j, lo j - (m j + (planePerturb n o d o' d' tstar / c + ε) * |d j|) ≤ (o + t • d) j ∧
+      (o + t • d) j ≤ hi j + (m j + (planePerturb n o d o' d' tstar / c + ε) * |d j|) := by
+  have hδ : |s - tstar| ≤ planePerturb n o d o' d' tstar / c :=
+    plane_t_incidence n o d o' d' h tstar s c h1 h2 hc0 hc
+  have htri : |t - tstar| ≤ |t - s| + |s - tstar| := by
+    have := abs_add_le (t - s) (s - tstar)
+    rwa [show t - s + (s - tstar) = t - tstar by ring] at this
+  exact hit_point_in_dilated_box o d lo hi m t tstar _ hin (by linarith)
+
 /-- **TLAS box conservativity for (instance, primitive) pairs.** If the BLAS's
     rounded ray point at `s` lies in the BLAS box `[lo, hi]` and the instance
     box contains the 8 mapped corners (`aff_in_corner_box`), then the world ray
