@@ -1159,3 +1159,7 @@ MTLX_EVAL(1149, "<crosshatch name=\"n\" type=\"color3\"><input name=\"texcoord\"
 MTLX_EVAL(1150, "<crosshatch name=\"n\" type=\"color3\"><input name=\"texcoord\" type=\"vector2\" value=\"0.125,1.625\"/><input name=\"thickness\" type=\"float\" value=\"0.1\"/><input name=\"staggered\" type=\"boolean\" value=\"true\"/></crosshatch>", "n", 1, "agg", "1/1,1/1,1/1")
 MTLX_EVAL(1151, "<crosshatch name=\"n\" type=\"color3\"><input name=\"texcoord\" type=\"vector2\" value=\"0.125,1.625\"/><input name=\"thickness\" type=\"float\" value=\"0.1\"/><input name=\"staggered\" type=\"boolean\" value=\"false\"/></crosshatch>", "n", 1, "agg", "0/1,0/1,0/1")
 MTLX_EVAL(1152, "<crosshatch name=\"n\" type=\"color3\"><input name=\"texcoord\" type=\"vector2\" value=\"0.25,0\"/><input name=\"uvoffset\" type=\"vector2\" value=\"0.125,0\"/><input name=\"thickness\" type=\"float\" value=\"0.25\"/></crosshatch>", "n", 1, "agg", "1/1,1/1,1/1")
+MTLX_EVAL(1153, "<hexagon name=\"n\" type=\"float\"><input name=\"texcoord\" type=\"vector2\" value=\"0,0\"/></hexagon>", "n", 1, "num", "1/1")
+MTLX_EVAL(1154, "<hexagon name=\"n\" type=\"float\"><input name=\"texcoord\" type=\"vector2\" value=\"0.5,0\"/></hexagon>", "n", 1, "num", "1/1")
+MTLX_EVAL(1155, "<hexagon name=\"n\" type=\"float\"><input name=\"texcoord\" type=\"vector2\" value=\"0.6,0.2\"/></hexagon>", "n", 1, "num", "0/1")
+MTLX_EVAL(1156, "<hexagon name=\"n\" type=\"float\"><input name=\"texcoord\" type=\"vector2\" value=\"0.6,0.2\"/><input name=\"center\" type=\"vector2\" value=\"0.1,0.2\"/></hexagon>", "n", 1, "num", "1/1")
