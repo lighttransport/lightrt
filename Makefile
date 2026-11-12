@@ -166,6 +166,12 @@ c_tri_seam_test: tests/test_lightrt_c_tri_seam.c lightrt_c_tri.c
 	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_WATERTIGHT_TRI -o lightrt_c_tri_seam_test_wt $^ -lm -lpthread
 	./lightrt_c_tri_seam_test && ./lightrt_c_tri_seam_test_wt
 
+# Any-hit interleaved pipeline vs per-ray, large cache-cold BVH8 scene
+# (resume-lean item 14; build without watertight so the pipeline is eligible).
+bench_occ: benchmark_c/bench_occ.c lightrt_c_tri.c
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_NO_WATERTIGHT_TRI -o lightrt_bench_occ benchmark_c/bench_occ.c lightrt_c_tri.c -lm -lpthread
+	@echo "Built lightrt_bench_occ (run: ./lightrt_bench_occ [grid] [rays])"
+
 # Axis-parallel rays exactly on box faces, all node formats; the _rb build
 # (robust slab + exact leaf boxes + watertight leaf) requires 0 misses.
 c_tri_parallel_test: tests/test_lightrt_c_tri_parallel.c lightrt_c_tri.c
@@ -288,7 +294,7 @@ info_cuda:
 	@echo "CUDA_ARCH: $(CUDA_ARCH)"
 	@echo "CUDA_FLAGS: $(CUDA_FLAGS)"
 
-.PHONY: cuda_full_test hip_rtc_test c_tri_parallel_test c_tri_seam_test all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip cuda_test info_cuda formal
+.PHONY: cuda_full_test hip_rtc_test c_tri_parallel_test c_tri_seam_test all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip cuda_test info_cuda formal bench_occ
 
 # Lean 4 formal verification (formal/): build specs+proofs, check the c2lean
 # translation is up to date, the sorry budget, the axiom allowlist, and run
