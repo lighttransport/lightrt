@@ -114,6 +114,7 @@ static v3 trace_path(const Scene *s, const MtlxDoc *doc, const MaterialBinding *
     VolumeMedium medium = { v3_splat(0.0f), v3_splat(0.0f), 0.0f };
 
     ShadeContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
     ctx.doc = doc; ctx.tex = tex; ctx.memo = memo; ctx.memo_done = memo_done;
 
     for (int depth = 0; depth < max_bounces; depth++) {
