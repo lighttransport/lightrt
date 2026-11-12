@@ -179,7 +179,9 @@ ASan/UBSan.
 `tests/white_furnace.c` integrates the evaluated CPU BSDF over a uniform
 hemisphere with deterministic angular quadrature. It checks total, diffuse, and
 specular energy for diffuse, no-specular, dielectric, metal, subsurface, coat,
-sheen, and colored parameter sets at normal and grazing view angles. This caught
+sheen, and colored parameter sets at normal and grazing view angles. It also
+checks that a colored zero-specular Lambert response integrates exactly to its
+base albedo at normal and grazing views. This caught
 a grazing-angle energy excess in the diffuse-plus-specular response; the BSDF now
 uses the authored specular weight as its grazing reflectance and attenuates
 diffuse/subsurface energy by the matching Fresnel response.
