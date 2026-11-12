@@ -159,6 +159,7 @@ through the real parse → doc → eval path (`mtlx_load_string` + a one-node gr
 make test        # node_truth, texture sampling, and CPU BSDF white furnace
 make test-texture  # nearest/linear, addressing, and sRGB sampler regression
 make test-white-furnace  # deterministic material/lobe energy integration
+make test-bsdf-response # Lean-generated pointwise isotropic GGX response vectors
 make test-lean    # Lean-generated node vectors
 make check       # node ground-truth + golden render regression
 # or: ctest       (via CMake)
