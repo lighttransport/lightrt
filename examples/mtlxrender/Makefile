@@ -11,7 +11,7 @@ LIGHTRT  = ../..
 DEPS     = deps
 TINYEXR  = $(DEPS)/tinyexr
 
-INCLUDES = -I. -I$(LIGHTRT) -I$(DEPS) -I$(TINYEXR)/include
+INCLUDES = -I. -I$(LIGHTRT) -I$(DEPS) -I$(TINYEXR)/include -I$(LIGHTRT)/viewer/third_party
 
 UNAME_M := $(shell uname -m)
 ifneq (,$(filter x86_64 amd64,$(UNAME_M)))
