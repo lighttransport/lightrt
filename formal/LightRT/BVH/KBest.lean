@@ -123,6 +123,179 @@ theorem kbest_mem (k : ℕ) (l : List (α × T)) {z : α × T} (hz : z ∈ kbest
 def pruneOf (k : ℕ) (buf : List (α × T)) (tmax : T) : T :=
   if buf.length = k then (buf.getLast?.map (·.2)).getD tmax else tmax
 
+/-! ### The k-th value and the k-smallest specification -/
+
+/-- The value order on primitives paired with their hit parameter. -/
+abbrev R (a b : α × T) : Prop := a.2 ≤ b.2
+
+theorem pairwise_mono {l : List (α × T)} (hs : l.Pairwise R) :
+    ∀ {i j : ℕ} (hi : i < l.length) (hj : j < l.length), i ≤ j → l[i].2 ≤ l[j].2 := by
+  intro i j hi hj hij
+  rcases Nat.lt_or_eq_of_le hij with h | rfl
+  · exact (List.pairwise_iff_getElem.1 hs i j hi hj h)
+  · exact le_rfl
+
+/-- An element present in a sorted list but not in its `k`-prefix is at least
+    the `k`-th element (the prefix holds the `k` smallest). -/
+theorem le_of_mem_not_mem_take {l : List (α × T)} (hs : l.Pairwise R) {z : α × T}
+    (hz : z ∈ l) {k : ℕ} (h0 : 0 < k) (hkl : k ≤ l.length) (hnt : z ∉ l.take k) :
+    (l[k-1]'(by omega)).2 ≤ z.2 := by
+  obtain ⟨j, hj, hjeq⟩ := List.mem_iff_getElem.1 hz
+  have hjk : ¬ j < k := by
+    intro hjk
+    have hjl : j < (l.take k).length := by rw [List.length_take]; omega
+    apply hnt
+    refine List.mem_iff_getElem.2 ⟨j, hjl, ?_⟩
+    rw [List.getElem_take, hjeq]
+  have hkj : k ≤ j := by omega
+  have hm := pairwise_mono hs (i := k-1) (j := j) (by omega) hj (by omega)
+  rwa [hjeq] at hm
+
+/-- Inserting one element into a sorted list cannot raise the value at any
+    position: the inserted element shifts the rest right. -/
+theorem ins_getElem?_le (x : α × T) {buf : List (α × T)} (hs : buf.Pairwise R) :
+    ∀ (tmax : T) (i : ℕ), i < buf.length →
+      (((ins x buf)[i]?).map (·.2)).getD tmax ≤ ((buf[i]?).map (·.2)).getD tmax := by
+  induction buf with
+  | nil => intro tmax i hi; simp at hi
+  | cons y ys ih =>
+    intro tmax i hi
+    simp only [ins]
+    by_cases h : x.2 ≤ y.2
+    · simp only [if_pos h]
+      cases i with
+      | zero => simpa using h
+      | succ j =>
+        have hj1 : j + 1 < (y :: ys).length := by simpa using hi
+        have hjlen : j < (y :: ys).length := by omega
+        have hjys : j < ys.length := by simpa using hj1
+        have hm : (y :: ys)[j].2 ≤ ys[j].2 := by
+          simpa using pairwise_mono hs hjlen hj1 (by omega)
+        simp only [List.getElem?_cons_succ]
+        rw [List.getElem?_eq_getElem hjlen, List.getElem?_eq_getElem hjys]
+        simpa using hm
+    · simp only [if_neg h]
+      cases i with
+      | zero => simp
+      | succ j =>
+        have hj : j < ys.length := by simpa using hi
+        simpa using ih hs.tail tmax j hj
+
+/-- **The k-th value only decreases under insertion** (the prefix keeps the
+    smallest `k`, so the full buffer may drop its maximum). -/
+theorem prune_take_ins_le (buf : List (α × T)) (x : α × T) (hs : buf.Pairwise R)
+    (k : ℕ) (hk : buf.length = k) (h0 : 0 < k) (tmax : T) :
+    pruneOf k ((ins x buf).take k) tmax ≤ pruneOf k buf tmax := by
+  have hlen : ((ins x buf).take k).length = k := by
+    rw [List.length_take, ins_length, hk]; omega
+  simp only [pruneOf]
+  rw [if_pos hlen, if_pos hk, List.getLast?_eq_getElem?, List.getLast?_eq_getElem?]
+  simp only [hlen, hk]
+  rw [List.getElem?_take]
+  have hk1 : k - 1 < k := by omega
+  simp only [hk1, if_true]
+  exact ins_getElem?_le x hs tmax (k - 1) (by omega)
+
+/-- The `k`-th value of a `k`-prefix is the `k`-th entry of the source. -/
+theorem prune_take_eq (l : List (α × T)) (k : ℕ) (h0 : 0 < k)
+    (hk : (l.take k).length = k) (tmax : T) :
+    pruneOf k (l.take k) tmax = (l[k-1]'(by
+      have := hk; rw [List.length_take] at this; omega)).2 := by
+  have hk1 : k - 1 < k := by omega
+  have hkl : k - 1 < l.length := by
+    have := hk; rw [List.length_take] at this; omega
+  simp only [pruneOf]
+  rw [if_pos hk, List.getLast?_eq_getElem?]
+  simp only [hk]
+  rw [List.getElem?_take]
+  simp only [hk1, if_true]
+  rw [List.getElem?_eq_getElem hkl]
+  rfl
+
+theorem mem_not_take_bound {k : ℕ} {l : List (α × T)} {z : α × T} (h0 : 0 < k) (hs : l.Pairwise R)
+    (hz : z ∈ l) (hB : (l.take k).length = k) (hnt : z ∉ l.take k) (tmax : T) :
+    pruneOf k (l.take k) tmax ≤ z.2 := by
+  rw [prune_take_eq l k h0 hB tmax]
+  exact le_of_mem_not_mem_take hs hz h0 (by rw [List.length_take] at hB; omega) hnt
+
+/-- Fold invariant of the k-best buffer: sorted, at most `k` entries, and every
+    processed element not kept is at least the `k`-th value. -/
+def KInv (k : ℕ) (tmax : T) (seen buf : List (α × T)) : Prop :=
+  buf.Pairwise R ∧ buf.length ≤ k ∧
+    ∀ z ∈ seen, z ∉ buf → buf.length = k ∧ pruneOf k buf tmax ≤ z.2
+
+theorem kInv_nil (k : ℕ) (tmax : T) :
+    KInv (α := α) k tmax ([] : List (α × T)) ([] : List (α × T)) := by
+  refine ⟨by simp, by simp, ?_⟩
+  intro z hz; simp at hz
+
+theorem kInv_step {k : ℕ} (h0 : 0 < k) (tmax : T) (seen buf : List (α × T)) (x : α × T)
+    (h : KInv k tmax seen buf) :
+    KInv k tmax (x :: seen) ((ins x buf).take k) := by
+  obtain ⟨hs, hlen, hcomp⟩ := h
+  have hBs : ((ins x buf).take k).Pairwise R :=
+    List.Pairwise.take (i := k) (ins_sorted x hs)
+  have hBl : ((ins x buf).take k).length ≤ k := List.length_take_le k _
+  have htake_k : ∀ z : α × T, z ∈ ins x buf → z ∉ (ins x buf).take k →
+      ((ins x buf).take k).length = k := by
+    intro z hzL hzB
+    by_contra hne
+    have hlt : ((ins x buf).take k).length < k := by omega
+    have hLk : (ins x buf).length ≤ k := by rw [List.length_take] at hlt; omega
+    have htake : (ins x buf).take k = ins x buf := List.take_of_length_le hLk
+    rw [htake] at hzB
+    exact hzB hzL
+  refine ⟨hBs, hBl, ?_⟩
+  intro z hz hzB
+  rcases List.mem_cons.1 hz with hzeq | hzseen
+  · subst z
+    exact ⟨htake_k x (ins_mem_self x buf) hzB,
+      mem_not_take_bound h0 (ins_sorted x hs) (ins_mem_self x buf)
+        (htake_k x (ins_mem_self x buf) hzB) hzB tmax⟩
+  · by_cases hzbuf : z ∈ buf
+    · have hzL : z ∈ ins x buf := mem_ins_of_mem x z buf hzbuf
+      exact ⟨htake_k z hzL hzB,
+        mem_not_take_bound h0 (ins_sorted x hs) hzL (htake_k z hzL hzB) hzB tmax⟩
+    · obtain ⟨hbk, hbp⟩ := hcomp z hzseen hzbuf
+      have hBk : ((ins x buf).take k).length = k := by
+        rw [List.length_take, ins_length, hbk]; omega
+      have hpr : pruneOf k ((ins x buf).take k) tmax ≤ pruneOf k buf tmax :=
+        prune_take_ins_le buf x hs k hbk h0 tmax
+      exact ⟨hBk, hpr.trans hbp⟩
+
+theorem KInv_perm {k : ℕ} {tmax : T} {a b buf : List (α × T)}
+    (h : KInv k tmax a buf) (hp : a.Perm b) : KInv k tmax b buf := by
+  obtain ⟨hs, hl, hc⟩ := h
+  exact ⟨hs, hl, fun z hz => hc z (hp.mem_iff.2 hz)⟩
+
+theorem foldKInv {k : ℕ} (h0 : 0 < k) (tmax : T) (l : List (α × T)) :
+    ∀ (seen buf : List (α × T)), KInv k tmax seen buf →
+      KInv k tmax (l ++ seen) (l.foldl (fun b x => (ins x b).take k) buf) := by
+  induction l with
+  | nil => intro seen buf h; simpa using h
+  | cons x xs ih =>
+    intro seen buf h
+    have h1 : KInv k tmax (x :: seen) ((ins x buf).take k) := kInv_step h0 tmax seen buf x h
+    have h2 := ih (x :: seen) ((ins x buf).take k) h1
+    have hp : (xs ++ (x :: seen)).Perm ((x :: xs) ++ seen) := by
+      rw [List.cons_append]
+      exact List.perm_middle
+    exact KInv_perm h2 hp
+
+theorem kbest_KInv {k : ℕ} (h0 : 0 < k) (tmax : T) (l : List (α × T)) :
+    KInv k tmax l (kbest k l) := by
+  have := foldKInv (α := α) (k := k) h0 tmax l
+    ([] : List (α × T)) ([] : List (α × T)) (kInv_nil (α := α) k tmax)
+  simpa [kbest] using this
+
+/-- **The k-best specification**: an element omitted from `kbest k l` is at
+    least the `k`-th kept value (and the buffer is full). -/
+theorem kbest_omitted {k : ℕ} (h0 : 0 < k) (tmax : T) {l : List (α × T)} {z : α × T}
+    (hz : z ∈ l) (hnot : z ∉ kbest k l) :
+    (kbest k l).length = k ∧ pruneOf k (kbest k l) tmax ≤ z.2 :=
+  (kbest_KInv h0 tmax l).2.2 z hz hnot
+
+
 /-- One primitive inserted into the buffer. -/
 def stepN (isect : α → Option T) (k : ℕ) (buf : List (α × T)) (p : α) : List (α × T) :=
   match isect p with
