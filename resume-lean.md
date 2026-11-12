@@ -72,11 +72,13 @@ pattern): `clang --target=aarch64-linux-gnu --sysroot=/usr/aarch64-linux-gnu
   triangles, interleaved above); benchmarked with `make bench_occ`.
 - 15/16/17: decisions recorded in PLAN.md (keep `hp_subpatch`; accept the
   Bézier exact-solve cost; keep degenerate triangles).
-- 3: `FP/TotalErr.lean` range-free `|rneR x − x| ≤ u|x| + 2⁻¹⁵⁰`, and
+- 3: `FP/TotalErr.lean` range-free `|rneR x − x| ≤ u|x| + 2⁻¹⁵⁰` and the
+  `1e-37` dilation-floor margin (`fl_add_margin_ge`, `fl_sub_margin_le`);
   `Robust/Total.lean` `num_err_total` / `den_bounds_total` /
-  `quot_bounds_total` / `woop_t_err_total` / `woop_t_err_total_model`
-  (full range-free Woop `t` error, `η/a0` slack). C-range instantiation and
-  the `1e-37` floor remain.
+  `quot_bounds_total(_tight)` / `woop_t_err_total(_model)(_tight)` (full
+  range-free Woop `t` error, `η/a0` slack); `BVH/ExactPruneTotal.lean`
+  `key_le_total` and `woop_key_le_t_total_model` (the C `EXACT_NEAREST`
+  call-site instantiation, positive edge-sign class).
 
 ## Remaining items
 
@@ -87,11 +89,13 @@ pattern): `clang --target=aarch64-linux-gnu --sysroot=/usr/aarch64-linux-gnu
    `t` bound (`woop_t_err_total_model`), with `η/a0` slack. Remaining:
    instantiate the ranges for the C call sites (slab/MT too), and the `1e-37`
    floor in `tlas_instance_margin`.
-4. **A refinement proof for the SIMD watertight leaf.** `tri_woop4/8_block`
-   and the new SVE `tri_woop_sve_*` are bit-identical to `tri_woop_one` by
-   testing (`wtcheck` leaf fuzz, incl. SVE 8/16), not by proof. A Lean model of
-   the SSE/AVX/SVE intrinsics, or a per-lane refinement argument, would close
-   it. Same for `BITEXACT` SIMD == scalar for MT.
+4. **A refinement proof for the SIMD watertight leaf (model started).**
+   `C/Proofs/SimdLanes.lean` gives the per-lane model: packed lane ops,
+   `vWoopK` mirroring `Ref.woopK` (same order, no FMA), `vWoopK_lane`
+   (lane `i` = scalar reference), and the driver fold with `blockBest_sound` /
+   `blockBest_all_skip` / `blockBest_woop`. Remaining: the ISA/intrinsics
+   semantics (the model assumes packed ops are `FP.Binary32` lane ops), and
+   `BITEXACT` SIMD == scalar for MT.
 7. **Curve, patch and point hit correctness (started).** `Geom/Hull.lean`
    proves box containment; `Geom/SphereTrace.lean` now proves the 1D core of
    the first-contact argument (1-Lipschitz `f`: no overshoot of a surface
