@@ -97,6 +97,35 @@ theorem build_prims_perm (bound : α → Box) (split : List α → List α × Li
     · exact ((build_prims_perm bound split leafSize hsplit n _).append
         (build_prims_perm bound split leafSize hsplit n _)).trans (hsplit ps)
 
+/-! ### Refit -/
+
+/-- Bottom-up refit of every box from the current primitive bounds
+    (`tri_refit_propagate`): a leaf box becomes the exact bound of its
+    primitives (`tri_leaf_prim_aabb` on the vertex format), an internal box the
+    union of the refitted children. The tree shape and primitives are kept. -/
+def refit (bound : α → Box) : Tree α → Tree α
+  | leaf _ ps => leaf (boxOf bound ps) ps
+  | node _ l r =>
+    let l' := refit bound l
+    let r' := refit bound r
+    node (l'.box.union r'.box) l' r'
+
+/-- Refit preserves the primitive lists. -/
+theorem refit_prims (bound : α → Box) : ∀ T : Tree α, (refit bound T).prims = T.prims
+  | leaf _ ps => rfl
+  | node _ l r => by
+    simp only [refit, prims, refit_prims bound l, refit_prims bound r]
+
+/-- **Refit restores containment** for any new primitive bounds: every node box
+    encloses the bounds of the primitives below it. -/
+theorem refit_contains (bound : α → Box) : ∀ T : Tree α, Contains bound (refit bound T)
+  | leaf _ ps => boxOf_subset bound ps
+  | node _ l r => by
+    simp only [refit]
+    exact ⟨Box.subset_union_left _ _, Box.subset_union_right _ _,
+      refit_contains bound l, refit_contains bound r⟩
+
+
 /-! ### Traversal -/
 
 def minOpt : Option ℝ → Option ℝ → Option ℝ
@@ -225,6 +254,13 @@ theorem traverseOrdered_eq_brute (bound : α → Box) (boxTest : Box → Option 
         simp only [prims, brute_append]
       · exact (far (node b l r) best ⟨h1, h2, cl, cr⟩ (by simpa [box] using h)).symm
   intro T hT; simpa using gen T none hT
+
+/-- Consequently a refitted tree still answers the brute-force nearest query. -/
+theorem refit_traverse_eq_brute (bound : α → Box) (boxTest : Box → Bool)
+    (isect : α → Option ℝ) (hcons : Conservative bound boxTest isect) (T : Tree α) :
+    traverse boxTest isect (refit bound T) = brute isect T.prims := by
+  rw [traverse_eq_brute bound boxTest isect hcons (refit bound T) (refit_contains bound T),
+    refit_prims]
 
 end Tree
 end
