@@ -539,6 +539,47 @@ theorem runN_prune_le {B : Type} (F : Flat B α) (test : B → T → Option T)
             (fold_prune_le isect k tmax (F.leafPrims blk n) buf hs hl hv hits)
         | node i => exact ih _ buf hs hl hv
 
+theorem KInv_add_ge {k : ℕ} {tmax : T} {seen buf extra : List (α × T)}
+    (hK : KInv k tmax seen buf)
+    (h : ∀ z ∈ extra, z ∉ buf → buf.length = k ∧ pruneOf k buf tmax ≤ z.2) :
+    KInv k tmax (extra ++ seen) buf := by
+  obtain ⟨hs, hl, hc⟩ := hK
+  refine ⟨hs, hl, ?_⟩
+  intro z hz hzb
+  rcases List.mem_append.1 hz with hz | hz
+  · exact h z hz hzb
+  · exact hc z hz hzb
+
+theorem mem_hitList {isect : α → Option T} {ps : List α} {x : α × T} :
+    x ∈ hitList isect ps ↔ x.1 ∈ ps ∧ isect x.1 = some x.2 := by
+  induction ps with
+  | nil => simp [hitList]
+  | cons p ps ih =>
+    obtain ⟨a, b⟩ := x
+    cases hp : isect p with
+    | none =>
+      simp only [hitList, hp]
+      rw [ih]
+      constructor
+      · rintro ⟨h1, h2⟩; exact ⟨List.mem_cons_of_mem p h1, h2⟩
+      · rintro ⟨h1, h2⟩
+        rcases List.mem_cons.1 h1 with rfl | h1
+        · rw [hp] at h2; cases h2
+        · exact ⟨h1, h2⟩
+    | some t =>
+      simp only [hitList, hp]
+      constructor
+      · intro hx
+        rcases List.mem_cons.1 hx with hx | hx
+        · cases hx; exact ⟨List.mem_cons_self, hp⟩
+        · obtain ⟨h1, h2⟩ := ih.1 hx
+          exact ⟨List.mem_cons_of_mem p h1, h2⟩
+      · rintro ⟨h1, h2⟩
+        rcases List.mem_cons.1 h1 with rfl | h1
+        · rw [hp] at h2; cases h2; exact List.mem_cons_self
+        · exact List.mem_cons_of_mem _ (ih.2 ⟨h1, h2⟩)
+
+
 /-- The buffer only ever holds actual hits. -/
 def BInv (isect : α → Option T) (buf : List (α × T)) : Prop :=
   ∀ x ∈ buf, isect x.1 = some x.2
