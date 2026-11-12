@@ -97,6 +97,7 @@ typedef struct {
 
 static void shade_range(ShadeJob *j, int k0, int k1, MtlxValue *memo, char *memo_done) {
     ShadeContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
     ctx.doc = j->doc; ctx.tex = j->tex; ctx.memo = memo; ctx.memo_done = memo_done;
 
     for (int k = k0; k < k1; k++) {
