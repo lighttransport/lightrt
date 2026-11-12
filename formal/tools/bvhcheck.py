@@ -22,8 +22,8 @@ def main():
     a = ap.parse_args()
     tmp = tempfile.mkdtemp()
     exe = {}
-    variants = (("plain", ["-DLRT_TRI_NO_SLAB_ROBUST", "-DLRT_TRI_NO_LEAF_BOX_EXACT"]),
-                ("exact", ["-DLRT_TRI_NO_SLAB_ROBUST", "-DLRT_TRI_LEAF_BOX_EXACT"]),
+    variants = (("plain", ["-DLRT_TRI_NO_SLAB_ROBUST", "-DLRT_TRI_NO_LEAF_BOX_EXACT", "-DLRT_TRI_NO_BITEXACT"]),
+                ("exact", ["-DLRT_TRI_NO_SLAB_ROBUST", "-DLRT_TRI_LEAF_BOX_EXACT", "-DLRT_TRI_NO_BITEXACT"]),
                 ("robust", ["-DLRT_TRI_LEAF_BOX_EXACT", "-DLRT_TRI_SLAB_ROBUST", "-DLRT_TRI_BITEXACT"]),
                 ("exactn", ["-DLRT_TRI_LEAF_BOX_EXACT", "-DLRT_TRI_SLAB_ROBUST", "-DLRT_TRI_BITEXACT",
                             "-DLRT_TRI_EXACT_NEAREST"]))

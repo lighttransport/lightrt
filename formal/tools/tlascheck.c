@@ -139,6 +139,8 @@ int main(int argc, char **argv) {
     printf("tlas boxes: %ld exact containment checks, %ld fail (worst %.2f ulp)\n", box_checks, box_bad,
            box_worst);
     int bad_t = 0, bad_any = 0, approx_t = 0, miss64 = 0, n64 = 0;
+    long npair = 0, margin_bad = 0, sbound_bad = 0;
+    double margin_worst = 0;
     double max_rel = 0;
     for (int r = 0; r < nrays; r++) {
         lrt_ray ray;
@@ -164,7 +166,34 @@ int main(int argc, char **argv) {
             q.tmin = ray.tmin;
             q.tmax = ray.tmax;
             lrt_hit h;
-            if (lrt_tri_intersect1(T->blas[in->blas_id], &q, &h) && h.t < bt) { bt = h.t; bk = 1; }
+            if (!lrt_tri_intersect1(T->blas[in->blas_id], &q, &h)) continue;
+            if (h.t < bt) { bt = h.t; bk = 1; }
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+            /* TwoLevel.world_near_obj: |o + s d - A(q.org + s q.dir)| <= alpha(|o|+|s||d|) + beta */
+            long double sv = h.t, on = 0, dn = 0, worst = 0;
+            for (int a = 0; a < 3; a++) { on += fabsl((long double)ray.org[a]); dn += fabsl((long double)ray.dir[a]); }
+            long double qp[3];
+            for (int a = 0; a < 3; a++) qp[a] = (long double)q.org[a] + sv * (long double)q.dir[a];
+            for (int a = 0; a < 3; a++) {
+                const float *m = &in->obj2world[4 * a];
+                long double aq = (long double)m[0] * qp[0] + (long double)m[1] * qp[1] +
+                                 (long double)m[2] * qp[2] + (long double)m[3];
+                long double w = (long double)ray.org[a] + sv * (long double)ray.dir[a];
+                long double e = fabsl(w - aq);
+                if (e > worst) worst = e;
+            }
+            long double bound = (long double)in->alpha * (on + fabsl(sv) * dn) + (long double)in->beta;
+            double ratio = (double)(worst / bound);
+            npair++;
+            if (ratio > margin_worst) margin_worst = ratio;
+            if (ratio > 1.0) margin_bad++;
+            /* TwoLevel.s_bound */
+            if (fabsl(sv) > 0 && (double)fabsl(sv) > 0) {
+                tlas_dil dl;
+                tlas_dil_setup(T, &ray, &dl);
+                if ((double)fabsl(sv) > dl.sgeo) sbound_bad++;
+            }
+#endif
         }
         if (k != bk || (k && th.t != bt)) {
 #ifdef LRT_TRI_EXACT_NEAREST
@@ -212,7 +241,11 @@ int main(int argc, char **argv) {
 #endif
            bad_t + approx_t, approx_t ? " (approx: BLAS not exact-nearest)" : "", bad_any, miss64,
            max_rel, n64);
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+    printf("tlas margin: %ld pair hits, |world - A(obj)| / bound worst %.3g, over bound %ld, |s| > s_bound %ld\n",
+           npair, margin_worst, margin_bad, sbound_bad);
+#endif
     lrt_tlas_free(T);
     for (int b = 0; b < NB; b++) { lrt_tri_scene_free(blas[b]); free(verts[b]); }
-    return (bad_t || bad_any || box_bad) ? 1 : 0;
+    return (bad_t || bad_any || box_bad || margin_bad || sbound_bad) ? 1 : 0;
 }
