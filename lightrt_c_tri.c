@@ -699,7 +699,12 @@ static inline int tri_vfmt(const lrt_tri_scene *s) {
 #if LRT_TRI_HAS_AVX2
 #define TRI_WBLK_SIMD(s) ((s)->wblk && !(s)->quantized && ((s)->layout == 4 || (s)->layout == 8))
 #elif LRT_TRI_HAS_SSE4
+#if LRT_TRI_HAS_SVE
+#define TRI_WBLK_SIMD(s) ((s)->wblk && !(s)->quantized && \
+                          ((s)->layout == 4 || (s)->layout == 8 || (s)->layout == 16))
+#else
 #define TRI_WBLK_SIMD(s) ((s)->wblk && !(s)->quantized && (s)->layout == 4)
+#endif
 #else
 #define TRI_WBLK_SIMD(s) 0
 #endif
@@ -10236,6 +10241,124 @@ static inline svbool_t tri_det_parallel_sve(svbool_t pg, svfloat32_t e1x,
 #endif
 }
 
+/* Watertight SVE leaf: the fp32 Woop test on the exact-vertex SoA block
+ * (`wblk`, 10*w floats: v0 xyz, v1 xyz, v2 xyz, ids). The ray's dominant
+ * axis, shear and scale are scalar (uniform); the edge functions are
+ * lane-parallel with separate mul/sub (no FMA), mirroring tri_woop8_lanes and
+ * tri_woop_one so every lane is bit-identical to the scalar test. One kernel
+ * serves width 8 (BVH8) and 16 (BVH16). */
+typedef struct tri_woop_sve_ctx {
+    int kx, ky, kz;
+    float sx, sy, sz, ox, oy, oz, tmin;
+} tri_woop_sve_ctx;
+
+static inline void tri_woop_sve_setup(const tri_ray_ctx *rc,
+                                      tri_woop_sve_ctx *w) {
+    const float *d = rc->dir, *o = rc->org;
+    float a0 = copysignf(d[0], 1.0f), a1 = copysignf(d[1], 1.0f),
+          a2 = copysignf(d[2], 1.0f);
+    int kz = 0;
+    if (a1 > a0) kz = 1;
+    if (a2 > a0 && a2 > a1) kz = 2;
+    int kx = kz + 1;
+    if (kx == 3) kx = 0;
+    int ky = kx + 1;
+    if (ky == 3) ky = 0;
+    if (d[kz] < 0.0f) {
+        int t = kx;
+        kx = ky;
+        ky = t;
+    }
+    w->kx = kx; w->ky = ky; w->kz = kz;
+    w->sx = d[kx] / d[kz];
+    w->sy = d[ky] / d[kz];
+    w->sz = 1.0f / d[kz];
+    w->ox = o[kx]; w->oy = o[ky]; w->oz = o[kz];
+    w->tmin = rc->tmin;
+}
+
+/* Materialise t/u/v/det for the lanes passing the edge-sign, det, and
+ * [tmin, best) tests; T is +INF elsewhere. Returns whether any lane passed. */
+static inline int tri_woop_sve_core(const float *wb, int w,
+                                    const tri_woop_sve_ctx *c, float best,
+                                    float T[16], float U[16], float V[16],
+                                    float D[16]) {
+    svbool_t pg = svwhilelt_b32((uint32_t)0, (uint32_t)w);
+    svfloat32_t ox = svdup_f32(c->ox), oy = svdup_f32(c->oy), oz = svdup_f32(c->oz);
+    svfloat32_t sx = svdup_f32(c->sx), sy = svdup_f32(c->sy), sz = svdup_f32(c->sz);
+    svfloat32_t ax = svsub_f32_x(pg, svld1_f32(pg, wb + (0 + c->kx) * w), ox);
+    svfloat32_t ay = svsub_f32_x(pg, svld1_f32(pg, wb + (0 + c->ky) * w), oy);
+    svfloat32_t az = svsub_f32_x(pg, svld1_f32(pg, wb + (0 + c->kz) * w), oz);
+    svfloat32_t bx = svsub_f32_x(pg, svld1_f32(pg, wb + (3 + c->kx) * w), ox);
+    svfloat32_t by = svsub_f32_x(pg, svld1_f32(pg, wb + (3 + c->ky) * w), oy);
+    svfloat32_t bz = svsub_f32_x(pg, svld1_f32(pg, wb + (3 + c->kz) * w), oz);
+    svfloat32_t cx = svsub_f32_x(pg, svld1_f32(pg, wb + (6 + c->kx) * w), ox);
+    svfloat32_t cy = svsub_f32_x(pg, svld1_f32(pg, wb + (6 + c->ky) * w), oy);
+    svfloat32_t cz = svsub_f32_x(pg, svld1_f32(pg, wb + (6 + c->kz) * w), oz);
+    ax = svsub_f32_x(pg, ax, svmul_f32_x(pg, sx, az));
+    ay = svsub_f32_x(pg, ay, svmul_f32_x(pg, sy, az));
+    bx = svsub_f32_x(pg, bx, svmul_f32_x(pg, sx, bz));
+    by = svsub_f32_x(pg, by, svmul_f32_x(pg, sy, bz));
+    cx = svsub_f32_x(pg, cx, svmul_f32_x(pg, sx, cz));
+    cy = svsub_f32_x(pg, cy, svmul_f32_x(pg, sy, cz));
+    svfloat32_t ue = svsub_f32_x(pg, svmul_f32_x(pg, cx, by), svmul_f32_x(pg, cy, bx));
+    svfloat32_t ve = svsub_f32_x(pg, svmul_f32_x(pg, ax, cy), svmul_f32_x(pg, ay, cx));
+    svfloat32_t we = svsub_f32_x(pg, svmul_f32_x(pg, bx, ay), svmul_f32_x(pg, by, ax));
+    svfloat32_t z = svdup_f32(0.0f);
+    svbool_t neg = svorr_b_z(pg, svorr_b_z(pg, svcmplt_f32(pg, ue, z),
+                                           svcmplt_f32(pg, ve, z)),
+                             svcmplt_f32(pg, we, z));
+    svbool_t pos = svorr_b_z(pg, svorr_b_z(pg, svcmpgt_f32(pg, ue, z),
+                                           svcmpgt_f32(pg, ve, z)),
+                             svcmpgt_f32(pg, we, z));
+    svfloat32_t det = svadd_f32_x(pg, svadd_f32_x(pg, ue, ve), we);
+    svbool_t ok = svbic_b_z(pg, svcmpne_f32(pg, det, z), svand_b_z(pg, neg, pos));
+    svfloat32_t num = svadd_f32_x(
+        pg, svadd_f32_x(pg, svmul_f32_x(pg, ue, svmul_f32_x(pg, sz, az)),
+                        svmul_f32_x(pg, ve, svmul_f32_x(pg, sz, bz))),
+        svmul_f32_x(pg, we, svmul_f32_x(pg, sz, cz)));
+    svfloat32_t tt = svdiv_f32_x(pg, num, det);
+    ok = svand_b_z(pg, ok,
+                   svand_b_z(pg, svcmpge_f32(pg, tt, svdup_f32(c->tmin)),
+                             svcmplt_f32(pg, tt, svdup_f32(best))));
+    svst1_f32(pg, T, svsel_f32(ok, tt, svdup_f32(TRI_INF_F)));
+    svst1_f32(pg, U, ve);
+    svst1_f32(pg, V, we);
+    svst1_f32(pg, D, det);
+    return svptest_any(pg, ok);
+}
+
+/* Closest hit in one block (mirrors tri_woop8_block). */
+static inline void tri_woop_sve_block(const float *wb, const uint32_t *ids,
+                                      int w, const tri_woop_sve_ctx *c,
+                                      float *best_t, float *best_u,
+                                      float *best_v, uint32_t *best_prim) {
+    _Alignas(64) float T[16], U[16], V[16], D[16];
+    if (!tri_woop_sve_core(wb, w, c, *best_t, T, U, V, D)) return;
+    int bl = -1;
+    float bt = *best_t;
+    for (int l = 0; l < w; l++)
+        if (ids[l] != LRT_TRI_NO_HIT && T[l] < bt) {
+            bt = T[l];
+            bl = l;
+        }
+    if (bl < 0) return;
+    *best_t = bt;
+    *best_u = U[bl] / D[bl];
+    *best_v = V[bl] / D[bl];
+    *best_prim = ids[bl];
+}
+
+/* Any hit in one block (mirrors tri_woop8_block_occ: half-open t < tmax). */
+static inline int tri_woop_sve_occ(const float *wb, const uint32_t *ids, int w,
+                                   const tri_woop_sve_ctx *c, float tmax) {
+    _Alignas(64) float T[16], U[16], V[16], D[16];
+    if (!tri_woop_sve_core(wb, w, c, tmax, T, U, V, D)) return 0;
+    for (int l = 0; l < w; l++)
+        if (ids[l] != LRT_TRI_NO_HIT && T[l] < tmax) return 1;
+    return 0;
+}
+
 /* 8-wide SoA Moller-Trumbore over one lrt_tri8 block. Updates best in place. */
 static inline void tri_block_isect_sve(const lrt_tri8 *blk,
                                        const tri_ray_ctx *rc, float *best_t,
@@ -10385,6 +10508,10 @@ static int tri_intersect_bvh8_sve(const lrt_tri_scene *s, const lrt_ray *ray,
                                   lrt_hit *hit) {
     tri_ray_ctx rc;
     tri_ray_setup(ray, &rc);
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    tri_woop_sve_ctx wc;
+    if (s->wblk) tri_woop_sve_setup(&rc, &wc);
+#endif
 
     float best_t = ray->tmax;
     float best_u = 0.0f, best_v = 0.0f;
@@ -10404,6 +10531,14 @@ static int tri_intersect_bvh8_sve(const lrt_tri_scene *s, const lrt_ray *ray,
             uint32_t nblk = TRI_REF_NBLOCKS(e.ref);
             const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+                if (s->wblk) {
+                    const float *wb = s->wblk + (size_t)(blk0 + b) * 80;
+                    tri_woop_sve_block(wb, (const uint32_t *)(wb + 72), 8, &wc,
+                                       &best_t, &best_u, &best_v, &best_prim);
+                    continue;
+                }
+#endif
                 tri_block_isect_sve(&blocks[blk0 + b], &rc, &best_t, &best_u,
                                     &best_v, &best_prim);
             }
@@ -10453,6 +10588,10 @@ static int tri_occluded_bvh8_sve(const lrt_tri_scene *s, const lrt_ray *ray) {
     tri_ray_ctx rc;
     tri_ray_setup(ray, &rc);
     float tmax = ray->tmax;
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    tri_woop_sve_ctx wc;
+    if (s->wblk) tri_woop_sve_setup(&rc, &wc);
+#endif
 
     uint32_t stack[TRI_STACK_SIZE];
     int sp = 0;
@@ -10465,6 +10604,14 @@ static int tri_occluded_bvh8_sve(const lrt_tri_scene *s, const lrt_ray *ray) {
             uint32_t nblk = TRI_REF_NBLOCKS(ref);
             const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+                if (s->wblk) {
+                    const float *wb = s->wblk + (size_t)(blk0 + b) * 80;
+                    if (tri_woop_sve_occ(wb, (const uint32_t *)(wb + 72), 8, &wc, tmax))
+                        return 1;
+                    continue;
+                }
+#endif
                 if (tri_block_occluded_sve(&blocks[blk0 + b], &rc, tmax)) return 1;
             }
             continue;
@@ -10626,6 +10773,10 @@ static int tri_intersect_bvh16_sve(const lrt_tri_scene *s, const lrt_ray *ray,
                                    lrt_hit *hit) {
     tri_ray_ctx rc;
     tri_ray_setup(ray, &rc);
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    tri_woop_sve_ctx wc;
+    if (s->wblk) tri_woop_sve_setup(&rc, &wc);
+#endif
     float best_t = ray->tmax, best_u = 0.0f, best_v = 0.0f;
     uint32_t best_prim = LRT_TRI_NO_HIT;
     tri_stack_entry stack[TRI_STACK_SIZE];
@@ -10639,9 +10790,18 @@ static int tri_intersect_bvh16_sve(const lrt_tri_scene *s, const lrt_ray *ray,
         if (TRI_REF_IS_LEAF(e.ref)) {
             uint32_t blk0 = TRI_REF_BLOCK(e.ref), nblk = TRI_REF_NBLOCKS(e.ref);
             const lrt_tri16 *blocks = (const lrt_tri16 *)s->blocks;
-            for (uint32_t b = 0; b < nblk; b++)
+            for (uint32_t b = 0; b < nblk; b++) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+                if (s->wblk) {
+                    const float *wb = s->wblk + (size_t)(blk0 + b) * 160;
+                    tri_woop_sve_block(wb, (const uint32_t *)(wb + 144), 16, &wc,
+                                       &best_t, &best_u, &best_v, &best_prim);
+                    continue;
+                }
+#endif
                 tri_block_isect_sve16(&blocks[blk0 + b], &rc, &best_t, &best_u,
                                       &best_v, &best_prim);
+            }
             continue;
         }
         const lrt_bvh16_node *n = &s->nodes16[TRI_REF_NODE(e.ref)];
@@ -10682,6 +10842,10 @@ static int tri_occluded_bvh16_sve(const lrt_tri_scene *s, const lrt_ray *ray) {
     tri_ray_ctx rc;
     tri_ray_setup(ray, &rc);
     float tmax = ray->tmax;
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    tri_woop_sve_ctx wc;
+    if (s->wblk) tri_woop_sve_setup(&rc, &wc);
+#endif
     uint32_t stack[TRI_STACK_SIZE];
     int sp = 0;
     stack[sp++] = s->root;
@@ -10690,8 +10854,17 @@ static int tri_occluded_bvh16_sve(const lrt_tri_scene *s, const lrt_ray *ray) {
         if (TRI_REF_IS_LEAF(ref)) {
             uint32_t blk0 = TRI_REF_BLOCK(ref), nblk = TRI_REF_NBLOCKS(ref);
             const lrt_tri16 *blocks = (const lrt_tri16 *)s->blocks;
-            for (uint32_t b = 0; b < nblk; b++)
+            for (uint32_t b = 0; b < nblk; b++) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+                if (s->wblk) {
+                    const float *wb = s->wblk + (size_t)(blk0 + b) * 160;
+                    if (tri_woop_sve_occ(wb, (const uint32_t *)(wb + 144), 16, &wc, tmax))
+                        return 1;
+                    continue;
+                }
+#endif
                 if (tri_block_occluded_sve16(&blocks[blk0 + b], &rc, tmax)) return 1;
+            }
             continue;
         }
         const lrt_bvh16_node *n = &s->nodes16[TRI_REF_NODE(ref)];
