@@ -15893,6 +15893,10 @@ typedef struct lrt_instance_int {
     float obj2world[12];
     float world2obj[12];
     uint32_t blas_id, instance_id, mask, degenerate;
+    /* LEAF_BOX_EXACT: margin coefficients (TwoLevel.world_near_obj). The world
+     * ray point at s is within alpha*(|o|_1 + |s| |d|_1) + beta of obj2world
+     * applied to the BLAS's rounded object-space ray point. */
+    float alpha, beta;
 } lrt_instance_int;
 
 struct lrt_tlas {
@@ -15905,6 +15909,10 @@ struct lrt_tlas {
     size_t ninsts;
     lrt_tri_scene **blas; /* owned copy of the pointer array (scenes not owned) */
     size_t nblas;
+    /* LEAF_BOX_EXACT: max instance alpha and the root half-extent per axis
+     * (|coord| bound of every instance box), for the per-ray TLAS dilation. */
+    float alpha_max;
+    float root_r[3];
 };
 
 /* out = inverse of the 3x4 affine m (row-major). Returns 0 if (near-)singular. */
@@ -15945,6 +15953,136 @@ static inline void tlas_xform_vec(const float m[12], const float v[3],
     for (int a = 0; a < 3; a++)
         out[a] = m[a * 4 + 0] * v[0] + m[a * 4 + 1] * v[1] + m[a * 4 + 2] * v[2];
 }
+
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+/* Round a nonnegative double up / a double down to float. */
+static inline float tri_d2f_up(double x) {
+    float f = (float)x;
+    if ((double)f < x) f = nextafterf(f, TRI_INF_F);
+    return f;
+}
+static inline float tri_d2f_down(double x) {
+    float f = (float)x;
+    if ((double)f > x) f = nextafterf(f, -TRI_INF_F);
+    return f;
+}
+/* Per-instance margin coefficients (formal: TwoLevel.world_near_obj,
+ * hres_of_entries, xform_point_err_simple / xform_vec_err_simple):
+ *   rho   >= max |(L_A L_W - I)_kj|,   sigma >= max |(L_A c_W + c_A)_k|
+ *   P_kl = sum_j |A_kj||W_jl|,         q_k = sum_j |A_kj||c_Wj|
+ *   alpha = rho + 5u max P,            beta = sigma + 5u max q
+ * Float products are exact in double; each double sum of <= 4 terms is off by
+ * at most 4*2^-53 times the sum of |terms|, which is added. */
+static void tlas_instance_margin(const float A[12], const float W[12],
+                                 float *alpha, float *beta) {
+    const double ue = 4.0 * 0x1p-53, u5 = 5.0 * 0x1p-24;
+    double rho = 0.0, sigma = 0.0, pmax = 0.0, qmax = 0.0;
+    for (int k = 0; k < 3; k++) {
+        for (int l = 0; l < 3; l++) {
+            double sum = 0.0, mag = 0.0, pk = 0.0;
+            for (int j = 0; j < 3; j++) {
+                double pr = (double)A[k * 4 + j] * (double)W[j * 4 + l];
+                sum += pr;
+                mag += fabs(pr);
+                pk += fabs((double)A[k * 4 + j]) * fabs((double)W[j * 4 + l]);
+            }
+            if (k == l) { sum -= 1.0; mag += 1.0; }
+            double r = fabs(sum) + ue * mag;
+            if (r > rho) rho = r;
+            if (pk > pmax) pmax = pk;
+        }
+        double v = (double)A[k * 4 + 3], mag = fabs(v), q = 0.0;
+        for (int j = 0; j < 3; j++) {
+            double pr = (double)A[k * 4 + j] * (double)W[j * 4 + 3];
+            v += pr;
+            mag += fabs(pr);
+            q += fabs(pr);
+        }
+        double sg = fabs(v) + ue * mag;
+        if (sg > sigma) sigma = sg;
+        if (q > qmax) qmax = q;
+    }
+    /* + an absolute floor for subnormal products (outside the relative model) */
+    *alpha = tri_d2f_up((rho + u5 * pmax) * (1.0 + 0x1p-40));
+    *beta = tri_d2f_up((sigma + u5 * qmax) * (1.0 + 0x1p-40) + 1e-36);
+}
+/* Per-ray dilation state: margin(s) = a + b |s| with |s| <= smax_geo. */
+typedef struct tlas_dil {
+    double a, b, sgeo;
+} tlas_dil;
+static inline void tlas_dil_setup(const lrt_tlas *t, const lrt_ray *ray, tlas_dil *dl) {
+    double on = fabs((double)ray->org[0]) + fabs((double)ray->org[1]) + fabs((double)ray->org[2]);
+    double dn = fabs((double)ray->dir[0]) + fabs((double)ray->dir[1]) + fabs((double)ray->dir[2]);
+    double al = (double)t->alpha_max * (1.0 + 0x1p-50);
+    dl->a = al * on * (1.0 + 0x1p-50);
+    dl->b = al * dn * (1.0 + 0x1p-50);
+    /* TwoLevel.s_bound on the dominant axis: |s| <= (|o_k| + R_k + a)/(|d_k| - b) */
+    int k = 0;
+    for (int j = 1; j < 3; j++)
+        if (fabs((double)ray->dir[j]) > fabs((double)ray->dir[k])) k = j;
+    double dk = fabs((double)ray->dir[k]);
+    dl->sgeo = INFINITY;
+    if (dl->b < dk)
+        dl->sgeo = (fabs((double)ray->org[k]) + (double)t->root_r[k] + dl->a) /
+                   (dk - dl->b) * (1.0 + 0x1p-48);
+}
+/* Shifted origins for the dilated box test: with oL = org + m' and oH = org - m'
+ * (both rounded outward, i.e. oL >= org + m, oH <= org - m), the slab terms
+ * (lo - oL) * sinv and (hi - oH) * sinv are the usual robust slab arithmetic
+ * for the planes lo - (oL - org) <= lo - m and hi + (org - oH) >= hi + m, so
+ * the slab conservativity argument applies unchanged to the dilated box. The
+ * margin m covers |s| <= max(|tmin|, best) (capped by sgeo). */
+static inline void tlas_dil_origins(const tlas_dil *dl, const lrt_ray *ray, float best,
+                                    float oL[3], float oH[3]) {
+    double sm = fabs((double)ray->tmin) > fabs((double)best) ? fabs((double)ray->tmin)
+                                                              : fabs((double)best);
+    if (dl->sgeo < sm) sm = dl->sgeo;
+    double m = dl->a + dl->b * sm;
+    /* fl(org + mf) >= org + mf - u(|org| + mf) >= org + m once
+     * mf >= (m + 2u|org|)(1 + 2^-20) (the factor also covers the double->float
+     * conversion of mf); symmetric for org - mf. */
+    for (int k = 0; k < 3; k++) {
+        double mk = (m + 0x1p-23 * fabs((double)ray->org[k]) + 1e-37) * (1.0 + 0x1p-20);
+        if (!(mk < 1e38)) {
+            oL[k] = TRI_INF_F;
+            oH[k] = -TRI_INF_F;
+            continue;
+        }
+        float mf = (float)mk;
+        oL[k] = ray->org[k] + mf;
+        oH[k] = ray->org[k] - mf;
+    }
+}
+static inline int tlas_slab_dil(const lrt_bvh4_node *n, int i, const tri_ray_ctx *rc,
+                                const float oL[3], const float oH[3], float t_best,
+                                float *tnear_out) {
+#ifdef LRT_TRI_SLAB_ROBUST
+    float tlx = (n->lo_x[i] - oL[0]) * rc->sinv[0];
+    float thx = (n->hi_x[i] - oH[0]) * rc->sinv[0];
+    float tly = (n->lo_y[i] - oL[1]) * rc->sinv[1];
+    float thy = (n->hi_y[i] - oH[1]) * rc->sinv[1];
+    float tlz = (n->lo_z[i] - oL[2]) * rc->sinv[2];
+    float thz = (n->hi_z[i] - oH[2]) * rc->sinv[2];
+    float tnx = tri_minf(thx, tlx), tfx = tri_maxf(tlx, thx);
+    float tny = tri_minf(thy, tly), tfy = tri_maxf(tly, thy);
+    float tnz = tri_minf(thz, tlz), tfz = tri_maxf(tlz, thz);
+#else
+    float tlx = (n->lo_x[i] - oL[0]) * rc->invd[0];
+    float thx = (n->hi_x[i] - oH[0]) * rc->invd[0];
+    float tly = (n->lo_y[i] - oL[1]) * rc->invd[1];
+    float thy = (n->hi_y[i] - oH[1]) * rc->invd[1];
+    float tlz = (n->lo_z[i] - oL[2]) * rc->invd[2];
+    float thz = (n->hi_z[i] - oH[2]) * rc->invd[2];
+    float tnx = tri_minf(tlx, thx), tfx = tri_maxf(tlx, thx);
+    float tny = tri_minf(tly, thy), tfy = tri_maxf(tly, thy);
+    float tnz = tri_minf(tlz, thz), tfz = tri_maxf(tlz, thz);
+#endif
+    float tnear = tri_maxf(tri_maxf(tnx, tny), tri_maxf(tnz, rc->tmin));
+    float tfar = tri_minf(tri_minf(tfx, tfy), tri_minf(tfz, t_best));
+    *tnear_out = tnear;
+    return tnear <= tfar;
+}
+#endif
 
 /* World AABB of an object-space box transformed by m (8 corners). */
 static void tlas_transform_aabb(const float m[12], const float olo[3],
@@ -16093,6 +16231,12 @@ static void tlas_bounds_chunk(const lrt_tlas *t, tri_build_ctx *bc,
             }
         } else {
             tlas_transform_aabb(in->obj2world, bl->root_lo, bl->root_hi, wlo, whi);
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+            for (int a = 0; a < 3; a++) {
+                wlo[a] = tri_d2f_down((double)wlo[a] - (double)in->beta);
+                whi[a] = -tri_d2f_down(-((double)whi[a] + (double)in->beta));
+            }
+#endif
         }
         for (int a = 0; a < 3; a++) {
             bc->plo[(size_t)i * 3 + a] = wlo[a];
@@ -16137,6 +16281,18 @@ static int tlas_rebuild(lrt_tlas *t, unsigned num_threads) {
     {
         tlas_bounds_chunk(t, &bc, 0u, (uint32_t)ninsts);
     }
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+    t->alpha_max = 0.0f;
+    t->root_r[0] = t->root_r[1] = t->root_r[2] = 0.0f;
+    for (size_t i = 0; i < ninsts; i++) {
+        if (t->insts[i].alpha > t->alpha_max) t->alpha_max = t->insts[i].alpha;
+        for (int a = 0; a < 3; a++) {
+            float r = fabsf(bc.plo[i * 3 + a]);
+            if (fabsf(bc.phi[i * 3 + a]) > r) r = fabsf(bc.phi[i * 3 + a]);
+            if (r > t->root_r[a]) t->root_r[a] = r;
+        }
+    }
+#endif
 #if LRT_TRI_HAS_THREADS
     if (num_threads > 1 && ninsts >= 4096) {
         bc.par_threads = num_threads;
@@ -16202,6 +16358,11 @@ static int tlas_fill_chunk(lrt_tlas *t, const lrt_instance *insts,
         in->instance_id = insts[i].instance_id;
         in->mask = insts[i].mask;
         in->degenerate = tlas_affine_invert(in->obj2world, in->world2obj) ? 0u : 1u;
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+        in->alpha = in->beta = 0.0f;
+        if (!in->degenerate)
+            tlas_instance_margin(in->obj2world, in->world2obj, &in->alpha, &in->beta);
+#endif
     }
     return bad;
 }
@@ -16306,6 +16467,12 @@ int lrt_tlas_intersect1(const lrt_tlas *t, const lrt_ray *ray, uint32_t ray_mask
     }
     tri_ray_ctx rc;
     tri_ray_setup(ray, &rc);
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+    tlas_dil dl;
+    tlas_dil_setup(t, ray, &dl);
+    float dL[3], dH[3], dm_best = ray->tmax;
+    tlas_dil_origins(&dl, ray, ray->tmax, dL, dH);
+#endif
     float best_t = ray->tmax, best_u = 0.0f, best_v = 0.0f;
     uint32_t best_prim = LRT_TRI_NO_HIT, best_inst = LRT_TRI_NO_HIT;
     tri_stack_entry stack[TRI_STACK_SIZE];
@@ -16342,11 +16509,21 @@ int lrt_tlas_intersect1(const lrt_tlas *t, const lrt_ray *ray, uint32_t ray_mask
         int nchildren = (int)n->nchildren;
         uint32_t hit_ref[4];
         float hit_tnear[4];
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+        if (best_t != dm_best) {
+            tlas_dil_origins(&dl, ray, best_t, dL, dH);
+            dm_best = best_t;
+        }
+#endif
         int nhit = 0;
         for (int i = 0; i < nchildren; i++) {
             float tnear;
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+            if (tlas_slab_dil(n, i, &rc, dL, dH, best_t, &tnear)) {
+#else
             if (tri_slab_scalar(n->lo_x, n->lo_y, n->lo_z, n->hi_x, n->hi_y,
                                 n->hi_z, i, &rc, best_t, &tnear)) {
+#endif
                 int j = nhit++;
                 while (j > 0 && hit_tnear[j - 1] > tnear) {
                     hit_tnear[j] = hit_tnear[j - 1];
@@ -16377,6 +16554,12 @@ int lrt_tlas_occluded1(const lrt_tlas *t, const lrt_ray *ray, uint32_t ray_mask)
     if (!t || !ray) return 0;
     tri_ray_ctx rc;
     tri_ray_setup(ray, &rc);
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+    tlas_dil dl;
+    tlas_dil_setup(t, ray, &dl);
+    float dL[3], dH[3];
+    tlas_dil_origins(&dl, ray, ray->tmax, dL, dH);
+#endif
     const float t_max = ray->tmax;
     uint32_t stack[TRI_STACK_SIZE];
     int sp = 0;
@@ -16401,8 +16584,12 @@ int lrt_tlas_occluded1(const lrt_tlas *t, const lrt_ray *ray, uint32_t ray_mask)
         int nchildren = (int)n->nchildren;
         for (int i = 0; i < nchildren; i++) {
             float tnear;
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+            if (tlas_slab_dil(n, i, &rc, dL, dH, t_max, &tnear)) {
+#else
             if (tri_slab_scalar(n->lo_x, n->lo_y, n->lo_z, n->hi_x, n->hi_y,
                                 n->hi_z, i, &rc, t_max, &tnear)) {
+#endif
                 if (sp < TRI_STACK_SIZE) stack[sp++] = n->child[i];
             }
         }

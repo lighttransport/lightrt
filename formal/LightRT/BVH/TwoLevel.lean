@@ -15,7 +15,12 @@
      a world-space hit at the same `t` on the object→world image.
   3. `xform_point_err` / `xform_vec_err`: rounding of `tlas_xform_point` /
      `tlas_xform_vec` (left-to-right sums, no FMA) in any `RoundingModel`,
-     as a running absolute-error bound.
+     as a running absolute-error bound; `_simple` forms `≤ 5u Σ|products|`.
+  4. `world_near_obj` / `world_in_dilated_box` / `s_bound` / `hres_of_entries`:
+     the TLAS pair conditions. The rounded object-space ray, mapped back by
+     the stored obj2world, stays within `α(|o|₁ + |s||d|₁) + β` of the world
+     ray, so instance boxes dilated by that margin are conservative.
+  5. `plane_t_perturb[_abs]`: world-space `t` error from the ray perturbation.
 -/
 import LightRT.BVH.Flat
 import LightRT.Geom.Basic
@@ -264,6 +269,157 @@ theorem aff_in_corner_box (A : Aff) (lo hi p : Vec3) (hp : ∀ j, lo j ≤ p j �
     have := term_upper (A.L a 2) (lo 2) (hi 2) (p 2) (hp 2).1 (hp 2).2
     linarith
 
+/-! ### The rounded object-space ray, mapped back to world space
+
+The BLAS traces `õ + s d̃` where `õ ≈ W o`, `d̃ ≈ W d` (rounded `world2obj`).
+Map its point back with the stored `obj2world` `A` (not the exact inverse of
+the float `W`): the distance to the world ray point `o + s d` is bounded by the
+residual of `A ∘ W − id` (`ρ`, `σ`, computable from the two float matrices)
+plus `|L_A|` times the transform rounding. So a world box dilated by that
+margin contains `o + s d` whenever the BLAS hit point lies in the BLAS box. -/
+
+theorem abs_lin_le (L : Matrix (Fin 3) (Fin 3) ℝ) (v : Vec3) (k : Fin 3) :
+    |L.mulVec v k| ≤ |L k 0| * |v 0| + |L k 1| * |v 1| + |L k 2| * |v 2| := by
+  simp only [Matrix.mulVec, dotProduct, Fin.sum_univ_three]
+  calc |L k 0 * v 0 + L k 1 * v 1 + L k 2 * v 2|
+      ≤ |L k 0 * v 0| + |L k 1 * v 1| + |L k 2 * v 2| := abs_add_three _ _ _
+    _ = _ := by simp only [abs_mul]
+
+/-- **World ray point vs the mapped-back object hit point.** -/
+theorem world_near_obj (W A : Aff) (ρ σ : ℝ)
+    (hres : ∀ x : Vec3, ∀ k, |A.app (W.app x) k - x k| ≤ ρ * (|x 0| + |x 1| + |x 2|) + σ)
+    (o d oo dd eo ed : Vec3) (s : ℝ)
+    (ho : ∀ j, |oo j - W.app o j| ≤ eo j) (hd : ∀ j, |dd j - W.lin d j| ≤ ed j) (k : Fin 3) :
+    |(o + s • d) k - A.app (oo + s • dd) k| ≤
+      ρ * (|(o + s • d) 0| + |(o + s • d) 1| + |(o + s • d) 2|) + σ +
+        (|A.L k 0| * (eo 0 + |s| * ed 0) + |A.L k 1| * (eo 1 + |s| * ed 1) +
+          |A.L k 2| * (eo 2 + |s| * ed 2)) := by
+  set w := o + s • d
+  set e : Vec3 := (oo + s • dd) - W.app w
+  have hsplit : A.app (oo + s • dd) = A.app (W.app w) + A.L.mulVec e := by
+    simp only [e, Aff.app, Matrix.mulVec_sub]; abel
+  have he : ∀ j, |e j| ≤ eo j + |s| * ed j := by
+    intro j
+    have hw : W.app w = W.app o + s • W.lin d := W.app_ray o d s
+    have : e j = (oo j - W.app o j) + s * (dd j - W.lin d j) := by
+      simp only [e, hw, Pi.add_apply, Pi.sub_apply, Pi.smul_apply, smul_eq_mul]; ring
+    rw [this]
+    calc |(oo j - W.app o j) + s * (dd j - W.lin d j)|
+        ≤ |oo j - W.app o j| + |s * (dd j - W.lin d j)| := abs_add_le _ _
+      _ = |oo j - W.app o j| + |s| * |dd j - W.lin d j| := by rw [abs_mul]
+      _ ≤ _ := by have := ho j; have := hd j; nlinarith [abs_nonneg s]
+  have hL := abs_lin_le A.L e k
+  have hr := hres w k
+  rw [hsplit, Pi.add_apply]
+  have h0 := mul_le_mul_of_nonneg_left (he 0) (abs_nonneg (A.L k 0))
+  have h1 := mul_le_mul_of_nonneg_left (he 1) (abs_nonneg (A.L k 1))
+  have h2 := mul_le_mul_of_nonneg_left (he 2) (abs_nonneg (A.L k 2))
+  calc |w k - (A.app (W.app w) k + A.L.mulVec e k)|
+      = |(A.app (W.app w) k - w k) + A.L.mulVec e k| := by rw [← abs_neg]; ring_nf
+    _ ≤ |A.app (W.app w) k - w k| + |A.L.mulVec e k| := abs_add_le _ _
+    _ ≤ _ := by linarith
+
+/-- **Per-ray bound on the hit parameter** (`tlas_ray_sbound`). If the world
+    point at `s` is within `a + b|s|` of a box inside `[-Rb, Rb]` on axis `k`
+    and `b < |d k|`, then `|s| ≤ (|o k| + Rb + a) / (|d k| − b)`. This caps the
+    `s`-dependent margin before the first hit (when `best` is still `tmax`). -/
+theorem s_bound (o d : Vec3) (s a b Rb : ℝ) (k : Fin 3) (hb : b < |d k|)
+    (h : |(o + s • d) k| ≤ Rb + a + b * |s|) :
+    |s| ≤ (|o k| + Rb + a) / (|d k| - b) := by
+  rw [le_div_iff₀ (by linarith)]
+  have e : (o + s • d) k = o k + s * d k := by simp
+  rw [e] at h
+  have h1 : |s| * |d k| ≤ |o k| + |o k + s * d k| := by
+    rw [← abs_mul]
+    calc |s * d k| = |(o k + s * d k) - o k| := by ring_nf
+      _ ≤ |o k + s * d k| + |o k| := abs_sub _ _
+      _ = _ := by ring
+  nlinarith [abs_nonneg s]
+
+/-- The residual hypothesis of `world_near_obj` from the entries of
+    `L_A L_W − I` and `L_A c_W + c_A` (what the C build bounds per instance). -/
+theorem hres_of_entries (W A : Aff) (ρ σ : ℝ)
+    (hM : ∀ k j, |(A.L * W.L - 1) k j| ≤ ρ) (hv : ∀ k, |(A.L.mulVec W.c + A.c) k| ≤ σ) :
+    ∀ x : Vec3, ∀ k, |A.app (W.app x) k - x k| ≤ ρ * (|x 0| + |x 1| + |x 2|) + σ := by
+  intro x k
+  have heq : A.app (W.app x) - x = (A.L * W.L - 1).mulVec x + (A.L.mulVec W.c + A.c) := by
+    simp only [Aff.app, Matrix.mulVec_add, Matrix.sub_mulVec, Matrix.one_mulVec,
+      Matrix.mulVec_mulVec]; abel
+  have hk : A.app (W.app x) k - x k = (A.L * W.L - 1).mulVec x k + (A.L.mulVec W.c + A.c) k := by
+    rw [← Pi.sub_apply, heq, Pi.add_apply]
+  rw [hk]
+  have hL := abs_lin_le (A.L * W.L - 1) x k
+  have e0 := mul_le_mul_of_nonneg_right (hM k 0) (abs_nonneg (x 0))
+  have e1 := mul_le_mul_of_nonneg_right (hM k 1) (abs_nonneg (x 1))
+  have e2 := mul_le_mul_of_nonneg_right (hM k 2) (abs_nonneg (x 2))
+  calc _ ≤ |(A.L * W.L - 1).mulVec x k| + |(A.L.mulVec W.c + A.c) k| := abs_add_le _ _
+    _ ≤ _ := by have := hv k; nlinarith
+
+/-- **World-space `t` error from the ray perturbation.** The BLAS solves on the
+    rounded object ray; mapped by `A` that is the world ray `o' + s d'` with
+    `o' = A õ`, `d' = L_A d̃`, which meets the world triangle `A T` at the same
+    `s` (`hit_iff`, affine maps preserve the parameter). Against the exact world
+    ray `o + t d` on the triangle's plane `n · x = h`, the two parameters differ
+    by the perturbation divided by the plane's incidence `|n · d'|`; grazing
+    rays (small `|n · d'|`) are unbounded, as for any ray/plane solve. The
+    reported `t` adds the BLAS kernel's own `t` error on top. `|o' − o|` and
+    `|d' − d|` are bounded componentwise by `world_near_obj` (at `s = 0`, and
+    its linear part). -/
+theorem plane_t_perturb (n o d o' d' : Vec3) (h t1 t2 : ℝ)
+    (h1 : n ⬝ᵥ (o + t1 • d) = h) (h2 : n ⬝ᵥ (o' + t2 • d') = h) (hnd : n ⬝ᵥ d' ≠ 0) :
+    t2 - t1 = (n ⬝ᵥ (o - o') + t1 * (n ⬝ᵥ (d - d'))) / (n ⬝ᵥ d') := by
+  rw [eq_div_iff hnd]
+  simp only [dotProduct_add, dotProduct_smul, smul_eq_mul, dotProduct_sub] at h1 h2 ⊢
+  linear_combination h2 - h1
+
+theorem plane_t_perturb_abs (n o d o' d' : Vec3) (h t1 t2 : ℝ)
+    (h1 : n ⬝ᵥ (o + t1 • d) = h) (h2 : n ⬝ᵥ (o' + t2 • d') = h) (hnd : n ⬝ᵥ d' ≠ 0) :
+    |t2 - t1| ≤ (|n 0| * (|o 0 - o' 0| + |t1| * |d 0 - d' 0|) +
+        |n 1| * (|o 1 - o' 1| + |t1| * |d 1 - d' 1|) +
+        |n 2| * (|o 2 - o' 2| + |t1| * |d 2 - d' 2|)) / |n ⬝ᵥ d'| := by
+  rw [plane_t_perturb n o d o' d' h t1 t2 h1 h2 hnd, abs_div]
+  apply div_le_div_of_nonneg_right _ (abs_nonneg _)
+  simp only [dotProduct, Fin.sum_univ_three, Pi.sub_apply]
+  have k : ∀ j : Fin 3, |n j * (o j - o' j)| + |t1 * (n j * (d j - d' j))| =
+      |n j| * (|o j - o' j| + |t1| * |d j - d' j|) := by
+    intro j; simp only [abs_mul]; ring
+  calc |n 0 * (o 0 - o' 0) + n 1 * (o 1 - o' 1) + n 2 * (o 2 - o' 2) +
+        t1 * (n 0 * (d 0 - d' 0) + n 1 * (d 1 - d' 1) + n 2 * (d 2 - d' 2))|
+      = |(n 0 * (o 0 - o' 0) + t1 * (n 0 * (d 0 - d' 0))) +
+          (n 1 * (o 1 - o' 1) + t1 * (n 1 * (d 1 - d' 1))) +
+          (n 2 * (o 2 - o' 2) + t1 * (n 2 * (d 2 - d' 2)))| := by ring_nf
+    _ ≤ |n 0 * (o 0 - o' 0) + t1 * (n 0 * (d 0 - d' 0))| +
+          |n 1 * (o 1 - o' 1) + t1 * (n 1 * (d 1 - d' 1))| +
+          |n 2 * (o 2 - o' 2) + t1 * (n 2 * (d 2 - d' 2))| := abs_add_three _ _ _
+    _ ≤ _ := by
+      rw [← k 0, ← k 1, ← k 2]
+      linarith [abs_add_le (n 0 * (o 0 - o' 0)) (t1 * (n 0 * (d 0 - d' 0))),
+        abs_add_le (n 1 * (o 1 - o' 1)) (t1 * (n 1 * (d 1 - d' 1))),
+        abs_add_le (n 2 * (o 2 - o' 2)) (t1 * (n 2 * (d 2 - d' 2)))]
+
+/-- **TLAS box conservativity for (instance, primitive) pairs.** If the BLAS's
+    rounded ray point at `s` lies in the BLAS box `[lo, hi]` and the instance
+    box contains the 8 mapped corners (`aff_in_corner_box`), then the world ray
+    point at the same `s` lies in that box dilated per axis by the margin of
+    `world_near_obj`. The C TLAS slab test runs on that dilated box, so it
+    cannot reject an ancestor of a reported pair hit (C1), and its entry
+    parameter is at most `s` (C2) given a conservative slab test. -/
+theorem world_in_dilated_box (W A : Aff) (ρ σ : ℝ)
+    (hres : ∀ x : Vec3, ∀ k, |A.app (W.app x) k - x k| ≤ ρ * (|x 0| + |x 1| + |x 2|) + σ)
+    (o d oo dd eo ed lo hi : Vec3) (s : ℝ)
+    (ho : ∀ j, |oo j - W.app o j| ≤ eo j) (hd : ∀ j, |dd j - W.lin d j| ≤ ed j)
+    (hin : ∀ j, lo j ≤ (oo + s • dd) j ∧ (oo + s • dd) j ≤ hi j)
+    (k : Fin 3) (wlo whi m : ℝ)
+    (hc : ∀ b : Fin 3 → Bool, wlo ≤ A.app (corner lo hi b) k ∧ A.app (corner lo hi b) k ≤ whi)
+    (hm : ρ * (|(o + s • d) 0| + |(o + s • d) 1| + |(o + s • d) 2|) + σ +
+        (|A.L k 0| * (eo 0 + |s| * ed 0) + |A.L k 1| * (eo 1 + |s| * ed 1) +
+          |A.L k 2| * (eo 2 + |s| * ed 2)) ≤ m) :
+    wlo - m ≤ (o + s • d) k ∧ (o + s • d) k ≤ whi + m := by
+  have hb := aff_in_corner_box A lo hi _ hin k wlo whi hc
+  have hn := world_near_obj W A ρ σ hres o d oo dd eo ed s ho hd k
+  have := abs_le.1 (hn.trans hm)
+  constructor <;> linarith [hb.1, hb.2, this.1, this.2]
+
 end TwoLevel
 
 /-! ### Rounding of the instance ray transform -/
@@ -323,6 +479,75 @@ theorem xform_point_err (m0 m1 m2 m3 p0 p1 p2 : ℝ)
   have a3 := add_err R (x := R.fl s2) (y := m3) (X := m0 * p0 + m1 * p1 + m2 * p2) (Y := m3) hs3
   simp only [sub_self, abs_zero, add_zero] at a3
   nlinarith [abs_nonneg s1, abs_nonneg s2, abs_nonneg s3, R.u_pos]
+
+theorem fl_abs_le {x : ℝ} (hr : R.InRange x) : |R.fl x| ≤ (1 + R.u) * |x| := by
+  have h := R.abs_err hr
+  have := abs_sub_abs_le_abs_sub (R.fl x) x
+  nlinarith [abs_nonneg x]
+
+/-- **Simple form of `xform_point_err`**: `|fl − exact| ≤ 5u (Σ|products| + |m3|)`
+    (binary32: `u = 2⁻²⁴`, so `u ≤ 1/100` is generous). This is the bound the C
+    TLAS margin uses, as per-instance row sums of `|world2obj|`. -/
+theorem xform_point_err_simple (m0 m1 m2 m3 p0 p1 p2 : ℝ) (hu : R.u ≤ 1 / 100)
+    (h0 : R.InRange (m0 * p0)) (h1 : R.InRange (m1 * p1)) (h2 : R.InRange (m2 * p2))
+    (hs1 : R.InRange (R.fl (m0 * p0) + R.fl (m1 * p1)))
+    (hs2 : R.InRange (R.fl (R.fl (m0 * p0) + R.fl (m1 * p1)) + R.fl (m2 * p2)))
+    (hs3 : R.InRange (R.fl (R.fl (R.fl (m0 * p0) + R.fl (m1 * p1)) + R.fl (m2 * p2)) + m3)) :
+    |R.fl (R.fl (R.fl (R.fl (m0 * p0) + R.fl (m1 * p1)) + R.fl (m2 * p2)) + m3) -
+        (m0 * p0 + m1 * p1 + m2 * p2 + m3)| ≤
+      5 * R.u * (|m0 * p0| + |m1 * p1| + |m2 * p2| + |m3|) := by
+  have he := xform_point_err R m0 m1 m2 m3 p0 p1 p2 h0 h1 h2 hs1 hs2 hs3
+  simp only at he
+  set a0 := |m0 * p0|; set a1 := |m1 * p1|; set a2 := |m2 * p2|
+  have u0 := R.u_pos
+  have f0 := fl_abs_le R h0; have f1 := fl_abs_le R h1; have f2 := fl_abs_le R h2
+  set s1 := R.fl (m0 * p0) + R.fl (m1 * p1)
+  set s2 := R.fl s1 + R.fl (m2 * p2)
+  set s3 := R.fl s2 + m3
+  have b1 : |s1| ≤ (1 + R.u) * (a0 + a1) := by
+    have := abs_add_le (R.fl (m0 * p0)) (R.fl (m1 * p1)); nlinarith
+  have g1 := fl_abs_le R hs1
+  have b2 : |s2| ≤ (1 + R.u) * (1 + R.u) * (a0 + a1) + (1 + R.u) * a2 := by
+    have := abs_add_le (R.fl s1) (R.fl (m2 * p2)); nlinarith [abs_nonneg s1]
+  have g2 := fl_abs_le R hs2
+  have b3 : |s3| ≤ (1 + R.u) * |s2| + |m3| := by
+    have := abs_add_le (R.fl s2) m3; nlinarith [abs_nonneg s2]
+  have hA : 0 ≤ a0 + a1 := by positivity
+  have h2' : 0 ≤ a2 := abs_nonneg _
+  have : |s1| + |s2| + |s3| ≤ 4 * (a0 + a1 + a2) + |m3| := by
+    have k1 : (1 + R.u) * (1 + R.u) ≤ 1.03 := by nlinarith
+    have k2 : (1 + R.u) * |s2| ≤ 1.01 * |s2| := by nlinarith [abs_nonneg s2]
+    have : |s2| ≤ 1.03 * (a0 + a1) + 1.01 * a2 := by nlinarith
+    nlinarith
+  nlinarith [abs_nonneg m3]
+
+/-- Same for `tlas_xform_vec` (no translation). -/
+theorem xform_vec_err_simple (m0 m1 m2 v0 v1 v2 : ℝ) (hu : R.u ≤ 1 / 100)
+    (h0 : R.InRange (m0 * v0)) (h1 : R.InRange (m1 * v1)) (h2 : R.InRange (m2 * v2))
+    (hs1 : R.InRange (R.fl (m0 * v0) + R.fl (m1 * v1)))
+    (hs2 : R.InRange (R.fl (R.fl (m0 * v0) + R.fl (m1 * v1)) + R.fl (m2 * v2))) :
+    |R.fl (R.fl (R.fl (m0 * v0) + R.fl (m1 * v1)) + R.fl (m2 * v2)) -
+        (m0 * v0 + m1 * v1 + m2 * v2)| ≤
+      5 * R.u * (|m0 * v0| + |m1 * v1| + |m2 * v2|) := by
+  have he := xform_vec_err R m0 m1 m2 v0 v1 v2 h0 h1 h2 hs1 hs2
+  simp only at he
+  set a0 := |m0 * v0|; set a1 := |m1 * v1|; set a2 := |m2 * v2|
+  have u0 := R.u_pos
+  have f0 := fl_abs_le R h0; have f1 := fl_abs_le R h1; have f2 := fl_abs_le R h2
+  set s1 := R.fl (m0 * v0) + R.fl (m1 * v1)
+  set s2 := R.fl s1 + R.fl (m2 * v2)
+  have b1 : |s1| ≤ (1 + R.u) * (a0 + a1) := by
+    have := abs_add_le (R.fl (m0 * v0)) (R.fl (m1 * v1)); nlinarith
+  have g1 := fl_abs_le R hs1
+  have b2 : |s2| ≤ (1 + R.u) * (1 + R.u) * (a0 + a1) + (1 + R.u) * a2 := by
+    have := abs_add_le (R.fl s1) (R.fl (m2 * v2)); nlinarith [abs_nonneg s1]
+  have hA : 0 ≤ a0 + a1 := by positivity
+  have h2' : 0 ≤ a2 := abs_nonneg _
+  have k1 : (1 + R.u) * (1 + R.u) ≤ 1.03 := by nlinarith
+  have k2 : |s1| ≤ 1.01 * (a0 + a1) := by nlinarith
+  have k3 : |s2| ≤ 1.03 * (a0 + a1) + 1.01 * a2 := by nlinarith
+  have k4 : |s1| + |s2| ≤ 4 * (a0 + a1 + a2) := by linarith
+  nlinarith [mul_le_mul_of_nonneg_left k4 u0.le]
 
 end TwoLevel
 end LightRT.BVH

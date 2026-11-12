@@ -30,7 +30,7 @@ OUT = os.path.join(ROOT, "formal", "LightRT", "C", "Gen.lean")
 # Configurations translated: (module name, preprocessor flags). `Gen` is the
 # legacy kernel (robust defaults opted out; the slab false-miss witness and the
 # original refinement proofs are about it); `GenRobust` is the default build.
-CONFIGS = [("Gen", ["-DLRT_TRI_NO_SLAB_ROBUST", "-DLRT_TRI_NO_LEAF_BOX_EXACT"]),
+CONFIGS = [("Gen", ["-DLRT_TRI_NO_SLAB_ROBUST", "-DLRT_TRI_NO_LEAF_BOX_EXACT", "-DLRT_TRI_NO_BITEXACT"]),
            ("GenRobust", [])]
 DEFINES = []
 MODULE = "Gen"
