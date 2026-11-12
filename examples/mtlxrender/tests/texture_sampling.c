@@ -289,6 +289,22 @@ int main(int argc, char **argv) {
       "<transformmatrix name=\"adobergb_to_rec709\" type=\"vector3\">"
       "<input name=\"in\" type=\"vector3\" nodename=\"adobe_encoded_gamma\"/>"
       "<input name=\"mat\" type=\"matrix33\" value=\"1.39835574e+00, -2.50233861e-16, 2.77555756e-17, -3.98355744e-01, 1.00000000e+00, -4.29289893e-02, 0.00000000e+00, 0.00000000e+00, 1.04292899e+00\"/>"
+      "</transformmatrix>"
+      "<transformmatrix name=\"linear_displayp3_to_rec709\" type=\"vector3\">"
+      "<input name=\"in\" type=\"vector3\" value=\"0.25, 0.5, 0.75\"/>"
+      "<input name=\"mat\" type=\"matrix33\" value=\"1.224940176281, -0.04205695470969, -0.01963755459033, -0.2249401762806, 1.042056954710, -0.07863604555063, 0., 0., 1.098273600141\"/>"
+      "</transformmatrix>"
+      "<transformmatrix name=\"linear_ap0_to_rec709\" type=\"vector3\">"
+      "<input name=\"in\" type=\"vector3\" value=\"0.25, 0.5, 0.75\"/>"
+      "<input name=\"mat\" type=\"matrix33\" value=\"2.521686186744, -0.276479914230, -0.015378064966, -1.134130988240, 1.372719087668, -0.152975335867, -0.387555198504, -0.096239173438, 1.16835340083\"/>"
+      "</transformmatrix>"
+      "<transformmatrix name=\"linear_rec2020_to_rec709\" type=\"vector3\">"
+      "<input name=\"in\" type=\"vector3\" value=\"0.25, 0.5, 0.75\"/>"
+      "<input name=\"mat\" type=\"matrix33\" value=\"1.660491002108, -0.124550474522, -0.018150763355, -0.587641138788, 1.132899897126, -0.100578898008, -0.072849863320, -0.008349422604, 1.11872966136\"/>"
+      "</transformmatrix>"
+      "<transformmatrix name=\"linear_xyzd65_to_rec709\" type=\"vector3\">"
+      "<input name=\"in\" type=\"vector3\" value=\"0.25, 0.5, 0.75\"/>"
+      "<input name=\"mat\" type=\"matrix33\" value=\"3.240969941905, -0.969243636281, 0.055630079697, -1.53738317757, 1.875967501508, -0.203976958889, -0.498610760293, 0.041555057407, 1.056971514243\"/>"
       "</transformmatrix></materialx>", filename, filename, filename);
   MtlxDoc *doc = mtlx_load_string(xml);
   if (!doc) {
@@ -304,11 +320,19 @@ int main(int argc, char **argv) {
   const int adobe_matrix_node = mtlx_find_node(doc, -1, "linear_adobergb_to_rec709");
   const int g22_ap1_node = mtlx_find_node(doc, -1, "g22_ap1_to_rec709");
   const int adobergb_node = mtlx_find_node(doc, -1, "adobergb_to_rec709");
+  const int displayp3_matrix_node =
+      mtlx_find_node(doc, -1, "linear_displayp3_to_rec709");
+  const int ap0_matrix_node = mtlx_find_node(doc, -1, "linear_ap0_to_rec709");
+  const int rec2020_matrix_node =
+      mtlx_find_node(doc, -1, "linear_rec2020_to_rec709");
+  const int xyz_matrix_node = mtlx_find_node(doc, -1, "linear_xyzd65_to_rec709");
   MtlxValue *memo = (MtlxValue *)calloc((size_t)doc->nnode, sizeof(MtlxValue));
   char *memo_done = (char *)calloc((size_t)doc->nnode, sizeof(char));
   if (node < 0 || tiled_node < 0 || tiled_zero_node < 0 ||
       aces_matrix_node < 0 || adobe_matrix_node < 0 ||
-      g22_ap1_node < 0 || adobergb_node < 0 || !memo || !memo_done) {
+      g22_ap1_node < 0 || adobergb_node < 0 ||
+      displayp3_matrix_node < 0 || ap0_matrix_node < 0 ||
+      rec2020_matrix_node < 0 || xyz_matrix_node < 0 || !memo || !memo_done) {
     free(memo);
     free(memo_done);
     mtlx_free(doc);
@@ -336,7 +360,17 @@ int main(int argc, char **argv) {
   memset(memo_done, 0, (size_t)doc->nnode * sizeof(char));
   const MtlxValue adobergb =
       mtlx_eval_node_test(&context, adobergb_node);
-  const int matrix_ok =
+  memset(memo_done, 0, (size_t)doc->nnode * sizeof(char));
+  const MtlxValue displayp3_matrix =
+      mtlx_eval_node_test(&context, displayp3_matrix_node);
+  memset(memo_done, 0, (size_t)doc->nnode * sizeof(char));
+  const MtlxValue ap0_matrix = mtlx_eval_node_test(&context, ap0_matrix_node);
+  memset(memo_done, 0, (size_t)doc->nnode * sizeof(char));
+  const MtlxValue rec2020_matrix =
+      mtlx_eval_node_test(&context, rec2020_matrix_node);
+  memset(memo_done, 0, (size_t)doc->nnode * sizeof(char));
+  const MtlxValue xyz_matrix = mtlx_eval_node_test(&context, xyz_matrix_node);
+  int matrix_ok =
       aces_matrix.type == MV_VEC3 &&
       near(aces_matrix.v[0], 0.052922534f, 2e-6f) &&
       near(aces_matrix.v[1], 0.529927025f, 2e-6f) &&
@@ -353,6 +387,21 @@ int main(int argc, char **argv) {
       near(adobergb.v[0], -0.086744165f, 3e-6f) &&
       near(adobergb.v[1], 0.217755528f, 3e-6f) &&
       near(adobergb.v[2], 0.544623099f, 3e-6f);
+  const MtlxValue matrix_values[] = {
+      displayp3_matrix, ap0_matrix, rec2020_matrix, xyz_matrix};
+  const float expected_matrix_values[][3] = {
+      {0.193764956f, 0.510514239f, 0.779477789f},
+      {-0.227310346f, 0.545060185f, 0.795932866f},
+      {0.066664784f, 0.529050263f, 0.784220106f},
+      {-0.332407174f, 0.726839135f, 0.704647676f}};
+  for (size_t conversion = 0; conversion < 4; ++conversion) {
+    matrix_ok = matrix_ok && matrix_values[conversion].type == MV_VEC3;
+    for (size_t channel = 0; channel < 3; ++channel) {
+      matrix_ok = matrix_ok &&
+          near(matrix_values[conversion].v[channel],
+               expected_matrix_values[conversion][channel], 3e-6f);
+    }
+  }
   if (!matrix_ok) {
     fprintf(stderr, "FAIL: cmlib color-space conversion result\\n");
     free(memo);
