@@ -156,7 +156,8 @@ catches real correctness bugs, not just regressions. Each case feeds inputs
 through the real parse → doc → eval path (`mtlx_load_string` + a one-node graph).
 
 ```bash
-make test        # node_truth plus the CPU BSDF white-furnace quadrature
+make test        # node_truth, texture sampling, and CPU BSDF white furnace
+make test-texture  # nearest/linear, addressing, and sRGB sampler regression
 make test-white-furnace  # deterministic material/lobe energy integration
 make test-lean    # Lean-generated node vectors
 make check       # node ground-truth + golden render regression
