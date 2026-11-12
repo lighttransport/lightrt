@@ -619,14 +619,16 @@ struct lrt_tri_scene {
      * NULL otherwise. */
     uint32_t *prim2slot;
 #ifdef LRT_TRI_WATERTIGHT_TRI
-    /* Exact input vertices for the watertight leaf, the only copy: the leaf
-     * blocks store rounded edges, so v0+e1 is not v1 and adjacent triangles
-     * would not see a shared vertex identically. SoA per leaf block (10*width
+    /* Exact input vertices for the watertight leaf, SoA per leaf block (10*width
      * words: v0x[w] v0y[w] v0z[w] v1x.. v2z, then the w prim ids), read by the
      * SIMD leaves (tri_woop4/8_block) and the scalar lane test alike. Padding
-     * lanes are zero with prim id LRT_TRI_NO_HIT. Built by tri_build_wblk at
-     * build, load (from the LRTS aux vertices) and refit; NULL for mmapped
-     * scenes, which fall back to Moller-Trumbore. */
+     * lanes are zero with prim id LRT_TRI_NO_HIT. The MT edge format (v0 e1 e2)
+     * cannot give these back (fl(v1 - v0) + v0 is not v1), so for BVH4/BVH8
+     * scenes the leaf blocks themselves are rewritten to this vertex format and
+     * wblk aliases s->blocks ("vertex-format" scenes, tri_vfmt; the edges are
+     * recomputed as fl(v1 - v0), bit-identical to what the build stored, by
+     * the few readers that need them). BVH16 and mmapped legacy-format files
+     * keep a separate wblk next to edge blocks. */
     float *wblk;
 #endif
     uint32_t block_stride; /* bytes per leaf block (varies for quantized leaves) */
@@ -677,6 +679,16 @@ static inline const float *tri_block_floats(const void *blocks, uint32_t idx,
                            (size_t)idx * tri_block_size(width));
 }
 
+/* Leaf blocks hold exact v0 v1 v2 instead of v0 e1 e2 (watertight scenes). */
+static inline int tri_vfmt(const lrt_tri_scene *s) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    return s->wblk != NULL && s->wblk == (const float *)s->blocks;
+#else
+    (void)s;
+    return 0;
+#endif
+}
+
 #ifdef LRT_TRI_WATERTIGHT_TRI
 /* Scene has a SIMD watertight leaf for its layout (BVH4 SSE / BVH8 AVX2, not
  * quantized nodes); otherwise the watertight build runs the scalar kernels. */
@@ -687,23 +699,33 @@ static inline const float *tri_block_floats(const void *blocks, uint32_t idx,
 #else
 #define TRI_WBLK_SIMD(s) 0
 #endif
-/* (Re)build s->wblk from prim-ordered exact vertices src (9 floats per prim
- * id, nsrc prims) and the leaf blocks' prim ids. Plain triangle scenes of any
- * width. Returns 0 on OOM or an out-of-range prim id. */
+/* (Re)build the exact vertices from prim-ordered src (9 floats per prim id,
+ * nsrc prims) and the leaf blocks' prim ids. BVH4/BVH8 heap scenes are
+ * converted in place to the vertex format (wblk = blocks); otherwise a
+ * separate wblk is allocated. Returns 0 on OOM or an out-of-range prim id. */
 static int tri_build_wblk(lrt_tri_scene *s, const float *src, size_t nsrc) {
     if (s->prim_kind != TRI_PRIM_TRI) return 1;
     int w = s->layout;
-    size_t n = (size_t)s->block_count * 10 * (size_t)w;
-    if (!s->wblk) {
-        s->wblk = (float *)malloc(n * sizeof(float) + 64);
+    int inplace = (w == 4 || w == 8) && !s->mem_mapped;
+    for (uint32_t b = 0; b < s->block_count; b++) {
+        const uint32_t *ids =
+            (const uint32_t *)(tri_block_floats(s->blocks, b, w) + 9 * w);
+        for (int l = 0; l < w; l++)
+            if (ids[l] != LRT_TRI_NO_HIT && ids[l] >= nsrc) return 0;
+    }
+    if (inplace) {
+        if (s->wblk && s->wblk != (float *)s->blocks) free(s->wblk);
+        s->wblk = (float *)s->blocks;
+    } else if (!s->wblk || s->wblk == (float *)s->blocks) {
+        s->wblk = (float *)malloc((size_t)s->block_count * 10 * (size_t)w * sizeof(float) + 64);
         if (!s->wblk) return 0;
     }
     for (uint32_t b = 0; b < s->block_count; b++) {
         const float *f = tri_block_floats(s->blocks, b, w);
-        const uint32_t *ids = (const uint32_t *)(f + 9 * w);
+        uint32_t ids[16];
+        memcpy(ids, f + 9 * w, (size_t)w * 4);
         float *o = &s->wblk[(size_t)b * 10 * w];
         for (int l = 0; l < w; l++) {
-            if (ids[l] != LRT_TRI_NO_HIT && ids[l] >= nsrc) return 0;
             for (int c = 0; c < 9; c++)
                 o[c * w + l] = ids[l] == LRT_TRI_NO_HIT ? 0.0f : src[(size_t)ids[l] * 9 + c];
             memcpy(&o[9 * w + l], &ids[l], 4);
@@ -764,6 +786,14 @@ int lrt_tri_get_verts(const lrt_tri_scene *s, uint32_t prim_id, float v0[3],
     const float *f = tri_block_floats(s->blocks, blk, w);
     /* Leaves store v0 and the precomputed edges e1=v1-v0, e2=v2-v0 (see
      * tri_emit_leaf); v0 + e is byte-exact for adjacent mesh coords (Sterbenz). */
+    if (tri_vfmt(s)) { /* exact vertices */
+        for (int a = 0; a < 3; a++) {
+            v0[a] = f[a * w + lane];
+            v1[a] = f[(3 + a) * w + lane];
+            v2[a] = f[(6 + a) * w + lane];
+        }
+        return 1;
+    }
     const float v0x = f[0 * w + lane], v0y = f[1 * w + lane], v0z = f[2 * w + lane];
     v0[0] = v0x;
     v0[1] = v0y;
@@ -10823,13 +10853,21 @@ static inline int tri_slab_hp(const float *lo_x, const float *lo_y,
 static inline void tri_block_isect_hp(const float *f, int bw,
                                       const tri_ray_ctx_hp *rc, double *best_t,
                                       double *best_u, double *best_v,
-                                      uint32_t *best_prim, const uint32_t *prim) {
-    /* Promote the block lanes to double scratch (bw <= 8). */
+                                      uint32_t *best_prim, const uint32_t *prim, int vf) {
+    /* Promote the block lanes to double scratch (bw <= 8). A vertex-format
+     * block gives the edges as fl(v1 - v0), bit-identical to the stored ones. */
     double v0x[8], v0y[8], v0z[8], e1x[8], e1y[8], e1z[8], e2x[8], e2y[8], e2z[8];
     for (int l = 0; l < bw; l++) {
-        v0x[l] = f[0 * bw + l]; v0y[l] = f[1 * bw + l]; v0z[l] = f[2 * bw + l];
-        e1x[l] = f[3 * bw + l]; e1y[l] = f[4 * bw + l]; e1z[l] = f[5 * bw + l];
-        e2x[l] = f[6 * bw + l]; e2y[l] = f[7 * bw + l]; e2z[l] = f[8 * bw + l];
+        float a0 = f[0 * bw + l], a1 = f[1 * bw + l], a2 = f[2 * bw + l];
+        float b0 = f[3 * bw + l], b1 = f[4 * bw + l], b2 = f[5 * bw + l];
+        float c0 = f[6 * bw + l], c1 = f[7 * bw + l], c2 = f[8 * bw + l];
+        if (vf) {
+            b0 = b0 - a0; b1 = b1 - a1; b2 = b2 - a2;
+            c0 = c0 - a0; c1 = c1 - a1; c2 = c2 - a2;
+        }
+        v0x[l] = a0; v0y[l] = a1; v0z[l] = a2;
+        e1x[l] = b0; e1y[l] = b1; e1z[l] = b2;
+        e2x[l] = c0; e2y[l] = c1; e2z[l] = c2;
     }
     double ta[8], ua[8], va[8];
 #if LRT_TRI_HAS_SVE
@@ -10954,7 +10992,7 @@ static int tri_intersect_hp(const lrt_tri_scene *s, const lrt_ray_hp *ray,
                     tri_block_floats(s->blocks, blk0 + b, bw);
                 const uint32_t *prim = (const uint32_t *)(f + 9 * bw);
                 tri_block_isect_hp(f, bw, &rc, &best_t, &best_u, &best_v,
-                                   &best_prim, prim);
+                                   &best_prim, prim, tri_vfmt(s));
             }
             continue;
         }
@@ -11617,7 +11655,7 @@ void lrt_tri_scene_free(lrt_tri_scene *s) {
     free(s->shade_cps);
     free(s->shade_dom);
 #ifdef LRT_TRI_WATERTIGHT_TRI
-    free(s->wblk);
+    if (s->wblk != (float *)s->blocks) free(s->wblk);
 #endif
     free(s);
 }
@@ -12168,7 +12206,15 @@ static float tri_point_tri_distsq(const float *A, const float *B,
 
 /* Reconstruct triangle vertices from a leaf block lane (v0, v0+e1, v0+e2). */
 static inline void tri_leaf_verts(const float *f, int bw, int lane, float A[3],
-                                  float B[3], float C[3]) {
+                                  float B[3], float C[3], int vf) {
+    if (vf) { /* vertex-format block: exact vertices */
+        for (int a = 0; a < 3; a++) {
+            A[a] = f[a * bw + lane];
+            B[a] = f[(3 + a) * bw + lane];
+            C[a] = f[(6 + a) * bw + lane];
+        }
+        return;
+    }
     for (int a = 0; a < 3; a++) {
         float v0 = f[a * bw + lane];
         A[a] = v0;
@@ -12179,7 +12225,17 @@ static inline void tri_leaf_verts(const float *f, int bw, int lane, float A[3],
 
 
 static inline void tri_leaf_prim_aabb(const float *f, int bw, int lane,
-                                      float lo[3], float hi[3]) {
+                                      float lo[3], float hi[3], int vf) {
+    if (vf) { /* exact vertices: their min/max is exact */
+        float A[3], B[3], C[3];
+        tri_leaf_verts(f, bw, lane, A, B, C, 1);
+        for (int a = 0; a < 3; a++) {
+            float mn = A[a] < B[a] ? A[a] : B[a], mx = A[a] > B[a] ? A[a] : B[a];
+            lo[a] = mn < C[a] ? mn : C[a];
+            hi[a] = mx > C[a] ? mx : C[a];
+        }
+        return;
+    }
 #ifdef LRT_TRI_LEAF_BOX_EXACT
     for (int a = 0; a < 3; a++) {
         float v0 = f[a * bw + lane];
@@ -12195,7 +12251,7 @@ static inline void tri_leaf_prim_aabb(const float *f, int bw, int lane,
     }
 #else
     float A[3], B[3], C[3];
-    tri_leaf_verts(f, bw, lane, A, B, C);
+    tri_leaf_verts(f, bw, lane, A, B, C, 0);
     for (int a = 0; a < 3; a++) {
         float mn = A[a] < B[a] ? A[a] : B[a];
         mn = mn < C[a] ? mn : C[a];
@@ -12234,7 +12290,7 @@ static size_t tri_nearest_core(const lrt_tri_scene *s, const float p[3],
                 for (int lane = 0; lane < width; lane++) {
                     if (ids[lane] == LRT_TRI_NO_HIT) continue;
                     float A[3], B[3], C[3], q[3];
-                    tri_leaf_verts(f, width, lane, A, B, C);
+                    tri_leaf_verts(f, width, lane, A, B, C, tri_vfmt(s));
                     float dsq = tri_point_tri_distsq(A, B, C, p, q);
                     if (cnt < k || dsq < kth) {
                         uint32_t pid = ids[lane];
@@ -12377,7 +12433,7 @@ static size_t tri_query_region(const lrt_tri_scene *s, const tri_region *rg,
                 for (int lane = 0; lane < width && cnt < cap; lane++) {
                     if (ids[lane] == LRT_TRI_NO_HIT) continue;
                     float blo[3], bhi[3];
-                    tri_leaf_prim_aabb(f, width, lane, blo, bhi);
+                    tri_leaf_prim_aabb(f, width, lane, blo, bhi, tri_vfmt(s));
                     if (tri_region_test_box(rg, blo, bhi)) out[cnt++] = ids[lane];
                 }
             }
@@ -15542,7 +15598,8 @@ lrt_result lrt_tri_scene_save_to_memory(const lrt_tri_scene *s, void **buf,
     h.version = LRT_TRI_FILE_VERSION;
     h.endian = 0x01020304u;
     h.flags = (s->prim_kind == TRI_PRIM_CURVE ? 1u : 0u) |
-              (s->quantized ? 2u : 0u);
+              (s->quantized ? 2u : 0u) |
+              (tri_vfmt(s) ? 4u : 0u) /* leaf blocks hold v0 v1 v2 (watertight) */;
     h.layout = (uint32_t)s->layout;
     h.prim_kind = (uint32_t)s->prim_kind;
     h.node_count = s->node_count;
@@ -15616,6 +15673,9 @@ static int tri_header_check(const lrt_tri_file_header *h, size_t n) {
     uint32_t exp_bstride = tri_kind_block_stride((int)h->prim_kind, (int)h->layout);
     if (exp_bstride == 0) return 1; /* not a serializable prim_kind */
     int quantized = (h->flags & 2u) != 0;
+#ifndef LRT_TRI_WATERTIGHT_TRI
+    if (h->flags & 4u) return 1; /* vertex-format leaves need a watertight build */
+#endif
     if (h->node_stride != tri_node_stride((int)h->layout, quantized)) return 1;
     if (h->block_stride != exp_bstride) return 1;
     if (h->file_size != (uint64_t)n) return 1;
@@ -15747,9 +15807,14 @@ static lrt_tri_scene *tri_scene_from_buffer(const void *buf, size_t n, int copy,
         }
     }
 #ifdef LRT_TRI_WATERTIGHT_TRI
-    /* Watertight-leaf exact vertices (heap-owned). Every leaf prim id must
-     * index inside the array, else the file is treated as having none. */
-    if (s->prim_kind == TRI_PRIM_TRI && (s->layout == 4 || s->layout == 8) &&
+    /* Vertex-format leaves (flag 4): the blocks already are the exact
+     * vertices (also when mmapped, read-only). Legacy watertight files carry
+     * edge blocks + the aux vertices: convert (heap) or keep a separate wblk
+     * (mmap). Every leaf prim id must index inside the aux array, else the
+     * file is treated as having none. */
+    if (s->prim_kind == TRI_PRIM_TRI && (h->flags & 4u)) {
+        s->wblk = (float *)s->blocks;
+    } else if (s->prim_kind == TRI_PRIM_TRI && (s->layout == 4 || s->layout == 8) &&
         h->aux_size >= sizeof(lrt_tri_aux_header)) {
         const unsigned char *ap = (const unsigned char *)buf + h->aux_offset;
         lrt_tri_aux_header ah;
@@ -15768,7 +15833,7 @@ static lrt_tri_scene *tri_scene_from_buffer(const void *buf, size_t n, int copy,
                 memcpy(wv, ap + sizeof(ah), vbytes);
                 if (!s->original_ntris) s->original_ntris = ah.npts;
                 if (!tri_build_wblk(s, wv, ah.npts)) {
-                    free(s->wblk);
+                    if (s->wblk != (float *)s->blocks) free(s->wblk);
                     s->wblk = NULL;
                 }
                 free(wv);
@@ -15965,7 +16030,7 @@ static void tri_leaf_box(const lrt_tri_scene *s, uint32_t ref, float lo[3],
         for (int lane = 0; lane < width; lane++) {
             if (ids[lane] == LRT_TRI_NO_HIT) continue;
             float plo[3], phi[3];
-            tri_leaf_prim_aabb(f, width, lane, plo, phi);
+            tri_leaf_prim_aabb(f, width, lane, plo, phi, tri_vfmt(s));
             for (int a = 0; a < 3; a++) {
                 if (plo[a] < lo[a]) lo[a] = plo[a];
                 if (phi[a] > hi[a]) hi[a] = phi[a];
