@@ -112,6 +112,50 @@ int main(int argc, char **argv) {
     return fail("bilinear center sample", sample);
   }
 
+  if (!texcache_build_mips(cache, linear_id) ||
+      !texcache_build_mips(cache, srgb_id)) {
+    texcache_free(cache);
+    remove(argv[1]);
+    fprintf(stderr, "FAIL: building linear and sRGB mip chains\n");
+    return 1;
+  }
+  if (!near(texcache_lod_from_grad(cache, linear_id, 0.25f, 0.0f,
+                                   0.0f, 0.25f), 0.0f, 1e-6f) ||
+      !near(texcache_lod_from_grad(cache, linear_id, 1.0f, 0.0f,
+                                   0.0f, 1.0f), 1.0f, 1e-6f)) {
+    texcache_free(cache);
+    remove(argv[1]);
+    fprintf(stderr, "FAIL: derivative-to-mip LOD selection\n");
+    return 1;
+  }
+  texcache_sample_trilinear(cache, linear_id, 0.5f, 0.5f, 1.0f,
+                            "clamp", "clamp", sample);
+  if (!near(sample[0], 0.37549f, 2e-5f) ||
+      !near(sample[1], 0.62549f, 2e-5f) ||
+      !near(sample[2], 0.62549f, 2e-5f) || !near(sample[3], 1.0f, 1e-6f)) {
+    texcache_free(cache);
+    remove(argv[1]);
+    return fail("linear-space 2x2 mip average", sample);
+  }
+  texcache_sample_trilinear(cache, srgb_id, 0.5f, 0.5f, 1.0f,
+                            "clamp", "clamp", sample);
+  if (!near(sample[0], 0.303965f, 2e-5f) ||
+      !near(sample[1], 0.553965f, 2e-5f) ||
+      !near(sample[2], 0.553965f, 2e-5f)) {
+    texcache_free(cache);
+    remove(argv[1]);
+    return fail("sRGB-decoded mip generation", sample);
+  }
+  texcache_sample_trilinear(cache, linear_id, 0.5f, 0.5f, -2.0f,
+                            "clamp", "clamp", sample);
+  if (!near(sample[0], 0.37549f, 2e-5f) ||
+      !near(sample[1], 0.62549f, 2e-5f) ||
+      !near(sample[2], 0.62549f, 2e-5f)) {
+    texcache_free(cache);
+    remove(argv[1]);
+    return fail("negative mip LOD clamps to base level", sample);
+  }
+
   texcache_sample_address_filter(cache, linear_id, 0.375f, 0.75f,
                                  "clamp", "clamp", "cubic", sample);
   if (!near(sample[0], 0.39998f, 2e-4f) ||
@@ -276,8 +320,49 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  char odd_path[1024], odd_filename[1024];
+  snprintf(odd_path, sizeof(odd_path), "%s.odd.ppm", argv[1]);
+  snprintf(odd_filename, sizeof(odd_filename), "%s.odd.ppm", filename);
+  FILE *odd_image = fopen(odd_path, "wb");
+  static const unsigned char odd_pixels[9] = {
+      255, 0, 0,  0, 255, 0,  0, 0, 255,
+  };
+  const int odd_wrote = odd_image &&
+      fprintf(odd_image, "P6\n3 1\n255\n") > 0 &&
+      fwrite(odd_pixels, 1, sizeof(odd_pixels), odd_image) == sizeof(odd_pixels);
+  const int odd_closed = odd_image ? fclose(odd_image) == 0 : 0;
+  const int odd_id = odd_wrote && odd_closed
+      ? texcache_get(cache, odd_filename, 0) : -1;
+  if (odd_id < 0 || !texcache_build_mips(cache, odd_id)) {
+    texcache_free(cache);
+    remove(odd_path);
+    remove(argv[1]);
+    fprintf(stderr, "FAIL: building round-up mips for odd image dimensions\n");
+    return 1;
+  }
+  texcache_sample_trilinear(cache, odd_id, 0.75f, 0.5f, 1.0f,
+                            "clamp", "clamp", sample);
+  if (!near(sample[0], 0.0f, 1e-6f) ||
+      !near(sample[1], 0.0f, 1e-6f) || !near(sample[2], 1.0f, 1e-6f)) {
+    texcache_free(cache);
+    remove(odd_path);
+    remove(argv[1]);
+    return fail("round-up mip retains the unmatched edge texel", sample);
+  }
+  texcache_sample_trilinear(cache, odd_id, 0.5f, 0.5f, 2.0f,
+                            "clamp", "clamp", sample);
+  if (!near(sample[0], 0.25f, 1e-6f) ||
+      !near(sample[1], 0.25f, 1e-6f) ||
+      !near(sample[2], 0.5f, 1e-6f)) {
+    texcache_free(cache);
+    remove(odd_path);
+    remove(argv[1]);
+    return fail("odd-edge mip pyramid terminal average", sample);
+  }
+
   texcache_free(cache);
+  remove(odd_path);
   remove(argv[1]);
-  puts("PASS: nearest, bilinear, Catmull-Rom cubic, derivative footprint, UV row orientation, all address modes, and sRGB sampling");
+  puts("PASS: nearest/bilinear/cubic, derivative footprint, mip generation/LOD, UV orientation, addressing, and sRGB sampling");
   return 0;
 }

@@ -157,7 +157,7 @@ through the real parse → doc → eval path (`mtlx_load_string` + a one-node gr
 
 ```bash
 make test        # node_truth, texture sampling, and CPU BSDF white furnace
-make test-texture  # nearest/linear, addressing, and sRGB sampler regression
+make test-texture  # filters, addressing, sRGB decode, mip generation, and LOD selection
 make test-white-furnace  # deterministic material/lobe energy integration
 make test-bsdf-response # Lean-generated pointwise isotropic GGX response vectors
 make test-lean    # Lean-generated node vectors
