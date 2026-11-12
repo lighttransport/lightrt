@@ -1158,7 +1158,7 @@ __device__ __forceinline__ int hp_bez_leaf_trace(const float cp[16], const float
 __device__ __forceinline__ int hp_bez_leaf_solve(const float cp[16], const float dir[3], float tmin,
                               float best, float a, float b, const float P0p[3],
                               float r0c, const float P3p[3], float r3c,
-                              float *t_out, float *u_out) {
+                              float *t_out, float *u_out, int anyhit) {
     float tseg, s;
     if (!hp_cone_seed(dir, tmin, best, P0p, r0c, P3p, r3c, &tseg, &s)) return 0;
     float th, uh;
@@ -1172,6 +1172,13 @@ __device__ __forceinline__ int hp_bez_leaf_solve(const float cp[16], const float
      * leaf's end balls (u pinned at a or b, where F != 0) are only found by the
      * u-restricted sphere trace below. */
     int inleaf = uh >= a - slack && uh <= b + slack;
+    /* any-hit (shadow rays): any converged, residual-verified surface point in
+     * [tmin, best) with u in [0,1] proves occlusion; nearest-ness is moot */
+    if (anyhit && nr == 1) {
+        *t_out = th;
+        *u_out = uh;
+        return 1;
+    }
     if (nr == 1 && front && inleaf) {
         *t_out = th;
         *u_out = uh;
@@ -1202,7 +1209,7 @@ __device__ __forceinline__ bool hp_bez_one(float ox, float oy, float oz,
                                            float dx, float dy, float dz,
                                            const float cp_in[16], float tmin,
                                            float best_t, float *t_out,
-                                           float *u_out) {
+                                           float *u_out, int anyhit) {
     float cp[16];
     for (int k = 0; k < 4; k++) {
         cp[k * 4 + 0] = cp_in[k * 4 + 0] - ox;
@@ -1275,8 +1282,9 @@ __device__ __forceinline__ bool hp_bez_one(float ox, float oy, float oz,
             if (r0c > 0.0f || r3c > 0.0f) {
                 float P0p[3] = {Pa[0], Pa[1], Pa[2]}, P3p[3] = {Pb[0], Pb[1], Pb[2]};
                 float th, uh;
-                if (hp_bez_leaf_solve(cp, dir, tmin, best, a, b, P0p, r0c, P3p, r3c, &th, &uh)) {
+                if (hp_bez_leaf_solve(cp, dir, tmin, best, a, b, P0p, r0c, P3p, r3c, &th, &uh, anyhit)) {
                     best = th; bu = uh; hit = 1;
+                    if (anyhit) break;
                 }
             }
         } else {
@@ -1700,7 +1708,7 @@ __device__ __forceinline__ void hp_leaf(const uint32_t *__restrict__ blocks,
                                         float *best_v, uint32_t *best_prim,
                                         const uint32_t *trim_off,
                                         const float *trim_pts,
-                                        uint32_t trim_nloops) {
+                                        uint32_t trim_nloops, int anyhit = 0) {
     if (prim_kind == HIP_PRIM_SPHERE) {
         for (uint32_t l = 0; l < 4u; l++) {
             uint32_t prim = blocks[blk + 16u + l];
@@ -1841,8 +1849,9 @@ __device__ __forceinline__ void hp_leaf(const uint32_t *__restrict__ blocks,
                 cp[k * 4 + 3] = fu(blocks[blk + (uint32_t)(k * 16 + 12) + l]);
             }
             float t, u;
-            if (hp_bez_one(ox, oy, oz, dx, dy, dz, cp, tmin, *best_t, &t, &u)) {
+            if (hp_bez_one(ox, oy, oz, dx, dy, dz, cp, tmin, *best_t, &t, &u, anyhit)) {
                 *best_t = t; *best_u = u; *best_v = 0.0f; *best_prim = prim;
+                if (anyhit) return;
             }
         }
     } else if (prim_kind == HIP_PRIM_QUAD || prim_kind == HIP_PRIM_TETRA) {
@@ -2077,7 +2086,7 @@ __launch_bounds__(64) __global__
                 uint32_t bp = LRT_HIP_NO_HIT;
                 hp_leaf(blocks, (blk0 + b) * bsw, prim_kind, point_type, ox, oy,
                         oz, dx, dy, dz, tmin, &bt, &bu, &bv, &bp, trim_off,
-                        trim_pts, trim_nloops);
+                        trim_pts, trim_nloops, 1);
                 if (bp != LRT_HIP_NO_HIT) hit = 1u;
             }
             continue;

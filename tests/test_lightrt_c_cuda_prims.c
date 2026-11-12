@@ -855,6 +855,16 @@ static void test_gpu_bezier(lrt_cuda_engine *e) {
         /* GPU mirrors the scalar adaptive sweep; CPU intersect1 uses the SSE
          * adaptive sweep -> tiny silhouette differences. */
         CHECK(f >= 0.99, "bezier agreement %.3f%% < 99%%", f * 100.0);
+        /* any-hit: both sides stop at the first verified contact */
+        unsigned char *go = (unsigned char *)malloc(nr);
+        lrt_cuda_scene_occluded(e, gs, rays, (uint32_t)nr, go, NULL);
+        size_t oagree = 0;
+        for (size_t i = 0; i < nr; i++)
+            oagree += (lrt_tri_occluded1(cpu, &rays[i]) != 0) == (go[i] != 0);
+        double fo = (double)oagree / nr;
+        printf("  bezier       occluded %.3f%%\n", fo * 100.0);
+        CHECK(fo >= 0.999, "bezier occluded agreement %.3f%% < 99.9%%", fo * 100.0);
+        free(go);
         free(rays);
         free(gh);
         lrt_cuda_scene_free(e, gs);
