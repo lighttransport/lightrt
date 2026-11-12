@@ -261,6 +261,34 @@ int main(int argc, char **argv) {
       "<transformmatrix name=\"linear_adobergb_to_rec709\" type=\"vector3\">"
       "<input name=\"in\" type=\"vector3\" value=\"0.25, 0.5, 0.75\"/>"
       "<input name=\"mat\" type=\"matrix33\" value=\"1.39835574e+00, -2.50233861e-16, 2.77555756e-17, -3.98355744e-01, 1.00000000e+00, -4.29289893e-02, 0.00000000e+00, 0.00000000e+00, 1.04292899e+00\"/>"
+      "</transformmatrix>"
+      "<max name=\"ap1_nonnegative\" type=\"color3\">"
+      "<input name=\"in1\" type=\"color3\" value=\"-0.25, 0.5, 0.75\"/>"
+      "<input name=\"in2\" type=\"float\" value=\"0\"/>"
+      "</max>"
+      "<power name=\"ap1_gamma\" type=\"color3\">"
+      "<input name=\"in1\" type=\"color3\" nodename=\"ap1_nonnegative\"/>"
+      "<input name=\"in2\" type=\"float\" value=\"2.2\"/>"
+      "</power>"
+      "<transformmatrix name=\"g22_ap1_to_rec709\" type=\"vector3\">"
+      "<input name=\"in\" type=\"vector3\" nodename=\"ap1_gamma\"/>"
+      "<input name=\"mat\" type=\"matrix33\" value=\"1.705050992658, -0.130256417507, -0.024003356805, -0.621792120657, 1.140804736575, -0.128968976065, -0.083258872001, -0.010548319068, 1.15297233287\"/>"
+      "</transformmatrix>"
+      "<divide name=\"adobe_gamma\" type=\"float\">"
+      "<input name=\"in1\" type=\"float\" value=\"563\"/>"
+      "<input name=\"in2\" type=\"float\" value=\"256\"/>"
+      "</divide>"
+      "<max name=\"adobe_nonnegative\" type=\"color3\">"
+      "<input name=\"in1\" type=\"color3\" value=\"-0.25, 0.5, 0.75\"/>"
+      "<input name=\"in2\" type=\"float\" value=\"0\"/>"
+      "</max>"
+      "<power name=\"adobe_encoded_gamma\" type=\"color3\">"
+      "<input name=\"in1\" type=\"color3\" nodename=\"adobe_nonnegative\"/>"
+      "<input name=\"in2\" type=\"float\" nodename=\"adobe_gamma\"/>"
+      "</power>"
+      "<transformmatrix name=\"adobergb_to_rec709\" type=\"vector3\">"
+      "<input name=\"in\" type=\"vector3\" nodename=\"adobe_encoded_gamma\"/>"
+      "<input name=\"mat\" type=\"matrix33\" value=\"1.39835574e+00, -2.50233861e-16, 2.77555756e-17, -3.98355744e-01, 1.00000000e+00, -4.29289893e-02, 0.00000000e+00, 0.00000000e+00, 1.04292899e+00\"/>"
       "</transformmatrix></materialx>", filename, filename, filename);
   MtlxDoc *doc = mtlx_load_string(xml);
   if (!doc) {
@@ -274,10 +302,13 @@ int main(int argc, char **argv) {
   const int tiled_zero_node = mtlx_find_node(doc, -1, "tiled_zero");
   const int aces_matrix_node = mtlx_find_node(doc, -1, "acescg_to_rec709");
   const int adobe_matrix_node = mtlx_find_node(doc, -1, "linear_adobergb_to_rec709");
+  const int g22_ap1_node = mtlx_find_node(doc, -1, "g22_ap1_to_rec709");
+  const int adobergb_node = mtlx_find_node(doc, -1, "adobergb_to_rec709");
   MtlxValue *memo = (MtlxValue *)calloc((size_t)doc->nnode, sizeof(MtlxValue));
   char *memo_done = (char *)calloc((size_t)doc->nnode, sizeof(char));
   if (node < 0 || tiled_node < 0 || tiled_zero_node < 0 ||
-      aces_matrix_node < 0 || adobe_matrix_node < 0 || !memo || !memo_done) {
+      aces_matrix_node < 0 || adobe_matrix_node < 0 ||
+      g22_ap1_node < 0 || adobergb_node < 0 || !memo || !memo_done) {
     free(memo);
     free(memo_done);
     mtlx_free(doc);
@@ -299,6 +330,12 @@ int main(int argc, char **argv) {
   memset(memo_done, 0, (size_t)doc->nnode * sizeof(char));
   const MtlxValue adobe_matrix =
       mtlx_eval_node_test(&context, adobe_matrix_node);
+  memset(memo_done, 0, (size_t)doc->nnode * sizeof(char));
+  const MtlxValue g22_ap1 =
+      mtlx_eval_node_test(&context, g22_ap1_node);
+  memset(memo_done, 0, (size_t)doc->nnode * sizeof(char));
+  const MtlxValue adobergb =
+      mtlx_eval_node_test(&context, adobergb_node);
   const int matrix_ok =
       aces_matrix.type == MV_VEC3 &&
       near(aces_matrix.v[0], 0.052922534f, 2e-6f) &&
@@ -307,11 +344,17 @@ int main(int argc, char **argv) {
       adobe_matrix.type == MV_VEC3 &&
       near(adobe_matrix.v[0], 0.150411063f, 2e-6f) &&
       near(adobe_matrix.v[1], 0.5f, 2e-6f) &&
-      near(adobe_matrix.v[2], 0.760732248f, 2e-6f);
+      near(adobe_matrix.v[2], 0.760732248f, 2e-6f) &&
+      g22_ap1.type == MV_VEC3 &&
+      near(g22_ap1.v[0], -0.179539930f, 3e-6f) &&
+      near(g22_ap1.v[1], 0.242680375f, 3e-6f) &&
+      near(g22_ap1.v[2], 0.584216560f, 3e-6f) &&
+      adobergb.type == MV_VEC3 &&
+      near(adobergb.v[0], -0.086744165f, 3e-6f) &&
+      near(adobergb.v[1], 0.217755528f, 3e-6f) &&
+      near(adobergb.v[2], 0.544623099f, 3e-6f);
   if (!matrix_ok) {
-    fprintf(stderr, "FAIL: cmlib color-space matrix result (ACES %.7f %.7f %.7f; Adobe %.7f %.7f %.7f)\n",
-            aces_matrix.v[0], aces_matrix.v[1], aces_matrix.v[2],
-            adobe_matrix.v[0], adobe_matrix.v[1], adobe_matrix.v[2]);
+    fprintf(stderr, "FAIL: cmlib color-space conversion result\\n");
     free(memo);
     free(memo_done);
     mtlx_free(doc);
@@ -400,6 +443,6 @@ int main(int argc, char **argv) {
   texcache_free(cache);
   remove(odd_path);
   remove(argv[1]);
-  puts("PASS: nearest/bilinear/cubic, derivative footprint, mip generation/LOD, color matrices, UV orientation, addressing, and sRGB sampling");
+  puts("PASS: nearest/bilinear/cubic, derivative footprint, mip generation/LOD, color matrices and gamma, UV orientation, addressing, and sRGB sampling");
   return 0;
 }
