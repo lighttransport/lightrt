@@ -4,7 +4,7 @@
 //   cd verif/lean && lake exe mtlxspec-gen --out ../../tests/generated/lean
 // and check for drift with `--check`.
 // MTLX_EVAL_APPROX(id, nodegraph_body, node, payload)
-//   Nodes defined over the reals (MtlxSpec/OpsReal.lean). The payload is the formula
+//   Real-valued operators and selected procedural nodes checked through binary64.
 //   evaluated in binary64, written as fractions over 2^40; compare with a tolerance.
 MTLX_EVAL_APPROX(0, "<power name=\"n\" type=\"float\"><input name=\"in1\" type=\"float\" value=\"2.000000\"/><input name=\"in2\" type=\"float\" value=\"0.500000\"/></power>", "n", "1554944255988/1099511627776")
 MTLX_EVAL_APPROX(1, "<power name=\"n\" type=\"float\"><input name=\"in1\" type=\"float\" value=\"0.250000\"/><input name=\"in2\" type=\"float\" value=\"2.000000\"/></power>", "n", "68719476736/1099511627776")
