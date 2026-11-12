@@ -250,4 +250,20 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   - *Format:* LRTS header flag bit 2 (value 4) marks vertex-format leaves. A build without `WATERTIGHT_TRI` rejects such a file instead of misreading it. Vertex-format files load directly, including when mmapped, read-only. Legacy watertight files (edge blocks + aux vertices) are converted on load, or keep a separate `wblk` when mmapped. BVH16 also keeps a separate `wblk`. The aux vertex array is still written, so the HIP/CUDA/Vulkan watertight kernels are unchanged.
   - *Validation* (`wtcheck`, in `make formal`): all sections from M17/M18, plus readers. `get_verts` equals the input exactly. `intersect_n` agrees with `intersect1` on hit/miss on every ray. Its first `t` differs on 2468 of 36000 rays, by at most 11 ulp, all on the shared-edge and coplanar scenes. That is the node-pruning slack of the two searches (`Flat.run_approx`): each prunes by a rounded `tnear` against its own running bound, so either can miss the true nearest by a few ulp, or pick another prim at a tie. It is the same count with the previous library. The ≤4-ulp figure from M7 was measured on ordinary scenes; in-plane rays on overlapping coplanar triangles reach 11. The fp64 path (MT in double on the same leaves) disagrees with the watertight hit/miss on 4% of these vertex- and edge-aimed rays, as expected for MT; it is reported, not failed. SSE-only and ASan/UBSan runs pass, `c_tri_seam_test_wt` has 0 leaks, and the full C suite built watertight passes.
   - *Speed* vs the default build (1 thread, 131k tris, load ~4 while measuring): BVH4 about +20% primary, −8 to −10% incoherent, −10% shadow; BVH8 0% primary, +1–2% incoherent, about −10% shadow.
+- **M20 (shadow retune; `WATERTIGHT_TRI` on by default):**
+  - *Retune:* measured best of 9 on a quiet machine (load < 0.5). Under load the earlier "−10% shadow" was mostly noise: the real loss was BVH4 −4%, BVH8 −1%. Two changes, neither altering any result:
+    - The Woop leaf returns before the `t` divide when no lane passes the edge-sign / det test (≈ +3% everywhere).
+    - The per-ray Woop setup (three divides) is lazy: done at the first leaf visit. Rays that reach no leaf skip it. This applies to the single-ray kernels and all four pipelines.
+    - The BVH4 shadow interleaved pipeline was re-measured with the Woop leaf and stays slower than per-ray (7.7 vs 7.9 Mray/s), so watertight any-hit batches remain per ray.
+  - *Result* (1 thread, 131k tris, 400k rays), watertight vs the MT build:
+
+    | | BVH4 | BVH8 |
+    |---|---|---|
+    | Primary | +20% | 0% |
+    | Incoherent | −2% | +9% |
+    | Shadow | +3% | +14% |
+
+    Memory is the same (M19).
+  - *Default:* `LRT_TRI_WATERTIGHT_TRI` is now set in `lightrt_c_tri.h`; opt out with `-DLRT_TRI_NO_WATERTIGHT_TRI`. The Lean mirror in `bvhcheck.py` models the Möller–Trumbore leaf, so its variants, `cdiff`'s legacy build, c2lean's `Gen`, and the "report" builds of the seam and parallel-ray tests opt out explicitly. The default watertight leaf is validated by `wtcheck.c` (bit-identical to `tri_woop_one`, which `tri_woop_one_refines` / `woop_no_gap_bits` cover) and by `c_tri_seam_test_wt` (0 leaks). Full C suite, quad/tetra, surfaces, HIP (RX 9070 XT), Vulkan and CUDA (RTX 3070, RTX 5060 Ti) pass with the new default.
+  - *Side finding, not acted on:* in the default MT build the batched `occluded1N` interleaved pipeline for BVH8 is slower than plain per-ray `occluded1` on this scene (7.7 vs 8.5 Mray/s). The pipeline targets cache-cold scenes; it needs a larger-scene benchmark before changing the heuristic.
 

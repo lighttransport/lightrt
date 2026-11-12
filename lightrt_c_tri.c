@@ -6598,6 +6598,15 @@ static inline int tri_woop4_lanes(const float *wb, const uint32_t *ids,
     __m128 neg = _mm_or_ps(_mm_or_ps(TWLT(ue, z), TWLT(ve, z)), TWLT(we, z));
     __m128 pos = _mm_or_ps(_mm_or_ps(TWGT(ue, z), TWGT(ve, z)), TWGT(we, z));
     __m128 det = _mm_add_ps(_mm_add_ps(ue, ve), we);
+    {
+        /* no lane passes the edge-sign / det test: skip the divide (same
+         * result, the t range test below can only reject further) */
+        int em = _mm_movemask_ps(_mm_andnot_ps(_mm_and_ps(neg, pos), _mm_cmpneq_ps(det, z)));
+        if (!em) {
+            *tt_o = *ve_o = *we_o = *det_o = z;
+            return 0;
+        }
+    }
     __m128 num = _mm_add_ps(_mm_add_ps(_mm_mul_ps(ue, _mm_mul_ps(w->sz, az)), _mm_mul_ps(ve, _mm_mul_ps(w->sz, bz))), _mm_mul_ps(we, _mm_mul_ps(w->sz, cz)));
     __m128 tt = _mm_div_ps(num, det);
     __m128 ok = _mm_andnot_ps(_mm_and_ps(neg, pos), TWNEQ(det, z));
@@ -6891,7 +6900,7 @@ static int tri_intersect_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray,
     tri_sse_setup(&rc, &sc);
 #if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
     tri_woop4_ctx wc;
-    if (s->wblk) tri_woop4_setup(&rc, &wc);
+    int wc_ready = 0; /* lazy: rays that reach no leaf skip the setup */
 #endif
 
     float best_t = ray->tmax;
@@ -6914,6 +6923,10 @@ static int tri_intersect_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray,
             for (uint32_t b = 0; b < nblk; b++) {
 #if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
                 if (s->wblk) {
+                    if (!wc_ready) {
+                        tri_woop4_setup(&rc, &wc);
+                        wc_ready = 1;
+                    }
                     tri_woop4_block(s->wblk + (size_t)(blk0 + b) * 40, (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 40 + 36),
                                     &wc, &best_t, &best_u, &best_v, &best_prim);
                     continue;
@@ -6988,7 +7001,7 @@ static int tri_occluded_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray) {
     __m128 tmax4 = _mm_set1_ps(ray->tmax);
 #if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
     tri_woop4_ctx wc;
-    if (s->wblk) tri_woop4_setup(&rc, &wc);
+    int wc_ready = 0; /* lazy: rays that reach no leaf skip the setup */
 #endif
 
     uint32_t stack[TRI_STACK_SIZE];
@@ -7004,6 +7017,10 @@ static int tri_occluded_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray) {
             for (uint32_t b = 0; b < nblk; b++) {
 #if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
                 if (s->wblk) {
+                    if (!wc_ready) {
+                        tri_woop4_setup(&rc, &wc);
+                        wc_ready = 1;
+                    }
                     if (tri_woop4_block_occ(s->wblk + (size_t)(blk0 + b) * 40,
                                             (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 40 + 36),
                                             &wc, ray->tmax))
@@ -8699,6 +8716,7 @@ typedef struct tri_pipe4_state {
     tri_stack_entry stack[TRI_STACK_SIZE];
 #if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
     tri_woop4_ctx wc;
+    int wc_ready;
 #endif
 } tri_pipe4_state;
 
@@ -8708,7 +8726,7 @@ static inline void tri_pipe4_init(const lrt_tri_scene *s, tri_pipe4_state *st,
     tri_ray_setup(ray, &st->rc);
     tri_sse_setup(&st->rc, &st->sc);
 #if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
-    if (s->wblk) tri_woop4_setup(&st->rc, &st->wc);
+    st->wc_ready = 0; /* lazy: set up at the first leaf */
 #endif
     st->best_t = ray->tmax;
     st->best_u = 0.0f;
@@ -8732,6 +8750,10 @@ static inline int tri_pipe4_step(const lrt_tri_scene *s, tri_pipe4_state *st) {
             for (uint32_t b = 0; b < nblk; b++) {
 #if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
                 if (s->wblk) {
+                    if (!st->wc_ready) {
+                        tri_woop4_setup(&st->rc, &st->wc);
+                        st->wc_ready = 1;
+                    }
                     tri_woop4_block(s->wblk + (size_t)(blk0 + b) * 40, (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 40 + 36),
                                     &st->wc, &st->best_t, &st->best_u, &st->best_v, &st->best_prim);
                     continue;
@@ -8828,6 +8850,7 @@ typedef struct tri_pipeocc4_state {
     uint32_t stack[TRI_STACK_SIZE];
 #if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
     tri_woop4_ctx wc;
+    int wc_ready;
 #endif
 } tri_pipeocc4_state;
 
@@ -8837,7 +8860,7 @@ static inline void tri_pipeocc4_init(const lrt_tri_scene *s,
     tri_ray_setup(ray, &st->rc);
     tri_sse_setup(&st->rc, &st->sc);
 #if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
-    if (s->wblk) tri_woop4_setup(&st->rc, &st->wc);
+    st->wc_ready = 0; /* lazy: set up at the first leaf */
 #endif
     st->tmax4 = _mm_set1_ps(ray->tmax);
     st->out = out;
@@ -8860,6 +8883,10 @@ static inline int tri_pipeocc4_step(const lrt_tri_scene *s,
         for (uint32_t b = 0; b < nblk; b++) {
 #if defined(LRT_TRI_WATERTIGHT_TRI) && !LRT_TRI_NEON_SHIM
         if (s->wblk) {
+            if (!st->wc_ready) {
+                tri_woop4_setup(&st->rc, &st->wc);
+                st->wc_ready = 1;
+            }
             if (tri_woop4_block_occ(s->wblk + (size_t)(blk0 + b) * 40, (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 40 + 36), &st->wc,
                                     _mm_cvtss_f32(st->tmax4))) {
                 *st->out = 1;
@@ -9036,6 +9063,15 @@ static inline int tri_woop8_lanes(const float *wb, const uint32_t *ids,
     __m256 neg = _mm256_or_ps(_mm256_or_ps(TWLT(ue, z), TWLT(ve, z)), TWLT(we, z));
     __m256 pos = _mm256_or_ps(_mm256_or_ps(TWGT(ue, z), TWGT(ve, z)), TWGT(we, z));
     __m256 det = _mm256_add_ps(_mm256_add_ps(ue, ve), we);
+    {
+        /* no lane passes the edge-sign / det test: skip the divide (same
+         * result, the t range test below can only reject further) */
+        int em = _mm256_movemask_ps(_mm256_andnot_ps(_mm256_and_ps(neg, pos), _mm256_cmp_ps(det, z, _CMP_NEQ_UQ)));
+        if (!em) {
+            *tt_o = *ve_o = *we_o = *det_o = z;
+            return 0;
+        }
+    }
     __m256 num = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(ue, _mm256_mul_ps(w->sz, az)), _mm256_mul_ps(ve, _mm256_mul_ps(w->sz, bz))), _mm256_mul_ps(we, _mm256_mul_ps(w->sz, cz)));
     __m256 tt = _mm256_div_ps(num, det);
     __m256 ok = _mm256_andnot_ps(_mm256_and_ps(neg, pos), TWNEQ(det, z));
@@ -9231,7 +9267,7 @@ static int tri_intersect_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray,
     tri_avx_setup(&rc, &ac);
 #ifdef LRT_TRI_WATERTIGHT_TRI
     tri_woop8_ctx wc;
-    if (s->wblk) tri_woop8_setup(&rc, &wc);
+    int wc_ready = 0; /* lazy: rays that reach no leaf skip the setup */
 #endif
 
     float best_t = ray->tmax;
@@ -9254,6 +9290,10 @@ static int tri_intersect_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray,
             for (uint32_t b = 0; b < nblk; b++) {
 #ifdef LRT_TRI_WATERTIGHT_TRI
                 if (s->wblk) {
+                    if (!wc_ready) {
+                        tri_woop8_setup(&rc, &wc);
+                        wc_ready = 1;
+                    }
                     tri_woop8_block(s->wblk + (size_t)(blk0 + b) * 80, (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 80 + 72),
                                     &wc, &best_t, &best_u, &best_v, &best_prim);
                     continue;
@@ -9310,7 +9350,7 @@ static int tri_occluded_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray) {
     __m256 tmax8 = _mm256_set1_ps(ray->tmax);
 #ifdef LRT_TRI_WATERTIGHT_TRI
     tri_woop8_ctx wc;
-    if (s->wblk) tri_woop8_setup(&rc, &wc);
+    int wc_ready = 0; /* lazy: rays that reach no leaf skip the setup */
 #endif
 
     uint32_t stack[TRI_STACK_SIZE];
@@ -9326,6 +9366,10 @@ static int tri_occluded_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray) {
             for (uint32_t b = 0; b < nblk; b++) {
 #ifdef LRT_TRI_WATERTIGHT_TRI
                 if (s->wblk) {
+                    if (!wc_ready) {
+                        tri_woop8_setup(&rc, &wc);
+                        wc_ready = 1;
+                    }
                     if (tri_woop8_block_occ(s->wblk + (size_t)(blk0 + b) * 80,
                                             (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 80 + 72),
                                             &wc, ray->tmax))
@@ -9769,6 +9813,7 @@ typedef struct tri_pipe8_state {
     tri_stack_entry stack[TRI_STACK_SIZE];
 #ifdef LRT_TRI_WATERTIGHT_TRI
     tri_woop8_ctx wc;
+    int wc_ready;
 #endif
 } tri_pipe8_state;
 
@@ -9777,7 +9822,7 @@ static inline void tri_pipe8_init(const lrt_tri_scene *s, tri_pipe8_state *st,
     tri_ray_setup(ray, &st->rc);
     tri_avx_setup(&st->rc, &st->ac);
 #ifdef LRT_TRI_WATERTIGHT_TRI
-    if (s->wblk) tri_woop8_setup(&st->rc, &st->wc);
+    st->wc_ready = 0; /* lazy: set up at the first leaf */
 #endif
     st->best_t = ray->tmax;
     st->best_u = 0.0f;
@@ -9800,6 +9845,10 @@ static inline int tri_pipe8_step(const lrt_tri_scene *s, tri_pipe8_state *st) {
             for (uint32_t b = 0; b < nblk; b++) {
 #ifdef LRT_TRI_WATERTIGHT_TRI
                 if (s->wblk) {
+                    if (!st->wc_ready) {
+                        tri_woop8_setup(&st->rc, &st->wc);
+                        st->wc_ready = 1;
+                    }
                     tri_woop8_block(s->wblk + (size_t)(blk0 + b) * 80, (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 80 + 72),
                                     &st->wc, &st->best_t, &st->best_u, &st->best_v, &st->best_prim);
                     continue;
@@ -9907,6 +9956,7 @@ typedef struct tri_pipeocc8_state {
     uint32_t stack[TRI_STACK_SIZE];
 #ifdef LRT_TRI_WATERTIGHT_TRI
     tri_woop8_ctx wc;
+    int wc_ready;
 #endif
 } tri_pipeocc8_state;
 
@@ -9916,7 +9966,7 @@ static inline void tri_pipeocc8_init(const lrt_tri_scene *s,
     tri_ray_setup(ray, &st->rc);
     tri_avx_setup(&st->rc, &st->ac);
 #ifdef LRT_TRI_WATERTIGHT_TRI
-    if (s->wblk) tri_woop8_setup(&st->rc, &st->wc);
+    st->wc_ready = 0; /* lazy: set up at the first leaf */
 #endif
     st->tmax8 = _mm256_set1_ps(ray->tmax);
     st->out = out;
@@ -9938,6 +9988,10 @@ static inline int tri_pipeocc8_step(const lrt_tri_scene *s,
         for (uint32_t b = 0; b < nblk; b++) {
 #ifdef LRT_TRI_WATERTIGHT_TRI
             if (s->wblk) {
+                if (!st->wc_ready) {
+                    tri_woop8_setup(&st->rc, &st->wc);
+                    st->wc_ready = 1;
+                }
                 if (tri_woop8_block_occ(s->wblk + (size_t)(blk0 + b) * 80, (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 80 + 72), &st->wc,
                                         _mm256_cvtss_f32(st->tmax8))) {
                     *st->out = 1;
@@ -12063,7 +12117,7 @@ void lrt_tri_occluded1N(const lrt_tri_scene *s, const lrt_ray *rays,
     /* Plain-triangle-only pipelines; loop per ray for every other prim_kind. */
     if (s->prim_kind != TRI_PRIM_TRI || s->qnode != 0
 #ifdef LRT_TRI_WATERTIGHT_TRI
-        || s->wblk /* watertight any-hit: per-ray SIMD kernels measured faster */
+        || s->wblk /* watertight any-hit: per-ray SIMD kernels measured faster (M20) */
 #endif
         ) {
         for (size_t i = 0; i < n; i++) {
