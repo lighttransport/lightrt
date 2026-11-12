@@ -61,9 +61,10 @@ $(BUILD)/node_truth.o: tests/node_truth.c | $(BUILD)
 	$(CC) $(CFLAGS) $(WARN) -c $< -o $@
 node_truth: $(TEST_DEPS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-test: node_truth white_furnace
+test: node_truth white_furnace texture_sampling
 	./node_truth
 	./white_furnace
+	./texture_sampling texture-sampling.ppm
 
 # Lean-generated node evaluation vectors (tests/generated/mtlx-eval.inc, from
 # the materialx-conformance repository). Links only the document loader and
@@ -74,6 +75,14 @@ white_furnace: tests/white_furnace.c bsdf.c bsdf.h mtlx_eval.h vecmath.h
 
 test-white-furnace: white_furnace
 	./white_furnace
+
+TEXTURE_TEST_SRC = tests/texture_sampling.c mtlx_doc.c mtlx_xml.c mtlx_eval.c \
+                   texture.c color.c third_party_impl.c
+texture_sampling: $(TEXTURE_TEST_SRC) texture.h mtlx_doc.h mtlx_eval.h
+	$(CC) $(CSTD) -O2 $(DEFS) $(INCLUDES) -I$(LIGHTRT)/viewer/third_party \
+		-o $@ $(TEXTURE_TEST_SRC) $(LDFLAGS)
+test-texture: texture_sampling
+	./texture_sampling texture-sampling.ppm
 
 lean_vectors: $(LEAN_SRC) tests/generated/mtlx-eval.inc tests/generated/mtlx-eval-approx.inc mtlx_stdlib_defs.inc
 	$(CC) $(CSTD) -O2 -D_POSIX_C_SOURCE=200809L -I. -Itests -o $@ $(LEAN_SRC) -lm
@@ -112,7 +121,8 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 clean:
-	rm -rf build build-vk mtlxrender node_truth white_furnace mtlxvk lean_vectors
+	rm -rf build build-vk mtlxrender node_truth white_furnace texture_sampling \
+	       texture-sampling.ppm mtlxvk lean_vectors
 
 # Cross-renderer verification against the ASF MaterialX reference (GLSL + OSL).
 # Needs the one-time setup in verify/README.md (conda env + reference builds).
@@ -121,4 +131,4 @@ VERIFY_MODE ?= all
 verify: mtlxrender
 	bash verify/run_verify.sh $(VERIFY_MODE)
 
-.PHONY: clean test test-white-furnace check verify
+.PHONY: clean test test-white-furnace test-texture check verify
