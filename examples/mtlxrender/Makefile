@@ -61,9 +61,10 @@ $(BUILD)/node_truth.o: tests/node_truth.c | $(BUILD)
 	$(CC) $(CFLAGS) $(WARN) -c $< -o $@
 node_truth: $(TEST_DEPS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-test: node_truth white_furnace texture_sampling
+test: node_truth white_furnace bsdf_response texture_sampling
 	./node_truth
 	./white_furnace
+	./bsdf_response
 	./texture_sampling texture-sampling.ppm
 
 # Lean-generated node evaluation vectors (tests/generated/mtlx-eval.inc, from
@@ -75,6 +76,12 @@ white_furnace: tests/white_furnace.c bsdf.c bsdf.h mtlx_eval.h vecmath.h
 
 test-white-furnace: white_furnace
 	./white_furnace
+
+bsdf_response: tests/bsdf_response.c bsdf.c bsdf.h mtlx_eval.h vecmath.h tests/generated/bsdf-response.inc
+	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/bsdf_response.c bsdf.c $(LDFLAGS)
+
+test-bsdf-response: bsdf_response
+	./bsdf_response
 
 TEXTURE_TEST_SRC = tests/texture_sampling.c mtlx_doc.c mtlx_xml.c mtlx_eval.c \
                    texture.c color.c third_party_impl.c
@@ -121,7 +128,7 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 clean:
-	rm -rf build build-vk mtlxrender node_truth white_furnace texture_sampling \
+	rm -rf build build-vk mtlxrender node_truth white_furnace bsdf_response texture_sampling \
 	       texture-sampling.ppm mtlxvk lean_vectors
 
 # Cross-renderer verification against the ASF MaterialX reference (GLSL + OSL).
@@ -131,4 +138,4 @@ VERIFY_MODE ?= all
 verify: mtlxrender
 	bash verify/run_verify.sh $(VERIFY_MODE)
 
-.PHONY: clean test test-white-furnace test-texture check verify
+.PHONY: clean test test-white-furnace test-bsdf-response test-texture check verify
