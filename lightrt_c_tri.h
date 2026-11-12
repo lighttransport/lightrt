@@ -20,6 +20,10 @@
 /* Robustness defaults (see formal/PLAN.md M7). All are on unless opted out:
  *  LRT_TRI_SLAB_ROBUST    : no false miss for rays lying on a slab plane
  *                           (opt out: -DLRT_TRI_NO_SLAB_ROBUST)
+ *  LRT_TRI_SLAB_INFLATE   : (with SLAB_ROBUST) the slab far value is scaled by
+ *                           1 + 10u, which rules out false misses of rays
+ *                           touching a box at an edge or corner (Robust/Slab)
+ *                           (opt out: -DLRT_TRI_NO_SLAB_INFLATE)
  *  LRT_TRI_LEAF_BOX_EXACT : node boxes exactly contain the stored triangles
  *                           (opt out: -DLRT_TRI_NO_LEAF_BOX_EXACT)
  *  LRT_TRI_BITEXACT       : SIMD leaf / det test use the scalar evaluation
@@ -33,6 +37,10 @@
  * the GPU kernels follow the same default. */
 #if !defined(LRT_TRI_NO_SLAB_ROBUST) && !defined(LRT_TRI_SLAB_ROBUST)
 #define LRT_TRI_SLAB_ROBUST 1
+#endif
+#if defined(LRT_TRI_SLAB_ROBUST) && !defined(LRT_TRI_NO_SLAB_INFLATE) && \
+    !defined(LRT_TRI_SLAB_INFLATE)
+#define LRT_TRI_SLAB_INFLATE 1
 #endif
 #if !defined(LRT_TRI_NO_LEAF_BOX_EXACT) && !defined(LRT_TRI_LEAF_BOX_EXACT)
 #define LRT_TRI_LEAF_BOX_EXACT 1

@@ -865,7 +865,9 @@ static vk_pipeline *trace_get_pipeline(lrt_vk_engine *e, uint32_t w,
         vk_pipeline_destroy(e, &e->trace_pipes[0]);
         slot = &e->trace_pipes[0];
     }
-#ifdef LRT_TRI_SLAB_ROBUST
+#if defined(LRT_TRI_SLAB_ROBUST) && defined(LRT_TRI_SLAB_INFLATE)
+    uint32_t spec_data[3] = {w, stack, 3u}; /* bit 0 robust slab, bit 1 inflated far */
+#elif defined(LRT_TRI_SLAB_ROBUST)
     uint32_t spec_data[3] = {w, stack, 1u};
 #else
     uint32_t spec_data[3] = {w, stack, 0u};

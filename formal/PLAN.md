@@ -266,4 +266,23 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
     Memory is the same (M19).
   - *Default:* `LRT_TRI_WATERTIGHT_TRI` is now set in `lightrt_c_tri.h`; opt out with `-DLRT_TRI_NO_WATERTIGHT_TRI`. The Lean mirror in `bvhcheck.py` models the Möller–Trumbore leaf, so its variants, `cdiff`'s legacy build, c2lean's `Gen`, and the "report" builds of the seam and parallel-ray tests opt out explicitly. The default watertight leaf is validated by `wtcheck.c` (bit-identical to `tri_woop_one`, which `tri_woop_one_refines` / `woop_no_gap_bits` cover) and by `c_tri_seam_test_wt` (0 leaks). Full C suite, quad/tetra, surfaces, HIP (RX 9070 XT), Vulkan and CUDA (RTX 3070, RTX 5060 Ti) pass with the new default.
   - *Side finding, not acted on:* in the default MT build the batched `occluded1N` interleaved pipeline for BVH8 is slower than plain per-ray `occluded1` on this scene (7.7 vs 8.5 Mray/s). The pipeline targets cache-cold scenes; it needs a larger-scene benchmark before changing the heuristic.
+- **M21 (exact nearest with pruning; slab false misses at vertices):**
+  - *Key* (`BVH/ExactPrune.lean`, 0 sorry): the Woop leaf's `t = fl(N/D)` is a weighted mean of the vertex depths `z_i = fl(sz · fl(v_i[kz] − o[kz]))` along the dominant axis, with all edge values of one sign. `woop_t_lower` / `woop_t_lower_neg` prove `t ≥ m − 16u M` for `m ≤ z_i`, `|z_i| ≤ M`, `|m| ≤ M`. `depth_bounds` gives such `m, M` from the box's two `kz` faces, because rounding is monotone. `key_le` shows the float key `fl(m − fl(2⁻¹⁹ M))` is below that bound. Together (`woop_key_le_t`), pushing `max(key, tmin)` satisfies `Flat.run_root`'s C2 for every accepted triangle whose exact vertices lie in the node box. The box test against the fixed `tmax` is C1, as in `run_exact`. So the traversal returns exactly the brute-force nearest `t` while still pruning by `best`.
+  - *C* (`-DLRT_TRI_EXACT_NEAREST`, watertight scenes with `wbox_exact`, i.e. node boxes that are the exact min/max of the exact vertices): `tri_exn_key` in the scalar, SSE BVH4 and AVX2 BVH8 closest-hit kernels. `wbox_exact` is set at build (not SBVH, not quantized nodes) and refit, and saved as LRTS flag 8. Other scenes (MT leaves, SBVH, quantized nodes) keep the unpruned rule. *Found:* `intersect1N`'s interleaved pipelines and the Ray4/Ray8 packets ignored `EXACT_NEAREST` and pruned by `best`; under the flag they now run the per-ray kernels.
+  - *Found while validating — slab false misses on vertex-aimed rays:* comparing every ray against brute force (`tri_woop_one` over all input triangles) showed 26–27 rays aimed at shared vertices of the heightfield missing entirely, in the default build since watertight became the default (and in the scalar kernel). The node slab test rejects a box the ray touches exactly at an edge or corner. This is the false miss proved to exist in `Robust/SlabMissReal.lean`; random rays almost never hit it, so `bvhcheck` never flagged it.
+  - *Fix:* `LRT_TRI_SLAB_INFLATE` (far value `× (1 + 10u)`, `Robust/Slab.lean` `ize_constant_sufficient`) is now on by default with `SLAB_ROBUST` (opt out: `-DLRT_TRI_NO_SLAB_INFLATE`). It is mirrored in every CPU node slab (scalar, SSE, AVX2 incl. BVH8Q / fp8 / q4 nodes, SVE, the Ray4 packet, the TLAS) and in the HIP, CUDA and hiprtc kernels and the Vulkan shader (specialization constant 2 is now a bit mask: bit 1 = inflate; SPIR-V regenerated). `Ref.slabRobust` now includes the inflation, and `tri_slab_scalar_robust_refines` and `slabRobust_parallel_hit` re-check against it.
+  - *Result* (`wtcheck`, both builds in `make formal`):
+    - Default: 0 misses against brute force (was 26), with `t` within 13 ulp (pruning slack); misses now fail the check.
+    - `EXACT_NEAREST`: `t` equal to brute force bit for bit on all 36000 rays.
+    - All earlier sections still pass. The full C suite also passes built with `EXACT_NEAREST`. Cost of the inflation: 1–3%.
+  - *Cost of the pruning key* (1 thread, 131k tris, best of 9; load 3–4):
+
+    | | Default | New `EXACT_NEAREST` | Old `EXACT_NEAREST` |
+    |---|---|---|---|
+    | BVH4 primary | 6.47 | 4.91 (−24%) | 2.95 (−55%) |
+    | BVH8 primary | 6.89 | 6.05 (−12%) | 3.42 (−52%) |
+    | BVH4 incoherent | 5.15 | 3.19 | 5.16 |
+    | BVH8 incoherent | 5.58 | 4.66 (−17%) | 3.75 |
+
+    The old BVH4 incoherent figure came from the non-exact pipeline. The key uses only the dominant-axis extent of the box, so diagonal rays prune less. `EXACT_NEAREST` stays opt-in.
 

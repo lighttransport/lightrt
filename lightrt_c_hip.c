@@ -118,7 +118,10 @@ lrt_hip_engine *lrt_hip_engine_create(const lrt_hip_engine_options *opts,
      * multiply-add unfused so the kernel is bit-faithful to the scalar CPU
      * kernel (and the Woop edge functions stay exactly antisymmetric, which
      * the watertightness proof needs). hiprtc contracts by default. */
-#ifdef LRT_TRI_SLAB_ROBUST
+#if defined(LRT_TRI_SLAB_ROBUST) && defined(LRT_TRI_SLAB_INFLATE)
+    const char *hopts[] = {"-ffp-contract=off", "-DLRT_TRI_SLAB_ROBUST", "-DLRT_TRI_SLAB_INFLATE"};
+    hiprtcResult cres = hiprtcCompileProgram(prog, 3, hopts);
+#elif defined(LRT_TRI_SLAB_ROBUST)
     const char *hopts[] = {"-ffp-contract=off", "-DLRT_TRI_SLAB_ROBUST"};
     hiprtcResult cres = hiprtcCompileProgram(prog, 2, hopts);
 #else
