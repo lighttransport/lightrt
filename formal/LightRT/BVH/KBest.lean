@@ -296,10 +296,12 @@ theorem kbest_omitted {k : ℕ} (h0 : 0 < k) (tmax : T) {l : List (α × T)} {z 
   (kbest_KInv h0 tmax l).2.2 z hz hnot
 
 
-/-- One primitive inserted into the buffer. -/
-def stepN (isect : α → Option T) (k : ℕ) (buf : List (α × T)) (p : α) : List (α × T) :=
+/-- One primitive inserted into the buffer (the C leaf test rejects
+    `t >= prune_t`, so an accepted hit is strictly below the current prune). -/
+def stepN (isect : α → Option T) (k : ℕ) (tmax : T) (buf : List (α × T)) (p : α) :
+    List (α × T) :=
   match isect p with
-  | some t => (ins (p, t) buf).take k
+  | some t => if t < pruneOf k buf tmax then (ins (p, t) buf).take k else buf
   | none => buf
 
 /-- The multi-hit traversal, mirroring `lrt_tri_intersect_n`'s loop (best-first
@@ -314,32 +316,254 @@ def runN {B : Type} (F : Flat B α) (test : B → T → Option T) (isect : α �
     if prune ≤ tn then runN F test isect order k f st tmax buf else
     match r with
     | .leaf blk n =>
-      runN F test isect order k f st tmax ((F.leafPrims blk n).foldl (stepN isect k) buf)
+      runN F test isect order k f st tmax
+        ((F.leafPrims blk n).foldl (stepN isect k tmax) buf)
     | .node i =>
       runN F test isect order k f
         (order ((F.children i).filterMap fun c => (test c.1 prune).map (c.2, ·)) ++ st) tmax buf
+
+theorem mem_of_getLast? {l : List (α × T)} {z : α × T} (h : l.getLast? = some z) : z ∈ l := by
+  obtain ⟨ys, rfl⟩ := List.getLast?_eq_some_iff.1 h
+  exact List.mem_append_right _ (List.mem_singleton_self z)
+
+theorem pruneOf_zero (buf : List (α × T)) (tmax : T) : pruneOf 0 buf tmax = tmax := by
+  unfold pruneOf
+  by_cases h : buf.length = 0
+  · rw [if_pos h]
+    have hb : buf = [] := List.eq_nil_of_length_eq_zero h
+    subst hb; rfl
+  · rw [if_neg h]
+
+theorem pruneOf_le_tmax {k : ℕ} {buf : List (α × T)} {tmax : T}
+    (h : ∀ z ∈ buf, z.2 ≤ tmax) : pruneOf k buf tmax ≤ tmax := by
+  unfold pruneOf
+  split_ifs with hk
+  · cases hg : buf.getLast? with
+    | none => simp
+    | some z => simpa [hg] using h z (mem_of_getLast? hg)
+  · exact le_rfl
+
+theorem stepN_sorted (isect : α → Option T) (k : ℕ) (tmax : T) {buf : List (α × T)}
+    (hs : buf.Pairwise R) (p : α) : (stepN isect k tmax buf p).Pairwise R := by
+  unfold stepN
+  cases hp : isect p with
+  | none => simpa [hp] using hs
+  | some t =>
+    simp only [hp]
+    by_cases hlt : t < pruneOf k buf tmax
+    · rw [if_pos hlt]; exact List.Pairwise.take (i := k) (ins_sorted (p,t) hs)
+    · rw [if_neg hlt]; exact hs
+
+theorem stepN_length_le (isect : α → Option T) (k : ℕ) (tmax : T) {buf : List (α × T)}
+    (hl : buf.length ≤ k) (p : α) : (stepN isect k tmax buf p).length ≤ k := by
+  unfold stepN
+  cases hp : isect p with
+  | none => simpa [hp] using hl
+  | some t =>
+    simp only [hp]
+    by_cases hlt : t < pruneOf k buf tmax
+    · rw [if_pos hlt]; exact List.length_take_le _ _
+    · rw [if_neg hlt]; exact hl
+
+theorem stepN_values_lt (isect : α → Option T) (k : ℕ) (tmax : T) {buf : List (α × T)}
+    (hv : ∀ z ∈ buf, z.2 < tmax) (hits : ∀ p t, isect p = some t → t < tmax) (p : α) :
+    ∀ z ∈ stepN isect k tmax buf p, z.2 < tmax := by
+  unfold stepN
+  cases hp : isect p with
+  | none => simpa [hp] using hv
+  | some t =>
+    simp only [hp]
+    by_cases hlt : t < pruneOf k buf tmax
+    · rw [if_pos hlt]
+      intro z hz
+      have hz' : z ∈ ins (p,t) buf := List.mem_of_mem_take hz
+      rcases (mem_ins_iff (p,t) z buf).1 hz' with rfl | hz''
+      · exact hits p t hp
+      · exact hv z hz''
+    · rw [if_neg hlt]; exact hv
+
+theorem stepN_prune_le (isect : α → Option T) (k : ℕ) (tmax : T) {buf : List (α × T)}
+    (hs : buf.Pairwise R) (hl : buf.length ≤ k) (hv : ∀ z ∈ buf, z.2 < tmax)
+    (hits : ∀ p t, isect p = some t → t < tmax) (p : α) :
+    pruneOf k (stepN isect k tmax buf p) tmax ≤ pruneOf k buf tmax := by
+  rcases k with _ | k'
+  · rw [pruneOf_zero, pruneOf_zero]
+  · unfold stepN
+    cases hp : isect p with
+    | none => simp [hp]
+    | some t =>
+      simp only [hp]
+      by_cases hlt : t < pruneOf (k'+1) buf tmax
+      · rw [if_pos hlt]
+        by_cases hk : buf.length = k' + 1
+        · exact prune_take_ins_le buf (p,t) hs (k'+1) hk (by omega) tmax
+        · have hpru : pruneOf (k'+1) buf tmax = tmax := by
+            unfold pruneOf; rw [if_neg hk]
+          rw [hpru]
+          apply pruneOf_le_tmax
+          intro z hz
+          have hz' : z ∈ ins (p,t) buf := List.mem_of_mem_take hz
+          rcases (mem_ins_iff (p,t) z buf).1 hz' with rfl | hz''
+          · exact le_of_lt (hits p t hp)
+          · exact le_of_lt (hv z hz'')
+      · rw [if_neg hlt]
+
+/-- The prune never increases along a leaf fold. -/
+theorem fold_prune_le (isect : α → Option T) (k : ℕ) (tmax : T) (ps : List α) :
+    ∀ buf : List (α × T), buf.Pairwise R → buf.length ≤ k → (∀ z ∈ buf, z.2 < tmax) →
+      (∀ p t, isect p = some t → t < tmax) →
+      pruneOf k (ps.foldl (stepN isect k tmax) buf) tmax ≤ pruneOf k buf tmax := by
+  induction ps with
+  | nil => intro buf _ _ _ _; simp
+  | cons p ps ih =>
+    intro buf hs hl hv hits
+    exact (ih _ (stepN_sorted isect k tmax hs p) (stepN_length_le isect k tmax hl p)
+      (stepN_values_lt isect k tmax hv hits p) hits).trans
+      (stepN_prune_le isect k tmax hs hl hv hits p)
+
+theorem fold_sortedN (isect : α → Option T) (k : ℕ) (tmax : T) (ps : List α) :
+    ∀ buf, buf.Pairwise R → (ps.foldl (stepN isect k tmax) buf).Pairwise R := by
+  induction ps with
+  | nil => intro buf h; exact h
+  | cons p ps ih => intro buf h; exact ih _ (stepN_sorted isect k tmax h p)
+
+theorem fold_lengthN (isect : α → Option T) (k : ℕ) (tmax : T) (ps : List α) :
+    ∀ buf, buf.length ≤ k → (ps.foldl (stepN isect k tmax) buf).length ≤ k := by
+  induction ps with
+  | nil => intro buf h; exact h
+  | cons p ps ih => intro buf h; exact ih _ (stepN_length_le isect k tmax h p)
+
+theorem fold_valuesN (isect : α → Option T) (k : ℕ) (tmax : T) (ps : List α)
+    (hits : ∀ p t, isect p = some t → t < tmax) :
+    ∀ buf, (∀ z ∈ buf, z.2 < tmax) → ∀ z ∈ ps.foldl (stepN isect k tmax) buf, z.2 < tmax := by
+  induction ps with
+  | nil =>
+    intro buf h z hz
+    exact h z hz
+  | cons p ps ih =>
+    intro buf h z hz
+    exact ih (stepN isect k tmax buf p) (stepN_values_lt isect k tmax h hits p) z hz
+
+
+
+theorem stepN_KInv {k : ℕ} (h0 : 0 < k) (isect : α → Option T) (tmax : T)
+    {seen buf : List (α × T)} (hK : KInv k tmax seen buf)
+    (hits : ∀ p t, isect p = some t → t < tmax) (p : α) :
+    KInv k tmax (match isect p with | some t => (p, t) :: seen | none => seen)
+      (stepN isect k tmax buf p) := by
+  unfold stepN
+  cases hp : isect p with
+  | none => simpa [hp] using hK
+  | some t =>
+    simp only [hp]
+    by_cases hlt : t < pruneOf k buf tmax
+    · rw [if_pos hlt]
+      exact kInv_step h0 tmax seen buf (p, t) hK
+    · rw [if_neg hlt]
+      obtain ⟨hs, hl, hc⟩ := hK
+      refine ⟨hs, hl, ?_⟩
+      intro z hz hzb
+      rcases List.mem_cons.1 hz with hzeq | hzseen
+      · subst z
+        have hbk : buf.length = k := by
+          rcases lt_or_eq_of_le hl with hlt' | heq
+          · exfalso
+            have hpru : pruneOf k buf tmax = tmax := by unfold pruneOf; rw [if_neg (by omega)]
+            rw [hpru] at hlt
+            exact (not_lt.2 (le_of_not_gt hlt)) (hits p t hp)
+          · exact heq
+        exact ⟨hbk, le_of_not_gt hlt⟩
+      · exact hc z hzseen hzb
+
+/-- The hit pairs of a primitive list (the order the leaf fold encounters them). -/
+def hitList (isect : α → Option T) : List α → List (α × T)
+  | [] => []
+  | p :: ps =>
+    match isect p with
+    | some t => (p, t) :: hitList isect ps
+    | none => hitList isect ps
+
+theorem hitList_append (isect : α → Option T) (l1 l2 : List α) :
+    hitList isect (l1 ++ l2) = hitList isect l1 ++ hitList isect l2 := by
+  induction l1 with
+  | nil => rfl
+  | cons p ps ih =>
+    simp only [List.cons_append, hitList]
+    cases hp : isect p <;> simp [hp, ih]
+
+theorem foldN_KInv {k : ℕ} (h0 : 0 < k) (isect : α → Option T) (tmax : T) (ps : List α)
+    (hits : ∀ p t, isect p = some t → t < tmax) :
+    ∀ seen buf, KInv k tmax seen buf →
+      KInv k tmax (hitList isect ps ++ seen) (ps.foldl (stepN isect k tmax) buf) := by
+  induction ps with
+  | nil => intro seen buf hK; simpa [hitList] using hK
+  | cons p ps ih =>
+    intro seen buf hK
+    have hK1 := stepN_KInv h0 isect tmax hK hits p
+    have h2 := ih _ _ hK1
+    cases hp : isect p with
+    | none => simpa [hitList, hp] using h2
+    | some t =>
+      have hp' : hitList isect (p :: ps) = (p, t) :: hitList isect ps := by simp [hitList, hp]
+      simp only [hp] at h2
+      rw [hp']
+      refine KInv_perm h2 ?_
+      simpa [List.cons_append] using
+        (List.perm_middle (l₁ := hitList isect ps) (a := (p, t)) (l₂ := seen))
+
+
+
+theorem runN_prune_le {B : Type} (F : Flat B α) (test : B → T → Option T)
+    (isect : α → Option T) (order : List (CRef × T) → List (CRef × T)) (k : ℕ)
+    (tmax : T) (hits : ∀ p t, isect p = some t → t < tmax) :
+    ∀ (f : ℕ) (st : List (CRef × T)) (buf : List (α × T)),
+      buf.Pairwise R → buf.length ≤ k → (∀ z ∈ buf, z.2 < tmax) →
+      pruneOf k (runN F test isect order k f st tmax buf) tmax ≤ pruneOf k buf tmax := by
+  intro f
+  induction f with
+  | zero => intro st buf _ _ _; rfl
+  | succ f ih =>
+    intro st buf hs hl hv
+    match st with
+    | [] => rfl
+    | (r, tn) :: st =>
+      simp only [runN]
+      split_ifs with hskip
+      · exact ih st buf hs hl hv
+      · cases r with
+        | leaf blk n =>
+          have hs' := fold_sortedN isect k tmax (F.leafPrims blk n) buf hs
+          have hl' := fold_lengthN isect k tmax (F.leafPrims blk n) buf hl
+          have hv' := fold_valuesN isect k tmax (F.leafPrims blk n) hits buf hv
+          exact (ih st _ hs' hl' hv').trans
+            (fold_prune_le isect k tmax (F.leafPrims blk n) buf hs hl hv hits)
+        | node i => exact ih _ buf hs hl hv
 
 /-- The buffer only ever holds actual hits. -/
 def BInv (isect : α → Option T) (buf : List (α × T)) : Prop :=
   ∀ x ∈ buf, isect x.1 = some x.2
 
-theorem stepN_inv (isect : α → Option T) (k : ℕ) {buf : List (α × T)}
-    (hb : BInv isect buf) (p : α) : BInv isect (stepN isect k buf p) := by
+theorem stepN_inv (isect : α → Option T) (k : ℕ) (tmax : T) {buf : List (α × T)}
+    (hb : BInv isect buf) (p : α) : BInv isect (stepN isect k tmax buf p) := by
   unfold stepN
   cases hp : isect p with
   | none => simpa [hp] using hb
   | some t =>
-    intro z hz
-    have hz' : z ∈ ins (p, t) buf := List.mem_of_mem_take (by simpa [hp] using hz)
-    rcases (mem_ins_iff (p, t) z buf).1 hz' with rfl | hz''
-    · exact hp
-    · exact hb z hz''
+    simp only [hp]
+    by_cases hlt : t < pruneOf k buf tmax
+    · rw [if_pos hlt]
+      intro z hz
+      have hz' : z ∈ ins (p, t) buf := List.mem_of_mem_take hz
+      rcases (mem_ins_iff (p, t) z buf).1 hz' with rfl | hz''
+      · exact hp
+      · exact hb z hz''
+    · rw [if_neg hlt]; exact hb
 
-theorem foldBInv (isect : α → Option T) (k : ℕ) (ps : List α) :
-    ∀ buf : List (α × T), BInv isect buf → BInv isect (ps.foldl (stepN isect k) buf) := by
+theorem foldBInv (isect : α → Option T) (k : ℕ) (tmax : T) (ps : List α) :
+    ∀ buf : List (α × T), BInv isect buf → BInv isect (ps.foldl (stepN isect k tmax) buf) := by
   induction ps with
   | nil => intro buf hb; exact hb
-  | cons p ps ih => intro buf hb; exact ih _ (stepN_inv isect k hb p)
+  | cons p ps ih => intro buf hb; exact ih _ (stepN_inv isect k tmax hb p)
 
 /-- **Soundness of the multi-hit loop**: every reported hit is a real hit of the
     reported primitive (`isect p = some t`). -/
@@ -359,7 +583,7 @@ theorem runN_sound {B : Type} (F : Flat B α) (test : B → T → Option T) (ise
       split_ifs
       · exact ih st tmax buf hb
       · cases r with
-        | leaf blk n => exact ih st tmax _ (foldBInv isect k (F.leafPrims blk n) buf hb)
+        | leaf blk n => exact ih st tmax _ (foldBInv isect k tmax (F.leafPrims blk n) buf hb)
         | node i => exact ih _ tmax buf hb
 
 end KBest
