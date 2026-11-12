@@ -87,4 +87,72 @@ theorem num_err_total (hu : R.u ≤ 1 / 1000) (p0 p1 p2 E0 E1 E2 b0 b1 b2 : ℝ)
       _ ≤ _ := by linarith [eN', es1, eP]
   nlinarith [key, ub0, ub1, ub2, un, en]
 
+theorem den_bounds_total (e0 e1 e2 : ℝ) (he0 : 0 ≤ e0) (he1 : 0 ≤ e1) (he2 : 0 ≤ e2)
+    (h1 : |R.fl (e0 + e1) - (e0 + e1)| ≤ R.u * (e0 + e1) + eta)
+    (h2 : |R.fl (R.fl (e0 + e1) + e2) - (R.fl (e0 + e1) + e2)| ≤
+      R.u * |R.fl (e0 + e1) + e2| + eta) :
+    0 ≤ R.fl (R.fl (e0 + e1) + e2) ∧
+      (1 - R.u) * ((1 - R.u) * (e0 + e1 + e2)) - 4 * eta ≤
+        R.fl (R.fl (e0 + e1) + e2) ∧
+      R.fl (R.fl (e0 + e1) + e2) ≤ (1 + R.u) * ((1 + R.u) * (e0 + e1 + e2)) + 4 * eta := by
+  have u0 := R.u_pos
+  have un : R.u ≤ 1 := R.u_lt_one.le
+  have en := eta_pos
+  have huη : R.u * eta ≤ eta := by nlinarith [u0.le, un, en]
+  have hun : 0 ≤ 1 - R.u := by linarith
+  have hup : 0 ≤ 1 + R.u := by linarith
+  have hsum : 0 ≤ e0 + e1 := by linarith
+  set A := e0 + e1 + e2 with hA
+  set d1 := R.fl (e0 + e1) with hd1
+  have hd1lo : (1 - R.u) * (e0 + e1) - eta ≤ d1 := by
+    have := (abs_le.1 h1).1; linarith
+  have hd1hi : d1 ≤ (1 + R.u) * (e0 + e1) + eta := by
+    have := (abs_le.1 h1).2; linarith
+  have hs : 0 ≤ d1 + e2 := by
+    have : 0 ≤ d1 := by rw [hd1]; exact R.fl_nonneg hsum
+    linarith
+  have hDlo : (1 - R.u) * (d1 + e2) - eta ≤ R.fl (d1 + e2) := by
+    have := (abs_le.1 h2).1
+    rw [abs_of_nonneg hs] at this
+    linarith
+  have hDhi : R.fl (d1 + e2) ≤ (1 + R.u) * (d1 + e2) + eta := by
+    have := (abs_le.1 h2).2
+    rw [abs_of_nonneg hs] at this
+    linarith
+  have lower : (1 - R.u) * ((1 - R.u) * A) - 4 * eta ≤ R.fl (d1 + e2) := by
+    have hl : (1 - R.u) * ((1 - R.u) * (e0 + e1) + e2) - eta ≤ (1 - R.u) * (d1 + e2) := by
+      have := mul_le_mul_of_nonneg_left hd1lo hun
+      have : (1 - R.u) * ((1 - R.u) * (e0 + e1) - eta + e2) =
+          (1 - R.u) * ((1 - R.u) * (e0 + e1) + e2) - (1 - R.u) * eta := by ring
+      nlinarith [this, mul_nonneg hun en.le]
+    have he2 : (1 - R.u) * ((1 - R.u) * A) ≤ (1 - R.u) * ((1 - R.u) * (e0 + e1) + e2) := by
+      apply mul_le_mul_of_nonneg_left _ hun
+      have h1m : (1 - R.u) * e2 ≤ e2 := by nlinarith
+      have : (1 - R.u) * (e0 + e1 + e2) = (1 - R.u) * (e0 + e1) + (1 - R.u) * e2 := by ring
+      rw [hA, this]; linarith
+    have heta : (1 - R.u) * eta ≤ eta := by nlinarith [huη, hun, en]
+    linarith [hDlo, hl, he2, heta, mul_nonneg hun (le_of_lt en)]
+  have upper : R.fl (d1 + e2) ≤ (1 + R.u) * ((1 + R.u) * A) + 4 * eta := by
+    have hh : d1 + e2 ≤ (1 + R.u) * (e0 + e1) + e2 + eta := by linarith [hd1hi]
+    have hu2 : R.fl (d1 + e2) ≤ (1 + R.u) * ((1 + R.u) * (e0 + e1) + e2 + eta) + eta := by
+      have := mul_le_mul_of_nonneg_left hh hup
+      linarith [hDhi, this]
+    have he2 : (1 + R.u) * ((1 + R.u) * (e0 + e1) + e2 + eta) + eta ≤
+        (1 + R.u) * ((1 + R.u) * A) + 4 * eta := by
+      have h1p : e2 ≤ (1 + R.u) * e2 := by nlinarith
+      have h2m : (1 + R.u) * eta ≤ 2 * eta := by nlinarith [huη, hup, en]
+      have : (1 + R.u) * ((1 + R.u) * (e0 + e1) + e2 + eta) + eta =
+          (1 + R.u) * ((1 + R.u) * (e0 + e1)) + (1 + R.u) * e2 +
+            (1 + R.u) * eta + eta := by ring
+      have hAe : (1 + R.u) * ((1 + R.u) * A) =
+          (1 + R.u) * ((1 + R.u) * (e0 + e1)) + (1 + R.u) * ((1 + R.u) * e2) := by
+        rw [hA]; ring
+      have hcoef : (1 + R.u) * e2 ≤ (1 + R.u) * ((1 + R.u) * e2) := by
+        have := mul_le_mul_of_nonneg_left h1p hup
+        linarith
+      linarith
+    linarith
+  exact ⟨R.fl_nonneg (by linarith), lower, upper⟩
+
+
 end LightRT.Robust
