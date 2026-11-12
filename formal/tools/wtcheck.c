@@ -355,6 +355,67 @@ static void trav(int seed, int n, int q, int w, int g, int nrays) {
     free(v);
 }
 
+
+#if LRT_TRI_HAS_SVE
+/* Bit-identity of the SVE watertight leaf (BVH8/BVH16 wblk) against
+ * tri_woop_one, including the any-hit variant. */
+static void leaf_fuzz_sve(int W, int iters) {
+    for (int it = 0; it < iters; it++) {
+        int mode = it % 3;
+        _Alignas(64) float wb[10 * 16];
+        uint32_t ids[16];
+        for (int l = 0; l < W; l++) {
+            ids[l] = (rnd() % 7 == 0) ? LRT_TRI_NO_HIT : (uint32_t)l * 10 + 1;
+            for (int c = 0; c < 9; c++)
+                wb[c * W + l] = ids[l] == LRT_TRI_NO_HIT ? 0.0f : fval(mode);
+            if (mode == 2 && l > 0 && rnd() % 2)
+                for (int c = 0; c < 6; c++) wb[c * W + l] = wb[(c + 3) % 9 * W + l - 1];
+        }
+        lrt_ray ray;
+        for (int a = 0; a < 3; a++) { ray.org[a] = fval(mode); ray.dir[a] = fval(mode); }
+        if (mode == 2) {
+            int l = (int)(rnd() % W), vtx = (int)(rnd() % 3), vtx2 = (int)(rnd() % 3);
+            float f = (rnd() % 2) ? 0.0f : frand();
+            for (int a = 0; a < 3; a++) {
+                float p = wb[(3 * vtx + a) * W + l] * (1 - f) + wb[(3 * vtx2 + a) * W + l] * f;
+                ray.dir[a] = p - ray.org[a];
+            }
+            if (rnd() % 4 == 0) ray.dir[rnd() % 3] = 0.0f;
+        }
+        ray.tmin = (rnd() % 5 == 0) ? -1.0f : 0.0f;
+        ray.tmax = (rnd() % 4 == 0) ? 0.7f : 1e30f;
+        tri_ray_ctx rc;
+        tri_ray_setup(&ray, &rc);
+        float bt = ray.tmax, bu = 0, bv = 0;
+        uint32_t bp = LRT_TRI_NO_HIT;
+        int bocc = 0;
+        for (int l = 0; l < W; l++) {
+            if (ids[l] == LRT_TRI_NO_HIT) continue;
+            float v0[3], v1[3], v2[3];
+            for (int a = 0; a < 3; a++) {
+                v0[a] = wb[(0 + a) * W + l]; v1[a] = wb[(3 + a) * W + l];
+                v2[a] = wb[(6 + a) * W + l];
+            }
+            float t, u, v;
+            if (tri_woop_one(rc.org, rc.dir, v0, v1, v2, rc.tmin, ray.tmax, &t, &u, &v)) bocc = 1;
+            if (tri_woop_one(rc.org, rc.dir, v0, v1, v2, rc.tmin, bt, &t, &u, &v)) {
+                bt = t; bu = u; bv = v; bp = ids[l];
+            }
+            leaf_lanes++;
+        }
+        tri_woop_sve_ctx wc;
+        tri_woop_sve_setup(&rc, &wc);
+        float st = ray.tmax, su = 0, sv = 0;
+        uint32_t sp = LRT_TRI_NO_HIT;
+        tri_woop_sve_block(wb, ids, W, &wc, &st, &su, &sv, &sp);
+        int socc = tri_woop_sve_occ(wb, ids, W, &wc, ray.tmax);
+        leaf_blocks++;
+        if (bp != sp || !same(bt, st) || !same(bu, su) || !same(bv, sv) || bocc != socc)
+            leaf_bad_blk++;
+    }
+}
+#endif
+
 int main(int argc, char **argv) {
     int seeds = argc > 1 ? atoi(argv[1]) : 2;
     int nrays = argc > 2 ? atoi(argv[2]) : 3000;
@@ -366,11 +427,20 @@ int main(int argc, char **argv) {
 #if LRT_TRI_HAS_AVX2
         leaf_fuzz(8, 200000);
 #endif
+#if LRT_TRI_HAS_SVE
+        leaf_fuzz_sve(8, 100000);
+        leaf_fuzz_sve(16, 100000);
+#endif
         const int cfg[][4] = {{400, 0, 4, 0}, {600, 1, 4, 1}, {500, 1, 4, 2},
                               {800, 1, 8, 0}, {1200, 0, 8, 1}, {500, 1, 8, 2}};
-        unsigned ncfg = (LRT_TRI_HAS_AVX2 || !LRT_TRI_HAS_SSE4) ? 6u : 3u; /* SSE-only: no BVH8 SIMD leaf */
+        unsigned ncfg = (LRT_TRI_HAS_AVX2 || LRT_TRI_HAS_SVE || !LRT_TRI_HAS_SSE4) ? 6u : 3u; /* SSE-only: no BVH8 SIMD leaf */
         for (unsigned c = 0; c < ncfg; c++)
             trav(seed, cfg[c][0], cfg[c][1], cfg[c][2], cfg[c][3], nrays);
+#if LRT_TRI_HAS_SVE
+        /* BVH16 watertight leaf: the 16-wide wblk kernel is covered by
+         * leaf_fuzz_sve(16); the scalar traversal reference does not support
+         * layout 16, so it is not run through trav. */
+#endif
     }
     printf("wtcheck leaf: %ld blocks (%ld lanes, %ld with a hit), SIMD != scalar %ld\n", leaf_blocks,
            leaf_lanes, leaf_hits, leaf_bad_blk);
