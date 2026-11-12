@@ -22,11 +22,13 @@ def main():
     a = ap.parse_args()
     tmp = tempfile.mkdtemp()
     exe = {}
-    variants = (("plain", ["-DLRT_TRI_NO_SLAB_ROBUST", "-DLRT_TRI_NO_LEAF_BOX_EXACT", "-DLRT_TRI_NO_BITEXACT"]),
-                ("exact", ["-DLRT_TRI_NO_SLAB_ROBUST", "-DLRT_TRI_LEAF_BOX_EXACT", "-DLRT_TRI_NO_BITEXACT"]),
-                ("robust", ["-DLRT_TRI_LEAF_BOX_EXACT", "-DLRT_TRI_SLAB_ROBUST", "-DLRT_TRI_BITEXACT"]),
+    # The Lean mirror (checkbvh) models the Moller-Trumbore leaf, so every variant
+    # opts out of the default watertight leaf; that one is checked by wtcheck.c.
+    variants = (("plain", ["-DLRT_TRI_NO_SLAB_ROBUST", "-DLRT_TRI_NO_LEAF_BOX_EXACT", "-DLRT_TRI_NO_BITEXACT", "-DLRT_TRI_NO_WATERTIGHT_TRI"]),
+                ("exact", ["-DLRT_TRI_NO_SLAB_ROBUST", "-DLRT_TRI_LEAF_BOX_EXACT", "-DLRT_TRI_NO_BITEXACT", "-DLRT_TRI_NO_WATERTIGHT_TRI"]),
+                ("robust", ["-DLRT_TRI_LEAF_BOX_EXACT", "-DLRT_TRI_SLAB_ROBUST", "-DLRT_TRI_BITEXACT", "-DLRT_TRI_NO_WATERTIGHT_TRI"]),
                 ("exactn", ["-DLRT_TRI_LEAF_BOX_EXACT", "-DLRT_TRI_SLAB_ROBUST", "-DLRT_TRI_BITEXACT",
-                            "-DLRT_TRI_EXACT_NEAREST"]))
+                            "-DLRT_TRI_EXACT_NEAREST", "-DLRT_TRI_NO_WATERTIGHT_TRI"]))
     for name, flags in variants:
         exe[name] = os.path.join(tmp, "bvhdump_" + name)
         subprocess.check_call(["cc", "-O1", "-ffp-contract=off", "-msse4.1", "-mavx2", "-mfma",
