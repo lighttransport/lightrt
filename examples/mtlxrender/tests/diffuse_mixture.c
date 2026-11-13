@@ -283,6 +283,43 @@ static int openpbr_metal_response_checks(void) {
       }
     }
   }
+  /* Compare film-coated OpenPBR endpoints to the retained MaterialX lobes,
+   * and verify that the film weight mixes complete responses. */
+  {
+    OpenPBRParams film = p, df = d, mf = m;
+    film.thin_film_thickness = 450.0f; film.thin_film_ior = 1.3f;
+    df.specular_lobes[0].frame.thinfilm_thickness = 450.0f;
+    df.specular_lobes[0].frame.thinfilm_ior = 1.3f;
+    mf.specular_lobes[0].frame.thinfilm_thickness = 450.0f;
+    mf.specular_lobes[0].frame.thinfilm_ior = 1.3f;
+    for (int v=0; v<2; ++v) for (int i=0; i<4; ++i) {
+      float pdf; v3 diffuse, actual;
+      film.metalness=amounts[i]; film.thin_film_weight=1.0f;
+      bsdf_eval_lobes(&film,n,views[v],lights[0],&diffuse,&actual,&pdf);
+      v3 dr=bsdf_eval(&df,n,views[v],lights[0],&pdf);
+      v3 mr=bsdf_eval(&mf,n,views[v],lights[0],&pdf);
+      v3 expected=v3_lerp(dr,mr,amounts[i]);
+      if (fabsf(actual.x-expected.x)>3e-6f || fabsf(actual.y-expected.y)>3e-6f || fabsf(actual.z-expected.z)>3e-6f) {
+        fprintf(stderr,"FAIL: OpenPBR film closure mixture\n"); return 0;
+      }
+      v3 full=bsdf_eval(&film,n,views[v],lights[0],&pdf);
+      film.thin_film_weight=0.0f;
+      v3 plain=bsdf_eval(&film,n,views[v],lights[0],&pdf);
+      film.thin_film_weight=0.5f;
+      v3 half=bsdf_eval(&film,n,views[v],lights[0],&pdf);
+      expected=v3_lerp(plain,full,0.5f);
+      if (fabsf(half.x-expected.x)>3e-6f || fabsf(half.y-expected.y)>3e-6f || fabsf(half.z-expected.z)>3e-6f) {
+        fprintf(stderr,"FAIL: OpenPBR film weight mixture\n"); return 0;
+      }
+    }
+  }
+  {
+    const char *film_doc = "<materialx><open_pbr_surface name=\"s\" type=\"surfaceshader\"><input name=\"thin_film_thickness\" type=\"float\" value=\"0.45\"/></open_pbr_surface></materialx>";
+    OpenPBRParams units;
+    if (!evaluate(film_doc,&units) || fabsf(units.thin_film_thickness-450.0f)>1e-4f) {
+      fprintf(stderr,"FAIL: OpenPBR film thickness units\n"); return 0;
+    }
+  }
   /* A zero-thickness film must not change either component of the mix. */
   {
     OpenPBRParams nofilm = p, zero = p;
