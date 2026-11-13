@@ -270,8 +270,8 @@ void render_wavefront(const Scene *scene, const MtlxDoc *doc,
             for (int x = 0; x < W; x++) {
                 size_t i = (size_t)y * W + x;
                 Path *p = &path[i];
-                float px = (x + pcg32_f(&p->rng)) / W;
-                float py = (y + pcg32_f(&p->rng)) / H;
+                float px = (x + mtlx_pixel_offset(pcg32_f(&p->rng), cfg->pixel_filter_tent)) / W;
+                float py = (y + mtlx_pixel_offset(pcg32_f(&p->rng), cfg->pixel_filter_tent)) / H;
                 p->ray = camera_ray(cam, px, py);
                 p->thr = v3_splat(1.0f);
                 p->rad = v3_splat(0.0f);

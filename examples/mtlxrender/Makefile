@@ -64,7 +64,8 @@ $(BUILD)/node_truth.o: tests/node_truth.c | $(BUILD)
 	$(CC) $(CFLAGS) $(WARN) -c $< -o $@
 node_truth: $(TEST_DEPS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-test: mtlxrender conductor_mixture conductor_response node_truth white_furnace bsdf_response eon_response rough_diffuse diffuse_mixture sheen_mixture texture_sampling volume_lobes
+test: pixel_filter mtlxrender conductor_mixture conductor_response node_truth white_furnace bsdf_response eon_response rough_diffuse diffuse_mixture sheen_mixture texture_sampling volume_lobes
+	./pixel_filter
 	./node_truth
 	./white_furnace
 	./bsdf_response
@@ -86,6 +87,9 @@ test-viewdirection: mtlxrender
 # the materialx-conformance repository). Links only the document loader and
 # the evaluator, with a neutral texture stub, so it needs no deps/.
 LEAN_SRC = tests/lean_vectors.c tests/texture_stub.c mtlx_doc.c mtlx_xml.c mtlx_eval.c color.c
+pixel_filter: tests/pixel_filter.c pathtrace.h
+	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/pixel_filter.c -lm
+
 white_furnace: tests/white_furnace.c bsdf.c bsdf.h mtlx_eval.h vecmath.h
 	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/white_furnace.c bsdf.c $(LDFLAGS)
 
@@ -158,7 +162,7 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 clean:
-	rm -rf build build-vk mtlxrender node_truth white_furnace bsdf_response texture_sampling \
+	rm -rf build build-vk mtlxrender node_truth pixel_filter white_furnace bsdf_response texture_sampling \
 	       texture-sampling.ppm mtlxvk lean_vectors
 
 # Cross-renderer verification against the ASF MaterialX reference (GLSL + OSL).

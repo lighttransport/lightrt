@@ -128,6 +128,7 @@ static void usage(const char *prog) {
         "  --cam-yaw <deg> --cam-pitch <deg> --cam-dist <f>   orbit camera\n"
         "  --cam-eye x,y,z --cam-target x,y,z --cam-fov <deg>  explicit look-at\n"
         "                         camera (overrides orbit; for the verify harness)\n"
+        "  --pixel-filter <box|tent>  camera pixel filter (default box)\n"
         "  --hide-env             black background; env still lights the scene\n"
         "  --backend <cpu|cpu-wavefront|vk>  tiled CPU, wavefront CPU, or GPU rays\n"
         "                         wavefront (needs a VK build + device)\n"
@@ -144,6 +145,7 @@ int main(int argc, char **argv) {
     const char *out_path = "chess.exr", *png_path = NULL, *env_path = NULL;
     const char *srgb_path = NULL; /* plain linear->sRGB PNG (no ACES) for verify harness */
     int W = 800, H = 600, spp = 64, bounces = 8, threads = 0, hq = 0, sss_walk = 0, sky = 0;
+    int pixel_filter_tent = 0;
     int hide_env_bg = 0; /* black background, env still lights (for verify harness) */
     float exposure = 1.0f, env_intensity = 1.0f, env_rot = 0.0f;
     float cam_yaw = 35.0f, cam_pitch = 25.0f, cam_dist = 1.6f;
@@ -168,6 +170,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--w")) W = atoi(NEXT);
         else if (!strcmp(a, "--h")) H = atoi(NEXT);
         else if (!strcmp(a, "--spp")) spp = atoi(NEXT);
+        else if (!strcmp(a, "--pixel-filter")) {
+            const char *filter = NEXT;
+            if (!strcmp(filter, "tent")) pixel_filter_tent = 1;
+            else if (!strcmp(filter, "box")) pixel_filter_tent = 0;
+            else { fprintf(stderr, "invalid pixel filter: %s\n", filter); return 1; }
+        }
         else if (!strcmp(a, "--bounces")) bounces = atoi(NEXT);
         else if (!strcmp(a, "--threads")) threads = atoi(NEXT);
         else if (!strcmp(a, "--env")) env_path = NEXT;
@@ -255,6 +263,7 @@ int main(int argc, char **argv) {
     cfg.nthreads = threads > 0 ? threads : (int)cpu_count();
     cfg.sss_walk = sss_walk; cfg.seed = 12345u;
     cfg.hide_env_bg = hide_env_bg;
+    cfg.pixel_filter_tent = pixel_filter_tent;
 
     /* directional sun from azimuth/elevation (degrees) */
     cfg.sun.enabled = sun_on;

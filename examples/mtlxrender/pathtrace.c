@@ -266,8 +266,8 @@ static void *worker(void *arg) {
                 pcg32_seed(&rng, ((uint64_t)j->cfg->seed << 32) ^ ((uint64_t)y * W + x), 0x9e3779b9u);
                 v3 sum = v3_splat(0.0f);
                 for (int sp = 0; sp < j->cfg->spp; sp++) {
-                    float px = (x + pcg32_f(&rng)) / W;
-                    float py = (y + pcg32_f(&rng)) / H;
+                    float px = (x + mtlx_pixel_offset(pcg32_f(&rng), j->cfg->pixel_filter_tent)) / W;
+                    float py = (y + mtlx_pixel_offset(pcg32_f(&rng), j->cfg->pixel_filter_tent)) / H;
                     lrt_ray r = camera_ray(j->cam, px, py);
                     v3 L = trace_path(j->s, j->doc, j->bind, j->tex, j->env, &j->cfg->sun, r,
                                       j->cfg->max_bounces, j->cfg->sss_walk,

@@ -110,6 +110,11 @@ target_compile_definitions(volume_lobes PRIVATE _POSIX_C_SOURCE=200809L)
 target_link_libraries(volume_lobes PRIVATE m)
 add_test(NAME volume_lobes COMMAND volume_lobes)
 
+add_executable(pixel_filter tests/pixel_filter.c)
+target_include_directories(pixel_filter PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(pixel_filter PRIVATE m)
+add_test(NAME pixel_filter COMMAND pixel_filter)
+
 add_executable(eon_response tests/eon_response.c bsdf.c)
 target_include_directories(eon_response PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(eon_response PRIVATE m)
