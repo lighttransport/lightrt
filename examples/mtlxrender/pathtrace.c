@@ -155,7 +155,12 @@ static v3 trace_path(const Scene *s, const MtlxDoc *doc, const MaterialBinding *
         ctx.P = hi.P;
         ctx.Ns = hi.Ns; ctx.Ng = hi.Ng; ctx.dpdu = hi.dpdu; ctx.dpdv = v3_cross(hi.Ns, hi.dpdu);
         OpenPBRParams params;
-        mtlx_eval_surface(&ctx, hi.surface_node, &params);
+        if (mtlx_eval_surface(&ctx, hi.surface_node, &params) != 0 && hi.surface_node >= 0) {
+            static atomic_flag reported = ATOMIC_FLAG_INIT;
+            if (!atomic_flag_test_and_set(&reported))
+                fprintf(stderr, "MaterialX surface evaluation failed (invalid node or diffuse lobe limit exceeded)\n");
+            break;
+        }
 
         if (params.emission > 0.0f)
             radiance = v3_add(radiance, v3_mul(throughput, v3_scale(params.emission_color, params.emission)));

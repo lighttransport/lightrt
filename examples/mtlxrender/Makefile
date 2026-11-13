@@ -64,12 +64,13 @@ $(BUILD)/node_truth.o: tests/node_truth.c | $(BUILD)
 	$(CC) $(CFLAGS) $(WARN) -c $< -o $@
 node_truth: $(TEST_DEPS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-test: node_truth white_furnace bsdf_response eon_response rough_diffuse texture_sampling volume_lobes
+test: node_truth white_furnace bsdf_response eon_response rough_diffuse diffuse_mixture texture_sampling volume_lobes
 	./node_truth
 	./white_furnace
 	./bsdf_response
 	./eon_response
 	./rough_diffuse
+	./diffuse_mixture
 	./texture_sampling texture-sampling.ppm
 	./volume_lobes
 
@@ -91,6 +92,9 @@ eon_response: tests/eon_response.c bsdf.c bsdf.h mtlx_eval.h vecmath.h
 
 rough_diffuse: tests/rough_diffuse.c bsdf.c bsdf.h mtlx_eval.h vecmath.h
 	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/rough_diffuse.c bsdf.c $(LDFLAGS)
+
+diffuse_mixture: tests/diffuse_mixture.c tests/texture_stub.c mtlx_doc.c mtlx_xml.c mtlx_eval.c color.c bsdf.c mtlx_eval.h
+	$(CC) $(CSTD) -O2 -D_POSIX_C_SOURCE=200809L -I. -Itests -o $@ tests/diffuse_mixture.c tests/texture_stub.c mtlx_doc.c mtlx_xml.c mtlx_eval.c color.c bsdf.c -lm
 
 test-bsdf-response: bsdf_response
 	./bsdf_response
