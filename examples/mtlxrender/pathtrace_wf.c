@@ -140,7 +140,7 @@ static void shade_range(ShadeJob *j, int k0, int k1, MtlxValue *memo, char *memo
         if (mtlx_eval_surface(&ctx, hi.surface_node, &params) != 0 && hi.surface_node >= 0) {
             static atomic_flag reported = ATOMIC_FLAG_INIT;
             if (!atomic_flag_test_and_set(&reported))
-                fprintf(stderr, "MaterialX surface evaluation failed (invalid node or diffuse lobe limit exceeded)\n");
+                fprintf(stderr, "MaterialX surface evaluation failed (invalid node or closure lobe limit exceeded)\n");
             p->alive = 0;
             continue;
         }
