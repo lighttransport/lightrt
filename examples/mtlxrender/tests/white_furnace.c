@@ -200,5 +200,23 @@ int main(void) {
            "albedo=(%.3f,%.3f,%.3f)\n",
            lambert_views[vi], actual.x, actual.y, actual.z);
   }
+  // EON should retain a white diffuse furnace across roughness and view angles.
+  lambert.base_color = v3_splat(1.0f);
+  lambert.diffuse_energy_compensation = 1;
+  const float eon_roughness[] = {0.25f, 1.0f};
+  for (size_t ri = 0; ri < sizeof(eon_roughness) / sizeof(eon_roughness[0]); ++ri) {
+    lambert.diffuse_roughness = eon_roughness[ri];
+    for (size_t vi = 0; vi < sizeof(lambert_views) / sizeof(lambert_views[0]); ++vi) {
+      v3 actual = integrate(&lambert, lambert_views[vi], 0);
+      if (!isfinite(actual.x) || fabsf(actual.x - 1.0f) > 0.015f ||
+          fabsf(actual.y - 1.0f) > 0.015f || fabsf(actual.z - 1.0f) > 0.015f) {
+        fprintf(stderr, "FAIL: EON furnace roughness=%.2f view=%.2f energy=(%.5f,%.5f,%.5f)\n",
+                eon_roughness[ri], lambert_views[vi], actual.x, actual.y, actual.z);
+        return 1;
+      }
+      printf("PASS: EON furnace roughness=%.2f view=%.2f energy=%.5f\n",
+             eon_roughness[ri], lambert_views[vi], actual.x);
+    }
+  }
   return 0;
 }

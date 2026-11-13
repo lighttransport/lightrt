@@ -17,6 +17,7 @@ typedef struct {
     float base_weight;
     v3    base_color;
     float diffuse_roughness;
+    int   diffuse_energy_compensation; /* OpenPBR EON, rather than Lambert */
     float metalness;
     /* specular (GGX dielectric) */
     float specular_weight;
@@ -111,7 +112,8 @@ void openpbr_defaults(OpenPBRParams *p);
 /* Evaluate a surface shader node into params. Returns 0 on success. */
 int mtlx_eval_surface(ShadeContext *ctx, int surface_node, OpenPBRParams *out);
 
-/* Evaluate a MaterialX volume constructor and its connected VDF/EDF graph. */
+/* Evaluate a volume constructor; returns nonzero for unsupported closure or
+ * connected value nodes, unresolved inputs, or exhausted graph work limits. */
 int mtlx_eval_volume(ShadeContext *ctx, int volume_node,
                      MtlxVolumeParams *out);
 
