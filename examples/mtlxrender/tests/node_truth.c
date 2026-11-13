@@ -52,8 +52,9 @@ static int test_texcoord_set(void *user, int index, float out_uv[2]) {
     return 1;
 }
 
-static MtlxValue ev_indexed_geomprop_default(void) {
-    const char *xml = "<materialx version=\"1.39\"><geompropdef name=\"UV0\" geomprop=\"texcoord\" type=\"vector2\" index=\"1\"/><nodegraph name=\"t\"><image name=\"img\" type=\"color3\"><input name=\"file\" type=\"filename\" value=\"unused.png\"/></image></nodegraph></materialx>";
+static MtlxValue ev_indexed_geomprop_default(int index) {
+    char xml[512];
+    snprintf(xml, sizeof(xml), "<materialx version=\"1.39\"><geompropdef name=\"UV0\" geomprop=\"texcoord\" type=\"vector2\" index=\"%d\"/><nodegraph name=\"t\"><image name=\"img\" type=\"color3\"><input name=\"file\" type=\"filename\" value=\"unused.png\"/></image></nodegraph></materialx>", index);
     MtlxDoc *d = mtlx_load_string(xml);
     if (!d) return (MtlxValue){0};
     int id = -1;
@@ -166,7 +167,8 @@ int main(void) {
     chk3("transformnormal model-world", ev_space_transform("transformnormal", "0,3,4", "model", "world"), 0.0f, 0.70710678f, 0.70710678f);
     chk3("transformnormal same-space", ev_space_transform("transformnormal", "0,3,4", "model", "model"), 0.0f, 0.6f, 0.8f);
     chk3("defaultgeomprop model-space", ev_model_geomprop_default(), 1.0f, 2.0f, 3.0f);
-    chk3("defaultgeomprop texcoord index", ev_indexed_geomprop_default(), 0.375f, 0.625f, 0.0f);
+    chk3("defaultgeomprop texcoord index", ev_indexed_geomprop_default(1), 0.375f, 0.625f, 0.0f);
+    chk3("defaultgeomprop UV0 fallback", ev_indexed_geomprop_default(2), 0.1f, 0.2f, 0.0f);
 
     /* ---- math: binary (definition = the operation) ---- */
     chk1("add",        ev(BIN("add","2","3"), "n", g).v[0], 5.0f);
