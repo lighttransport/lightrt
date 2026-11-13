@@ -45,6 +45,28 @@ static MtlxValue ev(const char *inner, const char *name, Geo g) {
 
 static Geo geo0(void) { Geo g = { {0.25f, 0.75f}, {1, 2, 3}, {0, 1, 0} }; return g; }
 
+static MtlxValue ev_space_transform(const char *category, const char *input,
+                                    const char *from, const char *to) {
+    char xml[1024], buf[2048];
+    snprintf(xml, sizeof(xml), "<%s name=\"n\" type=\"vector3\"><input name=\"in\" type=\"vector3\" value=\"%s\"/><input name=\"fromspace\" type=\"string\" value=\"%s\"/><input name=\"tospace\" type=\"string\" value=\"%s\"/></%s>", category, input, from, to, category);
+    snprintf(buf, sizeof(buf), "<materialx version=\"1.39\"><nodegraph name=\"t\">%s</nodegraph></materialx>", xml);
+    MtlxDoc *d = mtlx_load_string(buf);
+    if (!d) return (MtlxValue){0};
+    ShadeContext ctx; memset(&ctx, 0, sizeof(ctx));
+    ctx.doc = d; ctx.has_space_transforms = 1;
+    for (int i = 0; i < 16; ++i) ctx.model_to_world[i] = ctx.world_to_model[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+    ctx.model_to_world[0] = 2.0f; ctx.model_to_world[5] = 3.0f; ctx.model_to_world[10] = 4.0f;
+    ctx.model_to_world[12] = 1.0f; ctx.model_to_world[13] = 2.0f; ctx.model_to_world[14] = 3.0f;
+    ctx.world_to_model[0] = 0.5f; ctx.world_to_model[5] = 1.0f / 3.0f; ctx.world_to_model[10] = 0.25f;
+    ctx.world_to_model[12] = -0.5f; ctx.world_to_model[13] = -2.0f / 3.0f; ctx.world_to_model[14] = -0.75f;
+    int id = mtlx_find_node(d, 0, "n");
+    ctx.memo = calloc((size_t)(d->nnode > 0 ? d->nnode : 1), sizeof(MtlxValue));
+    ctx.memo_done = calloc((size_t)(d->nnode > 0 ? d->nnode : 1), 1);
+    MtlxValue result = id >= 0 ? mtlx_eval_node_test(&ctx, id) : (MtlxValue){0};
+    free(ctx.memo); free(ctx.memo_done); mtlx_free(d);
+    return result;
+}
+
 /* Evaluate a top-level surface shader node into OpenPBR params. */
 static OpenPBRParams eval_surf(const char *shader_xml, const char *name) {
     char buf[8192];
@@ -88,6 +110,11 @@ static void chk3(const char *name, MtlxValue v, float x, float y, float z) {
 int main(void) {
     Geo g = geo0();
     printf("MaterialX node ground-truth tests\n");
+    chk3("transformpoint model-world", ev_space_transform("transformpoint", "1,2,3", "model", "world"), 3.0f, 8.0f, 15.0f);
+    chk3("transformpoint world-model", ev_space_transform("transformpoint", "3,8,15", "world", "model"), 1.0f, 2.0f, 3.0f);
+    chk3("transformvector model-world", ev_space_transform("transformvector", "1,2,3", "model", "world"), 2.0f, 6.0f, 12.0f);
+    chk3("transformnormal model-world", ev_space_transform("transformnormal", "0,3,4", "model", "world"), 0.0f, 0.70710678f, 0.70710678f);
+    chk3("transformnormal same-space", ev_space_transform("transformnormal", "0,3,4", "model", "model"), 0.0f, 0.6f, 0.8f);
 
     /* ---- math: binary (definition = the operation) ---- */
     chk1("add",        ev(BIN("add","2","3"), "n", g).v[0], 5.0f);
