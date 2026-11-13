@@ -131,3 +131,11 @@ target_include_directories(sheen_mixture PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(sheen_mixture PRIVATE _POSIX_C_SOURCE=200809L)
 target_link_libraries(sheen_mixture PRIVATE m)
 add_test(NAME sheen_mixture COMMAND sheen_mixture)
+
+# End-to-end coverage of view-dependent shading in both CPU integrators.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME viewdirection_render
+        COMMAND ${CMAKE_COMMAND} -E env MTLXRENDER_BINARY=$<TARGET_FILE:mtlxrender>
+                ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/viewdirection_render.py)
+endif()

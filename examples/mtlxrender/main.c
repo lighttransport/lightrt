@@ -129,7 +129,7 @@ static void usage(const char *prog) {
         "  --cam-eye x,y,z --cam-target x,y,z --cam-fov <deg>  explicit look-at\n"
         "                         camera (overrides orbit; for the verify harness)\n"
         "  --hide-env             black background; env still lights the scene\n"
-        "  --backend <cpu|vk>     cpu = tiled tracer (default); vk = GPU-traced\n"
+        "  --backend <cpu|cpu-wavefront|vk>  tiled CPU, wavefront CPU, or GPU rays\n"
         "                         wavefront (needs a VK build + device)\n"
         "  --gpu-validate         render the wavefront on CPU and GPU, report RMSE\n",
         prog);
@@ -298,6 +298,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "gpu-validate: this binary was built without Vulkan (use VK=1)\n");
         fb_free(&fb); goto teardown;
 #endif
+    } else if (!strcmp(backend, "cpu-wavefront")) {
+        RayTracer *rt = rt_cpu_create(&scene);
+        if (!rt) {
+            fprintf(stderr, "backend cpu-wavefront: could not create CPU ray tracer\n");
+            fb_free(&fb); goto teardown;
+        }
+        render_wavefront(&scene, doc, &bind, tex, env, &cam, &cfg, &fb, rt);
+        rt_destroy(rt);
     } else if (!strcmp(backend, "vk")) {
 #ifdef MTLX_HAVE_VK
         RayTracer *rt = rt_vk_create(&scene);

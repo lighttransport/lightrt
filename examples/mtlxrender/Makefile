@@ -64,7 +64,7 @@ $(BUILD)/node_truth.o: tests/node_truth.c | $(BUILD)
 	$(CC) $(CFLAGS) $(WARN) -c $< -o $@
 node_truth: $(TEST_DEPS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-test: node_truth white_furnace bsdf_response eon_response rough_diffuse diffuse_mixture sheen_mixture texture_sampling volume_lobes
+test: mtlxrender node_truth white_furnace bsdf_response eon_response rough_diffuse diffuse_mixture sheen_mixture texture_sampling volume_lobes
 	./node_truth
 	./white_furnace
 	./bsdf_response
@@ -74,6 +74,10 @@ test: node_truth white_furnace bsdf_response eon_response rough_diffuse diffuse_
 	./sheen_mixture
 	./texture_sampling texture-sampling.ppm
 	./volume_lobes
+	python3 tests/viewdirection_render.py
+
+test-viewdirection: mtlxrender
+	python3 tests/viewdirection_render.py
 
 # Lean-generated node evaluation vectors (tests/generated/mtlx-eval.inc, from
 # the materialx-conformance repository). Links only the document loader and
