@@ -230,7 +230,7 @@ int main(int argc, char **argv) {
     return fail("sRGB decode", sample);
   }
 
-  char xml[8192];
+  char xml[16384];
   snprintf(xml, sizeof(xml),
       "<materialx version=\"1.39\">"
       "<image name=\"sample\" type=\"color3\">"
@@ -239,6 +239,11 @@ int main(int argc, char **argv) {
       "<input name=\"uaddressmode\" type=\"string\" value=\"constant\"/>"
       "<input name=\"vaddressmode\" type=\"string\" value=\"clamp\"/>"
       "<input name=\"filtertype\" type=\"string\" value=\"cubic\"/>"
+      "</image>"
+      "<image name=\"literal_uv\" type=\"color3\">"
+      "<input name=\"file\" type=\"filename\" value=\"%s\"/>"
+      "<input name=\"texcoord\" type=\"vector2\" value=\"0.75,0.25\"/>"
+      "<input name=\"filtertype\" type=\"string\" value=\"closest\"/>"
       "</image>"
       "<tiledimage name=\"tiled\" type=\"color3\">"
       "<input name=\"file\" type=\"filename\" value=\"%s\"/>"
@@ -305,7 +310,7 @@ int main(int argc, char **argv) {
       "<transformmatrix name=\"linear_xyzd65_to_rec709\" type=\"vector3\">"
       "<input name=\"in\" type=\"vector3\" value=\"0.25, 0.5, 0.75\"/>"
       "<input name=\"mat\" type=\"matrix33\" value=\"3.240969941905, -0.969243636281, 0.055630079697, -1.53738317757, 1.875967501508, -0.203976958889, -0.498610760293, 0.041555057407, 1.056971514243\"/>"
-      "</transformmatrix></materialx>", filename, filename, filename);
+      "</transformmatrix></materialx>", filename, filename, filename, filename);
   MtlxDoc *doc = mtlx_load_string(xml);
   if (!doc) {
     texcache_free(cache);
@@ -314,6 +319,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   const int node = mtlx_find_node(doc, -1, "sample");
+  const int literal_node = mtlx_find_node(doc, -1, "literal_uv");
   const int tiled_node = mtlx_find_node(doc, -1, "tiled");
   const int tiled_zero_node = mtlx_find_node(doc, -1, "tiled_zero");
   const int aces_matrix_node = mtlx_find_node(doc, -1, "acescg_to_rec709");
@@ -328,7 +334,7 @@ int main(int argc, char **argv) {
   const int xyz_matrix_node = mtlx_find_node(doc, -1, "linear_xyzd65_to_rec709");
   MtlxValue *memo = (MtlxValue *)calloc((size_t)doc->nnode, sizeof(MtlxValue));
   char *memo_done = (char *)calloc((size_t)doc->nnode, sizeof(char));
-  if (node < 0 || tiled_node < 0 || tiled_zero_node < 0 ||
+  if (node < 0 || literal_node < 0 || tiled_node < 0 || tiled_zero_node < 0 ||
       aces_matrix_node < 0 || adobe_matrix_node < 0 ||
       g22_ap1_node < 0 || adobergb_node < 0 ||
       displayp3_matrix_node < 0 || ap0_matrix_node < 0 ||
@@ -349,6 +355,14 @@ int main(int argc, char **argv) {
   context.uv[1] = 0.75f;
   context.memo = memo;
   context.memo_done = memo_done;
+  context.has_uv_derivatives = 1;
+  context.uv_dx[0] = 1.0f;
+  const MtlxValue literal_uv = mtlx_eval_node_test(&context, literal_node);
+  const int literal_uv_ok = literal_uv.type == MV_COLOR3 &&
+      near(literal_uv.v[0], 1.0f, 1e-6f) && near(literal_uv.v[1], 1.0f, 1e-6f) &&
+      near(literal_uv.v[2], 1.0f, 1e-6f);
+  context.has_uv_derivatives = 0;
+  context.uv_dx[0] = 0.0f;
   const MtlxValue aces_matrix =
       mtlx_eval_node_test(&context, aces_matrix_node);
   memset(memo_done, 0, (size_t)doc->nnode * sizeof(char));
@@ -442,7 +456,7 @@ int main(int argc, char **argv) {
   free(memo);
   free(memo_done);
   mtlx_free(doc);
-  if (!fallback_ok || !cubic_image_ok || !tiled_sample_ok || !tiled_zero_ok) {
+  if (!literal_uv_ok || !fallback_ok || !cubic_image_ok || !tiled_sample_ok || !tiled_zero_ok) {
     texcache_free(cache);
     remove(argv[1]);
     fprintf(stderr, "FAIL: MaterialX texture filter, tiledimage transform, or constant default behavior\n");
