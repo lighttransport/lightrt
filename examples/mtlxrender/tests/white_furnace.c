@@ -299,7 +299,7 @@ int main(void) {
           const float mu = cosines[vi];
           const v3 wo = v3_make(sqrtf(1.0f - mu * mu), 0, side ? -mu : mu);
           pcg32 rng; pcg32_seed(&rng, 341 + vi, 98 + ri + side);
-          double sum = 0;
+          double sum = 0, max_weight = 0;
           for (int i = 0; i < count; ++i) {
             BsdfSample sample;
             if (bsdf_sample(&p, n, wo, &rng, &sample)) {
@@ -308,7 +308,14 @@ int main(void) {
                 fprintf(stderr, "FAIL: nonfinite or negative glass throughput\n"); return 1;
               }
               sum += sample.throughput.x;
+              if (sample.throughput.x > max_weight) max_weight = sample.throughput.x;
             }
+          }
+          /* Grazing interior rough glass formerly produced weights above 79
+           * with full-normal sampling. The visible-normal proposal bounds
+           * this fixed deterministic case while preserving furnace energy. */
+          if (side == 1 && ri == 1 && vi == 0 && max_weight > 20.0) {
+            fprintf(stderr, "FAIL: grazing glass sample weight %g\n", max_weight); return 1;
           }
           const double energy = sum / count;
           if (energy > 1.05 || energy < 0.55 || (ri == 0 && energy < 0.95)) {
