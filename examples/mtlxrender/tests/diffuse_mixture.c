@@ -783,6 +783,35 @@ static int openpbr_fuzz_checks(void) {
   return 1;
 }
 
+static int standard_transmission_checks(void) {
+  const char *xml = "<materialx><standard_surface name=\"s\" type=\"surfaceshader\">"
+    "<input name=\"base\" type=\"float\" value=\"0\"/>"
+    "<input name=\"specular\" type=\"float\" value=\"1\"/>"
+    "<input name=\"specular_IOR\" type=\"float\" value=\"1.52\"/>"
+    "<input name=\"specular_roughness\" type=\"float\" value=\"0.01\"/>"
+    "<input name=\"transmission\" type=\"float\" value=\"1\"/>"
+    "</standard_surface></materialx>";
+  OpenPBRParams p;
+  if (!evaluate(xml, &p) || p.transmission < 0.99f || p.specular_weight < 0.99f) {
+    fprintf(stderr, "FAIL: standard glass parameters did not evaluate\n"); return 0;
+  }
+  const v3 n = {0,0,1};
+  pcg32 rng; pcg32_seed(&rng, 813, 37);
+  int transmissions = 0, duplicate_reflections = 0;
+  for (int i = 0; i < 50000; ++i) {
+    BsdfSample sample;
+    if (!bsdf_sample(&p, n, n, &rng, &sample) || !sample.transmission) continue;
+    if (sample.crossed) ++transmissions;
+    else ++duplicate_reflections;
+  }
+  if (!transmissions || duplicate_reflections) {
+    fprintf(stderr, "FAIL: standard glass duplicated interface reflection (%d transmitted, %d duplicate)\n",
+            transmissions, duplicate_reflections);
+    return 0;
+  }
+  return 1;
+}
+
 int main(void) {
   const char *parts =
     "<oren_nayar_diffuse_bsdf name=\"a\" type=\"BSDF\"><input name=\"color\" type=\"color3\" value=\"0.2,0.5,0.8\"/><input name=\"roughness\" type=\"float\" value=\"0.9\"/></oren_nayar_diffuse_bsdf>"
@@ -827,7 +856,7 @@ int main(void) {
       }
     }
   }
-  if (!openpbr_fuzz_checks() || !openpbr_transmission_ior_checks() || !layer_checks() || !specular_layer_checks() || !specular_response_checks() || !openpbr_dielectric_response_checks() || !openpbr_metal_response_checks() ||
+  if (!standard_transmission_checks() || !openpbr_fuzz_checks() || !openpbr_transmission_ior_checks() || !layer_checks() || !specular_layer_checks() || !specular_response_checks() || !openpbr_dielectric_response_checks() || !openpbr_metal_response_checks() ||
       !specular_overflow_check(MTLX_MAX_SPECULAR_LOBES,1) ||
       !specular_overflow_check(MTLX_MAX_SPECULAR_LOBES+1,0)) return 1;
   if (!overflow_check(MTLX_MAX_DIFFUSE_LOBES, 1) ||
