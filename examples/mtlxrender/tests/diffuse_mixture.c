@@ -204,6 +204,24 @@ static int specular_response_checks(void) {
       fprintf(stderr,"specular closure mixture failed view %d\n",v);return 0;
     }
   }
+  /* Rotating a lobe frame preserves its response after accounting for the
+   * common surface cosine; retroreflection reflects the local view first. */
+  {
+    OpenPBRParams tilted=p[2];
+    tilted.specular_lobes[0].frame.normal=v3_make(.6f,0,.8f);
+    tilted.specular_lobes[0].frame.tangent=v3_make(0,1,0);
+    tilted.specular_lobes[0].frame.retroreflective=1;
+    v3 world_view=v3_make(.8f,0,.6f), world_light=v3_make(0,.6f,.8f);
+    v3 local_view=v3_make(0,.28f,.96f), local_light=v3_make(.6f,.48f,.64f);
+    v3 d,actual,expected;float pdf;
+    bsdf_eval_lobes(&tilted,n,world_view,world_light,&d,&actual,&pdf);
+    bsdf_eval_lobes(&p[2],n,local_view,local_light,&d,&expected,&pdf);
+    expected=v3_scale(expected,.64f/.8f);
+    if(fabsf(actual.x-expected.x)>2e-5f || fabsf(actual.y-expected.y)>2e-5f ||
+       fabsf(actual.z-expected.z)>2e-5f) {
+      fprintf(stderr,"tilted retroreflective specular frame failed\n");return 0;
+    }
+  }
   /* Proposal and PDF include each independent closure, including retro mode. */
   p[4].specular_lobes[1].frame.retroreflective=1;
   p[4].specular_roughness=1.0f;
