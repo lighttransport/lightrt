@@ -9,6 +9,13 @@
 static int evaluate(const char *xml, MtlxVolumeParams *out) {
     MtlxDoc *doc = mtlx_load_string(xml);
     if (!doc) return 0;
+    /* Model an in-memory graph whose nodedef defaults have not been inserted. */
+    for (int i = 0; i < doc->nnode; ++i) {
+        MtlxNode *n = &doc->nodes[i];
+        if (strcmp(n->name, "defaultmix") && strcmp(n->name, "vm") && strcmp(n->name, "em")) continue;
+        for (int j = 0; j < n->ninput; ++j)
+            if (!strcmp(n->inputs[j].name, "mix")) n->inputs[j].name[0] = '_';
+    }
     int id = mtlx_find_node(doc, -1, "V");
     ShadeContext ctx; memset(&ctx, 0, sizeof(ctx)); ctx.doc = doc;
     ctx.memo = calloc((size_t)doc->nnode, sizeof(*ctx.memo));
@@ -34,6 +41,20 @@ int main(void) {
         !near(out.lobes[1].scattering.z, 4.5f) || !near(out.scattering.z, 7.5f) ||
         !near(out.emission.x, .025f) || !near(out.emission.y, .1f) ||
         !near(out.emission.z, .225f)) { fprintf(stderr, "weighted VDF failed\n"); return 1; }
+    /* Missing mix defaults to 0 for both VDF and EDF (pbrlib nodedefs). */
+    const char *default_mix =
+        "<materialx><anisotropic_vdf name=\"bg\" type=\"VDF\"><input name=\"scattering\" type=\"vector3\" value=\"1,2,3\"/></anisotropic_vdf>"
+        "<anisotropic_vdf name=\"fg\" type=\"VDF\"><input name=\"scattering\" type=\"vector3\" value=\"4,5,6\"/></anisotropic_vdf>"
+        "<mix name=\"vm\" type=\"VDF\"><input name=\"bg\" type=\"VDF\" nodename=\"bg\"/><input name=\"fg\" type=\"VDF\" nodename=\"fg\"/></mix>"
+        "<uniform_edf name=\"eb\" type=\"EDF\"><input name=\"color\" type=\"color3\" value=\"0.1,0.2,0.3\"/></uniform_edf>"
+        "<uniform_edf name=\"ef\" type=\"EDF\"><input name=\"color\" type=\"color3\" value=\"0.6,0.7,0.8\"/></uniform_edf>"
+        "<mix name=\"em\" type=\"EDF\"><input name=\"bg\" type=\"EDF\" nodename=\"eb\"/><input name=\"fg\" type=\"EDF\" nodename=\"ef\"/></mix>"
+        "<volume name=\"V\" type=\"volumeshader\"><input name=\"vdf\" type=\"VDF\" nodename=\"vm\"/><input name=\"edf\" type=\"EDF\" nodename=\"em\"/></volume></materialx>";
+    if (!evaluate(default_mix, &out) || !near(out.scattering.x, 1.0f) ||
+        !near(out.scattering.y, 2.0f) || !near(out.scattering.z, 3.0f) ||
+        !near(out.emission.x, .1f) || !near(out.emission.y, .2f) || !near(out.emission.z, .3f)) {
+        fprintf(stderr, "unauthored VDF/EDF mix failed\n"); return 1;
+    }
     const char *bad[] = {
         "<materialx><volume name=\"V\" type=\"volumeshader\"><input name=\"vdf\" type=\"VDF\" nodename=\"missing\"/></volume></materialx>",
         "<materialx><unsupported name=\"bad\" type=\"VDF\"/><volume name=\"V\" type=\"volumeshader\"><input name=\"vdf\" type=\"VDF\" nodename=\"bad\"/></volume></materialx>",
