@@ -209,19 +209,31 @@ int main(void) {
         "<input name=\"base_diffuse_roughness\" type=\"float\" value=\"0.7\"/>"
         "</open_pbr_surface>", "s");
       chk1("openpbr.diffuse_rough", p.diffuse_roughness, 0.7f);
-      chk1("openpbr.EON", (float)p.diffuse_energy_compensation, 1.0f); }
+      chk1("openpbr.EON", (float)p.diffuse_model, 1.0f); }
     { OpenPBRParams p = eval_surf(
         "<standard_surface name=\"s\" type=\"surfaceshader\">"
         "<input name=\"diffuse_roughness\" type=\"float\" value=\"0.7\"/>"
         "</standard_surface>", "s");
-      chk1("standard.not_EON", (float)p.diffuse_energy_compensation, 0.0f); }
+      chk1("standard.oren", (float)p.diffuse_model, (float)MTLX_DIFFUSE_OREN_NAYAR); }
+    { OpenPBRParams p = eval_surf(
+        "<burley_diffuse_bsdf name=\"d\" type=\"BSDF\">"
+        "<input name=\"roughness\" type=\"float\" value=\"0.7\"/>"
+        "</burley_diffuse_bsdf><surface name=\"s\" type=\"surfaceshader\">"
+        "<input name=\"bsdf\" type=\"BSDF\" nodename=\"d\"/></surface>", "s");
+      chk1("node.burley", (float)p.diffuse_model, (float)MTLX_DIFFUSE_BURLEY); }
+    { OpenPBRParams p = eval_surf(
+        "<oren_nayar_diffuse_bsdf name=\"d\" type=\"BSDF\">"
+        "<input name=\"roughness\" type=\"float\" value=\"0.7\"/>"
+        "</oren_nayar_diffuse_bsdf><surface name=\"s\" type=\"surfaceshader\">"
+        "<input name=\"bsdf\" type=\"BSDF\" nodename=\"d\"/></surface>", "s");
+      chk1("node.oren", (float)p.diffuse_model, (float)MTLX_DIFFUSE_OREN_NAYAR); }
     { OpenPBRParams p = eval_surf(
         "<oren_nayar_diffuse_bsdf name=\"d\" type=\"BSDF\">"
         "<input name=\"roughness\" type=\"float\" value=\"0.7\"/>"
         "<input name=\"energy_compensation\" type=\"boolean\" value=\"true\"/>"
         "</oren_nayar_diffuse_bsdf><surface name=\"s\" type=\"surfaceshader\">"
         "<input name=\"bsdf\" type=\"BSDF\" nodename=\"d\"/></surface>", "s");
-      chk1("node.EON", (float)p.diffuse_energy_compensation, 1.0f); }
+      chk1("node.EON", (float)p.diffuse_model, 1.0f); }
 
     { OpenPBRParams p = eval_surf(
         "<standard_surface name=\"s\" type=\"surfaceshader\">"

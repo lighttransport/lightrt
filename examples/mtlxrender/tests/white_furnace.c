@@ -202,7 +202,7 @@ int main(void) {
   }
   // EON should retain a white diffuse furnace across roughness and view angles.
   lambert.base_color = v3_splat(1.0f);
-  lambert.diffuse_energy_compensation = 1;
+  lambert.diffuse_model = 1;
   const float eon_roughness[] = {0.25f, 1.0f};
   for (size_t ri = 0; ri < sizeof(eon_roughness) / sizeof(eon_roughness[0]); ++ri) {
     lambert.diffuse_roughness = eon_roughness[ri];

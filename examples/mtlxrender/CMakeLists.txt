@@ -114,3 +114,8 @@ add_executable(eon_response tests/eon_response.c bsdf.c)
 target_include_directories(eon_response PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(eon_response PRIVATE m)
 add_test(NAME eon_response COMMAND eon_response)
+
+add_executable(rough_diffuse tests/rough_diffuse.c bsdf.c)
+target_include_directories(rough_diffuse PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(rough_diffuse PRIVATE m)
+add_test(NAME rough_diffuse COMMAND rough_diffuse)
