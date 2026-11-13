@@ -68,30 +68,31 @@ theorem key_le_total (m M c : ℝ) (hmM : |m| ≤ M) (hc : 32 * model.u ≤ c)
     nlinarith [hprod, hM, hu5, hueta, en, u0, un]
   linarith [hmain, hbig]
 
-set_option maxHeartbeats 1600000 in
-/-- **C-range instantiation of the range-free Woop bound.** The `EXACT_NEAREST`
-    node key (`tri_exn_key`: `fl(m - fl(2⁻¹⁹ M))`, i.e. `c = 32u`) is below the
+set_option maxHeartbeats 3200000 in
+/-- **C-range instantiation of the range-free Woop bound** (both edge-sign
+    classes accepted by the watertight test). The `EXACT_NEAREST` node key
+    (`tri_exn_key`: `fl(m - fl(2⁻¹⁹ M))`, i.e. `c = 32u`) is below the
     watertight leaf's `t` for every accepted triangle whose vertices' *computed*
     depths lie in `[m, M]` of the node's dominant-axis slab, provided the
     `η/a0` slack fits: `49η(1+M)/a0 + 4η ≤ 0.9 u M`. The remaining C-side
     condition is a projected area `a0` not far below
     `~50·2⁻¹²⁶(1+M)/M`, i.e. the regime where the `1e-37` dilation floor
     applies. This is the `InRange`-free replacement for
-    `ExactPrune.woop_key_le_t` (positive edge-sign class). -/
+    `ExactPrune.woop_key_le_t`. -/
 theorem woop_key_le_t_total_model (sz o lo hi : ℝ) (v0 v1 v2 e0 e1 e2 a0 : ℝ)
     (hv0 : lo ≤ v0 ∧ v0 ≤ hi) (hv1 : lo ≤ v1 ∧ v1 ≤ hi)
     (hv2 : lo ≤ v2 ∧ v2 ≤ hi)
-    (he0 : 0 ≤ e0) (he1 : 0 ≤ e1) (he2 : 0 ≤ e2)
+    (hsign : (0 ≤ e0 ∧ 0 ≤ e1 ∧ 0 ≤ e2) ∨ (e0 ≤ 0 ∧ e1 ≤ 0 ∧ e2 ≤ 0))
     (hD : model.fl (model.fl (e0 + e1) + e2) ≠ 0) :
     let z := fun v => model.fl (sz * model.fl (v - o))
     let m := min (z lo) (z hi)
     let M := max |z lo| |z hi|
-    (0 ≤ M) → (0 < a0) → (a0 ≤ e0 + e1 + e2) → (4 * eta ≤ a0 / 2) →
+    (0 ≤ M) → (0 < a0) → (a0 ≤ |e0 + e1 + e2|) → (4 * eta ≤ a0 / 2) →
     (49 * eta * (1 + M) / a0 + 4 * eta ≤ 0.9 * model.u * M) →
     model.fl (m - model.fl ((2:ℝ)^(-19:ℤ) * M)) ≤
       model.fl (model.fl (model.fl (model.fl (e0 * z v0) + model.fl (e1 * z v1)) +
         model.fl (e2 * z v2)) / model.fl (model.fl (e0 + e1) + e2)) := by
-  intro z m M hM ha0 hAa0 hηa hfit
+  intro z m M hM ha0 hA0 hηa hfit
   have hu : model.u ≤ 1 / 1000 := by unfold model; norm_num [zpow_neg]
   have hc : 32 * model.u ≤ (2:ℝ)^(-19:ℤ) := by
     have e : (2:ℝ)^(-19:ℤ) = 32 * (2:ℝ)^(-24:ℤ) := by
@@ -108,22 +109,45 @@ theorem woop_key_le_t_total_model (sz o lo hi : ℝ) (v0 v1 v2 e0 e1 e2 a0 : ℝ
     · exact le_max_left _ _
     · exact le_max_right _ _
   have hk := key_le_total m M ((2:ℝ)^(-19:ℤ)) hmM hc hc1
-  have hA : 0 < e0 + e1 + e2 := lt_of_lt_of_le ha0 hAa0
-  have hZ : m ≤ (e0 * z v0 + e1 * z v1 + e2 * z v2) / (e0 + e1 + e2) := by
-    rw [le_div_iff₀ hA]
-    nlinarith [mul_le_mul_of_nonneg_left m0 he0, mul_le_mul_of_nonneg_left m1 he1,
-      mul_le_mul_of_nonneg_left m2 he2]
-  have herr := woop_t_err_total_model_tight e0 e1 e2 (z v0) (z v1) (z v2) M a0
-    he0 he1 he2 M0 M1 M2 hM ha0 hAa0 hηa hD
-  have ht : m - (29.1 * model.u * M + 49 * eta * (1 + M) / a0 + eta) ≤
-      model.fl (model.fl (model.fl (model.fl (e0 * z v0) + model.fl (e1 * z v1)) +
-        model.fl (e2 * z v2)) / model.fl (model.fl (e0 + e1) + e2)) := by
-    have := (abs_le.1 herr).1
-    linarith
-  have hfin : m - 30 * model.u * M + 3 * eta ≤
-      m - (29.1 * model.u * M + 49 * eta * (1 + M) / a0 + eta) := by
-    nlinarith [hfit]
-  exact hk.trans (hfin.trans ht)
+  rcases hsign with ⟨a, b, d⟩ | ⟨a, b, d⟩
+  · have hA0pos : a0 ≤ e0 + e1 + e2 := by
+      rwa [abs_of_nonneg (by linarith : 0 ≤ e0 + e1 + e2)] at hA0
+    have hA : 0 < e0 + e1 + e2 := lt_of_lt_of_le ha0 hA0pos
+    have hZ : m ≤ (e0 * z v0 + e1 * z v1 + e2 * z v2) / (e0 + e1 + e2) := by
+      rw [le_div_iff₀ hA]
+      nlinarith [mul_le_mul_of_nonneg_left m0 a, mul_le_mul_of_nonneg_left m1 b,
+        mul_le_mul_of_nonneg_left m2 d]
+    have herr := woop_t_err_total_model_tight e0 e1 e2 (z v0) (z v1) (z v2) M a0
+      a b d M0 M1 M2 hM ha0 hA0pos hηa hD
+    have ht : m - (29.1 * model.u * M + 49 * eta * (1 + M) / a0 + eta) ≤
+        model.fl (model.fl (model.fl (model.fl (e0 * z v0) + model.fl (e1 * z v1)) +
+          model.fl (e2 * z v2)) / model.fl (model.fl (e0 + e1) + e2)) := by
+      have := (abs_le.1 herr).1
+      linarith
+    have hfin : m - 30 * model.u * M + 3 * eta ≤
+        m - (29.1 * model.u * M + 49 * eta * (1 + M) / a0 + eta) := by
+      nlinarith [hfit]
+    exact hk.trans (hfin.trans ht)
+  · have hA0neg : a0 ≤ -(e0 + e1 + e2) := by
+      rwa [abs_of_nonpos (by linarith : e0 + e1 + e2 ≤ 0)] at hA0
+    have hA : e0 + e1 + e2 < 0 := by nlinarith [hA0neg, ha0]
+    have hZ : m ≤ (e0 * z v0 + e1 * z v1 + e2 * z v2) / (e0 + e1 + e2) := by
+      rw [le_div_iff_of_neg hA]
+      have h1 := mul_le_mul_of_nonpos_left m0 a
+      have h2 := mul_le_mul_of_nonpos_left m1 b
+      have h3 := mul_le_mul_of_nonpos_left m2 d
+      linarith
+    have herr := woop_t_err_total_model_tight_neg e0 e1 e2 (z v0) (z v1) (z v2) M a0
+      a b d M0 M1 M2 hM ha0 hA0neg hηa hD
+    have ht : m - (29.1 * model.u * M + 49 * eta * (1 + M) / a0 + eta) ≤
+        model.fl (model.fl (model.fl (model.fl (e0 * z v0) + model.fl (e1 * z v1)) +
+          model.fl (e2 * z v2)) / model.fl (model.fl (e0 + e1) + e2)) := by
+      have := (abs_le.1 herr).1
+      linarith
+    have hfin : m - 30 * model.u * M + 3 * eta ≤
+        m - (29.1 * model.u * M + 49 * eta * (1 + M) / a0 + eta) := by
+      nlinarith [hfit]
+    exact hk.trans (hfin.trans ht)
 
 end ExactPrune
 end LightRT.BVH
