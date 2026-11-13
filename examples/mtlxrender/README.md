@@ -59,6 +59,8 @@ CUDA backend implements the same three ops with no integrator change.
 
 - `--backend cpu` *(default)*: the recursive, tiled, multi-threaded path tracer
   (`pathtrace.c`) — full NEE+MIS, subsurface, etc.
+- `--backend cpu-wavefront`: the wavefront integrator with CPU ray queries,
+  useful for checking the same shading path without a Vulkan device.
 - `--backend vk`: a **wavefront** integrator (`pathtrace_wf.c`) that issues ray
   *batches* (camera / shadow / bounce) and traces them on the GPU via
   `lrt_vk_trace_scene` (LightRT's Vulkan BVH trace). **Shading stays on the CPU

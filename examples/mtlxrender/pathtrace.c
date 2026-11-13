@@ -150,6 +150,7 @@ static v3 trace_path(const Scene *s, const MtlxDoc *doc, const MaterialBinding *
         HitInfo hi;
         fill_hit(s, bind, &ray, &hit, &hi);
         v3 wo = v3_neg(dir);
+        ctx.V = wo; /* surface-to-view direction for MaterialX nodes and EDFs */
 
         ctx.uv[0] = hi.uv[0]; ctx.uv[1] = hi.uv[1];
         ctx.P = hi.P;

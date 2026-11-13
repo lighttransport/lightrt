@@ -133,6 +133,7 @@ static void shade_range(ShadeJob *j, int k0, int k1, MtlxValue *memo, char *memo
         HitInfo hi;
         fill_hit(j->s, j->bind, &p->ray, hit, &hi);
         v3 wo = v3_neg(dir);
+        ctx.V = wo; /* surface-to-view direction for MaterialX nodes and EDFs */
         ctx.uv[0] = hi.uv[0]; ctx.uv[1] = hi.uv[1];
         ctx.P = hi.P; ctx.Ns = hi.Ns; ctx.Ng = hi.Ng;
         ctx.dpdu = hi.dpdu; ctx.dpdv = v3_cross(hi.Ns, hi.dpdu);
