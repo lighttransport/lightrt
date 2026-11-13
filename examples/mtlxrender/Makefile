@@ -77,6 +77,7 @@ test: mtlxrender conductor_mixture conductor_response node_truth white_furnace b
 	./texture_sampling texture-sampling.ppm
 	./volume_lobes
 	python3 tests/viewdirection_render.py
+	python3 tests/conductor_anisotropic_render.py
 
 test-viewdirection: mtlxrender
 	python3 tests/viewdirection_render.py
@@ -174,3 +175,6 @@ conductor_response: tests/conductor_response.c bsdf.c bsdf.h mtlx_eval.h vecmath
 
 conductor_mixture: tests/conductor_mixture.c tests/texture_stub.c mtlx_doc.c mtlx_xml.c mtlx_eval.c color.c bsdf.c
 	$(CC) $(CSTD) -O2 -D_POSIX_C_SOURCE=200809L -I. -Itests -o $@ $^ -lm
+
+test-conductor-anisotropic: mtlxrender
+	python3 tests/conductor_anisotropic_render.py
