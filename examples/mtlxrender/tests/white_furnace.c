@@ -281,6 +281,46 @@ int main(void) {
     printf("PASS: OpenPBR sample estimate matches quadrature\n");
   }
 
+  /* The reflection-only quadrature above cannot cover the transmitted
+   * hemisphere. Estimate full-interface energy directly, counting rejected
+   * samples as zero, for both sides and several roughness/view angles. */
+  {
+    FurnaceCase c = {"transmission", 0, 0, 0, 0, 0, 1, 0};
+    const v3 n = {0, 0, 1};
+    const float roughness[] = {0.02f, 0.4f, 0.7f};
+    const float cosines[] = {0.3f, 0.7f, 1.0f};
+    const int count = 500000;
+    for (int side = 0; side < 2; ++side) {
+      for (int ri = 0; ri < 3; ++ri) {
+        for (int vi = 0; vi < 3; ++vi) {
+          OpenPBRParams p; set_defaults(&p, &c);
+          p.openpbr_coat_remap = 1; p.base_weight = 0; p.transmission = 1;
+          p.specular_ior = 1.6f; p.specular_roughness = roughness[ri];
+          const float mu = cosines[vi];
+          const v3 wo = v3_make(sqrtf(1.0f - mu * mu), 0, side ? -mu : mu);
+          pcg32 rng; pcg32_seed(&rng, 341 + vi, 98 + ri + side);
+          double sum = 0;
+          for (int i = 0; i < count; ++i) {
+            BsdfSample sample;
+            if (bsdf_sample(&p, n, wo, &rng, &sample)) {
+              if (!v3_is_finite(sample.throughput) || sample.throughput.x < 0 ||
+                  sample.throughput.y < 0 || sample.throughput.z < 0) {
+                fprintf(stderr, "FAIL: nonfinite or negative glass throughput\n"); return 1;
+              }
+              sum += sample.throughput.x;
+            }
+          }
+          const double energy = sum / count;
+          if (energy > 1.05 || energy < 0.55 || (ri == 0 && energy < 0.95)) {
+            fprintf(stderr, "FAIL: glass furnace side=%d rough=%g view=%g energy=%g\n",
+                    side, roughness[ri], mu, energy); return 1;
+          }
+        }
+      }
+    }
+    printf("PASS: OpenPBR glass furnace across both sides and roughness\n");
+  }
+
   // Sweep the principal base/specular controls so the furnace bound also
   // covers combinations between the named material fixtures above.
   const v3 sweep_colors[] = {
