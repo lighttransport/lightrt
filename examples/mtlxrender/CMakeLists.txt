@@ -139,3 +139,8 @@ if(Python3_Interpreter_FOUND)
         COMMAND ${CMAKE_COMMAND} -E env MTLXRENDER_BINARY=$<TARGET_FILE:mtlxrender>
                 ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/viewdirection_render.py)
 endif()
+
+add_executable(conductor_response tests/conductor_response.c bsdf.c)
+target_include_directories(conductor_response PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(conductor_response PRIVATE m)
+add_test(NAME conductor_response COMMAND conductor_response)
