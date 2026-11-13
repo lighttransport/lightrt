@@ -234,6 +234,22 @@ int main(void) {
   }
   printf("PASS: OpenPBR dielectric and coat furnace cases\n");
   {
+    FurnaceCase c = {"film", 0.5f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0};
+    OpenPBRParams p; set_defaults(&p, &c); p.openpbr_coat_remap = 1;
+    p.thin_film_weight = 1.0f; p.thin_film_thickness = 450.0f; p.thin_film_ior = 1.3f;
+    for (int m = 0; m < 3; ++m) for (int vi = 0; vi < 2; ++vi) {
+      p.metalness = 0.5f * m;
+      v3 energy = integrate(&p, views[vi], 0);
+      if (!v3_is_finite(energy) || energy.x < -tolerance || energy.y < -tolerance ||
+          energy.z < -tolerance || energy.x > 1.0f + tolerance ||
+          energy.y > 1.0f + tolerance || energy.z > 1.0f + tolerance) {
+        fprintf(stderr, "FAIL: OpenPBR film furnace metalness=%g energy=(%g,%g,%g)\n", p.metalness,energy.x,energy.y,energy.z);
+        return 1;
+      }
+    }
+    printf("PASS: OpenPBR film furnace cases\n");
+  }
+  {
     FurnaceCase c = {"coat-sampling", 0.6f, 0.0f, 0.0f, 0.6f, 0.0f, 1.0f, 0};
     OpenPBRParams p; set_defaults(&p, &c); p.openpbr_coat_remap = 1;
     p.specular_roughness = 0.5f; p.coat_roughness = 0.4f;
