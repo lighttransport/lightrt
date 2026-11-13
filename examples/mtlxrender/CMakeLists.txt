@@ -111,7 +111,7 @@ target_link_libraries(volume_lobes PRIVATE m)
 add_test(NAME volume_lobes COMMAND volume_lobes)
 
 add_executable(pixel_filter tests/pixel_filter.c)
-target_include_directories(pixel_filter PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(pixel_filter PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${LIGHTRT_ROOT} ${DEPS} ${TINYEXR}/include)
 target_link_libraries(pixel_filter PRIVATE m)
 add_test(NAME pixel_filter COMMAND pixel_filter)
 
