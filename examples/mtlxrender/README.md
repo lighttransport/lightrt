@@ -195,7 +195,9 @@ ratio and the authored `coat_darkening` amount. OpenPBR also remaps the base
 specular IOR relative to the coat and roughens the base response using the
 MaterialX graph formulas. For nonmetallic OpenPBR without thin film, the base
 uses MaterialX dielectric Fresnel, directional throughput, and GGX energy
-compensation; the coat uses the matching dielectric response. Metallic mixes,
+compensation; the coat uses the matching dielectric response. OpenPBR without
+thin film mixes this dielectric base with the weighted generalized-Schlick metal
+closure, including weighted, tinted, and mixed-metal materials. Thin-film base,
 transmission, and full layered behavior remain approximate.
 
 ### Golden reference renders
