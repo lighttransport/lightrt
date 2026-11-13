@@ -45,6 +45,30 @@ static MtlxValue ev(const char *inner, const char *name, Geo g) {
 
 static Geo geo0(void) { Geo g = { {0.25f, 0.75f}, {1, 2, 3}, {0, 1, 0} }; return g; }
 
+static MtlxValue ev_model_geomprop_default(void) {
+    const char *xml = "<materialx version=\"1.39\"><geompropdef name=\"Pobject\" geomprop=\"position\" type=\"vector3\" space=\"model\"/><nodegraph name=\"t\"><noise3d name=\"n\" type=\"float\"/></nodegraph></materialx>";
+    MtlxDoc *d = mtlx_load_string(xml);
+    if (!d) return (MtlxValue){0};
+    int id = -1;
+    for (int i = 0; i < d->nnode; ++i) {
+        if (!strcmp(d->nodes[i].category, "position")) { id = i; break; }
+    }
+    if (id < 0) { mtlx_free(d); return (MtlxValue){0}; }
+    ShadeContext ctx; memset(&ctx, 0, sizeof(ctx));
+    ctx.doc = d; ctx.has_space_transforms = 1; ctx.P = v3_make(3, 8, 15);
+    for (int i = 0; i < 16; ++i) ctx.model_to_world[i] = ctx.world_to_model[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+    ctx.model_to_world[0] = 2.0f; ctx.model_to_world[5] = 3.0f; ctx.model_to_world[10] = 4.0f;
+    ctx.model_to_world[12] = 1.0f; ctx.model_to_world[13] = 2.0f; ctx.model_to_world[14] = 3.0f;
+    ctx.world_to_model[0] = 0.5f; ctx.world_to_model[5] = 1.0f / 3.0f; ctx.world_to_model[10] = 0.25f;
+    ctx.world_to_model[12] = -0.5f; ctx.world_to_model[13] = -2.0f / 3.0f; ctx.world_to_model[14] = -0.75f;
+    ctx.memo = calloc((size_t)d->nnode, sizeof(MtlxValue));
+    ctx.memo_done = calloc((size_t)d->nnode, 1);
+    MtlxValue result = mtlx_eval_node_test(&ctx, id);
+    free(ctx.memo); free(ctx.memo_done); mtlx_free(d);
+    return result;
+}
+
+
 static MtlxValue ev_space_transform(const char *category, const char *input,
                                     const char *from, const char *to) {
     char xml[1024], buf[2048];
@@ -115,6 +139,7 @@ int main(void) {
     chk3("transformvector model-world", ev_space_transform("transformvector", "1,2,3", "model", "world"), 2.0f, 6.0f, 12.0f);
     chk3("transformnormal model-world", ev_space_transform("transformnormal", "0,3,4", "model", "world"), 0.0f, 0.70710678f, 0.70710678f);
     chk3("transformnormal same-space", ev_space_transform("transformnormal", "0,3,4", "model", "model"), 0.0f, 0.6f, 0.8f);
+    chk3("defaultgeomprop model-space", ev_model_geomprop_default(), 1.0f, 2.0f, 3.0f);
 
     /* ---- math: binary (definition = the operation) ---- */
     chk1("add",        ev(BIN("add","2","3"), "n", g).v[0], 5.0f);
