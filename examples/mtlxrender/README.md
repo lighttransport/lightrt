@@ -191,8 +191,10 @@ a grazing-angle energy excess in the diffuse-plus-specular response; the BSDF no
 uses the authored specular weight as its grazing reflectance and attenuates
 diffuse/subsurface energy by the view-direction Fresnel response. OpenPBR coat
 darkening uses the graph's per-channel `(1 - Kcoat) / (1 - Ebase * Kcoat)`
-ratio and the authored `coat_darkening` amount. This remains an approximation of
-the complete MaterialX layered response, especially for coated materials.
+ratio and the authored `coat_darkening` amount. OpenPBR also remaps the base
+specular IOR relative to the coat and roughens the base response using the
+MaterialX graph formulas. This remains an approximation of the complete
+MaterialX layered response, especially for coated materials.
 
 ### Golden reference renders
 
