@@ -22,7 +22,7 @@
 #include "mtlx_eval.h"
 #include "vecmath.h"
 
-static int g_total = 0, g_fail = 0, g_xfail = 0, g_xpass = 0, g_verbose = 0;
+static int g_total = 0, g_fail = 0, g_xfail = 0, g_xpass = 0, g_verbose = 0, g_no_expected = 0;
 static int g_xfail_ids[1024];
 static int g_nxfail = 0;
 
@@ -89,7 +89,8 @@ static void check_eval(int id, const char *body, const char *node, int defined,
             double want[16];
             int nw = parse_payload(payload, want, 16);
             if (!defined) {
-                ok = 1; /* the model gives no value; nothing to compare */
+                ++g_no_expected;
+                ok = 1; /* parsed successfully; no expected value to compare */
             } else if (!strcmp(kind, "num") || !strcmp(kind, "int") || !strcmp(kind, "bool")) {
                 double w = !strcmp(kind, "bool") ? (!strcmp(payload, "true") ? 1.0 : 0.0) : want[0];
                 ok = close_enough(r.v[0], w);
@@ -151,7 +152,7 @@ int main(int argc, char **argv) {
     check_eval(100000 + id, body, node, 1, strchr(payload, ',') ? "agg" : "num", payload);
 #include "generated/mtlx-eval-approx.inc"
 #undef MTLX_EVAL_APPROX
-    printf("lean_vectors: %d vectors, %d failures, %d known differences, %d unexpected passes\n",
-           g_total, g_fail, g_xfail, g_xpass);
+    printf("lean_vectors: %d vectors, %d without expected values, %d failures, %d known differences, %d unexpected passes\n",
+           g_total, g_no_expected, g_fail, g_xfail, g_xpass);
     return (g_fail || g_xpass) ? 1 : 0;
 }
