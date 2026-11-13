@@ -189,7 +189,10 @@ The test also checks that a colored zero-specular Lambert response integrates
 exactly to its base albedo at normal and grazing views. This caught
 a grazing-angle energy excess in the diffuse-plus-specular response; the BSDF now
 uses the authored specular weight as its grazing reflectance and attenuates
-diffuse/subsurface energy by the matching Fresnel response.
+diffuse/subsurface energy by the view-direction Fresnel response. OpenPBR coat
+darkening uses the graph's per-channel `(1 - Kcoat) / (1 - Ebase * Kcoat)`
+ratio and the authored `coat_darkening` amount. This remains an approximation of
+the complete MaterialX layered response, especially for coated materials.
 
 ### Golden reference renders
 
