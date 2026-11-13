@@ -1,7 +1,7 @@
 /* Pointwise regression for LightRT's isolated isotropic dielectric GGX lobe.
  * Expected values are generated from the corresponding Lean implementation
  * model. This checks native evaluator consistency, not complete MaterialX
- * OpenPBR parity (the renderer uses separable Smith visibility). */
+ * OpenPBR parity (only isotropic height-correlated visibility is modeled). */
 #include "bsdf.h"
 
 #include <math.h>
