@@ -619,4 +619,56 @@ theorem woop_t_err_total_model_tight
   exact woop_t_err_total_tight model hu e0 e1 e2 z0 z1 z2 M a0 he0 he1 he2 hM0 hM1 hM2 hM
     a0pos hA0 hηa h0 h1 h2 hs hN hd hDd hD (by simpa [eta] using model_abs_err_total _)
 
+set_option maxHeartbeats 1600000 in
+/-- **Range-free Woop `t` error, nonpositive edge-sign class.** Both the
+    numerator and the denominator flip sign, so the error bound is unchanged;
+    `a0` bounds the absolute exact denominator. -/
+theorem woop_t_err_total_model_tight_neg
+    (e0 e1 e2 z0 z1 z2 M a0 : ℝ) (he0 : e0 ≤ 0) (he1 : e1 ≤ 0) (he2 : e2 ≤ 0)
+    (hM0 : |z0| ≤ M) (hM1 : |z1| ≤ M) (hM2 : |z2| ≤ M) (hM : 0 ≤ M)
+    (a0pos : 0 < a0) (hA0 : a0 ≤ -(e0 + e1 + e2)) (hηa : 4 * eta ≤ a0 / 2)
+    (hD : model.fl (model.fl (e0 + e1) + e2) ≠ 0) :
+    |model.fl (model.fl (model.fl (model.fl (e0 * z0) + model.fl (e1 * z1)) +
+        model.fl (e2 * z2)) / model.fl (model.fl (e0 + e1) + e2)) -
+      (e0 * z0 + e1 * z1 + e2 * z2) / (e0 + e1 + e2)| ≤
+      29.1 * model.u * M + 49 * eta * (1 + M) / a0 + eta := by
+  have flip : ∀ a b : ℝ, model.fl (a + b) = -model.fl (-a + -b) := by
+    intro a b
+    have h := model.neg (a + b)
+    rw [show -(a + b) = -a + -b by ring] at h
+    linarith [h]
+  have flipm : ∀ e z : ℝ, model.fl (e * z) = -model.fl (-e * z) := by
+    intro e z
+    have h := model.neg (e * z)
+    rw [show -(e * z) = -e * z by ring] at h
+    linarith [h]
+  have hD' : model.fl (model.fl (-e0 + -e1) + -e2) ≠ 0 := by
+    intro h
+    apply hD
+    rw [flip (model.fl (e0 + e1)) e2, flip e0 e1, neg_neg, h, neg_zero]
+  have key := woop_t_err_total_model_tight (-e0) (-e1) (-e2) z0 z1 z2 M a0
+    (by linarith) (by linarith) (by linarith) hM0 hM1 hM2 hM a0pos
+    (by linarith) hηa hD'
+  have eqN : model.fl (model.fl (model.fl (e0 * z0) + model.fl (e1 * z1)) + model.fl (e2 * z2)) =
+      -model.fl (model.fl (model.fl (-e0 * z0) + model.fl (-e1 * z1)) + model.fl (-e2 * z2)) := by
+    rw [flip (model.fl (model.fl (e0 * z0) + model.fl (e1 * z1))) (model.fl (e2 * z2)),
+        flip (model.fl (e0 * z0)) (model.fl (e1 * z1)),
+        flipm e0 z0, flipm e1 z1, flipm e2 z2]
+    simp only [neg_neg]
+  have eqD : model.fl (model.fl (e0 + e1) + e2) =
+      -model.fl (model.fl (-e0 + -e1) + -e2) := by
+    rw [flip (model.fl (e0 + e1)) e2, flip e0 e1, neg_neg]
+  have hdiv : model.fl (model.fl (model.fl (model.fl (e0 * z0) + model.fl (e1 * z1)) +
+        model.fl (e2 * z2)) / model.fl (model.fl (e0 + e1) + e2)) =
+      model.fl (model.fl (model.fl (model.fl (-e0 * z0) + model.fl (-e1 * z1)) +
+        model.fl (-e2 * z2)) / model.fl (model.fl (-e0 + -e1) + -e2)) := by
+    rw [eqN, eqD, neg_div_neg_eq]
+  have hEA : (e0 * z0 + e1 * z1 + e2 * z2) / (e0 + e1 + e2) =
+      ((-e0) * z0 + (-e1) * z1 + (-e2) * z2) / ((-e0) + (-e1) + (-e2)) := by
+    rw [show (-e0) * z0 + (-e1) * z1 + (-e2) * z2 = -(e0 * z0 + e1 * z1 + e2 * z2) by ring,
+        show (-e0) + (-e1) + (-e2) = -(e0 + e1 + e2) by ring,
+        neg_div_neg_eq]
+  rw [hdiv, hEA]
+  exact key
+
 end LightRT.Robust
