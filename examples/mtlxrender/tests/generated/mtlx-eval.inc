@@ -1197,3 +1197,7 @@ MTLX_EVAL(1187, "<tiledhexagons name=\"n\" type=\"color3\"><input name=\"texcoor
 MTLX_EVAL(1188, "<tiledhexagons name=\"n\" type=\"color3\"><input name=\"texcoord\" type=\"vector2\" value=\"0.25,0.4\"/><input name=\"size\" type=\"float\" value=\"0.5\"/><input name=\"staggered\" type=\"boolean\" value=\"true\"/></tiledhexagons>", "n", 1, "agg", "0/1,0/1,0/1")
 MTLX_EVAL(1189, "<tiledhexagons name=\"n\" type=\"color3\"><input name=\"texcoord\" type=\"vector2\" value=\"-0.1,-0.1\"/><input name=\"size\" type=\"float\" value=\"0.5\"/><input name=\"staggered\" type=\"boolean\" value=\"true\"/></tiledhexagons>", "n", 1, "agg", "1/1,1/1,1/1")
 MTLX_EVAL(1190, "<tiledhexagons name=\"n\" type=\"color3\"><input name=\"texcoord\" type=\"vector2\" value=\"0.5,0.5\"/><input name=\"size\" type=\"float\" value=\"-0.5\"/></tiledhexagons>", "n", 1, "agg", "0/1,0/1,0/1")
+MTLX_EVAL(1191, "<sqrt name=\"n\" type=\"float\"><input name=\"in\" type=\"float\" value=\"0.390625\"/></sqrt>", "n", 1, "num", "5/8")
+MTLX_EVAL(1192, "<sqrt name=\"n\" type=\"float\"><input name=\"in\" type=\"float\" value=\"6.25\"/></sqrt>", "n", 1, "num", "5/2")
+MTLX_EVAL(1193, "<distance name=\"n\" type=\"float\"><input name=\"in1\" type=\"vector2\" value=\"0,0\"/><input name=\"in2\" type=\"vector2\" value=\"3,4\"/></distance>", "n", 1, "num", "5/1")
+MTLX_EVAL(1194, "<distance name=\"n\" type=\"float\"><input name=\"in1\" type=\"vector3\" value=\"0,0,0\"/><input name=\"in2\" type=\"vector3\" value=\"1,2,2\"/></distance>", "n", 1, "num", "3/1")
