@@ -7,12 +7,13 @@ import tempfile
 from viewdirection_render import OBJ, center_rgb
 
 
-def material(tangent, thickness=0, film_ior=1.5, normal="0,0,1"):
+def material(tangent, thickness=0, film_ior=1.5, normal="0,0,1", retro=False):
     return f'''<materialx version="1.39">
 <conductor_bsdf name="c" type="BSDF">
   <input name="roughness" type="vector2" value="0.1,0.6"/>
   <input name="tangent" type="vector3" value="{tangent}"/>
   <input name="normal" type="vector3" value="{normal}"/>
+  <input name="retroreflective" type="boolean" value="{str(retro).lower()}"/>
   <input name="thinfilm_thickness" type="float" value="{thickness}"/>
   <input name="thinfilm_ior" type="float" value="{film_ior}"/>
 </conductor_bsdf>
@@ -70,7 +71,21 @@ def main():
                 normals.append(center_rgb(root / "frame.png"))
             if max(abs(a-b) for a,b in zip(*normals)) < 3:
                 raise AssertionError(f"{backend}: conductor normals did not affect response: {normals}")
-    print("PASS: tangent, normal and thin film change conductor renders on both CPU integrators")
+            retro_colors = []
+            for retro in (False, True):
+                (root / "material.mtlx").write_text(material("0,1,0", retro=retro))
+                subprocess.run([str(binary), "--obj", str(root / "plane.obj"),
+                    "--mtlx", str(root / "material.mtlx"), "--w", "16", "--h", "16",
+                    "--spp", "1", "--bounces", "1", "--threads", "1",
+                    "--cam-eye", "3,0,4", "--cam-target", "0,0,0", "--hide-env",
+                    "--env-intensity", "0", "--sun", "--sun-az", "45", "--sun-el", "0",
+                    "--sun-intensity", "2", "--backend", backend,
+                    "--out", str(root / "frame.exr"), "--srgb", str(root / "frame.png")],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                retro_colors.append(center_rgb(root / "frame.png"))
+            if max(abs(a-b) for a,b in zip(*retro_colors)) < 3:
+                raise AssertionError(f"{backend}: retroreflection did not affect response: {retro_colors}")
+    print("PASS: tangent, normal, retroreflection and thin film change conductor renders on both CPU integrators")
 
 
 if __name__ == "__main__":
