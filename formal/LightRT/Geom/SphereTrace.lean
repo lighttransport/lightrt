@@ -59,6 +59,25 @@ theorem stTrace_mono {f : ℝ → ℝ} (hf : ∀ t, 0 ≤ f t) (t : ℝ) :
     ∀ n, stTrace f t n ≤ stTrace f t (n + 1) :=
   fun n => stStep_ge (hf _)
 
+/-- **Distance to a point is 1-Lipschitz** (reverse triangle inequality). This
+    is the atom of the Bézier tube-distance function: each sampled point's
+    distance is 1-Lipschitz in `x`, and a minimum over samples inherits it. -/
+theorem dist_point_lipschitz (p x y : ℝ) : abs (abs (x - p) - abs (y - p)) ≤ abs (x - y) := by
+  have h1 : |x - p| ≤ |x - y| + |y - p| := by
+    have : x - p = (x - y) + (y - p) := by ring
+    rw [this]
+    exact abs_add_le (x - y) (y - p)
+  have h2 : |y - p| ≤ |x - y| + |x - p| := by
+    have : y - p = (y - x) + (x - p) := by ring
+    rw [this]
+    have := abs_add_le (y - x) (x - p)
+    rw [abs_sub_comm y x] at this
+    exact this
+  rw [abs_le]
+  constructor
+  · linarith [h1]
+  · linarith [h2]
+
 /-- **Newton step for solving `f x = 0`.** -/
 noncomputable def newtonStep (f : ℝ → ℝ) (x : ℝ) : ℝ := x - f x / deriv f x
 
