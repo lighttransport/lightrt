@@ -53,6 +53,9 @@ CFLAGS  = $(CSTD) $(OPT) $(SIMD) $(DEFS) $(INCLUDES)
 mtlxrender: $(APP_OBJ) $(TP_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+# The shading parameter layout is shared by the app and node tests.
+$(APP_OBJ) $(BUILD)/node_truth.o: mtlx_eval.h
+
 # Per-node numeric ground-truth tests (reuses the app object files).
 TEST_DEPS = $(BUILD)/node_truth.o $(BUILD)/mtlx_doc.o $(BUILD)/mtlx_xml.o \
             $(BUILD)/mtlx_eval.o $(BUILD)/texture.o $(BUILD)/color.o \
@@ -61,10 +64,11 @@ $(BUILD)/node_truth.o: tests/node_truth.c | $(BUILD)
 	$(CC) $(CFLAGS) $(WARN) -c $< -o $@
 node_truth: $(TEST_DEPS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-test: node_truth white_furnace bsdf_response texture_sampling volume_lobes
+test: node_truth white_furnace bsdf_response eon_response texture_sampling volume_lobes
 	./node_truth
 	./white_furnace
 	./bsdf_response
+	./eon_response
 	./texture_sampling texture-sampling.ppm
 	./volume_lobes
 
@@ -80,6 +84,9 @@ test-white-furnace: white_furnace
 
 bsdf_response: tests/bsdf_response.c bsdf.c bsdf.h mtlx_eval.h vecmath.h tests/generated/bsdf-response.inc
 	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/bsdf_response.c bsdf.c $(LDFLAGS)
+
+eon_response: tests/eon_response.c bsdf.c bsdf.h mtlx_eval.h vecmath.h
+	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/eon_response.c bsdf.c $(LDFLAGS)
 
 test-bsdf-response: bsdf_response
 	./bsdf_response

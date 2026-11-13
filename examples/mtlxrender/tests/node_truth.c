@@ -205,6 +205,25 @@ int main(void) {
 
     /* ---- surface shader -> OpenPBR parameter mapping ground truth ---- */
     { OpenPBRParams p = eval_surf(
+        "<open_pbr_surface name=\"s\" type=\"surfaceshader\">"
+        "<input name=\"base_diffuse_roughness\" type=\"float\" value=\"0.7\"/>"
+        "</open_pbr_surface>", "s");
+      chk1("openpbr.diffuse_rough", p.diffuse_roughness, 0.7f);
+      chk1("openpbr.EON", (float)p.diffuse_energy_compensation, 1.0f); }
+    { OpenPBRParams p = eval_surf(
+        "<standard_surface name=\"s\" type=\"surfaceshader\">"
+        "<input name=\"diffuse_roughness\" type=\"float\" value=\"0.7\"/>"
+        "</standard_surface>", "s");
+      chk1("standard.not_EON", (float)p.diffuse_energy_compensation, 0.0f); }
+    { OpenPBRParams p = eval_surf(
+        "<oren_nayar_diffuse_bsdf name=\"d\" type=\"BSDF\">"
+        "<input name=\"roughness\" type=\"float\" value=\"0.7\"/>"
+        "<input name=\"energy_compensation\" type=\"boolean\" value=\"true\"/>"
+        "</oren_nayar_diffuse_bsdf><surface name=\"s\" type=\"surfaceshader\">"
+        "<input name=\"bsdf\" type=\"BSDF\" nodename=\"d\"/></surface>", "s");
+      chk1("node.EON", (float)p.diffuse_energy_compensation, 1.0f); }
+
+    { OpenPBRParams p = eval_surf(
         "<standard_surface name=\"s\" type=\"surfaceshader\">"
         "<input name=\"base_color\" type=\"color3\" value=\"0.2,0.4,0.6\"/>"
         "<input name=\"metalness\" type=\"float\" value=\"0.7\"/>"
