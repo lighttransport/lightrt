@@ -193,8 +193,10 @@ diffuse/subsurface energy by the view-direction Fresnel response. OpenPBR coat
 darkening uses the graph's per-channel `(1 - Kcoat) / (1 - Ebase * Kcoat)`
 ratio and the authored `coat_darkening` amount. OpenPBR also remaps the base
 specular IOR relative to the coat and roughens the base response using the
-MaterialX graph formulas. This remains an approximation of the complete
-MaterialX layered response, especially for coated materials.
+MaterialX graph formulas. For nonmetallic OpenPBR without thin film, the base
+uses MaterialX dielectric Fresnel, directional throughput, and GGX energy
+compensation; the coat uses the matching dielectric response. Metallic mixes,
+transmission, and full layered behavior remain approximate.
 
 ### Golden reference renders
 
