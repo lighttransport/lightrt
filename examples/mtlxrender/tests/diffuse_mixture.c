@@ -565,9 +565,41 @@ static int openpbr_transmission_ior_checks(void) {
       if(!isfinite(sample.throughput.x) || fabsf(sample.throughput.x-expected)>2e-4f) {
         fprintf(stderr,"FAIL: rough transmission weight side=%d got=%g expected=%g\n",side,sample.throughput.x,expected); return 0;
       }
+      /* Independently recover the VNDF refraction Jacobian and check both
+       * the sample PDF and the evaluable f*cos/pdf weight on each side. */
+      v3 raw=v3_add(wo,v3_scale(sample.wi,1.0f/eta));
+      float raw2=v3_dot(raw,raw), nh=sign*h.z, ih=v3_dot(h,sample.wi);
+      float denom=(1-nh*nh)+a2*nh*nh;
+      float d=a2/(3.14159265358979323846f*denom*denom);
+      float expected_pdf=pg*d*g1*c/nv*fabsf(ih)/(eta*eta*raw2);
+      float evaluated_pdf=0; v3 f=bsdf_eval(&p,n,wo,sample.wi,&evaluated_pdf);
+      if(sample.specular || !(expected_pdf>0) ||
+         fabsf(sample.pdf-expected_pdf)>2e-4f*expected_pdf+1e-6f ||
+         fabsf(evaluated_pdf-expected_pdf)>2e-4f*expected_pdf+1e-6f ||
+         fabsf(f.x*nl/evaluated_pdf-sample.throughput.x)>3e-4f) {
+        fprintf(stderr,"FAIL: rough transmission PDF/eval side=%d sample=%g expected=%g eval=%g\n",
+                side,sample.pdf,expected_pdf,evaluated_pdf); return 0;
+      }
       ++checked;
     }
     if(checked<100) { fprintf(stderr,"FAIL: too few rough transmission samples\n");return 0; }
+  }
+  /* IOR one makes refraction a delta even when roughness is nonzero. */
+  {
+    OpenPBRParams p; openpbr_defaults(&p); p.base_weight=0; p.transmission=1;
+    p.openpbr_coat_remap=1; p.specular_ior=1.5f; p.specular_weight=0;
+    p.specular_roughness=.7f; p.transmission_color=v3_splat(1);
+    pcg32 rng; pcg32_seed(&rng, 19, 23); int found=0;
+    for (int i=0;i<2000 && !found;++i) {
+      BsdfSample sample;
+      if (!bsdf_sample(&p,n,n,&rng,&sample) || !sample.crossed) continue;
+      float pdf=1; v3 f=bsdf_eval(&p,n,n,sample.wi,&pdf);
+      if (!sample.specular || sample.pdf!=1.0f || pdf!=0.0f || v3_maxc(f)!=0.0f) {
+        fprintf(stderr,"FAIL: IOR-one transmission must remain delta\n"); return 0;
+      }
+      found=1;
+    }
+    if (!found) { fprintf(stderr,"FAIL: no IOR-one transmission sample\n"); return 0; }
   }
   /* The coat's authored tint and base-darkening multiplier apply to the
    * transmitting substrate too. Compare paired samples so the coat Fresnel
