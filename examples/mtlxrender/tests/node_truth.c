@@ -253,7 +253,14 @@ int main(void) {
         "<UsdPreviewSurface name=\"s\" type=\"surfaceshader\">"
         "<input name=\"diffuseColor\" type=\"color3\" value=\"0.8,0.2,0.1\"/>"
         "<input name=\"metallic\" type=\"float\" value=\"0.0\"/></UsdPreviewSurface>", "s");
-      chk3("usd.diffuse->base", mv_from(p.base_color), 0.8f, 0.2f, 0.1f); }
+      chk3("usd.diffuse->base", mv_from(p.base_color), 0.8f, 0.2f, 0.1f);
+      chk3("usd.metalness.specular-default", mv_from(p.specular_color), 1.0f, 1.0f, 1.0f); }
+    { OpenPBRParams p = eval_surf(
+        "<UsdPreviewSurface name=\"s\" type=\"surfaceshader\">"
+        "<input name=\"useSpecularWorkflow\" type=\"integer\" value=\"1\"/>"
+        "<input name=\"specularColor\" type=\"color3\" value=\"0.2,0.4,0.6\"/>"
+        "</UsdPreviewSurface>", "s");
+      chk3("usd.specular-workflow.color", mv_from(p.specular_color), 0.2f, 0.4f, 0.6f); }
     { OpenPBRParams p = eval_surf(
         "<disney_principled name=\"s\" type=\"surfaceshader\">"
         "<input name=\"baseColor\" type=\"color3\" value=\"0.3,0.6,0.3\"/>"
