@@ -318,3 +318,13 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   - *Item 4 (SIMD watertight leaf):* per-lane model (`SimdLanes.lean`) done; the ISA/intrinsics semantics gap is a **documented model boundary** (packed ops assumed to be the `FP.Binary32` lane ops), not an axiom. The MT packet path (`tri_packet4_tri` via `tri_isect_det_parallel4`, `LRT_TRI_BITEXACT` scalar order/predicate) is **not exercised by `wtcheck`** (it builds WATERTIGHT_TRI, packets fall back to per-ray). New `formal/tools/mtcheck.c` fuzzes `tri_packet4_tri` vs the scalar per-lane `tri_isect_lane` (fabricated bw=4 block, qNaN/inf/subnormal/special inputs, vertex-aimed mode): 2M blocks / 8M lanes / 642k hits, **0 differences** (added to `make formal`, 500k iterations); this is the empirical check that BITEXACT MT packet == scalar MT. The same reasoning applies to `tri_mt4_decoded_sse` (same det predicate + arithmetic order), not separately fuzzed.
   - *Item 7 (sphere trace and Newton):* `Geom/SphereTrace.lean` proves the 1D no-overshoot/monotonicity core; the distance-to-point 1-Lipschitz atom; and `newton_step_quadratic` (one Newton step squares the error under a Lipschitz Jacobian and bounded inverse). The Bézier *curve* and *patch* signed-distance models are not yet formalized; patch/NURBS remain adjudicated by `primhitcheck` (item 16 decision).
   - *Decisions (mirroring resume-lean.md):* 3b deferred; 3c out of scope; item 4 ISA gap = model boundary; item 7 full-2D Newton is the next formalization item (7b-1 `Geom/Newton2D.lean`, 7b-2 `Geom/BezNewton.lean`), then the 3D `Metric.infDist` no-overshoot (`Geom/SphereTrace3.lean`).
+- **M22 (addendum):** the full 2D Newton quadratic contraction (resume-lean
+  item 7b-1) is proved as `Geom/Newton2D.lean`: general `C2`
+  `F : ℝ² → ℝ²` with second-derivative bound `K`, `|det J(x)| ≥ δ > 0` (the C's
+  own acceptance guard), `K·|e|₁ ≤ B`, `|partials| ≤ B` at both points — then
+  one Newton step `x' = x - J(x)⁻¹F(x)` has `|x'_i - x*_i| ≤ (10BK/δ)·|e|₁²`
+  (first component) and `≤ (8BK·|e|₁² + 2B²|e|)/δ` (second; the `2B²E` term is
+  the same-point partial-product contribution, unavoidable without more
+  hypotheses). The file also has `residual_bound` (`|R| ≤ 3K‖e‖₁²`) and
+  `pd1/pd2_diff_bound` (`|Δpartials| ≤ K‖e‖₁`). `tri_bez_newton`
+  instantiation is the remaining step (7b-2).
