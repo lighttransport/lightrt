@@ -1,9 +1,11 @@
 # LightRT Lean formalization: remaining items and resume prompt
 
-State as of 2026-11-13, branch `formal-lean` at `a4d92b6` (18 commits on top of
+State as of 2026-11-14, branch `formal-lean` at `fb9ec29` (26 commits on top of
 `7fd2bf7`). Nothing is pushed. The plan and history are in `formal/PLAN.md`
 (milestones M1–M21); repo guidance is in `CLAUDE.md`, section "Formal
 verification".
+See also the PLAN entries for the negative-key / tighter-key / `hp_subpatch`
+decisions and item-3's `tlas_dil_origins` `1e-37` floor.
 
 ## Current state
 
@@ -78,38 +80,63 @@ pattern): `clang --target=aarch64-linux-gnu --sysroot=/usr/aarch64-linux-gnu
   `quot_bounds_total(_tight)` / `woop_t_err_total(_model)(_tight)` (full
   range-free Woop `t` error, `η/a0` slack); `BVH/ExactPruneTotal.lean`
   `key_le_total` and `woop_key_le_t_total_model` (the C `EXACT_NEAREST`
-  call-site instantiation, positive edge-sign class).
+  call-site instantiation, now both edge-sign classes, `hsign`,
+  `a0 ≤ |e0+e1+e2|`).
+- 7: `Geom/SphereTrace.lean` now also proves the distance-to-point
+  1-Lipschitz atom and the one-Newton-step quadratic contraction
+  (`newton_step_quadratic`). Full 2D Newton and the Bézier signed-distance
+  model remain (PLAN M14/M15).
+
+Explicitly deferred/recorded (see PLAN.md):
+- 3b: range-free Möller–Trumbore `t` error bound — out of scope. The TLAS
+  world-hit incidence theorem instantiates `ε := woop_t_err` (watertight BLAS
+  only); MT scenes are unsupported by it.
+- 3c: `tlas_instance_margin`'s fp64 `ρ/σ` bound — unproved, covered by
+  `tlascheck` empirically.
+- 4: ISA/intrinsics semantics gap — documented model boundary (packed ops are
+  `FP.Binary32` lane ops); exhaustively checked for this kernel by
+  `wtcheck`'s leaf fuzz (incl. SVE 8/16), not an axiom.
 
 ## Remaining items
 
 ### Proofs (Lean), large
 
-3. **Rounding-model hypotheses (core done).** `FP/TotalErr.lean` gives the
-   range-free primitive bound and `Robust/Total.lean` the full range-free Woop
-   `t` bound (`woop_t_err_total_model`), with `η/a0` slack. Remaining:
-   instantiate the ranges for the C call sites (slab/MT too), and the `1e-37`
-   floor in `tlas_instance_margin`.
-4. **A refinement proof for the SIMD watertight leaf (model started).**
-   `C/Proofs/SimdLanes.lean` gives the per-lane model: packed lane ops,
-   `vWoopK` mirroring `Ref.woopK` (same order, no FMA), `vWoopK_lane`
-   (lane `i` = scalar reference), and the driver fold with `blockBest_sound` /
-   `blockBest_all_skip` / `blockBest_woop`. Remaining: the ISA/intrinsics
-   semantics (the model assumes packed ops are `FP.Binary32` lane ops), and
-   `BITEXACT` SIMD == scalar for MT.
+3. **Rounding-model hypotheses (done for Woop/key; slab partial).** Woop `t`
+   error and the `EXACT_NEAREST` key are range-free (both sign classes).
+   Remaining authorized work: 3a, the range-free slab chain (`fpT_rel` /
+   `slab_t_err` / `slab_t_err_fma` / `slab_no_false_miss` against
+   `model_abs_err_total`). 3b (MT error bound) is **deferred** by decision;
+   3c (`tlas_instance_margin` fp64) is **out of scope** — `tlascheck` covers it.
+   The `1e-37` dilation floor is proved (`fl_add_margin_ge`/`fl_sub_margin_le`).
+4. **A refinement proof for the SIMD watertight leaf (model done; ISA gap
+   recorded).** `C/Proofs/SimdLanes.lean` gives the per-lane model (packed lane
+   ops, `vWoopK` mirroring `Ref.woopK`, `vWoopK_lane`, `blockBest_*`). The
+   ISA/intrinsics semantics is a documented model boundary (see PLAN.md), not
+   an axiom; `wtcheck`'s leaf fuzz (400k blocks / 2.7M lanes, incl. SVE 8/16) is
+   the empirical check. Remaining: `BITEXACT` SIMD == scalar for MT (pending
+   check whether a SIMD MT kernel exists; otherwise record the decision).
 7. **Curve, patch and point hit correctness (started).** `Geom/Hull.lean`
-   proves box containment; `Geom/SphereTrace.lean` now proves the 1D core of
-   the first-contact argument (1-Lipschitz `f`: no overshoot of a surface
-   point, monotone trace). Remaining: the full Bézier signed-distance model and
-   the Newton refinement; patch/NURBS still measured against `primhitcheck`.
+   proves box containment; `Geom/SphereTrace.lean` proves the 1D no-overshoot
+   core, the distance-to-point 1-Lipschitz atom, and
+   `newton_step_quadratic`. Remaining (in order):
+   - 7b-1 `Geom/Newton2D.lean`: general 2D Newton quadratic contraction.
+   - 7b-2 `Geom/BezNewton.lean`: Bézier specialization of the `F(u, t)` system
+     (`tri_bez_newton`), full 2D — Jacobian entries as polynomial sums,
+     conditional on the determinant side condition; final contraction corollary.
+   - 7a `Geom/SphereTrace3.lean`: 3D no-overshoot via `Metric.infDist`
+     (`lipschitz_infDist_pt`).
+   Patch/NURBS stay measured against `primhitcheck` (item 16 decision).
 
 ## Resuming prompt
 
 > Continue the LightRT Lean formalization on branch `formal-lean` in
 > `/mnt/nvme02/work/lightrt`. Read `resume-lean.md` and `formal/PLAN.md`
 > (M14–M21) first. Run `make formal` to confirm the baseline (0 sorry, all
-> checks PASS). Then work through the three remaining large items: 3
-> (range-free slab/MT/Woop bounds from `model_abs_err_total`), 4 (per-lane
-> SIMD refinement), 7 (Bézier first-contact model). For every C change: keep
+> checks PASS). Remaining large items: 3a (range-free slab chain), 4
+> (BITEXACT SIMD == scalar for MT; ISA boundary recorded), 7 (Bézier/patch
+> first-contact: full 2D Newton, Then 3D `infDist` sphere-trace). 3b (MT
+> error bound) and 3c (`tlas_instance_margin` fp64) are **deferred/out of
+> scope** by decision; do not attempt them. For every C change: keep
 > SIMD bit-identical to scalar (`wtcheck`, incl. the SVE leaf fuzz under
 > qemu), rerun `make formal`, the C suites (`make c_tri_test c_tri_seam_test
 > c_tri_parallel_test`, plus `tests/test_lightrt_c_quadtetra.c` and
