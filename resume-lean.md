@@ -101,6 +101,11 @@ Explicitly deferred/recorded (see PLAN.md):
   `BITEXACT` SIMD == scalar for MT: new `formal/tools/mtcheck.c` fuzzes
   `tri_packet4_tri` vs the scalar per-lane `tri_isect_lane` — 2M blocks /
   8M lanes / 642k hits, 0 differences (`make formal` gate, 500k iterations).
+  Item 3b (range-free MT `t` error bound): `Robust/MTTotal.lean` proves the
+  leaf bounds (`fl_mul_err_total`, `fl_mul_ops_err_total`, `fl_sub/add_err_total`,
+  `fl_abs_le`, `eta_eq_def`) with no `InRange`; the composition
+  `mt_t_fl_err_total` is **not proved** (elaboration too costly; MT is not
+  watertight, so a `t` bound would buy no conservativity anyway).
 
 ## Remaining items
 

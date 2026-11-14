@@ -339,3 +339,16 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   (front-facing/simple contacts) and the `E ≤ B/K` ball establishment.
   Until those are done, 7b-1's `newton2_step_quadratic` is the
   contraction core to instantiate.
+
+- **M22 (addendum 3):** item 3b (range-free Möller–Trumbore `t` error
+  bound): leaf bounds proved in new `Robust/MTTotal.lean` — `fl_sub_err_total` /
+  `fl_add_err_total`, `fl_abs_le`, `fl_mul_err_total` (`|fl(fl a·fl b) − a·b| ≤
+  7uAB + 9η(A+B+1)`), `fl_mul_ops_err_total` (product of operands each with an
+  absolute operand error), `add2_fl_err_total` / `sub2_fl_err_total` (later
+  removed to keep build times sane; the cross-product component lemma
+  `cross2_fl_err_total` was likewise dropped), no `InRange` anywhere.
+  **Not done**: the composition `mt_t_fl_err_total` — the per-declaration
+  elaboration cost of the multi-stage tree in this toolchain is prohibitive,
+  and MT is not watertight so a `t` bound would buy no conservativity anyway.
+  The verified pieces stand as the bound toolkit for the Woop-style analysis;
+  `mtcheck` remains the empirical check. `LightRT.lean` imports the module.
