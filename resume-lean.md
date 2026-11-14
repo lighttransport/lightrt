@@ -82,6 +82,8 @@ pattern): `clang --target=aarch64-linux-gnu --sysroot=/usr/aarch64-linux-gnu
   `key_le_total` and `woop_key_le_t_total_model` (the C `EXACT_NEAREST`
   call-site instantiation, now both edge-sign classes, `hsign`,
   `a0 ≤ |e0+e1+e2|`).
+- 3a: `Robust/SlabTotal.fpT_abs_err_total` — range-free error bound for one
+  scalar slab parameter (`fl(fl(x−o)·fl(1/d))`), no `InRange`.
 - 7: `Geom/SphereTrace.lean` now also proves the distance-to-point
   1-Lipschitz atom and the one-Newton-step quadratic contraction
   (`newton_step_quadratic`). Full 2D Newton and the Bézier signed-distance
@@ -104,13 +106,17 @@ Explicitly deferred/recorded (see PLAN.md):
 
 ### Proofs (Lean), large
 
-3. **Rounding-model hypotheses (done for Woop/key; slab partial).** Woop `t`
+3. **Rounding-model hypotheses (done for Woop/key/slab bounds).** Woop `t`
    error and the `EXACT_NEAREST` key are range-free (both sign classes).
-   Remaining authorized work: 3a, the range-free slab chain (`fpT_rel` /
-   `slab_t_err` / `slab_t_err_fma` / `slab_no_false_miss` against
-   `model_abs_err_total`). 3b (MT error bound) is **deferred** by decision;
-   3c (`tlas_instance_margin` fp64) is **out of scope** — `tlascheck` covers it.
-   The `1e-37` dilation floor is proved (`fl_add_margin_ge`/`fl_sub_margin_le`).
+   `Robust/SlabTotal.lean` now proves the range-free scalar slab-parameter
+   error bound `fpT_abs_err_total` (`|fpT − q/d| ≤ 4u|q/d| + 4(1+u)(|q| +
+   |1/d|)η + 2(1+u)η² + η`, no `InRange`). 3b (MT error bound) is **deferred**
+   by decision; 3c (`tlas_instance_margin` fp64) is **out of scope** —
+   `tlascheck` covers it. The `1e-37` dilation floor is proved
+   (`fl_add_margin_ge`/`fl_sub_margin_le`); a range-free `slab_no_false_miss`
+   needs a non-degeneracy floor and is not attempted (tangent rays admit no
+   absolute-error-dominating `K`). `fpT_rel`/`slab_t_err_fma` keep their
+   `InRange` versions.
 4. **A refinement proof for the SIMD watertight leaf (model done; ISA gap
    recorded).** `C/Proofs/SimdLanes.lean` gives the per-lane model (packed lane
    ops, `vWoopK` mirroring `Ref.woopK`, `vWoopK_lane`, `blockBest_*`). The
