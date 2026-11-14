@@ -328,3 +328,14 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   hypotheses). The file also has `residual_bound` (`|R| ≤ 3K‖e‖₁²`) and
   `pd1/pd2_diff_bound` (`|Δpartials| ≤ K‖e‖₁`). `tri_bez_newton`
   instantiation is the remaining step (7b-2).
+- **M22 (addendum 2):** 7b-2 (Bézier specialization of the 2D Newton) is
+  **deferred**, not attempted this pass. The remaining work is large and
+  specific: (i) polynomial differentiability bounds for the stationarity
+  `f = ⟨R, C′⟩ + r·r′` (tractable via Mathlib's polynomial/`deriv` API) and
+  (ii) for `g(u, t) = |R| - r(u)`, `R = o + t·d − C(u)` — `g` is not
+  polynomial (involves `√`); second derivatives need Mathlib's `deriv` of
+  `sqrt` machinery plus an explicit second bound, and a
+  `C2Seg`-bundle packaging, and (iii) the `δ ≤ |det J|` side condition
+  (front-facing/simple contacts) and the `E ≤ B/K` ball establishment.
+  Until those are done, 7b-1's `newton2_step_quadratic` is the
+  contraction core to instantiate.

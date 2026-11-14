@@ -129,9 +129,13 @@ Explicitly deferred/recorded (see PLAN.md):
    core, the distance-to-point 1-Lipschitz atom, and
    `newton_step_quadratic`. Remaining (in order):
    - 7b-1 `Geom/Newton2D.lean`: general 2D Newton quadratic contraction.
+     **Done** (`residual_bound`, `pd1/pd2_diff_bound`, `newton2_step_quadratic`;
+     note the honest `2 B² E` term for the second component in absence of a
+     `B ≤ K E`-style extra hypothesis; with `B ≤ K·E` the constant is
+     `(10 B K/δ) E²` for both).
    - 7b-2 `Geom/BezNewton.lean`: Bézier specialization of the `F(u, t)` system
-     (`tri_bez_newton`), full 2D — Jacobian entries as polynomial sums,
-     conditional on the determinant side condition; final contraction corollary.
+     (`tri_bez_newton`): Jacobian entries as polynomial sums, conditional on
+     the determinant side condition; final contraction corollary.
    - 7a `Geom/SphereTrace3.lean`: 3D no-overshoot via `Metric.infDist`
      (`lipschitz_infDist_pt`).
    Patch/NURBS stay measured against `primhitcheck` (item 16 decision).
