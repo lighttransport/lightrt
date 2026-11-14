@@ -96,6 +96,9 @@ Explicitly deferred/recorded (see PLAN.md):
 - 4: ISA/intrinsics semantics gap — documented model boundary (packed ops are
   `FP.Binary32` lane ops); exhaustively checked for this kernel by
   `wtcheck`'s leaf fuzz (incl. SVE 8/16), not an axiom.
+  `BITEXACT` SIMD == scalar for MT: new `formal/tools/mtcheck.c` fuzzes
+  `tri_packet4_tri` vs the scalar per-lane `tri_isect_lane` — 2M blocks /
+  8M lanes / 642k hits, 0 differences (`make formal` gate, 500k iterations).
 
 ## Remaining items
 
@@ -113,8 +116,8 @@ Explicitly deferred/recorded (see PLAN.md):
    ops, `vWoopK` mirroring `Ref.woopK`, `vWoopK_lane`, `blockBest_*`). The
    ISA/intrinsics semantics is a documented model boundary (see PLAN.md), not
    an axiom; `wtcheck`'s leaf fuzz (400k blocks / 2.7M lanes, incl. SVE 8/16) is
-   the empirical check. Remaining: `BITEXACT` SIMD == scalar for MT (pending
-   check whether a SIMD MT kernel exists; otherwise record the decision).
+   the empirical check for the watertight kernel, and the new `mtcheck`
+   fuzz (`make formal` gate) covers the BITEXACT MT packet path vs scalar.
 7. **Curve, patch and point hit correctness (started).** `Geom/Hull.lean`
    proves box containment; `Geom/SphereTrace.lean` proves the 1D no-overshoot
    core, the distance-to-point 1-Lipschitz atom, and
