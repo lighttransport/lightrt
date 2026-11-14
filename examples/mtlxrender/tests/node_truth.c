@@ -45,14 +45,17 @@ static MtlxValue ev(const char *inner, const char *name, Geo g) {
 
 static Geo geo0(void) { Geo g = { {0.25f, 0.75f}, {1, 2, 3}, {0, 1, 0} }; return g; }
 
-static int test_texcoord_set(void *user, int index, float out_uv[2]) {
+static int test_texcoord_set(void *user, int index, int probe_axis,
+                             float out_uv[2]) {
     (void)user;
     if (index != 1) return 0;
     out_uv[0] = 0.375f; out_uv[1] = 0.625f;
+    if (probe_axis == 1) { out_uv[0] += 0.05f; out_uv[1] += 0.01f; }
+    if (probe_axis == 2) { out_uv[0] -= 0.02f; out_uv[1] += 0.04f; }
     return 1;
 }
 
-static MtlxValue ev_indexed_geomprop_default(int index) {
+static MtlxValue ev_indexed_geomprop_default(int index, int probe_axis) {
     char xml[512];
     snprintf(xml, sizeof(xml), "<materialx version=\"1.39\"><geompropdef name=\"UV0\" geomprop=\"texcoord\" type=\"vector2\" index=\"%d\"/><nodegraph name=\"t\"><image name=\"img\" type=\"color3\"><input name=\"file\" type=\"filename\" value=\"unused.png\"/></image></nodegraph></materialx>", index);
     MtlxDoc *d = mtlx_load_string(xml);
@@ -65,6 +68,7 @@ static MtlxValue ev_indexed_geomprop_default(int index) {
     ShadeContext ctx; memset(&ctx, 0, sizeof(ctx));
     ctx.doc = d; ctx.uv[0] = 0.1f; ctx.uv[1] = 0.2f;
     ctx.texcoord = test_texcoord_set;
+    ctx.texcoord_probe_axis = probe_axis;
     ctx.memo = calloc((size_t)d->nnode, sizeof(MtlxValue));
     ctx.memo_done = calloc((size_t)d->nnode, 1);
     MtlxValue result = mtlx_eval_node_test(&ctx, id);
@@ -167,8 +171,10 @@ int main(void) {
     chk3("transformnormal model-world", ev_space_transform("transformnormal", "0,3,4", "model", "world"), 0.0f, 0.70710678f, 0.70710678f);
     chk3("transformnormal same-space", ev_space_transform("transformnormal", "0,3,4", "model", "model"), 0.0f, 0.6f, 0.8f);
     chk3("defaultgeomprop model-space", ev_model_geomprop_default(), 1.0f, 2.0f, 3.0f);
-    chk3("defaultgeomprop texcoord index", ev_indexed_geomprop_default(1), 0.375f, 0.625f, 0.0f);
-    chk3("defaultgeomprop UV0 fallback", ev_indexed_geomprop_default(2), 0.1f, 0.2f, 0.0f);
+    chk3("defaultgeomprop texcoord index", ev_indexed_geomprop_default(1, 0), 0.375f, 0.625f, 0.0f);
+    chk3("indexed texcoord x probe", ev_indexed_geomprop_default(1, 1), 0.425f, 0.635f, 0.0f);
+    chk3("indexed texcoord y probe", ev_indexed_geomprop_default(1, 2), 0.355f, 0.665f, 0.0f);
+    chk3("defaultgeomprop UV0 fallback", ev_indexed_geomprop_default(2, 0), 0.1f, 0.2f, 0.0f);
 
     /* ---- math: binary (definition = the operation) ---- */
     chk1("add",        ev(BIN("add","2","3"), "n", g).v[0], 5.0f);

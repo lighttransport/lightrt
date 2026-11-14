@@ -556,6 +556,7 @@ static int coordinate_graph_gradients(ShadeContext *ctx, const MtlxInput *input,
         ShadeContext sample = *ctx;
         sample.memo = memo;
         sample.memo_done = done;
+        sample.texcoord_probe_axis = axis;
         if (axis && ctx->has_uv_derivatives) {
             const float *delta = axis == 1 ? ctx->uv_dx : ctx->uv_dy;
             sample.uv[0] += delta[0]; sample.uv[1] += delta[1];
@@ -651,10 +652,12 @@ static MtlxValue eval_image(ShadeContext *ctx, const MtlxNode *n) {
                 const int direct_uv = !strcmp(src->category, "texcoord") &&
                     src->type == MV_VEC2 && !tc->channels &&
                     (!tc->src_output || !strcmp(tc->src_output, "out"));
+                const MtlxValue uv_index = in_or(ctx, src, "index", mv_zero(MV_INT));
+                const int indexed_uv = direct_uv && (int)uv_index.v[0] != 0;
                 const int constant = !strcmp(src->category, "constant") &&
                     (!value || (value->src_node < 0 && !value->has_connection));
                 if (constant) dudx = dvdx = dudy = dvdy = 0.0f;
-                else if (!direct_uv && !dynamic_tiling)
+                else if ((!direct_uv || indexed_uv) && !dynamic_tiling)
                     (void)coordinate_graph_gradients(ctx, tc, NULL, &dudx, &dvdx, &dudy, &dvdy);
             }
         }
@@ -1096,7 +1099,8 @@ static MtlxValue eval_node(ShadeContext *ctx, int node_id) {
             float uv[2] = {ctx->uv[0], ctx->uv[1]};
             if (ctx->texcoord) {
                 float sampled[2] = {uv[0], uv[1]};
-                if (ctx->texcoord(ctx->texcoord_user, (int)index.v[0], sampled)) {
+                if (ctx->texcoord(ctx->texcoord_user, (int)index.v[0],
+                                  ctx->texcoord_probe_axis, sampled)) {
                     uv[0] = sampled[0]; uv[1] = sampled[1];
                 }
             }

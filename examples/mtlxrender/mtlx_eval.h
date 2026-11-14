@@ -175,8 +175,10 @@ typedef struct {
     int (*geomprop)(void *user,const char *name,MtlxType type,MtlxValue *out);
     void *geomprop_user;
     /* Optional indexed UV-set sampler used by texcoord nodes. */
-    int (*texcoord)(void *user,int index,float out_uv[2]);
+    int (*texcoord)(void *user,int index,int probe_axis,float out_uv[2]);
     void *texcoord_user;
+    /* 0 evaluates the texcoord at the shading point; 1/2 request x/y probes. */
+    int texcoord_probe_axis;
     /* per-shade-point memo (size doc->nnode) */
     MtlxValue *memo;
     char      *memo_done;
