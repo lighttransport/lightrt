@@ -159,16 +159,23 @@ c_tri_test: $(C_TRI_TEST_SRC)
 	@echo "Built lightrt_c_tri_test (run: ./lightrt_c_tri_test)"
 
 # Seam (watertightness) test of the main triangle leaf: default build reports the
-# Moller-Trumbore leak count; the _wt build (-DLRT_TRI_WATERTIGHT_TRI) requires 0.
+# Moller-Trumbore leak count (-DLRT_TRI_NO_WATERTIGHT_TRI); the _wt build (the
+# default watertight leaf) requires 0.
 c_tri_seam_test: tests/test_lightrt_c_tri_seam.c lightrt_c_tri.c
-	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -o lightrt_c_tri_seam_test $^ -lm -lpthread
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_NO_WATERTIGHT_TRI -o lightrt_c_tri_seam_test $^ -lm -lpthread
 	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_WATERTIGHT_TRI -o lightrt_c_tri_seam_test_wt $^ -lm -lpthread
 	./lightrt_c_tri_seam_test && ./lightrt_c_tri_seam_test_wt
+
+# Any-hit interleaved pipeline vs per-ray, large cache-cold BVH8 scene
+# (resume-lean item 14; build without watertight so the pipeline is eligible).
+bench_occ: benchmark_c/bench_occ.c lightrt_c_tri.c
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_NO_WATERTIGHT_TRI -o lightrt_bench_occ benchmark_c/bench_occ.c lightrt_c_tri.c -lm -lpthread
+	@echo "Built lightrt_bench_occ (run: ./lightrt_bench_occ [grid] [rays])"
 
 # Axis-parallel rays exactly on box faces, all node formats; the _rb build
 # (robust slab + exact leaf boxes + watertight leaf) requires 0 misses.
 c_tri_parallel_test: tests/test_lightrt_c_tri_parallel.c lightrt_c_tri.c
-	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_NO_SLAB_ROBUST -DLRT_TRI_NO_LEAF_BOX_EXACT -o lightrt_c_tri_parallel_test $^ -lm -lpthread
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_NO_SLAB_ROBUST -DLRT_TRI_NO_LEAF_BOX_EXACT -DLRT_TRI_NO_BITEXACT -DLRT_TRI_NO_WATERTIGHT_TRI -o lightrt_c_tri_parallel_test $^ -lm -lpthread
 	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_SLAB_ROBUST -DLRT_TRI_LEAF_BOX_EXACT -DLRT_TRI_WATERTIGHT_TRI -o lightrt_c_tri_parallel_test_rb $^ -lm -lpthread
 	./lightrt_c_tri_parallel_test && ./lightrt_c_tri_parallel_test_rb
 
@@ -287,7 +294,7 @@ info_cuda:
 	@echo "CUDA_ARCH: $(CUDA_ARCH)"
 	@echo "CUDA_FLAGS: $(CUDA_FLAGS)"
 
-.PHONY: cuda_full_test hip_rtc_test c_tri_parallel_test c_tri_seam_test all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip cuda_test info_cuda formal
+.PHONY: cuda_full_test hip_rtc_test c_tri_parallel_test c_tri_seam_test all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip cuda_test info_cuda formal bench_occ
 
 # Lean 4 formal verification (formal/): build specs+proofs, check the c2lean
 # translation is up to date, the sorry budget, the axiom allowlist, and run
@@ -303,6 +310,10 @@ formal:
 	$(CC) -O1 -ffp-contract=off -msse4.1 -mavx2 -mfma -w -I. -o formal/.lake/tlascheck formal/tools/tlascheck.c -lm -lpthread
 	$(CC) -O1 -ffp-contract=off -msse4.1 -mavx2 -mfma -w -I. -DLRT_TRI_EXACT_NEAREST -o formal/.lake/tlascheck_exn formal/tools/tlascheck.c -lm -lpthread
 	for s in 1 2; do formal/.lake/tlascheck $$s 1000 && formal/.lake/tlascheck_exn $$s 1000 || exit 1; done
+	$(CC) -O1 -ffp-contract=off -msse4.1 -mavx2 -mfma -w -I. -DLRT_TRI_WATERTIGHT_TRI -o formal/.lake/wtcheck formal/tools/wtcheck.c -lm -lpthread
+	formal/.lake/wtcheck 2 3000
+	$(CC) -O1 -ffp-contract=off -msse4.1 -mavx2 -mfma -w -I. -DLRT_TRI_WATERTIGHT_TRI -DLRT_TRI_EXACT_NEAREST -o formal/.lake/wtcheck_exn formal/tools/wtcheck.c -lm -lpthread
+	formal/.lake/wtcheck_exn 2 3000
 	$(CC) -O1 -ffp-contract=off -msse4.1 -mavx2 -mfma -w -I. -o formal/.lake/primboxcheck formal/tools/primboxcheck.c -lm -lpthread
 	for s in 1 2 3; do formal/.lake/primboxcheck $$s formal/.lake > formal/.lake/primboxcheck.log || { cat formal/.lake/primboxcheck.log; exit 1; }; done; tail -n 3 formal/.lake/primboxcheck.log
 	$(CC) -O2 -ffp-contract=off -msse4.1 -mavx2 -mfma -w -I. -o formal/.lake/primhitcheck formal/tools/primhitcheck.c -lm -lpthread

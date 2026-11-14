@@ -619,12 +619,22 @@ struct lrt_tri_scene {
      * NULL otherwise. */
     uint32_t *prim2slot;
 #ifdef LRT_TRI_WATERTIGHT_TRI
-    /* Exact input vertices (9 floats per prim id) for the watertight leaf:
-     * the leaf blocks store rounded edges, so v0+e1 is not v1 and adjacent
-     * triangles would not see a shared vertex identically. Built scenes only
-     * (serialized/mmapped scenes have NULL and fall back to Moller-Trumbore). */
-    float *wverts;
+    /* Exact input vertices for the watertight leaf, SoA per leaf block (10*width
+     * words: v0x[w] v0y[w] v0z[w] v1x.. v2z, then the w prim ids), read by the
+     * SIMD leaves (tri_woop4/8_block) and the scalar lane test alike. Padding
+     * lanes are zero with prim id LRT_TRI_NO_HIT. The MT edge format (v0 e1 e2)
+     * cannot give these back (fl(v1 - v0) + v0 is not v1), so for BVH4/BVH8
+     * scenes the leaf blocks themselves are rewritten to this vertex format and
+     * wblk aliases s->blocks ("vertex-format" scenes, tri_vfmt; the edges are
+     * recomputed as fl(v1 - v0), bit-identical to what the build stored, by
+     * the few readers that need them). BVH16 and mmapped legacy-format files
+     * keep a separate wblk next to edge blocks. */
+    float *wblk;
 #endif
+    /* Node boxes are the exact min/max of the exact (vertex-format) leaf
+     * vertices (LEAF_BOX_EXACT, not SBVH-clipped, not quantized nodes): the
+     * precondition of the pruning EXACT_NEAREST key (ExactPrune.woop_key_le_t). */
+    int wbox_exact;
     uint32_t block_stride; /* bytes per leaf block (varies for quantized leaves) */
     lrt_tri_stats stats;
     const char *kernel_name;
@@ -673,6 +683,80 @@ static inline const float *tri_block_floats(const void *blocks, uint32_t idx,
                            (size_t)idx * tri_block_size(width));
 }
 
+/* Leaf blocks hold exact v0 v1 v2 instead of v0 e1 e2 (watertight scenes). */
+static inline int tri_vfmt(const lrt_tri_scene *s) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    return s->wblk != NULL && s->wblk == (const float *)s->blocks;
+#else
+    (void)s;
+    return 0;
+#endif
+}
+
+#ifdef LRT_TRI_WATERTIGHT_TRI
+/* Scene has a SIMD watertight leaf for its layout (BVH4 SSE / BVH8 AVX2, not
+ * quantized nodes); otherwise the watertight build runs the scalar kernels. */
+#if LRT_TRI_HAS_AVX2
+#define TRI_WBLK_SIMD(s) ((s)->wblk && !(s)->quantized && ((s)->layout == 4 || (s)->layout == 8))
+#elif LRT_TRI_HAS_SSE4
+#if LRT_TRI_HAS_SVE
+#define TRI_WBLK_SIMD(s) ((s)->wblk && !(s)->quantized && \
+                          ((s)->layout == 4 || (s)->layout == 8 || (s)->layout == 16))
+#else
+#define TRI_WBLK_SIMD(s) ((s)->wblk && !(s)->quantized && (s)->layout == 4)
+#endif
+#else
+#define TRI_WBLK_SIMD(s) 0
+#endif
+/* (Re)build the exact vertices from prim-ordered src (9 floats per prim id,
+ * nsrc prims) and the leaf blocks' prim ids. BVH4/BVH8 heap scenes are
+ * converted in place to the vertex format (wblk = blocks); otherwise a
+ * separate wblk is allocated. Returns 0 on OOM or an out-of-range prim id. */
+static int tri_build_wblk(lrt_tri_scene *s, const float *src, size_t nsrc) {
+    if (s->prim_kind != TRI_PRIM_TRI) return 1;
+    int w = s->layout;
+    int inplace = (w == 4 || w == 8) && !s->mem_mapped;
+    for (uint32_t b = 0; b < s->block_count; b++) {
+        const uint32_t *ids =
+            (const uint32_t *)(tri_block_floats(s->blocks, b, w) + 9 * w);
+        for (int l = 0; l < w; l++)
+            if (ids[l] != LRT_TRI_NO_HIT && ids[l] >= nsrc) return 0;
+    }
+    if (inplace) {
+        if (s->wblk && s->wblk != (float *)s->blocks) free(s->wblk);
+        s->wblk = (float *)s->blocks;
+    } else if (!s->wblk || s->wblk == (float *)s->blocks) {
+        s->wblk = (float *)malloc((size_t)s->block_count * 10 * (size_t)w * sizeof(float) + 64);
+        if (!s->wblk) return 0;
+    }
+    for (uint32_t b = 0; b < s->block_count; b++) {
+        const float *f = tri_block_floats(s->blocks, b, w);
+        uint32_t ids[16];
+        memcpy(ids, f + 9 * w, (size_t)w * 4);
+        float *o = &s->wblk[(size_t)b * 10 * w];
+        for (int l = 0; l < w; l++) {
+            for (int c = 0; c < 9; c++)
+                o[c * w + l] = ids[l] == LRT_TRI_NO_HIT ? 0.0f : src[(size_t)ids[l] * 9 + c];
+            memcpy(&o[9 * w + l], &ids[l], 4);
+        }
+    }
+    return 1;
+}
+/* Exact vertices of prim id `prim`, prim-ordered, from wblk (its first slot);
+ * for serialization. Missing prims (not in any leaf) stay zero. */
+static void tri_wblk_to_prims(const lrt_tri_scene *s, float *out, size_t nprim) {
+    int w = s->layout;
+    memset(out, 0, nprim * 9 * sizeof(float));
+    for (uint32_t b = 0; b < s->block_count; b++) {
+        const float *o = &s->wblk[(size_t)b * 10 * w];
+        const uint32_t *ids = (const uint32_t *)(o + 9 * w);
+        for (int l = 0; l < w; l++)
+            if (ids[l] != LRT_TRI_NO_HIT && ids[l] < nprim)
+                for (int c = 0; c < 9; c++) out[(size_t)ids[l] * 9 + c] = o[c * w + l];
+    }
+}
+#endif
+
 /* Build the prim_id -> leaf-slot map for a plain triangle scene, so
  * lrt_tri_get_verts can recover object-space vertices from the swizzled leaves.
  * Cheap O(ntris) pass over the leaf blocks; leaves s->prim2slot NULL on any
@@ -711,6 +795,14 @@ int lrt_tri_get_verts(const lrt_tri_scene *s, uint32_t prim_id, float v0[3],
     const float *f = tri_block_floats(s->blocks, blk, w);
     /* Leaves store v0 and the precomputed edges e1=v1-v0, e2=v2-v0 (see
      * tri_emit_leaf); v0 + e is byte-exact for adjacent mesh coords (Sterbenz). */
+    if (tri_vfmt(s)) { /* exact vertices */
+        for (int a = 0; a < 3; a++) {
+            v0[a] = f[a * w + lane];
+            v1[a] = f[(3 + a) * w + lane];
+            v2[a] = f[(6 + a) * w + lane];
+        }
+        return 1;
+    }
     const float v0x = f[0 * w + lane], v0y = f[1 * w + lane], v0z = f[2 * w + lane];
     v0[0] = v0x;
     v0[1] = v0y;
@@ -860,6 +952,7 @@ static inline float tri_maxf(float a, float b) { return a > b ? a : b; }
 #define TRI_CULL_T(best, tmax) (best)
 #define TRI_PUSH_TN(tn, tmin) (tn)
 #endif
+#define TRI_SLAB_K 0x1.00000ap+0f /* 1 + 10u: Robust/Slab.lean ize_constant_sufficient */
 /* Per-axis slab entry: min(tl, th); under LRT_TRI_SLAB_ROBUST the operands are
  * swapped so a NaN plane (parallel ray on it) is dropped (see tri_slab_scalar). */
 #ifdef LRT_TRI_SLAB_ROBUST
@@ -3360,6 +3453,49 @@ typedef struct tri_ray_ctx {
 #endif
 } tri_ray_ctx;
 
+#ifdef LRT_TRI_EXACT_NEAREST
+/* Pruning key for watertight scenes (formal: ExactPrune.woop_key_le_t). The
+ * Woop leaf's t is a weighted mean of the vertex depths
+ * z = fl(sz * fl(v[kz] - o[kz])) along the ray's dominant axis, so every
+ * accepted triangle with its exact vertices in the node box has
+ * t >= m - 16u M, m / M the min depth / max |depth| of the box's two kz faces
+ * (rounding is monotone). The float key fl(m - fl(2^-19 M)) is below that
+ * (key_le), so pushing max(key, tmin) satisfies Flat.run_root's C2 and the
+ * traversal returns exactly the brute-force nearest t while still pruning by
+ * the best hit. The box test itself runs against the fixed tmax (C1, as for
+ * run_exact). Scenes without wbox_exact (MT leaves, SBVH, quantized nodes)
+ * keep pushing tmin (no pruning). */
+typedef struct tri_exn_ctx {
+    int on, kz;
+    float sz, oz;
+} tri_exn_ctx;
+static inline void tri_exn_setup(const lrt_tri_scene *s, const tri_ray_ctx *rc, tri_exn_ctx *x) {
+    const float *d = rc->dir;
+    float a0 = copysignf(d[0], 1.0f), a1 = copysignf(d[1], 1.0f), a2 = copysignf(d[2], 1.0f);
+    int kz = 0;
+    if (a1 > a0) kz = 1;
+    if (a2 > a0 && a2 > a1) kz = 2;
+    x->kz = kz;
+    x->sz = 1.0f / d[kz];
+    x->oz = rc->org[kz];
+    x->on = s->wbox_exact;
+}
+static inline float tri_exn_key(const tri_exn_ctx *x, float lo, float hi, float tmin) {
+    if (!x->on) return tmin;
+    float dl = lo - x->oz, dh = hi - x->oz;
+    float za = x->sz * dl, zb = x->sz * dh;
+    float m = za < zb ? za : zb;
+    float aa = fabsf(za), ab = fabsf(zb);
+    float M = aa > ab ? aa : ab;
+    float key = m - 0x1p-19f * M; /* c = 32u, u = 2^-24 */
+    return key > tmin ? key : tmin; /* NaN key: tmin (no pruning) */
+}
+#define TRI_EXN_KEY(x, lx, ly, lz, hx, hy, hz, i, tmin)                        \
+    tri_exn_key((x), (x)->kz == 0 ? (lx)[i] : (x)->kz == 1 ? (ly)[i] : (lz)[i], \
+                (x)->kz == 0 ? (hx)[i] : (x)->kz == 1 ? (hy)[i] : (hz)[i], (tmin))
+#endif
+
+
 /* Degenerate direction components get a finite huge inverse instead of inf.
  * 1e18 (not FLT_MAX) so that the quantized-node decode, which multiplies
  * invd by a node-local scale, cannot overflow to inf and produce 0 * inf
@@ -3403,6 +3539,14 @@ static inline void tri_prefetch_ref(const lrt_tri_scene *s, uint32_t ref,
                                     int width) {
     (void)width;
     if (TRI_REF_IS_LEAF(ref)) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+        if (s->wblk) { /* the SIMD watertight leaf reads only the wblk block */
+            const char *w = (const char *)&s->wblk[(size_t)TRI_REF_BLOCK(ref) * 10 * s->layout];
+            TRI_PREFETCH_T0(w);
+            TRI_PREFETCH_T0(w + 64);
+            return;
+        }
+#endif
         const char *b = (const char *)tri_block_ptr(
             s->blocks, TRI_REF_BLOCK(ref), s->block_stride);
         TRI_PREFETCH_T0(b);
@@ -4161,18 +4305,37 @@ static float tri_bez_leaf_dist(const float cp[16], float a, float b,
     }
     float step = (b - a) / (float)NS;
     float lo = bu - step < a ? a : bu - step, hi = bu + step > b ? b : bu + step;
-    const float g = 0.6180339887f;
-    for (int it = 0; it < 14; it++) {
-        float m1 = hi - g * (hi - lo), m2 = lo + g * (hi - lo);
-        float P1[4], P2[4], d1[4], d2[4], e1[4], e2[4];
-        tri_bez_eval(cp, m1, P1, d1, e1);
-        tri_bez_eval(cp, m2, P2, d2, e2);
-        float a1 = x[0] - P1[0], b1 = x[1] - P1[1], c1 = x[2] - P1[2];
-        float a2 = x[0] - P2[0], b2 = x[1] - P2[1], c2 = x[2] - P2[2];
-        float f1 = sqrtf(a1 * a1 + b1 * b1 + c1 * c1) - (P1[3] > 0.0f ? P1[3] : 0.0f);
-        float f2 = sqrtf(a2 * a2 + b2 * b2 + c2 * c2) - (P2[3] > 0.0f ? P2[3] : 0.0f);
-        if (f1 < f2) { hi = m2; if (f1 < bd) { bd = f1; bu = m1; } }
-        else { lo = m1; if (f2 < bd) { bd = f2; bu = m2; } }
+    /* safeguarded Newton on phi'(u), phi = |x - C(u)| - r(u), bracketed by the
+     * samples around the best one (bisection when a step leaves the bracket);
+     * ~5 evaluations instead of 28 golden-section ones */
+    float u = bu;
+    for (int it = 0; it < 6; it++) {
+        float P[4], dP[4], ddP[4];
+        tri_bez_eval(cp, u, P, dP, ddP);
+        float wx = x[0] - P[0], wy = x[1] - P[1], wz = x[2] - P[2];
+        float wl = sqrtf(wx * wx + wy * wy + wz * wz);
+        if (!(wl > 1e-30f)) break;
+        float r = P[3] > 0.0f ? P[3] : 0.0f;
+        float dr = P[3] > 0.0f ? dP[3] : 0.0f, ddr = P[3] > 0.0f ? ddP[3] : 0.0f;
+        float d = wl - r;
+        if (d < bd) { bd = d; bu = u; }
+        float wd = wx * dP[0] + wy * dP[1] + wz * dP[2];
+        float g1 = -wd / wl - dr;
+        float g2 = (dP[0] * dP[0] + dP[1] * dP[1] + dP[2] * dP[2] -
+                    (wx * ddP[0] + wy * ddP[1] + wz * ddP[2])) / wl -
+                   wd * wd / (wl * wl * wl) - ddr;
+        if (g1 > 0.0f) hi = u; else lo = u;
+        float un = (g2 > 0.0f) ? u - g1 / g2 : 0.5f * (lo + hi);
+        if (!(un > lo && un < hi)) un = 0.5f * (lo + hi);
+        if (fabsf(un - u) < 1e-6f * (b - a)) { u = un; break; }
+        u = un;
+    }
+    {
+        float P[4], dP[4], ddP[4];
+        tri_bez_eval(cp, u, P, dP, ddP);
+        float wx = x[0] - P[0], wy = x[1] - P[1], wz = x[2] - P[2];
+        float d = sqrtf(wx * wx + wy * wy + wz * wz) - (P[3] > 0.0f ? P[3] : 0.0f);
+        if (d < bd) { bd = d; bu = u; }
     }
     *u_best = bu;
     return bd;
@@ -4338,7 +4501,7 @@ static int tri_bez_leaf_trace(const float cp[16], const float dir[3], float tmin
 static int tri_bez_leaf_solve(const float cp[16], const float dir[3], float tmin,
                               float best, float a, float b, const float P0p[3],
                               float r0c, const float P3p[3], float r3c,
-                              float *t_out, float *u_out) {
+                              float *t_out, float *u_out, int anyhit) {
     float tseg, s;
     if (!tri_cone_seed(dir, tmin, best, P0p, r0c, P3p, r3c, &tseg, &s)) return 0;
     float th, uh;
@@ -4352,6 +4515,13 @@ static int tri_bez_leaf_solve(const float cp[16], const float dir[3], float tmin
      * leaf's end balls (u pinned at a or b, where F != 0) are only found by the
      * u-restricted sphere trace below. */
     int inleaf = uh >= a - slack && uh <= b + slack;
+    /* any-hit (shadow rays): any converged, residual-verified surface point in
+     * [tmin, best) with u in [0,1] proves occlusion; nearest-ness is moot */
+    if (anyhit && nr == 1) {
+        *t_out = th;
+        *u_out = uh;
+        return 1;
+    }
     if (nr == 1 && front && inleaf) {
         *t_out = th;
         *u_out = uh;
@@ -4453,7 +4623,7 @@ static int tri_cone_seed(const float dir[3], float tmin, float best,
 }
 
 static int tri_bez_isect_one(const float cp_in[16], const tri_ray_ctx *rc,
-                             float best_t, float *t_out, float *u_out) {
+                             float best_t, float *t_out, float *u_out, int anyhit) {
     /* translate control points to ray-local space (ray origin at 0) */
     float cp[16];
     for (int k = 0; k < 4; k++) {
@@ -4554,10 +4724,11 @@ static int tri_bez_isect_one(const float cp_in[16], const tri_ray_ctx *rc,
                       P3p[3] = {Pb[0], Pb[1], Pb[2]};
                 float th, uh;
                 if (tri_bez_leaf_solve(cp, dir, tmin, best, a, b, P0p, r0c, P3p,
-                                       r3c, &th, &uh)) {
+                                       r3c, &th, &uh, anyhit)) {
                     best = th;
                     bu = uh;
                     hit = 1;
+                    if (anyhit) break;
                 }
             }
         } else {
@@ -4581,7 +4752,7 @@ static int tri_bez_isect_one(const float cp_in[16], const tri_ray_ctx *rc,
 
 static inline void tri_bez4_isect(const lrt_bez4 *blk, const tri_ray_ctx *rc,
                                   float *best_t, float *best_u,
-                                  uint32_t *best_prim) {
+                                  uint32_t *best_prim, int anyhit) {
     for (int lane = 0; lane < 4; lane++) {
         if (blk->prim[lane] == LRT_TRI_NO_HIT) continue;
         float cp[16] = {
@@ -4590,10 +4761,11 @@ static inline void tri_bez4_isect(const lrt_bez4 *blk, const tri_ray_ctx *rc,
             blk->b2x[lane], blk->b2y[lane], blk->b2z[lane], blk->b2r[lane],
             blk->b3x[lane], blk->b3y[lane], blk->b3z[lane], blk->b3r[lane]};
         float t, u;
-        if (tri_bez_isect_one(cp, rc, *best_t, &t, &u)) {
+        if (tri_bez_isect_one(cp, rc, *best_t, &t, &u, anyhit)) {
             *best_t = t;
             *best_u = u;
             *best_prim = blk->prim[lane];
+            if (anyhit) return;
         }
     }
 }
@@ -4711,9 +4883,10 @@ static inline int tri_slab_scalar(const float *lo_x, const float *lo_y,
      * formal/LightRT/Robust/Slab.lean proves that a factor K with
      * 1 + g3 <= (1 - g3)(1 - u) K (e.g. 1 + 2 g4 <= 1 + 10u) rules out false
      * misses of this scalar test; without it, false misses exist
-     * (Robust/SlabMissReal.lean, C/Proofs/SlabMiss.lean). Opt-in: it changes
-     * hit sets at the ulp level and is not mirrored in the SIMD/GPU kernels. */
-    tfar *= 0x1.00000ap+0f;
+     * (Robust/SlabMissReal.lean, C/Proofs/SlabMiss.lean). On by default with
+     * SLAB_ROBUST; mirrored in every CPU node slab (SSE/AVX2/quantized/SVE/
+     * packets/TLAS) and the HIP/CUDA/Vulkan kernels (PLAN.md M21). */
+    tfar = tfar * TRI_SLAB_K;
 #endif
     *tnear_out = tnear;
     return tnear <= tfar;
@@ -4810,10 +4983,13 @@ static inline int tri_isect_lane_s(const lrt_tri_scene *s, const float *f, int b
                                    int lane, const tri_ray_ctx *rc, float t_best,
                                    float *t, float *u, float *v) {
 #ifdef LRT_TRI_WATERTIGHT_TRI
-    if (s->wverts) {
-        uint32_t prim = ((const uint32_t *)(f + 9 * bw))[lane];
-        const float *w = &s->wverts[(size_t)prim * 9];
-        return tri_woop_one(rc->org, rc->dir, w, w + 3, w + 6, rc->tmin, t_best, t, u, v);
+    if (s->wblk) {
+        size_t b = (size_t)((const char *)f - (const char *)s->blocks) / tri_block_size(bw);
+        const float *o = &s->wblk[b * 10 * (size_t)bw];
+        float v0[3] = {o[0 * bw + lane], o[1 * bw + lane], o[2 * bw + lane]};
+        float v1[3] = {o[3 * bw + lane], o[4 * bw + lane], o[5 * bw + lane]};
+        float v2[3] = {o[6 * bw + lane], o[7 * bw + lane], o[8 * bw + lane]};
+        return tri_woop_one(rc->org, rc->dir, v0, v1, v2, rc->tmin, t_best, t, u, v);
     }
 #else
     (void)s;
@@ -5053,51 +5229,8 @@ static inline void tri_bezpatch_eval_sve(const float *cpx, const float *cpy,
 #endif
 
 /* de Casteljau split/restrict of a cubic over 4 points × 3 floats. */
-static void tri_bez_split3(const float c[12], float t, float L[12],
-                           float R[12]) {
-    for (int k = 0; k < 3; k++) {
-        float P0 = c[k], P1 = c[3 + k], P2 = c[6 + k], P3 = c[9 + k];
-        float ab = P0 + (P1 - P0) * t, bc = P1 + (P2 - P1) * t,
-              cd = P2 + (P3 - P2) * t;
-        float abc = ab + (bc - ab) * t, bcd = bc + (cd - bc) * t;
-        float abcd = abc + (bcd - abc) * t;
-        L[k] = P0; L[3 + k] = ab; L[6 + k] = abc; L[9 + k] = abcd;
-        R[k] = abcd; R[3 + k] = bcd; R[6 + k] = cd; R[9 + k] = P3;
-    }
-}
-static void tri_bez_subcurve3(const float c[12], float a, float b,
-                              float out[12]) {
-    float L[12], R[12];
-    tri_bez_split3(c, b, L, R);
-    if (a > 0.0f) {
-        float L2[12];
-        tri_bez_split3(L, a / b, L2, out);
-    } else {
-        memcpy(out, L, 12 * sizeof(float));
-    }
-}
 
 /* Control points of the sub-patch over [umin,umax]×[vmin,vmax]. */
-static void tri_bezpatch_subpatch(const float cp[48], float umin, float umax,
-                                  float vmin, float vmax, float out[48]) {
-    float tmp[48];
-    for (int j = 0; j < 4; j++) {
-        float row[12], sub[12];
-        for (int i = 0; i < 4; i++)
-            for (int k = 0; k < 3; k++) row[i * 3 + k] = cp[(j * 4 + i) * 3 + k];
-        tri_bez_subcurve3(row, umin, umax, sub);
-        for (int i = 0; i < 4; i++)
-            for (int k = 0; k < 3; k++) tmp[(j * 4 + i) * 3 + k] = sub[i * 3 + k];
-    }
-    for (int i = 0; i < 4; i++) {
-        float col[12], sub[12];
-        for (int j = 0; j < 4; j++)
-            for (int k = 0; k < 3; k++) col[j * 3 + k] = tmp[(j * 4 + i) * 3 + k];
-        tri_bez_subcurve3(col, vmin, vmax, sub);
-        for (int j = 0; j < 4; j++)
-            for (int k = 0; k < 3; k++) out[(j * 4 + i) * 3 + k] = sub[j * 3 + k];
-    }
-}
 
 static inline float tri_det3(const float a[3], const float b[3],
                              const float c[3]) {
@@ -5111,13 +5244,23 @@ static int tri_bezpatch_newton(const float cp[48], const float *cpx,
                                const float *cpy, const float *cpz,
                                const float *org, const float *dir, float u,
                                float v, float t, float tmin, float best,
-                               float *t_out, float *u_out, float *v_out) {
+                               float *t_out, float *u_out, float *v_out,
+                               float cu0, float cu1, float cv0, float cv1) {
 #if LRT_TRI_PATCH_EVAL_SVE
     (void)cp;
 #else
     (void)cpx; (void)cpy; (void)cpz;
 #endif
-    for (int it = 0; it < 8; it++) {
+    /* Cell-bounded, damped Newton: steps are limited to one cell size and the
+     * iterate is kept within the cell (+ half a cell); a root is reported only
+     * inside that window. An undamped step near a grazing root could jump far
+     * away (one test ray went from the corner cell to (0.71, -0.41)) and the
+     * cell's own root was lost; the driver refines a cell whose Newton fails
+     * (formal/tools/primhitcheck.c, exact-root adjudication). */
+    const float hu = cu1 - cu0, hv = cv1 - cv0;
+    const float ulo = cu0 - 0.5f * hu, uhi = cu1 + 0.5f * hu;
+    const float vlo = cv0 - 0.5f * hv, vhi = cv1 + 0.5f * hv;
+    for (int it = 0; it < 12; it++) {
         float S[3], du[3], dv[3];
         TRI_BEZ_EVAL(cp, cpx, cpy, cpz, u, v, S, du, dv);
         float R[3] = {S[0] - org[0] - t * dir[0], S[1] - org[1] - t * dir[1],
@@ -5145,13 +5288,19 @@ static int tri_bezpatch_newton(const float cp[48], const float *cpx,
                 }
             }
             if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f && t >= tmin &&
-                t < best) {
+                t < best && u >= ulo && u <= uhi && v >= vlo && v <= vhi) {
                 *t_out = t;
                 *u_out = u;
                 *v_out = v;
                 return 1;
             }
-            return 0;
+            /* 2: converged to a root INSIDE the patch domain and this cell's
+             * window, only outside [tmin, best): refining cannot find a nearer
+             * root there. A root of the extended surface outside [0,1]^2 is
+             * NOT settled (a different in-domain root can sit right next to
+             * it), so that returns 0 and the driver refines. */
+            return (u >= ulo && u <= uhi && v >= vlo && v <= vhi && u >= 0.0f &&
+                    u <= 1.0f && v >= 0.0f && v <= 1.0f) ? 2 : 0;
         }
         float ndir[3] = {-dir[0], -dir[1], -dir[2]};
         float det = tri_det3(du, dv, ndir);
@@ -5160,24 +5309,66 @@ static int tri_bezpatch_newton(const float cp[48], const float *cpx,
         float d0 = tri_det3(R, dv, ndir) * inv;
         float d1 = tri_det3(du, R, ndir) * inv;
         float d2 = tri_det3(du, dv, R) * inv;
-        u -= d0;
-        v -= d1;
-        t -= d2;
+        float sc = 1.0f;
+        if (fabsf(d0) > hu) sc = hu / fabsf(d0);
+        if (fabsf(d1) * sc > hv) sc = hv / fabsf(d1);
+        u -= sc * d0;
+        v -= sc * d1;
+        t -= sc * d2;
+        u = u < ulo ? ulo : (u > uhi ? uhi : u);
+        v = v < vlo ? vlo : (v > vhi ? vhi : v);
     }
     return 0;
+}
+
+/* Split a bicubic (nc = 3) or homogeneous rational (nc = 4) Bezier patch at
+ * the parameter midpoint in u and in v (de Casteljau, t = 1/2): out[2a+b] is
+ * the child over u-half a, v-half b. The adaptive patch drivers carry each
+ * cell's control net on their stack and split it, instead of re-deriving every
+ * cell from the root net (that re-derivation was ~55% of patch trace time). */
+static void tri_patch_split4(const float *cp, int nc, float out[4][64]) {
+    float L[64], R[64];
+    for (int j = 0; j < 4; j++) /* rows: split in u */
+        for (int c = 0; c < nc; c++) {
+            float P0 = cp[(j * 4 + 0) * nc + c], P1 = cp[(j * 4 + 1) * nc + c],
+                  P2 = cp[(j * 4 + 2) * nc + c], P3 = cp[(j * 4 + 3) * nc + c];
+            float ab = 0.5f * (P0 + P1), bc = 0.5f * (P1 + P2), cd = 0.5f * (P2 + P3);
+            float abc = 0.5f * (ab + bc), bcd = 0.5f * (bc + cd), m = 0.5f * (abc + bcd);
+            L[(j * 4 + 0) * nc + c] = P0; L[(j * 4 + 1) * nc + c] = ab;
+            L[(j * 4 + 2) * nc + c] = abc; L[(j * 4 + 3) * nc + c] = m;
+            R[(j * 4 + 0) * nc + c] = m; R[(j * 4 + 1) * nc + c] = bcd;
+            R[(j * 4 + 2) * nc + c] = cd; R[(j * 4 + 3) * nc + c] = P3;
+        }
+    for (int a = 0; a < 2; a++) {
+        const float *H = a ? R : L;
+        for (int i = 0; i < 4; i++) /* columns: split in v */
+            for (int c = 0; c < nc; c++) {
+                float P0 = H[(0 * 4 + i) * nc + c], P1 = H[(1 * 4 + i) * nc + c],
+                      P2 = H[(2 * 4 + i) * nc + c], P3 = H[(3 * 4 + i) * nc + c];
+                float ab = 0.5f * (P0 + P1), bc = 0.5f * (P1 + P2), cd = 0.5f * (P2 + P3);
+                float abc = 0.5f * (ab + bc), bcd = 0.5f * (bc + cd), m = 0.5f * (abc + bcd);
+                float *B0 = out[2 * a + 0], *B1 = out[2 * a + 1];
+                B0[(0 * 4 + i) * nc + c] = P0; B0[(1 * 4 + i) * nc + c] = ab;
+                B0[(2 * 4 + i) * nc + c] = abc; B0[(3 * 4 + i) * nc + c] = m;
+                B1[(0 * 4 + i) * nc + c] = m; B1[(1 * 4 + i) * nc + c] = bcd;
+                B1[(2 * 4 + i) * nc + c] = cd; B1[(3 * 4 + i) * nc + c] = P3;
+            }
+    }
 }
 
 static int tri_bezpatch_isect_one(const float cp[48], const tri_ray_ctx *rc,
                                   float best_t, float *t_out, float *u_out,
                                   float *v_out) {
-    enum { BEZPATCH_MAXDEPTH = 4 };
+    enum { BEZPATCH_MAXDEPTH = 4, BEZPATCH_REFINE = 7 }; /* refine a cell whose Newton fails */
     struct {
         float u0, u1, v0, v1;
         int depth;
-    } stk[4 * BEZPATCH_MAXDEPTH + 4];
+        float sub[48]; /* this cell's control net */
+    } stk[4 * BEZPATCH_REFINE + 4];
     int sp = 0;
     stk[sp].u0 = 0.0f; stk[sp].u1 = 1.0f; stk[sp].v0 = 0.0f; stk[sp].v1 = 1.0f;
     stk[sp].depth = 0;
+    memcpy(stk[sp].sub, cp, sizeof(float) * 48);
     sp++;
     float best = best_t;
     int hit = 0;
@@ -5196,8 +5387,9 @@ static int tri_bezpatch_isect_one(const float cp[48], const tri_ray_ctx *rc,
         float u0 = stk[sp].u0, u1 = stk[sp].u1, v0 = stk[sp].v0, v1 = stk[sp].v1;
         int depth = stk[sp].depth;
         float sub[48];
-        tri_bezpatch_subpatch(cp, u0, u1, v0, v1, sub);
-        /* conservative AABB = control hull of the sub-patch */
+        memcpy(sub, stk[sp].sub, sizeof sub);
+        /* conservative AABB = control hull of the sub-patch, widened by 16u
+         * for the rounding of the repeated midpoint splits */
         float lo[3] = {sub[0], sub[1], sub[2]}, hi[3] = {sub[0], sub[1], sub[2]};
         for (int k = 1; k < 16; k++)
             for (int a = 0; a < 3; a++) {
@@ -5205,6 +5397,10 @@ static int tri_bezpatch_isect_one(const float cp[48], const tri_ray_ctx *rc,
                 if (c < lo[a]) lo[a] = c;
                 if (c > hi[a]) hi[a] = c;
             }
+        for (int a = 0; a < 3; a++) {
+            lo[a] -= fabsf(lo[a]) * 0x1p-20f + 1e-30f;
+            hi[a] += fabsf(hi[a]) * 0x1p-20f + 1e-30f;
+        }
         /* ray/AABB slab test (clamped to [tmin, best]) */
         float tn = rc->tmin, tf = best;
         int miss = 0;
@@ -5228,24 +5424,50 @@ static int tri_bezpatch_isect_one(const float cp[48], const tri_ray_ctx *rc,
                         (S[2] - rc->org[2]) * rc->dir[2]) /
                        (ddot > 1e-20f ? ddot : 1e-20f);
             float th, uh, vh;
-            if (tri_bezpatch_newton(cp, cpx, cpy, cpz, rc->org, rc->dir, uc, vc,
-                                    t0, rc->tmin, best, &th, &uh, &vh)) {
+            int nr = tri_bezpatch_newton(cp, cpx, cpy, cpz, rc->org, rc->dir, uc, vc,
+                                         t0, rc->tmin, best, &th, &uh, &vh, u0, u1, v0, v1);
+            if (nr == 1) {
                 best = th;
                 *t_out = th;
                 *u_out = uh;
                 *v_out = vh;
                 hit = 1;
+                /* A nearer second root in this cell needs the surface to fold
+                 * against the ray here (n.dir changes sign: a silhouette). Then
+                 * also search the children (with the new best) instead of
+                 * trusting whichever root Newton reached. */
+                if (depth < BEZPATCH_REFINE) {
+                    int pos = 0, neg = 0;
+                    const float cu[5] = {u0, u1, u0, u1, 0.5f * (u0 + u1)};
+                    const float cvv[5] = {v0, v0, v1, v1, 0.5f * (v0 + v1)};
+                    for (int q = 0; q < 5; q++) {
+                        float Sq[3], dq[3], eq[3];
+                        TRI_BEZ_EVAL(cp, cpx, cpy, cpz, cu[q], cvv[q], Sq, dq, eq);
+                        float nx = dq[1] * eq[2] - dq[2] * eq[1], ny = dq[2] * eq[0] - dq[0] * eq[2],
+                              nz = dq[0] * eq[1] - dq[1] * eq[0];
+                        float nd = nx * rc->dir[0] + ny * rc->dir[1] + nz * rc->dir[2];
+                        if (nd > 0.0f) pos = 1; else neg = 1;
+                    }
+                    if (!(pos && neg)) continue;
+                } else {
+                    continue;
+                }
+            } else if (nr == 2 || depth >= BEZPATCH_REFINE) {
+                continue;
             }
-            continue;
+            /* Newton failed (or a silhouette cell): refine it */
         }
         float um = 0.5f * (u0 + u1), vm = 0.5f * (v0 + v1);
         const float uu[2][2] = {{u0, um}, {um, u1}};
         const float vv[2][2] = {{v0, vm}, {vm, v1}};
+        float kids[4][64];
+        tri_patch_split4(sub, 3, kids);
         for (int a = 0; a < 2; a++)
             for (int b = 0; b < 2; b++) {
                 stk[sp].u0 = uu[a][0]; stk[sp].u1 = uu[a][1];
                 stk[sp].v0 = vv[b][0]; stk[sp].v1 = vv[b][1];
                 stk[sp].depth = depth + 1;
+                memcpy(stk[sp].sub, kids[2 * a + b], sizeof(float) * 48);
                 sp++;
             }
     }
@@ -5273,49 +5495,6 @@ static inline void tri_bezpatch4_isect(const lrt_bezpatch4 *blk,
 /* ---- Rational bicubic Bézier (NURBS) patch ------------------------------
  * cp[64] = 16 homogeneous control points, point k = j*4+i, components
  * cp[k*4 + 0..3] = (w*x, w*y, w*z, w). */
-static void tri_bez_split4(const float c[16], float t, float L[16],
-                           float R[16]) {
-    for (int k = 0; k < 4; k++) {
-        float P0 = c[k], P1 = c[4 + k], P2 = c[8 + k], P3 = c[12 + k];
-        float ab = P0 + (P1 - P0) * t, bc = P1 + (P2 - P1) * t,
-              cd = P2 + (P3 - P2) * t;
-        float abc = ab + (bc - ab) * t, bcd = bc + (cd - bc) * t;
-        float abcd = abc + (bcd - abc) * t;
-        L[k] = P0; L[4 + k] = ab; L[8 + k] = abc; L[12 + k] = abcd;
-        R[k] = abcd; R[4 + k] = bcd; R[8 + k] = cd; R[12 + k] = P3;
-    }
-}
-static void tri_bez_subcurve4(const float c[16], float a, float b,
-                              float out[16]) {
-    float L[16], R[16];
-    tri_bez_split4(c, b, L, R);
-    if (a > 0.0f) {
-        float L2[16];
-        tri_bez_split4(L, a / b, L2, out);
-    } else {
-        memcpy(out, L, 16 * sizeof(float));
-    }
-}
-static void tri_rbezpatch_subpatch(const float cp[64], float umin, float umax,
-                                   float vmin, float vmax, float out[64]) {
-    float tmp[64];
-    for (int j = 0; j < 4; j++) {
-        float row[16], sub[16];
-        for (int i = 0; i < 4; i++)
-            for (int k = 0; k < 4; k++) row[i * 4 + k] = cp[(j * 4 + i) * 4 + k];
-        tri_bez_subcurve4(row, umin, umax, sub);
-        for (int i = 0; i < 4; i++)
-            for (int k = 0; k < 4; k++) tmp[(j * 4 + i) * 4 + k] = sub[i * 4 + k];
-    }
-    for (int i = 0; i < 4; i++) {
-        float col[16], sub[16];
-        for (int j = 0; j < 4; j++)
-            for (int k = 0; k < 4; k++) col[j * 4 + k] = tmp[(j * 4 + i) * 4 + k];
-        tri_bez_subcurve4(col, vmin, vmax, sub);
-        for (int j = 0; j < 4; j++)
-            for (int k = 0; k < 4; k++) out[(j * 4 + i) * 4 + k] = sub[j * 4 + k];
-    }
-}
 
 /* S(u,v) + partials via perspective divide of the homogeneous bicubic. */
 static inline void tri_rbezpatch_eval(const float cp[64], float u, float v,
@@ -5387,13 +5566,23 @@ static int tri_rbezpatch_newton(const float cp[64], const float *cx,
                                 const float *cw, const float *org,
                                 const float *dir, float u, float v, float t,
                                 float tmin, float best, float *t_out,
-                                float *u_out, float *v_out) {
+                                float *u_out, float *v_out, float cu0, float cu1,
+                                float cv0, float cv1) {
 #if LRT_TRI_PATCH_EVAL_SVE
     (void)cp;
 #else
     (void)cx; (void)cy; (void)cz; (void)cw;
 #endif
-    for (int it = 0; it < 8; it++) {
+    /* Cell-bounded, damped Newton: steps are limited to one cell size and the
+     * iterate is kept within the cell (+ half a cell); a root is reported only
+     * inside that window. An undamped step near a grazing root could jump far
+     * away (one test ray went from the corner cell to (0.71, -0.41)) and the
+     * cell's own root was lost; the driver refines a cell whose Newton fails
+     * (formal/tools/primhitcheck.c, exact-root adjudication). */
+    const float hu = cu1 - cu0, hv = cv1 - cv0;
+    const float ulo = cu0 - 0.5f * hu, uhi = cu1 + 0.5f * hu;
+    const float vlo = cv0 - 0.5f * hv, vhi = cv1 + 0.5f * hv;
+    for (int it = 0; it < 12; it++) {
         float S[3], du[3], dv[3];
         TRI_RBEZ_EVAL(cp, cx, cy, cz, cw, u, v, S, du, dv);
         float R[3] = {S[0] - org[0] - t * dir[0], S[1] - org[1] - t * dir[1],
@@ -5421,19 +5610,33 @@ static int tri_rbezpatch_newton(const float cp[64], const float *cx,
                 }
             }
             if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f && t >= tmin &&
-                t < best) {
+                t < best && u >= ulo && u <= uhi && v >= vlo && v <= vhi) {
                 *t_out = t; *u_out = u; *v_out = v;
                 return 1;
             }
-            return 0;
+            /* 2: converged to a root INSIDE the patch domain and this cell's
+             * window, only outside [tmin, best): refining cannot find a nearer
+             * root there. A root of the extended surface outside [0,1]^2 is
+             * NOT settled (a different in-domain root can sit right next to
+             * it), so that returns 0 and the driver refines. */
+            return (u >= ulo && u <= uhi && v >= vlo && v <= vhi && u >= 0.0f &&
+                    u <= 1.0f && v >= 0.0f && v <= 1.0f) ? 2 : 0;
         }
         float ndir[3] = {-dir[0], -dir[1], -dir[2]};
         float det = tri_det3(du, dv, ndir);
         if (det > -1e-20f && det < 1e-20f) return 0;
         float inv = 1.0f / det;
-        u -= tri_det3(R, dv, ndir) * inv;
-        v -= tri_det3(du, R, ndir) * inv;
-        t -= tri_det3(du, dv, R) * inv;
+        float d0 = tri_det3(R, dv, ndir) * inv;
+        float d1 = tri_det3(du, R, ndir) * inv;
+        float d2 = tri_det3(du, dv, R) * inv;
+        float sc = 1.0f;
+        if (fabsf(d0) > hu) sc = hu / fabsf(d0);
+        if (fabsf(d1) * sc > hv) sc = hv / fabsf(d1);
+        u -= sc * d0;
+        v -= sc * d1;
+        t -= sc * d2;
+        u = u < ulo ? ulo : (u > uhi ? uhi : u);
+        v = v < vlo ? vlo : (v > vhi ? vhi : v);
     }
     return 0;
 }
@@ -5468,11 +5671,12 @@ static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
                                    const uint32_t *trim_off, const float *trim_pts,
                                    uint32_t trim_nloops, float *t_out,
                                    float *u_out, float *v_out) {
-    enum { RBEZ_MAXDEPTH = 4 };
-    struct { float u0, u1, v0, v1; int depth; } stk[4 * RBEZ_MAXDEPTH + 4];
+    enum { RBEZ_MAXDEPTH = 4, RBEZ_REFINE = 7 }; /* refine a cell whose Newton fails */
+    struct { float u0, u1, v0, v1; int depth; float sub[64]; } stk[4 * RBEZ_REFINE + 4];
     int sp = 0;
     stk[sp].u0 = 0.0f; stk[sp].u1 = 1.0f; stk[sp].v0 = 0.0f; stk[sp].v1 = 1.0f;
     stk[sp].depth = 0;
+    memcpy(stk[sp].sub, cp, sizeof(float) * 64);
     sp++;
     float best = best_t;
     int hit = 0;
@@ -5491,7 +5695,7 @@ static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
         float u0 = stk[sp].u0, u1 = stk[sp].u1, v0 = stk[sp].v0, v1 = stk[sp].v1;
         int depth = stk[sp].depth;
         float sub[64];
-        tri_rbezpatch_subpatch(cp, u0, u1, v0, v1, sub);
+        memcpy(sub, stk[sp].sub, sizeof sub);
         float lo[3], hi[3];
         for (int a = 0; a < 3; a++) {
             float p = sub[a] / sub[3];
@@ -5511,8 +5715,8 @@ static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
          * widening the finished bounds by 8u of their magnitude (+ a tiny
          * absolute term for subnormals) is conservative and costs 6 ops. */
         for (int a = 0; a < 3; a++) {
-            lo[a] -= fabsf(lo[a]) * 0x1p-21f + 1e-30f;
-            hi[a] += fabsf(hi[a]) * 0x1p-21f + 1e-30f;
+            lo[a] -= fabsf(lo[a]) * 0x1p-20f + 1e-30f;
+            hi[a] += fabsf(hi[a]) * 0x1p-20f + 1e-30f;
         }
 #endif
         float tn = rc->tmin, tf = best;
@@ -5537,8 +5741,9 @@ static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
                         (S[2] - rc->org[2]) * rc->dir[2]) /
                        (ddot > 1e-20f ? ddot : 1e-20f);
             float th, uh, vh;
-            if (tri_rbezpatch_newton(cp, cx, cy, cz, cw, rc->org, rc->dir, uc, vc,
-                                     t0, rc->tmin, best, &th, &uh, &vh)) {
+            int nh = tri_rbezpatch_newton(cp, cx, cy, cz, cw, rc->org, rc->dir, uc, vc,
+                                          t0, rc->tmin, best, &th, &uh, &vh, u0, u1, v0, v1);
+            if (nh == 1) {
                 float gu = dom[0] + uh * (dom[1] - dom[0]); /* local -> global */
                 float gv = dom[2] + vh * (dom[3] - dom[2]);
                 /* trimmed hits are rejected; keep searching for the nearest
@@ -5551,16 +5756,36 @@ static int tri_rbezpatch_isect_one(const float cp[64], const float dom[4],
                     hit = 1;
                 }
             }
-            continue;
+            if (nh == 1 && depth < RBEZ_REFINE) {
+                /* silhouette inside the cell -> a nearer root may exist: search
+                 * the children too (see tri_bezpatch_isect_one) */
+                int pos = 0, neg = 0;
+                const float cu[5] = {u0, u1, u0, u1, 0.5f * (u0 + u1)};
+                const float cvv[5] = {v0, v0, v1, v1, 0.5f * (v0 + v1)};
+                for (int q = 0; q < 5; q++) {
+                    float Sq[3], dq[3], eq[3];
+                    TRI_RBEZ_EVAL(cp, cx, cy, cz, cw, cu[q], cvv[q], Sq, dq, eq);
+                    float nx = dq[1] * eq[2] - dq[2] * eq[1], ny = dq[2] * eq[0] - dq[0] * eq[2],
+                          nz = dq[0] * eq[1] - dq[1] * eq[0];
+                    float nd = nx * rc->dir[0] + ny * rc->dir[1] + nz * rc->dir[2];
+                    if (nd > 0.0f) pos = 1; else neg = 1;
+                }
+                if (pos && neg) nh = 0; /* fall through to refinement */
+            }
+            if (nh == 2 || (nh == 1) || depth >= RBEZ_REFINE) continue;
+            /* Newton failed (or a silhouette cell): refine it */
         }
         float um = 0.5f * (u0 + u1), vm = 0.5f * (v0 + v1);
         const float uu[2][2] = {{u0, um}, {um, u1}};
         const float vv[2][2] = {{v0, vm}, {vm, v1}};
+        float kids[4][64];
+        tri_patch_split4(sub, 4, kids);
         for (int a = 0; a < 2; a++)
             for (int b = 0; b < 2; b++) {
                 stk[sp].u0 = uu[a][0]; stk[sp].u1 = uu[a][1];
                 stk[sp].v0 = vv[b][0]; stk[sp].v1 = vv[b][1];
                 stk[sp].depth = depth + 1;
+                memcpy(stk[sp].sub, kids[2 * a + b], sizeof(float) * 64);
                 sp++;
             }
     }
@@ -5663,6 +5888,10 @@ static int tri_intersect_scalar(const lrt_tri_scene *s, const lrt_ray *ray,
                                 lrt_hit *hit) {
     tri_ray_ctx rc;
     tri_ray_setup(ray, &rc);
+#ifdef LRT_TRI_EXACT_NEAREST
+    tri_exn_ctx xc;
+    tri_exn_setup(s, &rc, &xc);
+#endif
     float best_t = ray->tmax;
     float best_u = 0.0f, best_v = 0.0f;
     uint32_t best_prim = LRT_TRI_NO_HIT;
@@ -5716,7 +5945,7 @@ static int tri_intersect_scalar(const lrt_tri_scene *s, const lrt_ray *ray,
                 const lrt_bez4 *blocks = (const lrt_bez4 *)s->blocks;
                 for (uint32_t b = 0; b < nblk; b++) {
                     tri_bez4_isect(&blocks[blk0 + b], &rc, &best_t, &best_u,
-                                   &best_prim);
+                                   &best_prim, 0);
                 }
                 continue;
             }
@@ -5876,7 +6105,11 @@ static int tri_intersect_scalar(const lrt_tri_scene *s, const lrt_ray *ray,
             float tnear;
             if (tri_slab_scalar(lo_x, lo_y, lo_z, hi_x, hi_y, hi_z, i, &rc,
                                 TRI_CULL_T(best_t, ray->tmax), &tnear)) {
+#ifdef LRT_TRI_EXACT_NEAREST
+                tnear = TRI_EXN_KEY(&xc, lo_x, lo_y, lo_z, hi_x, hi_y, hi_z, i, rc.tmin);
+#else
                 tnear = TRI_PUSH_TN(tnear, rc.tmin);
+#endif
                 /* insertion: keep ascending tnear */
                 int j = nhit++;
                 while (j > 0 && hit_tnear[j - 1] > tnear) {
@@ -5966,7 +6199,7 @@ static int tri_occluded_scalar(const lrt_tri_scene *s, const lrt_ray *ray) {
                 for (uint32_t b = 0; b < nblk; b++) {
                     float t = t_max, u = 0.0f;
                     uint32_t prim = LRT_TRI_NO_HIT;
-                    tri_bez4_isect(&blocks[blk0 + b], &rc, &t, &u, &prim);
+                    tri_bez4_isect(&blocks[blk0 + b], &rc, &t, &u, &prim, 1);
                     if (prim != LRT_TRI_NO_HIT) return 1;
                 }
                 continue;
@@ -6356,11 +6589,136 @@ static inline int tri_bvh4_slab_sse(const lrt_bvh4_node *n,
     __m128 tfar = _mm_min_ps(
         _mm_min_ps(_mm_max_ps(tlx, thx), _mm_max_ps(tly, thy)),
         _mm_min_ps(_mm_max_ps(tlz, thz), t_best));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = _mm_mul_ps(tfar, _mm_set1_ps(TRI_SLAB_K));
+#endif
     _mm_store_ps(tnear_out, tnear);
     return _mm_movemask_ps(_mm_cmple_ps(tnear, tfar));
 }
 
 /* 4-wide SoA Moller-Trumbore over one block. Updates best hit in place. */
+#if defined(LRT_TRI_WATERTIGHT_TRI)
+#define TWLT(a, b) _mm_cmplt_ps(a, b)
+#define TWGT(a, b) _mm_cmpgt_ps(a, b)
+#define TWGE(a, b) _mm_cmpge_ps(a, b)
+#define TWNEQ(a, b) _mm_cmpneq_ps(a, b)
+/* SIMD watertight leaf (4 lanes): tri_woop_one's operations in its order (no
+ * FMA, same association), so every lane is bit-identical to the scalar test
+ * and the formal results (tri_woop_one_refines, woop_no_gap_bits) carry over.
+ * Comparisons keep the scalar NaN behaviour: ordered <, >, >=, and an
+ * unordered != for `det == 0 -> reject`. The closest lane is the minimum t,
+ * lowest lane on ties, which is what the scalar lane loop with a strict
+ * `t < best` update returns. */
+typedef struct tri_woop4_ctx {
+    __m128 sx, sy, sz, ox, oy, oz, tmin;
+    int kx, ky, kz;
+} tri_woop4_ctx;
+static inline void tri_woop4_setup(const tri_ray_ctx *rc, tri_woop4_ctx *w) {
+    const float *d = rc->dir, *o = rc->org;
+    float a0 = copysignf(d[0], 1.0f), a1 = copysignf(d[1], 1.0f), a2 = copysignf(d[2], 1.0f);
+    int kz = 0;
+    if (a1 > a0) kz = 1;
+    if (a2 > a0 && a2 > a1) kz = 2;
+    int kx = kz + 1;
+    if (kx == 3) kx = 0;
+    int ky = kx + 1;
+    if (ky == 3) ky = 0;
+    if (d[kz] < 0.0f) {
+        int t = kx;
+        kx = ky;
+        ky = t;
+    }
+    w->kx = kx;
+    w->ky = ky;
+    w->kz = kz;
+    w->sx = _mm_set1_ps(d[kx] / d[kz]);
+    w->sy = _mm_set1_ps(d[ky] / d[kz]);
+    w->sz = _mm_set1_ps(1.0f / d[kz]);
+    w->ox = _mm_set1_ps(o[kx]);
+    w->oy = _mm_set1_ps(o[ky]);
+    w->oz = _mm_set1_ps(o[kz]);
+    w->tmin = _mm_set1_ps(rc->tmin);
+}
+/* Lane mask of accepted hits in [tmin, best). */
+static inline int tri_woop4_lanes(const float *wb, const uint32_t *ids,
+                                  const tri_woop4_ctx *w, float best, __m128 *tt_o,
+                                  __m128 *ve_o, __m128 *we_o, __m128 *det_o) {
+    const int kx = w->kx, ky = w->ky, kz = w->kz;
+    __m128 ax = _mm_sub_ps(_mm_loadu_ps(wb + (0 + kx) * 4), w->ox), ay = _mm_sub_ps(_mm_loadu_ps(wb + (0 + ky) * 4), w->oy),
+       az = _mm_sub_ps(_mm_loadu_ps(wb + (0 + kz) * 4), w->oz);
+    __m128 bx = _mm_sub_ps(_mm_loadu_ps(wb + (3 + kx) * 4), w->ox), by = _mm_sub_ps(_mm_loadu_ps(wb + (3 + ky) * 4), w->oy),
+       bz = _mm_sub_ps(_mm_loadu_ps(wb + (3 + kz) * 4), w->oz);
+    __m128 cx = _mm_sub_ps(_mm_loadu_ps(wb + (6 + kx) * 4), w->ox), cy = _mm_sub_ps(_mm_loadu_ps(wb + (6 + ky) * 4), w->oy),
+       cz = _mm_sub_ps(_mm_loadu_ps(wb + (6 + kz) * 4), w->oz);
+    ax = _mm_sub_ps(ax, _mm_mul_ps(w->sx, az));
+    ay = _mm_sub_ps(ay, _mm_mul_ps(w->sy, az));
+    bx = _mm_sub_ps(bx, _mm_mul_ps(w->sx, bz));
+    by = _mm_sub_ps(by, _mm_mul_ps(w->sy, bz));
+    cx = _mm_sub_ps(cx, _mm_mul_ps(w->sx, cz));
+    cy = _mm_sub_ps(cy, _mm_mul_ps(w->sy, cz));
+    __m128 ue = _mm_sub_ps(_mm_mul_ps(cx, by), _mm_mul_ps(cy, bx));
+    __m128 ve = _mm_sub_ps(_mm_mul_ps(ax, cy), _mm_mul_ps(ay, cx));
+    __m128 we = _mm_sub_ps(_mm_mul_ps(bx, ay), _mm_mul_ps(by, ax));
+    __m128 z = _mm_setzero_ps();
+    __m128 neg = _mm_or_ps(_mm_or_ps(TWLT(ue, z), TWLT(ve, z)), TWLT(we, z));
+    __m128 pos = _mm_or_ps(_mm_or_ps(TWGT(ue, z), TWGT(ve, z)), TWGT(we, z));
+    __m128 det = _mm_add_ps(_mm_add_ps(ue, ve), we);
+    {
+        /* no lane passes the edge-sign / det test: skip the divide (same
+         * result, the t range test below can only reject further) */
+        int em = _mm_movemask_ps(_mm_andnot_ps(_mm_and_ps(neg, pos), _mm_cmpneq_ps(det, z)));
+        if (!em) {
+            *tt_o = *ve_o = *we_o = *det_o = z;
+            return 0;
+        }
+    }
+    __m128 num = _mm_add_ps(_mm_add_ps(_mm_mul_ps(ue, _mm_mul_ps(w->sz, az)), _mm_mul_ps(ve, _mm_mul_ps(w->sz, bz))), _mm_mul_ps(we, _mm_mul_ps(w->sz, cz)));
+    __m128 tt = _mm_div_ps(num, det);
+    __m128 ok = _mm_andnot_ps(_mm_and_ps(neg, pos), TWNEQ(det, z));
+    ok = _mm_and_ps(ok, _mm_and_ps(TWGE(tt, w->tmin), TWLT(tt, _mm_set1_ps(best))));
+    int m = _mm_movemask_ps(ok);
+    for (int l = 0; l < 4; l++)
+        if (ids[l] == LRT_TRI_NO_HIT) m &= ~(1 << l);
+    *tt_o = tt;
+    *ve_o = ve;
+    *we_o = we;
+    *det_o = det;
+    return m;
+}
+static inline void tri_woop4_block(const float *wb, const uint32_t *ids,
+                                   const tri_woop4_ctx *w, float *best_t,
+                                   float *best_u, float *best_v, uint32_t *best_prim) {
+    __m128 tt, ve, we, det;
+    int m = tri_woop4_lanes(wb, ids, w, *best_t, &tt, &ve, &we, &det);
+    if (!m) return;
+    _Alignas(32) float T[4], V[4], WW[4], D[4];
+    _mm_store_ps(T, tt);
+    _mm_store_ps(V, ve);
+    _mm_store_ps(WW, we);
+    _mm_store_ps(D, det);
+    int bl = -1;
+    float bt = *best_t;
+    for (int l = 0; l < 4; l++)
+        if (((m >> l) & 1) && T[l] < bt) {
+            bt = T[l];
+            bl = l;
+        }
+    *best_t = bt;
+    *best_u = V[bl] / D[bl];
+    *best_v = WW[bl] / D[bl];
+    *best_prim = ids[bl];
+}
+static inline int tri_woop4_block_occ(const float *wb, const uint32_t *ids,
+                                      const tri_woop4_ctx *w, float tmax) {
+    __m128 tt, ve, we, det;
+    return tri_woop4_lanes(wb, ids, w, tmax, &tt, &ve, &we, &det) != 0;
+}
+#undef TWLT
+#undef TWGT
+#undef TWGE
+#undef TWNEQ
+#endif
+
 static inline void tri_block_isect_sse(const lrt_tri4 *blk,
                                        const tri_sse_ctx *sc, float *best_t,
                                        float *best_u, float *best_v,
@@ -6603,8 +6961,16 @@ static int tri_intersect_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray,
                                   lrt_hit *hit) {
     tri_ray_ctx rc;
     tri_ray_setup(ray, &rc);
+#ifdef LRT_TRI_EXACT_NEAREST
+    tri_exn_ctx xc;
+    tri_exn_setup(s, &rc, &xc);
+#endif
     tri_sse_ctx sc;
     tri_sse_setup(&rc, &sc);
+#if defined(LRT_TRI_WATERTIGHT_TRI)
+    tri_woop4_ctx wc;
+    int wc_ready = 0; /* lazy: rays that reach no leaf skip the setup */
+#endif
 
     float best_t = ray->tmax;
     float best_u = 0.0f, best_v = 0.0f;
@@ -6624,6 +6990,17 @@ static int tri_intersect_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray,
             uint32_t nblk = TRI_REF_NBLOCKS(e.ref);
             const lrt_tri4 *blocks = (const lrt_tri4 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++) {
+#if defined(LRT_TRI_WATERTIGHT_TRI)
+                if (s->wblk) {
+                    if (!wc_ready) {
+                        tri_woop4_setup(&rc, &wc);
+                        wc_ready = 1;
+                    }
+                    tri_woop4_block(s->wblk + (size_t)(blk0 + b) * 40, (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 40 + 36),
+                                    &wc, &best_t, &best_u, &best_v, &best_prim);
+                    continue;
+                }
+#endif
                 tri_block_isect_sse(&blocks[blk0 + b], &sc, &best_t, &best_u,
                                     &best_v, &best_prim);
             }
@@ -6633,7 +7010,12 @@ static int tri_intersect_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray,
         const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(e.ref)];
         _Alignas(16) float tnear[4];
         int mask = tri_bvh4_slab_sse(n, &sc, _mm_set1_ps(TRI_CULL_T(best_t, ray->tmax)), tnear);
+#ifdef LRT_TRI_EXACT_NEAREST
+        for (int k = 0; k < 4; k++)
+            tnear[k] = TRI_EXN_KEY(&xc, n->lo_x, n->lo_y, n->lo_z, n->hi_x, n->hi_y, n->hi_z, k, rc.tmin);
+#else
         for (int k = 0; k < 4; k++) tnear[k] = TRI_PUSH_TN(tnear[k], rc.tmin);
+#endif
         mask &= (1 << n->nchildren) - 1;
 #ifdef LRT_TRI_BITEXACT
         /* tri_intersect_scalar's order: insertion-sort hits by tnear (stable,
@@ -6691,6 +7073,10 @@ static int tri_occluded_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray) {
     tri_sse_ctx sc;
     tri_sse_setup(&rc, &sc);
     __m128 tmax4 = _mm_set1_ps(ray->tmax);
+#if defined(LRT_TRI_WATERTIGHT_TRI)
+    tri_woop4_ctx wc;
+    int wc_ready = 0; /* lazy: rays that reach no leaf skip the setup */
+#endif
 
     uint32_t stack[TRI_STACK_SIZE];
     int sp = 0;
@@ -6703,6 +7089,19 @@ static int tri_occluded_bvh4_sse(const lrt_tri_scene *s, const lrt_ray *ray) {
             uint32_t nblk = TRI_REF_NBLOCKS(ref);
             const lrt_tri4 *blocks = (const lrt_tri4 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++) {
+#if defined(LRT_TRI_WATERTIGHT_TRI)
+                if (s->wblk) {
+                    if (!wc_ready) {
+                        tri_woop4_setup(&rc, &wc);
+                        wc_ready = 1;
+                    }
+                    if (tri_woop4_block_occ(s->wblk + (size_t)(blk0 + b) * 40,
+                                            (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 40 + 36),
+                                            &wc, ray->tmax))
+                        return 1;
+                    continue;
+                }
+#endif
                 if (tri_block_occluded_sse(&blocks[blk0 + b], &sc, tmax4)) {
                     return 1;
                 }
@@ -7578,7 +7977,7 @@ static inline void tri_bez_eval4u(const __m128 C[16], __m128 u, __m128 P[4],
  * This vectorizes the broad phase that the scalar tri_bez_isect_one does one
  * interval at a time, so low pre-subdivision (K small) stays fast. */
 static int tri_bez_sweep_sse(const float cp_world[16], const tri_ray_ctx *rc,
-                             float best_t, float *t_out, float *u_out) {
+                             float best_t, float *t_out, float *u_out, int anyhit) {
     const __m128 Z = _mm_setzero_ps(), ONE = _mm_set1_ps(1.0f);
     float cpl[16];
     __m128 C[16];
@@ -7697,10 +8096,11 @@ static int tri_bez_sweep_sse(const float cp_world[16], const tri_ray_ctx *rc,
                     float th, uh;
                     (void)hL;
                     if (tri_bez_leaf_solve(cpl, dir, tmin, best, u0, u1, P0p, r0c,
-                                           P3p, r3c, &th, &uh)) {
+                                           P3p, r3c, &th, &uh, anyhit)) {
                         best = th;
                         bu = uh;
                         hit = 1;
+                        if (anyhit) { sp = 0; break; }
                     }
                 }
             } else {
@@ -7726,7 +8126,7 @@ static int tri_bez_sweep_sse(const float cp_world[16], const tri_ray_ctx *rc,
 
 static inline void tri_bez4_isect_sse(const lrt_bez4 *blk, const tri_ray_ctx *rc,
                                       const tri_sse_ctx *sc, float *best_t,
-                                      float *best_u, uint32_t *best_prim) {
+                                      float *best_u, uint32_t *best_prim, int anyhit) {
     const __m128 Z = _mm_setzero_ps();
     const __m128 ONE = _mm_set1_ps(1.0f);
     __m128 dirx = sc->dirx, diry = sc->diry, dirz = sc->dirz;
@@ -7842,10 +8242,11 @@ static inline void tri_bez4_isect_sse(const lrt_bez4 *blk, const tri_ray_ctx *rc
         float cp[16];
         for (int k = 0; k < 16; k++) cp[k] = src[k][lane];
         float t, u;
-        if (tri_bez_sweep_sse(cp, rc, *best_t, &t, &u)) {
+        if (tri_bez_sweep_sse(cp, rc, *best_t, &t, &u, anyhit)) {
             *best_t = t;
             *best_u = u;
             *best_prim = blk->prim[lane];
+            if (anyhit) return;
         }
     }
 }
@@ -7873,7 +8274,7 @@ static int tri_bezcurve_intersect_bvh4(const lrt_tri_scene *s,
             const lrt_bez4 *blocks = (const lrt_bez4 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++)
                 tri_bez4_isect_sse(&blocks[blk0 + b], &rc, &sc, &best_t, &best_u,
-                                   &best_prim);
+                                   &best_prim, 0);
             continue;
         }
         const lrt_bvh4_node *n = &s->nodes4[TRI_REF_NODE(e.ref)];
@@ -7918,7 +8319,7 @@ static int tri_bezcurve_occluded_bvh4(const lrt_tri_scene *s,
             for (uint32_t b = 0; b < nblk; b++) {
                 float t = t_max, u = 0.0f;
                 uint32_t prim = LRT_TRI_NO_HIT;
-                tri_bez4_isect_sse(&blocks[blk0 + b], &rc, &sc, &t, &u, &prim);
+                tri_bez4_isect_sse(&blocks[blk0 + b], &rc, &sc, &t, &u, &prim, 1);
                 if (prim != LRT_TRI_NO_HIT) return 1;
             }
             continue;
@@ -8387,6 +8788,10 @@ typedef struct tri_pipe4_state {
     lrt_hit *hit;
     int sp;
     tri_stack_entry stack[TRI_STACK_SIZE];
+#if defined(LRT_TRI_WATERTIGHT_TRI)
+    tri_woop4_ctx wc;
+    int wc_ready;
+#endif
 } tri_pipe4_state;
 
 static inline void tri_pipe4_init(const lrt_tri_scene *s, tri_pipe4_state *st,
@@ -8394,6 +8799,9 @@ static inline void tri_pipe4_init(const lrt_tri_scene *s, tri_pipe4_state *st,
     (void)s;
     tri_ray_setup(ray, &st->rc);
     tri_sse_setup(&st->rc, &st->sc);
+#if defined(LRT_TRI_WATERTIGHT_TRI)
+    st->wc_ready = 0; /* lazy: set up at the first leaf */
+#endif
     st->best_t = ray->tmax;
     st->best_u = 0.0f;
     st->best_v = 0.0f;
@@ -8414,6 +8822,17 @@ static inline int tri_pipe4_step(const lrt_tri_scene *s, tri_pipe4_state *st) {
             uint32_t nblk = TRI_REF_NBLOCKS(e.ref);
             const lrt_tri4 *blocks = (const lrt_tri4 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++) {
+#if defined(LRT_TRI_WATERTIGHT_TRI)
+                if (s->wblk) {
+                    if (!st->wc_ready) {
+                        tri_woop4_setup(&st->rc, &st->wc);
+                        st->wc_ready = 1;
+                    }
+                    tri_woop4_block(s->wblk + (size_t)(blk0 + b) * 40, (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 40 + 36),
+                                    &st->wc, &st->best_t, &st->best_u, &st->best_v, &st->best_prim);
+                    continue;
+                }
+#endif
                 tri_block_isect_sse(&blocks[blk0 + b], &st->sc, &st->best_t,
                                     &st->best_u, &st->best_v, &st->best_prim);
             }
@@ -8503,6 +8922,10 @@ typedef struct tri_pipeocc4_state {
     uint8_t *out;
     int sp;
     uint32_t stack[TRI_STACK_SIZE];
+#if defined(LRT_TRI_WATERTIGHT_TRI)
+    tri_woop4_ctx wc;
+    int wc_ready;
+#endif
 } tri_pipeocc4_state;
 
 static inline void tri_pipeocc4_init(const lrt_tri_scene *s,
@@ -8510,6 +8933,9 @@ static inline void tri_pipeocc4_init(const lrt_tri_scene *s,
                                      const lrt_ray *ray, uint8_t *out) {
     tri_ray_setup(ray, &st->rc);
     tri_sse_setup(&st->rc, &st->sc);
+#if defined(LRT_TRI_WATERTIGHT_TRI)
+    st->wc_ready = 0; /* lazy: set up at the first leaf */
+#endif
     st->tmax4 = _mm_set1_ps(ray->tmax);
     st->out = out;
     st->stack[0] = s->root;
@@ -8529,6 +8955,20 @@ static inline int tri_pipeocc4_step(const lrt_tri_scene *s,
         uint32_t nblk = TRI_REF_NBLOCKS(ref);
         const lrt_tri4 *blocks = (const lrt_tri4 *)s->blocks;
         for (uint32_t b = 0; b < nblk; b++) {
+#if defined(LRT_TRI_WATERTIGHT_TRI)
+        if (s->wblk) {
+            if (!st->wc_ready) {
+                tri_woop4_setup(&st->rc, &st->wc);
+                st->wc_ready = 1;
+            }
+            if (tri_woop4_block_occ(s->wblk + (size_t)(blk0 + b) * 40, (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 40 + 36), &st->wc,
+                                    _mm_cvtss_f32(st->tmax4))) {
+                *st->out = 1;
+                return 0;
+            }
+            continue;
+        }
+#endif
             if (tri_block_occluded_sse(&blocks[blk0 + b], &st->sc, st->tmax4)) {
                 *st->out = 1;
                 return 0;
@@ -8629,6 +9069,128 @@ static inline void tri_avx_setup(const tri_ray_ctx *rc, tri_avx_ctx *ac) {
 #define TRI_X8(a, b, c, d) _mm256_fmsub_ps(a, b, _mm256_mul_ps(c, d))
 #define TRI_DOT8(a1, b1, a2, b2, a3, b3) \
     _mm256_fmadd_ps(a1, b1, _mm256_fmadd_ps(a2, b2, _mm256_mul_ps(a3, b3)))
+#endif
+
+#ifdef LRT_TRI_WATERTIGHT_TRI
+#define TWLT(a, b) _mm256_cmp_ps(a, b, _CMP_LT_OQ)
+#define TWGT(a, b) _mm256_cmp_ps(a, b, _CMP_GT_OQ)
+#define TWGE(a, b) _mm256_cmp_ps(a, b, _CMP_GE_OQ)
+#define TWNEQ(a, b) _mm256_cmp_ps(a, b, _CMP_NEQ_UQ)
+/* SIMD watertight leaf (8 lanes): tri_woop_one's operations in its order (no
+ * FMA, same association), so every lane is bit-identical to the scalar test
+ * and the formal results (tri_woop_one_refines, woop_no_gap_bits) carry over.
+ * Comparisons keep the scalar NaN behaviour: ordered <, >, >=, and an
+ * unordered != for `det == 0 -> reject`. The closest lane is the minimum t,
+ * lowest lane on ties, which is what the scalar lane loop with a strict
+ * `t < best` update returns. */
+typedef struct tri_woop8_ctx {
+    __m256 sx, sy, sz, ox, oy, oz, tmin;
+    int kx, ky, kz;
+} tri_woop8_ctx;
+static inline void tri_woop8_setup(const tri_ray_ctx *rc, tri_woop8_ctx *w) {
+    const float *d = rc->dir, *o = rc->org;
+    float a0 = copysignf(d[0], 1.0f), a1 = copysignf(d[1], 1.0f), a2 = copysignf(d[2], 1.0f);
+    int kz = 0;
+    if (a1 > a0) kz = 1;
+    if (a2 > a0 && a2 > a1) kz = 2;
+    int kx = kz + 1;
+    if (kx == 3) kx = 0;
+    int ky = kx + 1;
+    if (ky == 3) ky = 0;
+    if (d[kz] < 0.0f) {
+        int t = kx;
+        kx = ky;
+        ky = t;
+    }
+    w->kx = kx;
+    w->ky = ky;
+    w->kz = kz;
+    w->sx = _mm256_set1_ps(d[kx] / d[kz]);
+    w->sy = _mm256_set1_ps(d[ky] / d[kz]);
+    w->sz = _mm256_set1_ps(1.0f / d[kz]);
+    w->ox = _mm256_set1_ps(o[kx]);
+    w->oy = _mm256_set1_ps(o[ky]);
+    w->oz = _mm256_set1_ps(o[kz]);
+    w->tmin = _mm256_set1_ps(rc->tmin);
+}
+/* Lane mask of accepted hits in [tmin, best). */
+static inline int tri_woop8_lanes(const float *wb, const uint32_t *ids,
+                                  const tri_woop8_ctx *w, float best, __m256 *tt_o,
+                                  __m256 *ve_o, __m256 *we_o, __m256 *det_o) {
+    const int kx = w->kx, ky = w->ky, kz = w->kz;
+    __m256 ax = _mm256_sub_ps(_mm256_loadu_ps(wb + (0 + kx) * 8), w->ox), ay = _mm256_sub_ps(_mm256_loadu_ps(wb + (0 + ky) * 8), w->oy),
+       az = _mm256_sub_ps(_mm256_loadu_ps(wb + (0 + kz) * 8), w->oz);
+    __m256 bx = _mm256_sub_ps(_mm256_loadu_ps(wb + (3 + kx) * 8), w->ox), by = _mm256_sub_ps(_mm256_loadu_ps(wb + (3 + ky) * 8), w->oy),
+       bz = _mm256_sub_ps(_mm256_loadu_ps(wb + (3 + kz) * 8), w->oz);
+    __m256 cx = _mm256_sub_ps(_mm256_loadu_ps(wb + (6 + kx) * 8), w->ox), cy = _mm256_sub_ps(_mm256_loadu_ps(wb + (6 + ky) * 8), w->oy),
+       cz = _mm256_sub_ps(_mm256_loadu_ps(wb + (6 + kz) * 8), w->oz);
+    ax = _mm256_sub_ps(ax, _mm256_mul_ps(w->sx, az));
+    ay = _mm256_sub_ps(ay, _mm256_mul_ps(w->sy, az));
+    bx = _mm256_sub_ps(bx, _mm256_mul_ps(w->sx, bz));
+    by = _mm256_sub_ps(by, _mm256_mul_ps(w->sy, bz));
+    cx = _mm256_sub_ps(cx, _mm256_mul_ps(w->sx, cz));
+    cy = _mm256_sub_ps(cy, _mm256_mul_ps(w->sy, cz));
+    __m256 ue = _mm256_sub_ps(_mm256_mul_ps(cx, by), _mm256_mul_ps(cy, bx));
+    __m256 ve = _mm256_sub_ps(_mm256_mul_ps(ax, cy), _mm256_mul_ps(ay, cx));
+    __m256 we = _mm256_sub_ps(_mm256_mul_ps(bx, ay), _mm256_mul_ps(by, ax));
+    __m256 z = _mm256_setzero_ps();
+    __m256 neg = _mm256_or_ps(_mm256_or_ps(TWLT(ue, z), TWLT(ve, z)), TWLT(we, z));
+    __m256 pos = _mm256_or_ps(_mm256_or_ps(TWGT(ue, z), TWGT(ve, z)), TWGT(we, z));
+    __m256 det = _mm256_add_ps(_mm256_add_ps(ue, ve), we);
+    {
+        /* no lane passes the edge-sign / det test: skip the divide (same
+         * result, the t range test below can only reject further) */
+        int em = _mm256_movemask_ps(_mm256_andnot_ps(_mm256_and_ps(neg, pos), _mm256_cmp_ps(det, z, _CMP_NEQ_UQ)));
+        if (!em) {
+            *tt_o = *ve_o = *we_o = *det_o = z;
+            return 0;
+        }
+    }
+    __m256 num = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(ue, _mm256_mul_ps(w->sz, az)), _mm256_mul_ps(ve, _mm256_mul_ps(w->sz, bz))), _mm256_mul_ps(we, _mm256_mul_ps(w->sz, cz)));
+    __m256 tt = _mm256_div_ps(num, det);
+    __m256 ok = _mm256_andnot_ps(_mm256_and_ps(neg, pos), TWNEQ(det, z));
+    ok = _mm256_and_ps(ok, _mm256_and_ps(TWGE(tt, w->tmin), TWLT(tt, _mm256_set1_ps(best))));
+    int m = _mm256_movemask_ps(ok);
+    for (int l = 0; l < 8; l++)
+        if (ids[l] == LRT_TRI_NO_HIT) m &= ~(1 << l);
+    *tt_o = tt;
+    *ve_o = ve;
+    *we_o = we;
+    *det_o = det;
+    return m;
+}
+static inline void tri_woop8_block(const float *wb, const uint32_t *ids,
+                                   const tri_woop8_ctx *w, float *best_t,
+                                   float *best_u, float *best_v, uint32_t *best_prim) {
+    __m256 tt, ve, we, det;
+    int m = tri_woop8_lanes(wb, ids, w, *best_t, &tt, &ve, &we, &det);
+    if (!m) return;
+    _Alignas(32) float T[8], V[8], WW[8], D[8];
+    _mm256_store_ps(T, tt);
+    _mm256_store_ps(V, ve);
+    _mm256_store_ps(WW, we);
+    _mm256_store_ps(D, det);
+    int bl = -1;
+    float bt = *best_t;
+    for (int l = 0; l < 8; l++)
+        if (((m >> l) & 1) && T[l] < bt) {
+            bt = T[l];
+            bl = l;
+        }
+    *best_t = bt;
+    *best_u = V[bl] / D[bl];
+    *best_v = WW[bl] / D[bl];
+    *best_prim = ids[bl];
+}
+static inline int tri_woop8_block_occ(const float *wb, const uint32_t *ids,
+                                      const tri_woop8_ctx *w, float tmax) {
+    __m256 tt, ve, we, det;
+    return tri_woop8_lanes(wb, ids, w, tmax, &tt, &ve, &we, &det) != 0;
+}
+#undef TWLT
+#undef TWGT
+#undef TWGE
+#undef TWNEQ
 #endif
 
 /* 8-wide SoA Moller-Trumbore over one lrt_tri8 block. Updates best in place. */
@@ -8767,6 +9329,9 @@ static inline int tri_bvh8_slab_avx(const lrt_bvh8_node *n,
     __m256 tfar = _mm256_min_ps(
         _mm256_min_ps(_mm256_max_ps(tlx, thx), _mm256_max_ps(tly, thy)),
         _mm256_min_ps(_mm256_max_ps(tlz, thz), t_best));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = _mm256_mul_ps(tfar, _mm256_set1_ps(TRI_SLAB_K));
+#endif
     _mm256_store_ps(tnear_out, tnear);
     return _mm256_movemask_ps(_mm256_cmp_ps(tnear, tfar, _CMP_LE_OQ));
 }
@@ -8775,8 +9340,16 @@ static int tri_intersect_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray,
                                    lrt_hit *hit) {
     tri_ray_ctx rc;
     tri_ray_setup(ray, &rc);
+#ifdef LRT_TRI_EXACT_NEAREST
+    tri_exn_ctx xc;
+    tri_exn_setup(s, &rc, &xc);
+#endif
     tri_avx_ctx ac;
     tri_avx_setup(&rc, &ac);
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    tri_woop8_ctx wc;
+    int wc_ready = 0; /* lazy: rays that reach no leaf skip the setup */
+#endif
 
     float best_t = ray->tmax;
     float best_u = 0.0f, best_v = 0.0f;
@@ -8796,6 +9369,17 @@ static int tri_intersect_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray,
             uint32_t nblk = TRI_REF_NBLOCKS(e.ref);
             const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+                if (s->wblk) {
+                    if (!wc_ready) {
+                        tri_woop8_setup(&rc, &wc);
+                        wc_ready = 1;
+                    }
+                    tri_woop8_block(s->wblk + (size_t)(blk0 + b) * 80, (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 80 + 72),
+                                    &wc, &best_t, &best_u, &best_v, &best_prim);
+                    continue;
+                }
+#endif
                 tri_block_isect_avx(&blocks[blk0 + b], &ac, &best_t, &best_u,
                                     &best_v, &best_prim);
             }
@@ -8805,7 +9389,12 @@ static int tri_intersect_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray,
         const lrt_bvh8_node *n = &s->nodes8[TRI_REF_NODE(e.ref)];
         _Alignas(32) float tnear[8];
         int mask = tri_bvh8_slab_avx(n, &ac, _mm256_set1_ps(TRI_CULL_T(best_t, ray->tmax)), tnear);
+#ifdef LRT_TRI_EXACT_NEAREST
+        for (int k = 0; k < 8; k++)
+            tnear[k] = TRI_EXN_KEY(&xc, n->lo_x, n->lo_y, n->lo_z, n->hi_x, n->hi_y, n->hi_z, k, rc.tmin);
+#else
         for (int k = 0; k < 8; k++) tnear[k] = TRI_PUSH_TN(tnear[k], rc.tmin);
+#endif
         mask &= (1 << n->nchildren) - 1;
         uint32_t hit_ref[8];
         float hit_tn[8];
@@ -8845,6 +9434,10 @@ static int tri_occluded_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray) {
     tri_avx_ctx ac;
     tri_avx_setup(&rc, &ac);
     __m256 tmax8 = _mm256_set1_ps(ray->tmax);
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    tri_woop8_ctx wc;
+    int wc_ready = 0; /* lazy: rays that reach no leaf skip the setup */
+#endif
 
     uint32_t stack[TRI_STACK_SIZE];
     int sp = 0;
@@ -8857,6 +9450,19 @@ static int tri_occluded_bvh8_avx2(const lrt_tri_scene *s, const lrt_ray *ray) {
             uint32_t nblk = TRI_REF_NBLOCKS(ref);
             const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+                if (s->wblk) {
+                    if (!wc_ready) {
+                        tri_woop8_setup(&rc, &wc);
+                        wc_ready = 1;
+                    }
+                    if (tri_woop8_block_occ(s->wblk + (size_t)(blk0 + b) * 80,
+                                            (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 80 + 72),
+                                            &wc, ray->tmax))
+                        return 1;
+                    continue;
+                }
+#endif
                 if (tri_block_occluded_avx(&blocks[blk0 + b], &ac, tmax8)) {
                     return 1;
                 }
@@ -8900,6 +9506,9 @@ static inline int tri_slab8_robust_q(const float org3[3], const float scale3[3],
     __m256 tfar = _mm256_min_ps(
         _mm256_min_ps(_mm256_max_ps(tlx, thx), _mm256_max_ps(tly, thy)),
         _mm256_min_ps(_mm256_max_ps(tlz, thz), t_best));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = _mm256_mul_ps(tfar, _mm256_set1_ps(TRI_SLAB_K));
+#endif
     _mm256_store_ps(tnear_out, tnear);
     return _mm256_movemask_ps(_mm256_cmp_ps(tnear, tfar, _CMP_LE_OQ));
 }
@@ -8939,6 +9548,9 @@ static inline int tri_bvh8q_slab_avx(const lrt_bvh8q_node *n,
     __m256 tfar = _mm256_min_ps(
         _mm256_min_ps(_mm256_max_ps(tlx, thx), _mm256_max_ps(tly, thy)),
         _mm256_min_ps(_mm256_max_ps(tlz, thz), t_best));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = _mm256_mul_ps(tfar, _mm256_set1_ps(TRI_SLAB_K));
+#endif
     _mm256_store_ps(tnear_out, tnear);
     return _mm256_movemask_ps(_mm256_cmp_ps(tnear, tfar, _CMP_LE_OQ));
 }
@@ -9102,6 +9714,9 @@ static inline int tri_bvh8qf8_slab_avx(const lrt_bvh8q_node *n,
     __m256 tfar = _mm256_min_ps(
         _mm256_min_ps(_mm256_max_ps(tlx, thx), _mm256_max_ps(tly, thy)),
         _mm256_min_ps(_mm256_max_ps(tlz, thz), t_best));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = _mm256_mul_ps(tfar, _mm256_set1_ps(TRI_SLAB_K));
+#endif
     _mm256_store_ps(tnear_out, tnear);
     return _mm256_movemask_ps(_mm256_cmp_ps(tnear, tfar, _CMP_LE_OQ));
 }
@@ -9130,6 +9745,9 @@ static inline int tri_bvh8q4_slab_avx(const lrt_bvh8q4_node *n,
     __m256 tfar = _mm256_min_ps(
         _mm256_min_ps(_mm256_max_ps(tlx, thx), _mm256_max_ps(tly, thy)),
         _mm256_min_ps(_mm256_max_ps(tlz, thz), t_best));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = _mm256_mul_ps(tfar, _mm256_set1_ps(TRI_SLAB_K));
+#endif
     _mm256_store_ps(tnear_out, tnear);
     return _mm256_movemask_ps(_mm256_cmp_ps(tnear, tfar, _CMP_LE_OQ));
 }
@@ -9143,7 +9761,7 @@ static inline void tri_qleaf_isect(const lrt_tri_scene *s, const lrt_tri8 *blk,
                                    float *best_t, float *best_u, float *best_v,
                                    uint32_t *best_prim) {
 #ifdef LRT_TRI_WATERTIGHT_TRI
-    if (s->wverts) {
+    if (s->wblk) {
         const float *f = (const float *)(const void *)blk;
         for (int lane = 0; lane < 8; lane++) {
             float t, u, v;
@@ -9162,7 +9780,7 @@ static inline int tri_qleaf_occluded(const lrt_tri_scene *s, const lrt_tri8 *blk
                                      const tri_ray_ctx *rc, const tri_avx_ctx *ac,
                                      __m256 tmax8) {
 #ifdef LRT_TRI_WATERTIGHT_TRI
-    if (s->wverts) {
+    if (s->wblk) {
         const float *f = (const float *)(const void *)blk;
         _Alignas(32) float tm[8];
         _mm256_store_ps(tm, tmax8);
@@ -9291,12 +9909,19 @@ typedef struct tri_pipe8_state {
     lrt_hit *hit;
     int sp;
     tri_stack_entry stack[TRI_STACK_SIZE];
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    tri_woop8_ctx wc;
+    int wc_ready;
+#endif
 } tri_pipe8_state;
 
 static inline void tri_pipe8_init(const lrt_tri_scene *s, tri_pipe8_state *st,
                                   const lrt_ray *ray, lrt_hit *hit) {
     tri_ray_setup(ray, &st->rc);
     tri_avx_setup(&st->rc, &st->ac);
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    st->wc_ready = 0; /* lazy: set up at the first leaf */
+#endif
     st->best_t = ray->tmax;
     st->best_u = 0.0f;
     st->best_v = 0.0f;
@@ -9316,6 +9941,17 @@ static inline int tri_pipe8_step(const lrt_tri_scene *s, tri_pipe8_state *st) {
             uint32_t nblk = TRI_REF_NBLOCKS(e.ref);
             const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+                if (s->wblk) {
+                    if (!st->wc_ready) {
+                        tri_woop8_setup(&st->rc, &st->wc);
+                        st->wc_ready = 1;
+                    }
+                    tri_woop8_block(s->wblk + (size_t)(blk0 + b) * 80, (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 80 + 72),
+                                    &st->wc, &st->best_t, &st->best_u, &st->best_v, &st->best_prim);
+                    continue;
+                }
+#endif
                 tri_block_isect_avx(&blocks[blk0 + b], &st->ac, &st->best_t,
                                     &st->best_u, &st->best_v, &st->best_prim);
             }
@@ -9416,6 +10052,10 @@ typedef struct tri_pipeocc8_state {
     uint8_t *out;
     int sp;
     uint32_t stack[TRI_STACK_SIZE];
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    tri_woop8_ctx wc;
+    int wc_ready;
+#endif
 } tri_pipeocc8_state;
 
 static inline void tri_pipeocc8_init(const lrt_tri_scene *s,
@@ -9423,6 +10063,9 @@ static inline void tri_pipeocc8_init(const lrt_tri_scene *s,
                                      const lrt_ray *ray, uint8_t *out) {
     tri_ray_setup(ray, &st->rc);
     tri_avx_setup(&st->rc, &st->ac);
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    st->wc_ready = 0; /* lazy: set up at the first leaf */
+#endif
     st->tmax8 = _mm256_set1_ps(ray->tmax);
     st->out = out;
     st->stack[0] = s->root;
@@ -9441,6 +10084,20 @@ static inline int tri_pipeocc8_step(const lrt_tri_scene *s,
         uint32_t nblk = TRI_REF_NBLOCKS(ref);
         const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
         for (uint32_t b = 0; b < nblk; b++) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+            if (s->wblk) {
+                if (!st->wc_ready) {
+                    tri_woop8_setup(&st->rc, &st->wc);
+                    st->wc_ready = 1;
+                }
+                if (tri_woop8_block_occ(s->wblk + (size_t)(blk0 + b) * 80, (const uint32_t *)(s->wblk + (size_t)(blk0 + b) * 80 + 72), &st->wc,
+                                        _mm256_cvtss_f32(st->tmax8))) {
+                    *st->out = 1;
+                    return 0;
+                }
+                continue;
+            }
+#endif
             if (tri_block_occluded_avx(&blocks[blk0 + b], &st->ac, st->tmax8)) {
                 *st->out = 1;
                 return 0;
@@ -9584,6 +10241,124 @@ static inline svbool_t tri_det_parallel_sve(svbool_t pg, svfloat32_t e1x,
 #endif
 }
 
+/* Watertight SVE leaf: the fp32 Woop test on the exact-vertex SoA block
+ * (`wblk`, 10*w floats: v0 xyz, v1 xyz, v2 xyz, ids). The ray's dominant
+ * axis, shear and scale are scalar (uniform); the edge functions are
+ * lane-parallel with separate mul/sub (no FMA), mirroring tri_woop8_lanes and
+ * tri_woop_one so every lane is bit-identical to the scalar test. One kernel
+ * serves width 8 (BVH8) and 16 (BVH16). */
+typedef struct tri_woop_sve_ctx {
+    int kx, ky, kz;
+    float sx, sy, sz, ox, oy, oz, tmin;
+} tri_woop_sve_ctx;
+
+static inline void tri_woop_sve_setup(const tri_ray_ctx *rc,
+                                      tri_woop_sve_ctx *w) {
+    const float *d = rc->dir, *o = rc->org;
+    float a0 = copysignf(d[0], 1.0f), a1 = copysignf(d[1], 1.0f),
+          a2 = copysignf(d[2], 1.0f);
+    int kz = 0;
+    if (a1 > a0) kz = 1;
+    if (a2 > a0 && a2 > a1) kz = 2;
+    int kx = kz + 1;
+    if (kx == 3) kx = 0;
+    int ky = kx + 1;
+    if (ky == 3) ky = 0;
+    if (d[kz] < 0.0f) {
+        int t = kx;
+        kx = ky;
+        ky = t;
+    }
+    w->kx = kx; w->ky = ky; w->kz = kz;
+    w->sx = d[kx] / d[kz];
+    w->sy = d[ky] / d[kz];
+    w->sz = 1.0f / d[kz];
+    w->ox = o[kx]; w->oy = o[ky]; w->oz = o[kz];
+    w->tmin = rc->tmin;
+}
+
+/* Materialise t/u/v/det for the lanes passing the edge-sign, det, and
+ * [tmin, best) tests; T is +INF elsewhere. Returns whether any lane passed. */
+static inline int tri_woop_sve_core(const float *wb, int w,
+                                    const tri_woop_sve_ctx *c, float best,
+                                    float T[16], float U[16], float V[16],
+                                    float D[16]) {
+    svbool_t pg = svwhilelt_b32((uint32_t)0, (uint32_t)w);
+    svfloat32_t ox = svdup_f32(c->ox), oy = svdup_f32(c->oy), oz = svdup_f32(c->oz);
+    svfloat32_t sx = svdup_f32(c->sx), sy = svdup_f32(c->sy), sz = svdup_f32(c->sz);
+    svfloat32_t ax = svsub_f32_x(pg, svld1_f32(pg, wb + (0 + c->kx) * w), ox);
+    svfloat32_t ay = svsub_f32_x(pg, svld1_f32(pg, wb + (0 + c->ky) * w), oy);
+    svfloat32_t az = svsub_f32_x(pg, svld1_f32(pg, wb + (0 + c->kz) * w), oz);
+    svfloat32_t bx = svsub_f32_x(pg, svld1_f32(pg, wb + (3 + c->kx) * w), ox);
+    svfloat32_t by = svsub_f32_x(pg, svld1_f32(pg, wb + (3 + c->ky) * w), oy);
+    svfloat32_t bz = svsub_f32_x(pg, svld1_f32(pg, wb + (3 + c->kz) * w), oz);
+    svfloat32_t cx = svsub_f32_x(pg, svld1_f32(pg, wb + (6 + c->kx) * w), ox);
+    svfloat32_t cy = svsub_f32_x(pg, svld1_f32(pg, wb + (6 + c->ky) * w), oy);
+    svfloat32_t cz = svsub_f32_x(pg, svld1_f32(pg, wb + (6 + c->kz) * w), oz);
+    ax = svsub_f32_x(pg, ax, svmul_f32_x(pg, sx, az));
+    ay = svsub_f32_x(pg, ay, svmul_f32_x(pg, sy, az));
+    bx = svsub_f32_x(pg, bx, svmul_f32_x(pg, sx, bz));
+    by = svsub_f32_x(pg, by, svmul_f32_x(pg, sy, bz));
+    cx = svsub_f32_x(pg, cx, svmul_f32_x(pg, sx, cz));
+    cy = svsub_f32_x(pg, cy, svmul_f32_x(pg, sy, cz));
+    svfloat32_t ue = svsub_f32_x(pg, svmul_f32_x(pg, cx, by), svmul_f32_x(pg, cy, bx));
+    svfloat32_t ve = svsub_f32_x(pg, svmul_f32_x(pg, ax, cy), svmul_f32_x(pg, ay, cx));
+    svfloat32_t we = svsub_f32_x(pg, svmul_f32_x(pg, bx, ay), svmul_f32_x(pg, by, ax));
+    svfloat32_t z = svdup_f32(0.0f);
+    svbool_t neg = svorr_b_z(pg, svorr_b_z(pg, svcmplt_f32(pg, ue, z),
+                                           svcmplt_f32(pg, ve, z)),
+                             svcmplt_f32(pg, we, z));
+    svbool_t pos = svorr_b_z(pg, svorr_b_z(pg, svcmpgt_f32(pg, ue, z),
+                                           svcmpgt_f32(pg, ve, z)),
+                             svcmpgt_f32(pg, we, z));
+    svfloat32_t det = svadd_f32_x(pg, svadd_f32_x(pg, ue, ve), we);
+    svbool_t ok = svbic_b_z(pg, svcmpne_f32(pg, det, z), svand_b_z(pg, neg, pos));
+    svfloat32_t num = svadd_f32_x(
+        pg, svadd_f32_x(pg, svmul_f32_x(pg, ue, svmul_f32_x(pg, sz, az)),
+                        svmul_f32_x(pg, ve, svmul_f32_x(pg, sz, bz))),
+        svmul_f32_x(pg, we, svmul_f32_x(pg, sz, cz)));
+    svfloat32_t tt = svdiv_f32_x(pg, num, det);
+    ok = svand_b_z(pg, ok,
+                   svand_b_z(pg, svcmpge_f32(pg, tt, svdup_f32(c->tmin)),
+                             svcmplt_f32(pg, tt, svdup_f32(best))));
+    svst1_f32(pg, T, svsel_f32(ok, tt, svdup_f32(TRI_INF_F)));
+    svst1_f32(pg, U, ve);
+    svst1_f32(pg, V, we);
+    svst1_f32(pg, D, det);
+    return svptest_any(pg, ok);
+}
+
+/* Closest hit in one block (mirrors tri_woop8_block). */
+static inline void tri_woop_sve_block(const float *wb, const uint32_t *ids,
+                                      int w, const tri_woop_sve_ctx *c,
+                                      float *best_t, float *best_u,
+                                      float *best_v, uint32_t *best_prim) {
+    _Alignas(64) float T[16], U[16], V[16], D[16];
+    if (!tri_woop_sve_core(wb, w, c, *best_t, T, U, V, D)) return;
+    int bl = -1;
+    float bt = *best_t;
+    for (int l = 0; l < w; l++)
+        if (ids[l] != LRT_TRI_NO_HIT && T[l] < bt) {
+            bt = T[l];
+            bl = l;
+        }
+    if (bl < 0) return;
+    *best_t = bt;
+    *best_u = U[bl] / D[bl];
+    *best_v = V[bl] / D[bl];
+    *best_prim = ids[bl];
+}
+
+/* Any hit in one block (mirrors tri_woop8_block_occ: half-open t < tmax). */
+static inline int tri_woop_sve_occ(const float *wb, const uint32_t *ids, int w,
+                                   const tri_woop_sve_ctx *c, float tmax) {
+    _Alignas(64) float T[16], U[16], V[16], D[16];
+    if (!tri_woop_sve_core(wb, w, c, tmax, T, U, V, D)) return 0;
+    for (int l = 0; l < w; l++)
+        if (ids[l] != LRT_TRI_NO_HIT && T[l] < tmax) return 1;
+    return 0;
+}
+
 /* 8-wide SoA Moller-Trumbore over one lrt_tri8 block. Updates best in place. */
 static inline void tri_block_isect_sve(const lrt_tri8 *blk,
                                        const tri_ray_ctx *rc, float *best_t,
@@ -9722,6 +10497,9 @@ static inline void tri_bvh8_slab_sve(const lrt_bvh8_node *n,
     svfloat32_t tfar = TRI_SVMIN(
         pg, TRI_SVMIN(pg, TRI_SVMAX(pg, tlx, thx), TRI_SVMAX(pg, tly, thy)),
         TRI_SVMIN(pg, TRI_SVMAX(pg, tlz, thz), svdup_f32(best_t)));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = svmul_n_f32_x(pg, tfar, TRI_SLAB_K);
+#endif
     svst1_f32(pg, tnear_out, tnear);
     svst1_f32(pg, tfar_out, tfar);
 }
@@ -9730,6 +10508,10 @@ static int tri_intersect_bvh8_sve(const lrt_tri_scene *s, const lrt_ray *ray,
                                   lrt_hit *hit) {
     tri_ray_ctx rc;
     tri_ray_setup(ray, &rc);
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    tri_woop_sve_ctx wc;
+    if (s->wblk) tri_woop_sve_setup(&rc, &wc);
+#endif
 
     float best_t = ray->tmax;
     float best_u = 0.0f, best_v = 0.0f;
@@ -9749,6 +10531,14 @@ static int tri_intersect_bvh8_sve(const lrt_tri_scene *s, const lrt_ray *ray,
             uint32_t nblk = TRI_REF_NBLOCKS(e.ref);
             const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+                if (s->wblk) {
+                    const float *wb = s->wblk + (size_t)(blk0 + b) * 80;
+                    tri_woop_sve_block(wb, (const uint32_t *)(wb + 72), 8, &wc,
+                                       &best_t, &best_u, &best_v, &best_prim);
+                    continue;
+                }
+#endif
                 tri_block_isect_sve(&blocks[blk0 + b], &rc, &best_t, &best_u,
                                     &best_v, &best_prim);
             }
@@ -9798,6 +10588,10 @@ static int tri_occluded_bvh8_sve(const lrt_tri_scene *s, const lrt_ray *ray) {
     tri_ray_ctx rc;
     tri_ray_setup(ray, &rc);
     float tmax = ray->tmax;
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    tri_woop_sve_ctx wc;
+    if (s->wblk) tri_woop_sve_setup(&rc, &wc);
+#endif
 
     uint32_t stack[TRI_STACK_SIZE];
     int sp = 0;
@@ -9810,6 +10604,14 @@ static int tri_occluded_bvh8_sve(const lrt_tri_scene *s, const lrt_ray *ray) {
             uint32_t nblk = TRI_REF_NBLOCKS(ref);
             const lrt_tri8 *blocks = (const lrt_tri8 *)s->blocks;
             for (uint32_t b = 0; b < nblk; b++) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+                if (s->wblk) {
+                    const float *wb = s->wblk + (size_t)(blk0 + b) * 80;
+                    if (tri_woop_sve_occ(wb, (const uint32_t *)(wb + 72), 8, &wc, tmax))
+                        return 1;
+                    continue;
+                }
+#endif
                 if (tri_block_occluded_sve(&blocks[blk0 + b], &rc, tmax)) return 1;
             }
             continue;
@@ -9960,6 +10762,9 @@ static inline void tri_bvh16_slab_sve(const lrt_bvh16_node *n,
     svfloat32_t tfar = TRI_SVMIN(
         pg, TRI_SVMIN(pg, TRI_SVMAX(pg, tlx, thx), TRI_SVMAX(pg, tly, thy)),
         TRI_SVMIN(pg, TRI_SVMAX(pg, tlz, thz), svdup_f32(best_t)));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = svmul_n_f32_x(pg, tfar, TRI_SLAB_K);
+#endif
     svst1_f32(pg, tnear_out, tnear);
     svst1_f32(pg, tfar_out, tfar);
 }
@@ -9968,6 +10773,10 @@ static int tri_intersect_bvh16_sve(const lrt_tri_scene *s, const lrt_ray *ray,
                                    lrt_hit *hit) {
     tri_ray_ctx rc;
     tri_ray_setup(ray, &rc);
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    tri_woop_sve_ctx wc;
+    if (s->wblk) tri_woop_sve_setup(&rc, &wc);
+#endif
     float best_t = ray->tmax, best_u = 0.0f, best_v = 0.0f;
     uint32_t best_prim = LRT_TRI_NO_HIT;
     tri_stack_entry stack[TRI_STACK_SIZE];
@@ -9981,9 +10790,18 @@ static int tri_intersect_bvh16_sve(const lrt_tri_scene *s, const lrt_ray *ray,
         if (TRI_REF_IS_LEAF(e.ref)) {
             uint32_t blk0 = TRI_REF_BLOCK(e.ref), nblk = TRI_REF_NBLOCKS(e.ref);
             const lrt_tri16 *blocks = (const lrt_tri16 *)s->blocks;
-            for (uint32_t b = 0; b < nblk; b++)
+            for (uint32_t b = 0; b < nblk; b++) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+                if (s->wblk) {
+                    const float *wb = s->wblk + (size_t)(blk0 + b) * 160;
+                    tri_woop_sve_block(wb, (const uint32_t *)(wb + 144), 16, &wc,
+                                       &best_t, &best_u, &best_v, &best_prim);
+                    continue;
+                }
+#endif
                 tri_block_isect_sve16(&blocks[blk0 + b], &rc, &best_t, &best_u,
                                       &best_v, &best_prim);
+            }
             continue;
         }
         const lrt_bvh16_node *n = &s->nodes16[TRI_REF_NODE(e.ref)];
@@ -10024,6 +10842,10 @@ static int tri_occluded_bvh16_sve(const lrt_tri_scene *s, const lrt_ray *ray) {
     tri_ray_ctx rc;
     tri_ray_setup(ray, &rc);
     float tmax = ray->tmax;
+#ifdef LRT_TRI_WATERTIGHT_TRI
+    tri_woop_sve_ctx wc;
+    if (s->wblk) tri_woop_sve_setup(&rc, &wc);
+#endif
     uint32_t stack[TRI_STACK_SIZE];
     int sp = 0;
     stack[sp++] = s->root;
@@ -10032,8 +10854,17 @@ static int tri_occluded_bvh16_sve(const lrt_tri_scene *s, const lrt_ray *ray) {
         if (TRI_REF_IS_LEAF(ref)) {
             uint32_t blk0 = TRI_REF_BLOCK(ref), nblk = TRI_REF_NBLOCKS(ref);
             const lrt_tri16 *blocks = (const lrt_tri16 *)s->blocks;
-            for (uint32_t b = 0; b < nblk; b++)
+            for (uint32_t b = 0; b < nblk; b++) {
+#ifdef LRT_TRI_WATERTIGHT_TRI
+                if (s->wblk) {
+                    const float *wb = s->wblk + (size_t)(blk0 + b) * 160;
+                    if (tri_woop_sve_occ(wb, (const uint32_t *)(wb + 144), 16, &wc, tmax))
+                        return 1;
+                    continue;
+                }
+#endif
                 if (tri_block_occluded_sve16(&blocks[blk0 + b], &rc, tmax)) return 1;
+            }
             continue;
         }
         const lrt_bvh16_node *n = &s->nodes16[TRI_REF_NODE(ref)];
@@ -10079,6 +10910,9 @@ static inline void tri_bvh8q_slab_sve(const lrt_bvh8q_node *n,
     svfloat32_t tfar = svmin_f32_x(
         pg, svmin_f32_x(pg, svmax_f32_x(pg, tlx, thx), svmax_f32_x(pg, tly, thy)),
         svmin_f32_x(pg, svmax_f32_x(pg, tlz, thz), svdup_f32(best_t)));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = svmul_n_f32_x(pg, tfar, TRI_SLAB_K);
+#endif
     svst1_f32(pg, tnear_out, tnear);
     svst1_f32(pg, tfar_out, tfar);
 }
@@ -10247,6 +11081,9 @@ static void tri_intersect16_sve(const lrt_tri_scene *s, const lrt_ray *rays,
             svfloat32_t thz = svmul_f32_x(pg, svsub_f32_x(pg, svdup_f32(nv.hi_z[i]), orgz), invdz);
             svfloat32_t tnear = svmax_f32_x(pg, svmax_f32_x(pg, svmin_f32_x(pg, tlx, thx), svmin_f32_x(pg, tly, thy)), svmax_f32_x(pg, svmin_f32_x(pg, tlz, thz), tmin));
             svfloat32_t tfar = svmin_f32_x(pg, svmin_f32_x(pg, svmax_f32_x(pg, tlx, thx), svmax_f32_x(pg, tly, thy)), svmin_f32_x(pg, svmax_f32_x(pg, tlz, thz), best_t));
+#ifdef LRT_TRI_SLAB_INFLATE
+            tfar = svmul_n_f32_x(pg, tfar, TRI_SLAB_K);
+#endif
             if (svptest_any(pg, svcmple_f32(pg, tnear, tfar))) stack[sp++] = nv.child[i];
         }
     }
@@ -10303,7 +11140,9 @@ static int tri_occluded_bvh8q_sve(const lrt_tri_scene *s, const lrt_ray *ray) {
 /* scalar double elsewhere. Triangle vertices are the build's fp32 values.    */
 /* ========================================================================= */
 typedef struct tri_ray_ctx_hp {
-    double org[3], dir[3], invd[3], tmin;
+    double org[3], dir[3], invd[3];
+    double sinv[3]; /* +inf for d == 0: the robust-slab NaN-drop semantics */
+    double tmin;
 } tri_ray_ctx_hp;
 
 #define TRI_INVD_MAX_HP 1e300
@@ -10316,6 +11155,7 @@ static inline void tri_ray_setup_hp(const lrt_ray_hp *ray, tri_ray_ctx_hp *rc) {
         if (!(inv >= -TRI_INVD_MAX_HP && inv <= TRI_INVD_MAX_HP))
             inv = copysign(TRI_INVD_MAX_HP, ray->dir[k] == 0.0 ? 1.0 : ray->dir[k]);
         rc->invd[k] = inv;
+        rc->sinv[k] = ray->dir[k] == 0.0 ? INFINITY : inv;
     }
     rc->tmin = ray->tmin;
 }
@@ -10329,18 +11169,62 @@ static inline int tri_slab_hp(const float *lo_x, const float *lo_y,
                               const float *hi_y, const float *hi_z, int i,
                               const tri_ray_ctx_hp *rc, double t_best,
                               double *tnear_out) {
-    double tlx = ((double)lo_x[i] - rc->org[0]) * rc->invd[0];
-    double thx = ((double)hi_x[i] - rc->org[0]) * rc->invd[0];
-    double tly = ((double)lo_y[i] - rc->org[1]) * rc->invd[1];
-    double thy = ((double)hi_y[i] - rc->org[1]) * rc->invd[1];
-    double tlz = ((double)lo_z[i] - rc->org[2]) * rc->invd[2];
-    double thz = ((double)hi_z[i] - rc->org[2]) * rc->invd[2];
-    double tnear = tri_maxd(tri_maxd(tri_mind(tlx, thx), tri_mind(tly, thy)),
-                            tri_maxd(tri_mind(tlz, thz), rc->tmin));
-    double tfar = tri_mind(tri_mind(tri_maxd(tlx, thx), tri_maxd(tly, thy)),
-                           tri_mind(tri_maxd(tlz, thz), t_best));
+    double tlx = ((double)lo_x[i] - rc->org[0]) * rc->sinv[0];
+    double thx = ((double)hi_x[i] - rc->org[0]) * rc->sinv[0];
+    double tly = ((double)lo_y[i] - rc->org[1]) * rc->sinv[1];
+    double thy = ((double)hi_y[i] - rc->org[1]) * rc->sinv[1];
+    double tlz = ((double)lo_z[i] - rc->org[2]) * rc->sinv[2];
+    double thz = ((double)hi_z[i] - rc->org[2]) * rc->sinv[2];
+    double tnx = tri_mind(thx, tlx), tfx = tri_maxd(tlx, thx);
+    double tny = tri_mind(thy, tly), tfy = tri_maxd(tly, thy);
+    double tnz = tri_mind(thz, tlz), tfz = tri_maxd(tlz, thz);
+    double tnear = tri_maxd(tri_maxd(tnx, tny), tri_maxd(tnz, rc->tmin));
+    double tfar = tri_mind(tri_mind(tfx, tfy), tri_mind(tfz, t_best));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = tfar * (double)TRI_SLAB_K;
+#endif
     *tnear_out = tnear;
     return tnear <= tfar;
+}
+
+/* fp64 Woop leaf: the scalar `tri_woop_one` sheared-space test in double, on
+ * the exact stored vertices of a vertex-format block. It is the fp64
+ * counterpart of the fp32 SIMD leaf: no det epsilon, and on a shared edge the
+ * two triangles evaluate the same double expression up to sign, so the test
+ * is watertight whenever the fp64 ray itself meets the surface. */
+static inline int tri_woop_one_hp(const double o[3], const double d[3],
+                                  const double v0[3], const double v1[3],
+                                  const double v2[3], double tmin, double tbest,
+                                  double *t, double *u, double *v) {
+    double a0 = fabs(d[0]), a1 = fabs(d[1]), a2 = fabs(d[2]);
+    int kz = 0;
+    if (a1 > a0) kz = 1;
+    if (a2 > a0 && a2 > a1) kz = 2;
+    int kx = kz + 1;
+    if (kx == 3) kx = 0;
+    int ky = kx + 1;
+    if (ky == 3) ky = 0;
+    if (d[kz] < 0.0) { int tmp = kx; kx = ky; ky = tmp; }
+    double sx = d[kx] / d[kz], sy = d[ky] / d[kz], sz = 1.0 / d[kz];
+    double ax = v0[kx] - o[kx], ay = v0[ky] - o[ky], az = v0[kz] - o[kz];
+    double bx = v1[kx] - o[kx], by = v1[ky] - o[ky], bz = v1[kz] - o[kz];
+    double cx = v2[kx] - o[kx], cy = v2[ky] - o[ky], cz = v2[kz] - o[kz];
+    ax = ax - sx * az; ay = ay - sy * az;
+    bx = bx - sx * bz; by = by - sy * bz;
+    cx = cx - sx * cz; cy = cy - sy * cz;
+    double ue = cx * by - cy * bx;
+    double ve = ax * cy - ay * cx;
+    double we = bx * ay - by * ax;
+    if ((ue < 0.0 || ve < 0.0 || we < 0.0) &&
+        (ue > 0.0 || ve > 0.0 || we > 0.0)) return 0;
+    double det = ue + ve + we;
+    if (det == 0.0) return 0;
+    double tt = (ue * (sz * az) + ve * (sz * bz) + we * (sz * cz)) / det;
+    if (!(tt >= tmin && tt < tbest)) return 0;
+    *t = tt;
+    *u = ve / det;
+    *v = we / det;
+    return 1;
 }
 
 /* fp64 leaf Moller-Trumbore over a generic-width block (f = 9 float arrays of
@@ -10348,15 +11232,43 @@ static inline int tri_slab_hp(const float *lo_x, const float *lo_y,
 static inline void tri_block_isect_hp(const float *f, int bw,
                                       const tri_ray_ctx_hp *rc, double *best_t,
                                       double *best_u, double *best_v,
-                                      uint32_t *best_prim, const uint32_t *prim) {
-    /* Promote the block lanes to double scratch (bw <= 8). */
+                                      uint32_t *best_prim, const uint32_t *prim, int vf) {
+    /* Promote the block lanes to double scratch (bw <= 8). A vertex-format
+     * block gives the edges as fl(v1 - v0), bit-identical to the stored ones. */
     double v0x[8], v0y[8], v0z[8], e1x[8], e1y[8], e1z[8], e2x[8], e2y[8], e2z[8];
     for (int l = 0; l < bw; l++) {
-        v0x[l] = f[0 * bw + l]; v0y[l] = f[1 * bw + l]; v0z[l] = f[2 * bw + l];
-        e1x[l] = f[3 * bw + l]; e1y[l] = f[4 * bw + l]; e1z[l] = f[5 * bw + l];
-        e2x[l] = f[6 * bw + l]; e2y[l] = f[7 * bw + l]; e2z[l] = f[8 * bw + l];
+        float a0 = f[0 * bw + l], a1 = f[1 * bw + l], a2 = f[2 * bw + l];
+        float b0 = f[3 * bw + l], b1 = f[4 * bw + l], b2 = f[5 * bw + l];
+        float c0 = f[6 * bw + l], c1 = f[7 * bw + l], c2 = f[8 * bw + l];
+        if (vf) {
+            b0 = b0 - a0; b1 = b1 - a1; b2 = b2 - a2;
+            c0 = c0 - a0; c1 = c1 - a1; c2 = c2 - a2;
+        }
+        v0x[l] = a0; v0y[l] = a1; v0z[l] = a2;
+        e1x[l] = b0; e1y[l] = b1; e1z[l] = b2;
+        e2x[l] = c0; e2y[l] = c1; e2z[l] = c2;
     }
     double ta[8], ua[8], va[8];
+    if (vf) {
+        /* Watertight fp64 leaf on the exact vertices. */
+        for (int l = 0; l < bw; l++) {
+            if (prim[l] == LRT_TRI_NO_HIT) continue;
+            double w0[3] = {v0x[l], v0y[l], v0z[l]};
+            double w1[3] = {(double)f[3 * bw + l], (double)f[4 * bw + l],
+                            (double)f[5 * bw + l]};
+            double w2[3] = {(double)f[6 * bw + l], (double)f[7 * bw + l],
+                            (double)f[8 * bw + l]};
+            double tt, uu, vv;
+            if (tri_woop_one_hp(rc->org, rc->dir, w0, w1, w2, rc->tmin, *best_t,
+                                &tt, &uu, &vv)) {
+                *best_t = tt;
+                *best_u = uu;
+                *best_v = vv;
+                *best_prim = prim[l];
+            }
+        }
+        return;
+    }
 #if LRT_TRI_HAS_SVE
     svbool_t pg = svwhilelt_b64((uint64_t)0, (uint64_t)bw);
     svfloat64_t dx = svdup_f64(rc->dir[0]), dy = svdup_f64(rc->dir[1]),
@@ -10479,7 +11391,7 @@ static int tri_intersect_hp(const lrt_tri_scene *s, const lrt_ray_hp *ray,
                     tri_block_floats(s->blocks, blk0 + b, bw);
                 const uint32_t *prim = (const uint32_t *)(f + 9 * bw);
                 tri_block_isect_hp(f, bw, &rc, &best_t, &best_u, &best_v,
-                                   &best_prim, prim);
+                                   &best_prim, prim, tri_vfmt(s));
             }
             continue;
         }
@@ -10941,15 +11853,22 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
 #endif
 #ifdef LRT_TRI_WATERTIGHT_TRI
     if (s->prim_kind == TRI_PRIM_TRI) {
-        s->wverts = (float *)malloc(ntris * 9 * sizeof(float));
-        if (!s->wverts) {
+        float *wv = (float *)malloc(ntris * 9 * sizeof(float));
+        if (!wv) {
             lrt_tri_scene_free(s);
             tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
             return NULL;
         }
         for (size_t i = 0; i < ntris; i++) {
             float buf[9];
-            memcpy(&s->wverts[i * 9], tri_fetch9(vertices, vidx, i, buf), 9 * sizeof(float));
+            memcpy(&wv[i * 9], tri_fetch9(vertices, vidx, i, buf), 9 * sizeof(float));
+        }
+        int okw = tri_build_wblk(s, wv, ntris);
+        free(wv); /* wblk is the only copy kept */
+        if (!okw) {
+            lrt_tri_scene_free(s);
+            tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+            return NULL;
         }
     }
 #endif
@@ -10959,11 +11878,13 @@ static lrt_tri_scene *tri_scene_build_impl(const float *vertices, size_t ntris,
      * intersector actually tests. SBVH (HQ) is skipped: its clipped leaf boxes
      * intentionally cover only part of a triangle. */
     if (s->prim_kind == TRI_PRIM_TRI && o.quality != LRT_TRI_BUILD_HQ &&
-        (layout == 4 || (layout == 8 && !quantized && !s->qnode)) &&
-        tri_refit_propagate(s) != LRT_RESULT_OK) {
-        lrt_tri_scene_free(s);
-        tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
-        return NULL;
+        (layout == 4 || (layout == 8 && !quantized && !s->qnode))) {
+        if (tri_refit_propagate(s) != LRT_RESULT_OK) {
+            lrt_tri_scene_free(s);
+            tri_set_err(err, LRT_RESULT_OUT_OF_MEMORY);
+            return NULL;
+        }
+        s->wbox_exact = tri_vfmt(s); /* boxes = exact min/max of exact vertices */
     }
 #endif
     tri_build_prim2slot(s);
@@ -11135,7 +12056,7 @@ void lrt_tri_scene_free(lrt_tri_scene *s) {
     free(s->shade_cps);
     free(s->shade_dom);
 #ifdef LRT_TRI_WATERTIGHT_TRI
-    free(s->wverts);
+    if (s->wblk != (float *)s->blocks) free(s->wblk);
 #endif
     free(s);
 }
@@ -11146,7 +12067,7 @@ int lrt_tri_intersect1(const lrt_tri_scene *s, const lrt_ray *ray, lrt_hit *hit)
         return 0;
     }
 #ifdef LRT_TRI_WATERTIGHT_TRI
-    if (s->prim_kind == TRI_PRIM_TRI && s->wverts && s->layout != 16 && s->qnode == 0)
+    if (s->prim_kind == TRI_PRIM_TRI && s->wblk && !TRI_WBLK_SIMD(s) && s->layout != 16 && s->qnode == 0)
         return tri_intersect_scalar(s, ray, hit); /* watertight leaf is scalar */
 #endif
     if (s->prim_kind == TRI_PRIM_QTRI) {
@@ -11394,7 +12315,7 @@ int lrt_tri_intersect1_hp(const lrt_tri_scene *s, const lrt_ray_hp *ray,
 int lrt_tri_occluded1(const lrt_tri_scene *s, const lrt_ray *ray) {
     if (!s || !ray) return 0;
 #ifdef LRT_TRI_WATERTIGHT_TRI
-    if (s->prim_kind == TRI_PRIM_TRI && s->wverts && s->layout != 16 && s->qnode == 0)
+    if (s->prim_kind == TRI_PRIM_TRI && s->wblk && !TRI_WBLK_SIMD(s) && s->layout != 16 && s->qnode == 0)
         return tri_occluded_scalar(s, ray);
 #endif
     if (s->prim_kind == TRI_PRIM_QTRI) {
@@ -11463,11 +12384,19 @@ void lrt_tri_intersect1N(const lrt_tri_scene *s, const lrt_ray *rays,
                          lrt_hit *hits, size_t n, lrt_tri_batch_hint hint) {
     if (!s || !rays || !hits) return;
     (void)hint; /* unused in scalar-only builds */
+#ifdef LRT_TRI_EXACT_NEAREST
+    /* The interleaved pipelines and ray packets prune by the running best and
+     * do not implement the exact-nearest node rule; run the per-ray kernels. */
+    for (size_t i = 0; i < n; i++) lrt_tri_intersect1(s, &rays[i], &hits[i]);
+    return;
+#endif
     /* The interleaved/packet pipelines are plain-triangle-only; every other
      * prim_kind (and qnode-quantized triangle nodes) must loop per ray. */
     if (s->prim_kind != TRI_PRIM_TRI || s->qnode != 0
 #ifdef LRT_TRI_WATERTIGHT_TRI
-        || s->wverts /* qnode != 0 is already per-ray above */
+        /* watertight: the interleaved pipeline pays off only for BVH4 closest
+         * hit (measured, PLAN.md M17); otherwise the per-ray SIMD kernels */
+        || (s->wblk && !(TRI_WBLK_SIMD(s) && s->layout == 4))
 #endif
         ) {
         for (size_t i = 0; i < n; i++) lrt_tri_intersect1(s, &rays[i], &hits[i]);
@@ -11541,7 +12470,7 @@ void lrt_tri_occluded1N(const lrt_tri_scene *s, const lrt_ray *rays,
     /* Plain-triangle-only pipelines; loop per ray for every other prim_kind. */
     if (s->prim_kind != TRI_PRIM_TRI || s->qnode != 0
 #ifdef LRT_TRI_WATERTIGHT_TRI
-        || s->wverts /* qnode != 0 is already per-ray above */
+        || s->wblk /* watertight any-hit: per-ray SIMD kernels measured faster (M20) */
 #endif
         ) {
         for (size_t i = 0; i < n; i++) {
@@ -11550,7 +12479,11 @@ void lrt_tri_occluded1N(const lrt_tri_scene *s, const lrt_ray *rays,
         return;
     }
 #if LRT_TRI_HAS_AVX2
-    if (s->layout == 8 && hint != LRT_TRI_BATCH_COHERENT) {
+    /* The interleaved any-hit pipeline wins only once the BVH is cache-cold:
+     * measured crossover ~250k-500k triangles (bench_occ; per-ray is 11-14%
+     * faster below it). Explicit LRT_TRI_BATCH_INCOHERENT always interleaves. */
+    if (s->layout == 8 && hint != LRT_TRI_BATCH_COHERENT &&
+        (hint == LRT_TRI_BATCH_INCOHERENT || s->original_ntris >= 300000u)) {
         tri_occluded1N_bvh8_avx2(s, rays, occluded, n);
         return;
     }
@@ -11684,7 +12617,15 @@ static float tri_point_tri_distsq(const float *A, const float *B,
 
 /* Reconstruct triangle vertices from a leaf block lane (v0, v0+e1, v0+e2). */
 static inline void tri_leaf_verts(const float *f, int bw, int lane, float A[3],
-                                  float B[3], float C[3]) {
+                                  float B[3], float C[3], int vf) {
+    if (vf) { /* vertex-format block: exact vertices */
+        for (int a = 0; a < 3; a++) {
+            A[a] = f[a * bw + lane];
+            B[a] = f[(3 + a) * bw + lane];
+            C[a] = f[(6 + a) * bw + lane];
+        }
+        return;
+    }
     for (int a = 0; a < 3; a++) {
         float v0 = f[a * bw + lane];
         A[a] = v0;
@@ -11695,7 +12636,17 @@ static inline void tri_leaf_verts(const float *f, int bw, int lane, float A[3],
 
 
 static inline void tri_leaf_prim_aabb(const float *f, int bw, int lane,
-                                      float lo[3], float hi[3]) {
+                                      float lo[3], float hi[3], int vf) {
+    if (vf) { /* exact vertices: their min/max is exact */
+        float A[3], B[3], C[3];
+        tri_leaf_verts(f, bw, lane, A, B, C, 1);
+        for (int a = 0; a < 3; a++) {
+            float mn = A[a] < B[a] ? A[a] : B[a], mx = A[a] > B[a] ? A[a] : B[a];
+            lo[a] = mn < C[a] ? mn : C[a];
+            hi[a] = mx > C[a] ? mx : C[a];
+        }
+        return;
+    }
 #ifdef LRT_TRI_LEAF_BOX_EXACT
     for (int a = 0; a < 3; a++) {
         float v0 = f[a * bw + lane];
@@ -11711,7 +12662,7 @@ static inline void tri_leaf_prim_aabb(const float *f, int bw, int lane,
     }
 #else
     float A[3], B[3], C[3];
-    tri_leaf_verts(f, bw, lane, A, B, C);
+    tri_leaf_verts(f, bw, lane, A, B, C, 0);
     for (int a = 0; a < 3; a++) {
         float mn = A[a] < B[a] ? A[a] : B[a];
         mn = mn < C[a] ? mn : C[a];
@@ -11750,7 +12701,7 @@ static size_t tri_nearest_core(const lrt_tri_scene *s, const float p[3],
                 for (int lane = 0; lane < width; lane++) {
                     if (ids[lane] == LRT_TRI_NO_HIT) continue;
                     float A[3], B[3], C[3], q[3];
-                    tri_leaf_verts(f, width, lane, A, B, C);
+                    tri_leaf_verts(f, width, lane, A, B, C, tri_vfmt(s));
                     float dsq = tri_point_tri_distsq(A, B, C, p, q);
                     if (cnt < k || dsq < kth) {
                         uint32_t pid = ids[lane];
@@ -11893,7 +12844,7 @@ static size_t tri_query_region(const lrt_tri_scene *s, const tri_region *rg,
                 for (int lane = 0; lane < width && cnt < cap; lane++) {
                     if (ids[lane] == LRT_TRI_NO_HIT) continue;
                     float blo[3], bhi[3];
-                    tri_leaf_prim_aabb(f, width, lane, blo, bhi);
+                    tri_leaf_prim_aabb(f, width, lane, blo, bhi, tri_vfmt(s));
                     if (tri_region_test_box(rg, blo, bhi)) out[cnt++] = ids[lane];
                 }
             }
@@ -15040,7 +15991,7 @@ lrt_result lrt_tri_scene_save_to_memory(const lrt_tri_scene *s, void **buf,
 #ifdef LRT_TRI_WATERTIGHT_TRI
     /* Watertight-leaf exact vertices ride in the aux region too: header
      * {nloops = 0, npts = ntris}, then float[9 * ntris]. */
-    if (s->prim_kind == TRI_PRIM_TRI && s->wverts && s->original_ntris > 0) {
+    if (s->prim_kind == TRI_PRIM_TRI && s->wblk && s->original_ntris > 0) {
         aux_npts = s->original_ntris;
         aux_bytes = sizeof(lrt_tri_aux_header) + aux_npts * 9 * sizeof(float);
         aux_off = tri_align_up(block_off + blocks_bytes, LRT_TRI_FILE_ALIGN);
@@ -15058,7 +16009,9 @@ lrt_result lrt_tri_scene_save_to_memory(const lrt_tri_scene *s, void **buf,
     h.version = LRT_TRI_FILE_VERSION;
     h.endian = 0x01020304u;
     h.flags = (s->prim_kind == TRI_PRIM_CURVE ? 1u : 0u) |
-              (s->quantized ? 2u : 0u);
+              (s->quantized ? 2u : 0u) |
+              (tri_vfmt(s) ? 4u : 0u) /* leaf blocks hold v0 v1 v2 (watertight) */ |
+              (s->wbox_exact ? 8u : 0u) /* boxes exact on those vertices */;
     h.layout = (uint32_t)s->layout;
     h.prim_kind = (uint32_t)s->prim_kind;
     h.node_count = s->node_count;
@@ -15090,7 +16043,7 @@ lrt_result lrt_tri_scene_save_to_memory(const lrt_tri_scene *s, void **buf,
         if (s->prim_kind == TRI_PRIM_TRI) {
             ah.nloops = 0;
             memcpy(p - sizeof(ah), &ah, sizeof(ah));
-            memcpy(p, s->wverts, aux_npts * 9 * sizeof(float));
+            tri_wblk_to_prims(s, (float *)(void *)p, aux_npts);
         } else
 #endif
         {
@@ -15132,6 +16085,9 @@ static int tri_header_check(const lrt_tri_file_header *h, size_t n) {
     uint32_t exp_bstride = tri_kind_block_stride((int)h->prim_kind, (int)h->layout);
     if (exp_bstride == 0) return 1; /* not a serializable prim_kind */
     int quantized = (h->flags & 2u) != 0;
+#ifndef LRT_TRI_WATERTIGHT_TRI
+    if (h->flags & 4u) return 1; /* vertex-format leaves need a watertight build */
+#endif
     if (h->node_stride != tri_node_stride((int)h->layout, quantized)) return 1;
     if (h->block_stride != exp_bstride) return 1;
     if (h->file_size != (uint64_t)n) return 1;
@@ -15263,9 +16219,15 @@ static lrt_tri_scene *tri_scene_from_buffer(const void *buf, size_t n, int copy,
         }
     }
 #ifdef LRT_TRI_WATERTIGHT_TRI
-    /* Watertight-leaf exact vertices (heap-owned). Every leaf prim id must
-     * index inside the array, else the file is treated as having none. */
-    if (s->prim_kind == TRI_PRIM_TRI && (s->layout == 4 || s->layout == 8) &&
+    /* Vertex-format leaves (flag 4): the blocks already are the exact
+     * vertices (also when mmapped, read-only). Legacy watertight files carry
+     * edge blocks + the aux vertices: convert (heap) or keep a separate wblk
+     * (mmap). Every leaf prim id must index inside the aux array, else the
+     * file is treated as having none. */
+    if (s->prim_kind == TRI_PRIM_TRI && (h->flags & 4u)) {
+        s->wblk = (float *)s->blocks;
+        s->wbox_exact = (h->flags & 8u) != 0;
+    } else if (s->prim_kind == TRI_PRIM_TRI && (s->layout == 4 || s->layout == 8) &&
         h->aux_size >= sizeof(lrt_tri_aux_header)) {
         const unsigned char *ap = (const unsigned char *)buf + h->aux_offset;
         lrt_tri_aux_header ah;
@@ -15282,8 +16244,12 @@ static lrt_tri_scene *tri_scene_from_buffer(const void *buf, size_t n, int copy,
             float *wv = ok ? (float *)malloc(vbytes) : NULL;
             if (wv) {
                 memcpy(wv, ap + sizeof(ah), vbytes);
-                s->wverts = wv;
                 if (!s->original_ntris) s->original_ntris = ah.npts;
+                if (!tri_build_wblk(s, wv, ah.npts)) {
+                    if (s->wblk != (float *)s->blocks) free(s->wblk);
+                    s->wblk = NULL;
+                }
+                free(wv);
             }
         }
     }
@@ -15477,7 +16443,7 @@ static void tri_leaf_box(const lrt_tri_scene *s, uint32_t ref, float lo[3],
         for (int lane = 0; lane < width; lane++) {
             if (ids[lane] == LRT_TRI_NO_HIT) continue;
             float plo[3], phi[3];
-            tri_leaf_prim_aabb(f, width, lane, plo, phi);
+            tri_leaf_prim_aabb(f, width, lane, plo, phi, tri_vfmt(s));
             for (int a = 0; a < 3; a++) {
                 if (plo[a] < lo[a]) lo[a] = plo[a];
                 if (phi[a] > hi[a]) hi[a] = phi[a];
@@ -15527,7 +16493,11 @@ lrt_result lrt_tri_scene_refit(lrt_tri_scene *s, const float *vertices,
     }
 
 #ifdef LRT_TRI_WATERTIGHT_TRI
-    if (s->wverts) memcpy(s->wverts, vertices, ntris * 9 * sizeof(float));
+    if (s->wblk && !tri_build_wblk(s, vertices, ntris)) return LRT_RESULT_OUT_OF_MEMORY;
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+    /* the propagate below recomputes every box from the exact vertices */
+    if (tri_vfmt(s) && !s->quantized && !s->qnode) s->wbox_exact = 1;
+#endif
 #endif
     /* 2. Recompute node bounds bottom-up (children have higher indices). */
     return tri_refit_propagate(s);
@@ -15814,6 +16784,10 @@ typedef struct lrt_instance_int {
     float obj2world[12];
     float world2obj[12];
     uint32_t blas_id, instance_id, mask, degenerate;
+    /* LEAF_BOX_EXACT: margin coefficients (TwoLevel.world_near_obj). The world
+     * ray point at s is within alpha*(|o|_1 + |s| |d|_1) + beta of obj2world
+     * applied to the BLAS's rounded object-space ray point. */
+    float alpha, beta;
 } lrt_instance_int;
 
 struct lrt_tlas {
@@ -15826,6 +16800,10 @@ struct lrt_tlas {
     size_t ninsts;
     lrt_tri_scene **blas; /* owned copy of the pointer array (scenes not owned) */
     size_t nblas;
+    /* LEAF_BOX_EXACT: max instance alpha and the root half-extent per axis
+     * (|coord| bound of every instance box), for the per-ray TLAS dilation. */
+    float alpha_max;
+    float root_r[3];
 };
 
 /* out = inverse of the 3x4 affine m (row-major). Returns 0 if (near-)singular. */
@@ -15866,6 +16844,139 @@ static inline void tlas_xform_vec(const float m[12], const float v[3],
     for (int a = 0; a < 3; a++)
         out[a] = m[a * 4 + 0] * v[0] + m[a * 4 + 1] * v[1] + m[a * 4 + 2] * v[2];
 }
+
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+/* Round a nonnegative double up / a double down to float. */
+static inline float tri_d2f_up(double x) {
+    float f = (float)x;
+    if ((double)f < x) f = nextafterf(f, TRI_INF_F);
+    return f;
+}
+static inline float tri_d2f_down(double x) {
+    float f = (float)x;
+    if ((double)f > x) f = nextafterf(f, -TRI_INF_F);
+    return f;
+}
+/* Per-instance margin coefficients (formal: TwoLevel.world_near_obj,
+ * hres_of_entries, xform_point_err_simple / xform_vec_err_simple):
+ *   rho   >= max |(L_A L_W - I)_kj|,   sigma >= max |(L_A c_W + c_A)_k|
+ *   P_kl = sum_j |A_kj||W_jl|,         q_k = sum_j |A_kj||c_Wj|
+ *   alpha = rho + 5u max P,            beta = sigma + 5u max q
+ * Float products are exact in double; each double sum of <= 4 terms is off by
+ * at most 4*2^-53 times the sum of |terms|, which is added. */
+static void tlas_instance_margin(const float A[12], const float W[12],
+                                 float *alpha, float *beta) {
+    const double ue = 4.0 * 0x1p-53, u5 = 5.0 * 0x1p-24;
+    double rho = 0.0, sigma = 0.0, pmax = 0.0, qmax = 0.0;
+    for (int k = 0; k < 3; k++) {
+        for (int l = 0; l < 3; l++) {
+            double sum = 0.0, mag = 0.0, pk = 0.0;
+            for (int j = 0; j < 3; j++) {
+                double pr = (double)A[k * 4 + j] * (double)W[j * 4 + l];
+                sum += pr;
+                mag += fabs(pr);
+                pk += fabs((double)A[k * 4 + j]) * fabs((double)W[j * 4 + l]);
+            }
+            if (k == l) { sum -= 1.0; mag += 1.0; }
+            double r = fabs(sum) + ue * mag;
+            if (r > rho) rho = r;
+            if (pk > pmax) pmax = pk;
+        }
+        double v = (double)A[k * 4 + 3], mag = fabs(v), q = 0.0;
+        for (int j = 0; j < 3; j++) {
+            double pr = (double)A[k * 4 + j] * (double)W[j * 4 + 3];
+            v += pr;
+            mag += fabs(pr);
+            q += fabs(pr);
+        }
+        double sg = fabs(v) + ue * mag;
+        if (sg > sigma) sigma = sg;
+        if (q > qmax) qmax = q;
+    }
+    /* + an absolute floor for subnormal products (outside the relative model) */
+    *alpha = tri_d2f_up((rho + u5 * pmax) * (1.0 + 0x1p-40));
+    *beta = tri_d2f_up((sigma + u5 * qmax) * (1.0 + 0x1p-40) + 1e-36);
+}
+/* Per-ray dilation state: margin(s) = a + b |s| with |s| <= smax_geo. */
+typedef struct tlas_dil {
+    double a, b, sgeo;
+} tlas_dil;
+static inline void tlas_dil_setup(const lrt_tlas *t, const lrt_ray *ray, tlas_dil *dl) {
+    double on = fabs((double)ray->org[0]) + fabs((double)ray->org[1]) + fabs((double)ray->org[2]);
+    double dn = fabs((double)ray->dir[0]) + fabs((double)ray->dir[1]) + fabs((double)ray->dir[2]);
+    double al = (double)t->alpha_max * (1.0 + 0x1p-50);
+    dl->a = al * on * (1.0 + 0x1p-50);
+    dl->b = al * dn * (1.0 + 0x1p-50);
+    /* TwoLevel.s_bound on the dominant axis: |s| <= (|o_k| + R_k + a)/(|d_k| - b) */
+    int k = 0;
+    for (int j = 1; j < 3; j++)
+        if (fabs((double)ray->dir[j]) > fabs((double)ray->dir[k])) k = j;
+    double dk = fabs((double)ray->dir[k]);
+    dl->sgeo = INFINITY;
+    if (dl->b < dk)
+        dl->sgeo = (fabs((double)ray->org[k]) + (double)t->root_r[k] + dl->a) /
+                   (dk - dl->b) * (1.0 + 0x1p-48);
+}
+/* Shifted origins for the dilated box test: with oL = org + m' and oH = org - m'
+ * (both rounded outward, i.e. oL >= org + m, oH <= org - m), the slab terms
+ * (lo - oL) * sinv and (hi - oH) * sinv are the usual robust slab arithmetic
+ * for the planes lo - (oL - org) <= lo - m and hi + (org - oH) >= hi + m, so
+ * the slab conservativity argument applies unchanged to the dilated box. The
+ * margin m covers |s| <= max(|tmin|, best) (capped by sgeo). */
+static inline void tlas_dil_origins(const tlas_dil *dl, const lrt_ray *ray, float best,
+                                    float oL[3], float oH[3]) {
+    double sm = fabs((double)ray->tmin) > fabs((double)best) ? fabs((double)ray->tmin)
+                                                              : fabs((double)best);
+    if (dl->sgeo < sm) sm = dl->sgeo;
+    double m = dl->a + dl->b * sm;
+    /* fl(org + mf) >= org + mf - u(|org| + mf) >= org + m once
+     * mf >= (m + 2u|org|)(1 + 2^-20) (the factor also covers the double->float
+     * conversion of mf); symmetric for org - mf. */
+    for (int k = 0; k < 3; k++) {
+        double mk = (m + 0x1p-23 * fabs((double)ray->org[k]) + 1e-37) * (1.0 + 0x1p-20);
+        if (!(mk < 1e38)) {
+            oL[k] = TRI_INF_F;
+            oH[k] = -TRI_INF_F;
+            continue;
+        }
+        float mf = (float)mk;
+        oL[k] = ray->org[k] + mf;
+        oH[k] = ray->org[k] - mf;
+    }
+}
+static inline int tlas_slab_dil(const lrt_bvh4_node *n, int i, const tri_ray_ctx *rc,
+                                const float oL[3], const float oH[3], float t_best,
+                                float *tnear_out) {
+#ifdef LRT_TRI_SLAB_ROBUST
+    float tlx = (n->lo_x[i] - oL[0]) * rc->sinv[0];
+    float thx = (n->hi_x[i] - oH[0]) * rc->sinv[0];
+    float tly = (n->lo_y[i] - oL[1]) * rc->sinv[1];
+    float thy = (n->hi_y[i] - oH[1]) * rc->sinv[1];
+    float tlz = (n->lo_z[i] - oL[2]) * rc->sinv[2];
+    float thz = (n->hi_z[i] - oH[2]) * rc->sinv[2];
+    float tnx = tri_minf(thx, tlx), tfx = tri_maxf(tlx, thx);
+    float tny = tri_minf(thy, tly), tfy = tri_maxf(tly, thy);
+    float tnz = tri_minf(thz, tlz), tfz = tri_maxf(tlz, thz);
+#else
+    float tlx = (n->lo_x[i] - oL[0]) * rc->invd[0];
+    float thx = (n->hi_x[i] - oH[0]) * rc->invd[0];
+    float tly = (n->lo_y[i] - oL[1]) * rc->invd[1];
+    float thy = (n->hi_y[i] - oH[1]) * rc->invd[1];
+    float tlz = (n->lo_z[i] - oL[2]) * rc->invd[2];
+    float thz = (n->hi_z[i] - oH[2]) * rc->invd[2];
+    float tnx = tri_minf(tlx, thx), tfx = tri_maxf(tlx, thx);
+    float tny = tri_minf(tly, thy), tfy = tri_maxf(tly, thy);
+    float tnz = tri_minf(tlz, thz), tfz = tri_maxf(tlz, thz);
+#endif
+    float tnear = tri_maxf(tri_maxf(tnx, tny), tri_maxf(tnz, rc->tmin));
+    float tfar = tri_minf(tri_minf(tfx, tfy), tri_minf(tfz, t_best));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = tfar * TRI_SLAB_K;
+#endif
+    *tnear_out = tnear;
+    return tnear <= tfar;
+}
+#endif
 
 /* World AABB of an object-space box transformed by m (8 corners). */
 static void tlas_transform_aabb(const float m[12], const float olo[3],
@@ -16014,6 +17125,12 @@ static void tlas_bounds_chunk(const lrt_tlas *t, tri_build_ctx *bc,
             }
         } else {
             tlas_transform_aabb(in->obj2world, bl->root_lo, bl->root_hi, wlo, whi);
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+            for (int a = 0; a < 3; a++) {
+                wlo[a] = tri_d2f_down((double)wlo[a] - (double)in->beta);
+                whi[a] = -tri_d2f_down(-((double)whi[a] + (double)in->beta));
+            }
+#endif
         }
         for (int a = 0; a < 3; a++) {
             bc->plo[(size_t)i * 3 + a] = wlo[a];
@@ -16058,6 +17175,18 @@ static int tlas_rebuild(lrt_tlas *t, unsigned num_threads) {
     {
         tlas_bounds_chunk(t, &bc, 0u, (uint32_t)ninsts);
     }
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+    t->alpha_max = 0.0f;
+    t->root_r[0] = t->root_r[1] = t->root_r[2] = 0.0f;
+    for (size_t i = 0; i < ninsts; i++) {
+        if (t->insts[i].alpha > t->alpha_max) t->alpha_max = t->insts[i].alpha;
+        for (int a = 0; a < 3; a++) {
+            float r = fabsf(bc.plo[i * 3 + a]);
+            if (fabsf(bc.phi[i * 3 + a]) > r) r = fabsf(bc.phi[i * 3 + a]);
+            if (r > t->root_r[a]) t->root_r[a] = r;
+        }
+    }
+#endif
 #if LRT_TRI_HAS_THREADS
     if (num_threads > 1 && ninsts >= 4096) {
         bc.par_threads = num_threads;
@@ -16123,6 +17252,11 @@ static int tlas_fill_chunk(lrt_tlas *t, const lrt_instance *insts,
         in->instance_id = insts[i].instance_id;
         in->mask = insts[i].mask;
         in->degenerate = tlas_affine_invert(in->obj2world, in->world2obj) ? 0u : 1u;
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+        in->alpha = in->beta = 0.0f;
+        if (!in->degenerate)
+            tlas_instance_margin(in->obj2world, in->world2obj, &in->alpha, &in->beta);
+#endif
     }
     return bad;
 }
@@ -16227,6 +17361,12 @@ int lrt_tlas_intersect1(const lrt_tlas *t, const lrt_ray *ray, uint32_t ray_mask
     }
     tri_ray_ctx rc;
     tri_ray_setup(ray, &rc);
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+    tlas_dil dl;
+    tlas_dil_setup(t, ray, &dl);
+    float dL[3], dH[3], dm_best = ray->tmax;
+    tlas_dil_origins(&dl, ray, ray->tmax, dL, dH);
+#endif
     float best_t = ray->tmax, best_u = 0.0f, best_v = 0.0f;
     uint32_t best_prim = LRT_TRI_NO_HIT, best_inst = LRT_TRI_NO_HIT;
     tri_stack_entry stack[TRI_STACK_SIZE];
@@ -16263,11 +17403,21 @@ int lrt_tlas_intersect1(const lrt_tlas *t, const lrt_ray *ray, uint32_t ray_mask
         int nchildren = (int)n->nchildren;
         uint32_t hit_ref[4];
         float hit_tnear[4];
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+        if (best_t != dm_best) {
+            tlas_dil_origins(&dl, ray, best_t, dL, dH);
+            dm_best = best_t;
+        }
+#endif
         int nhit = 0;
         for (int i = 0; i < nchildren; i++) {
             float tnear;
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+            if (tlas_slab_dil(n, i, &rc, dL, dH, best_t, &tnear)) {
+#else
             if (tri_slab_scalar(n->lo_x, n->lo_y, n->lo_z, n->hi_x, n->hi_y,
                                 n->hi_z, i, &rc, best_t, &tnear)) {
+#endif
                 int j = nhit++;
                 while (j > 0 && hit_tnear[j - 1] > tnear) {
                     hit_tnear[j] = hit_tnear[j - 1];
@@ -16298,6 +17448,12 @@ int lrt_tlas_occluded1(const lrt_tlas *t, const lrt_ray *ray, uint32_t ray_mask)
     if (!t || !ray) return 0;
     tri_ray_ctx rc;
     tri_ray_setup(ray, &rc);
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+    tlas_dil dl;
+    tlas_dil_setup(t, ray, &dl);
+    float dL[3], dH[3];
+    tlas_dil_origins(&dl, ray, ray->tmax, dL, dH);
+#endif
     const float t_max = ray->tmax;
     uint32_t stack[TRI_STACK_SIZE];
     int sp = 0;
@@ -16322,8 +17478,12 @@ int lrt_tlas_occluded1(const lrt_tlas *t, const lrt_ray *ray, uint32_t ray_mask)
         int nchildren = (int)n->nchildren;
         for (int i = 0; i < nchildren; i++) {
             float tnear;
+#ifdef LRT_TRI_LEAF_BOX_EXACT
+            if (tlas_slab_dil(n, i, &rc, dL, dH, t_max, &tnear)) {
+#else
             if (tri_slab_scalar(n->lo_x, n->lo_y, n->lo_z, n->hi_x, n->hi_y,
                                 n->hi_z, i, &rc, t_max, &tnear)) {
+#endif
                 if (sp < TRI_STACK_SIZE) stack[sp++] = n->child[i];
             }
         }
@@ -16428,6 +17588,9 @@ static inline __m128 tri_packet4_slab(const tri_packet4 *p, float lo_x,
     __m128 tfar = _mm_min_ps(
         _mm_min_ps(_mm_max_ps(tlx, thx), _mm_max_ps(tly, thy)),
         _mm_min_ps(_mm_max_ps(tlz, thz), tmax4));
+#ifdef LRT_TRI_SLAB_INFLATE
+    tfar = _mm_mul_ps(tfar, _mm_set1_ps(TRI_SLAB_K));
+#endif
     return _mm_cmple_ps(tnear, tfar);
 }
 
@@ -16600,8 +17763,14 @@ static void tri_occluded4_sse(const lrt_tri_scene *s, const lrt_ray4 *r,
 void lrt_tri_intersect4(const lrt_tri_scene *s, const lrt_ray4 *r,
                         lrt_hit4 *h) {
     if (!s || !r || !h) return;
-#if LRT_TRI_HAS_SSE4
-    if (s->prim_kind == TRI_PRIM_TRI) {
+#if LRT_TRI_HAS_SSE4 && !defined(LRT_TRI_EXACT_NEAREST) /* packets prune by best */
+    /* The packet kernel runs Moller-Trumbore on the edge blocks; a watertight
+     * scene (exact vertices) runs per ray so every query uses the watertight leaf. */
+    if (s->prim_kind == TRI_PRIM_TRI
+#ifdef LRT_TRI_WATERTIGHT_TRI
+        && !s->wblk
+#endif
+    ) {
         tri_intersect4_sse(s, r, h);
         return;
     }
@@ -16624,7 +17793,13 @@ void lrt_tri_occluded4(const lrt_tri_scene *s, const lrt_ray4 *r,
                        uint8_t occ[4]) {
     if (!s || !r || !occ) return;
 #if LRT_TRI_HAS_SSE4
-    if (s->prim_kind == TRI_PRIM_TRI) {
+    /* The packet kernel runs Moller-Trumbore on the edge blocks; a watertight
+     * scene (exact vertices) runs per ray so every query uses the watertight leaf. */
+    if (s->prim_kind == TRI_PRIM_TRI
+#ifdef LRT_TRI_WATERTIGHT_TRI
+        && !s->wblk
+#endif
+    ) {
         tri_occluded4_sse(s, r, occ);
         return;
     }
