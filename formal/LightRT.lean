@@ -28,3 +28,4 @@ import LightRT.C.Proofs.WoopWatertight
 import LightRT.C.Proofs.WoopDet
 import LightRT.C.Proofs.SlabParallel
 import LightRT.C.Proofs.SlabRobustRefines
+import LightRT.Robust.MTTotal
