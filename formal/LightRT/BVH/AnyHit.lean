@@ -303,5 +303,112 @@ theorem runAnyB_root {inside : α → B → Prop} {sub : B → B → Prop} (F : 
     (by simp only [Good, List.length_nil, zero_add]; exact ⟨hcap, trivial⟩)]
   exact runAny_root F hw mono test0 hit order hord C1
 
+/-! ### Bounded stack, closest hit
+
+`tri_intersect_scalar` returns "no hit" when the remaining stack plus the
+children that passed the box test would exceed `TRI_STACK_SIZE`
+(`if (sp + nhit > TRI_STACK_SIZE) return 0`). `runB` models the overflow as
+`none`. Under the same `need` bound as any-hit the check never fires, so the
+bounded loop equals `run`, and with `run_root` / `run_exact` / `run_cover_root`
+its answer is theirs. -/
+
+/-- `tri_intersect_scalar` with the capacity check. -/
+def runB {T : Type} [LinearOrder T] (F : Flat B α) (cap : ℕ) (test : B → T → Option T)
+    (isect : α → Option T) (order : List (CRef × T) → List (CRef × T)) :
+    ℕ → List (CRef × T) → T → Option T
+  | 0, _, _ => none
+  | _ + 1, [], best => some best
+  | f + 1, (r, tn) :: st, best =>
+    if best ≤ tn then runB F cap test isect order f st best else
+    match r with
+    | .leaf blk n => runB F cap test isect order f st ((F.leafPrims blk n).foldl (step isect) best)
+    | .node i =>
+      let Y := (F.children i).filterMap fun c => (test c.1 best).map (c.2, ·)
+      if cap < st.length + Y.length then none else
+      runB F cap test isect order f (order Y ++ st) best
+
+theorem length_filterMap_le' {β γ : Type} (g : β → Option γ) (l : List β) :
+    (l.filterMap g).length ≤ l.length := by
+  induction l with
+  | nil => simp
+  | cons x l ih => simp only [List.filterMap_cons]; split <;> simp <;> omega
+
+/-- **The closest-hit capacity check never fires** under the stack invariant:
+    the bounded loop equals `run`. -/
+theorem runB_eq {T : Type} [LinearOrder T] (F : Flat B α) (hw : F.WFidx) (cap : ℕ)
+    (test : B → T → Option T) (isect : α → Option T)
+    (order : List (CRef × T) → List (CRef × T)) (hord : ∀ l, (order l).Perm l) :
+    ∀ f (st : List (CRef × T)) best, (∀ e ∈ st, ∀ j, e.1 = .node j → j < F.nodes.length) →
+      F.Good cap (st.map Prod.fst) →
+      runB F cap test isect order f st best = run F test isect order f st best := by
+  intro f
+  induction f with
+  | zero => intros; rfl
+  | succ f ih =>
+    intro st best hv hg
+    match st with
+    | [] => rfl
+    | (r, tn) :: st =>
+      have hvst : ∀ e ∈ st, ∀ j, e.1 = .node j → j < F.nodes.length :=
+        fun e he => hv e (by simp [he])
+      have hg2 : F.Good cap (st.map Prod.fst) := hg.2
+      simp only [runB, run]
+      split_ifs with hb
+      · exact ih st best hvst hg2
+      · cases r with
+        | leaf blk n => exact ih st _ hvst hg2
+        | node i =>
+          have hi := hv (.node i, tn) (by simp) i rfl
+          set Y := (F.children i).filterMap fun c => (test c.1 best).map (c.2, ·) with hY
+          have hYmem : ∀ x ∈ Y, ∃ c ∈ F.children i, x.1 = c.2 := by
+            intro x hx
+            rw [hY, List.mem_filterMap] at hx
+            obtain ⟨c, hc, hce⟩ := hx
+            cases h : test c.1 best with
+            | none => simp [h] at hce
+            | some t => simp [h] at hce; exact ⟨c, hc, by rw [← hce]⟩
+          have hYlen : Y.length ≤ (F.children i).length := length_filterMap_le' _ _
+          have h3 := hg.1
+          simp only [List.length_map, needRef] at h3
+          have hcap : ¬ cap < st.length + Y.length := by
+            have := children_le_need F i; omega
+          show (if cap < st.length + Y.length then none else
+            runB F cap test isect order f (order Y ++ st) best) = _
+          rw [if_neg hcap]
+          apply ih
+          · intro e he j hj
+            rcases List.mem_append.1 he with he | he
+            · obtain ⟨c, hc, hce⟩ := hYmem e ((hord Y).mem_iff.1 he)
+              exact (hw.2 i hi c hc j (hce.symm.trans hj)).2
+            · exact hvst e he j hj
+          · rw [List.map_append]
+            refine good_append F cap _ hg2 _ fun x hx => ?_
+            rw [List.mem_map] at hx
+            obtain ⟨e, he, rfl⟩ := hx
+            obtain ⟨c, hc, hce⟩ := hYmem e ((hord Y).mem_iff.1 he)
+            have h1 := need_child F hw hi hc
+            have h2 : ((order Y).map Prod.fst).length ≤ (F.children i).length := by
+              rw [List.length_map, (hord Y).length_eq]; exact hYlen
+            rw [hce]; simp only [List.length_map] at h2 ⊢; omega
+
+/-- **Root form**: if the tree's stack requirement fits in `TRI_STACK_SIZE`, the
+    C closest-hit loop (with its overflow `return 0`) returns `run_root`'s answer,
+    the brute-force fold. -/
+theorem runB_root {T : Type} [LinearOrder T] {inside : α → B → Prop} {sub : B → B → Prop}
+    (F : Flat B α)
+    (hw : F.WF inside sub) (mono : ∀ p b b', inside p b' → sub b' b → inside p b)
+    (cap : ℕ) (hcap : F.needRef F.root ≤ cap)
+    (test : B → T → Option T) (isect : α → Option T)
+    (order : List (CRef × T) → List (CRef × T)) (hord : ∀ l, (order l).Perm l)
+    (C1 : ∀ p b t best, inside p b → isect p = some t → t < best → (test b best).isSome)
+    (C2 : ∀ p b t best tn, test b best = some tn → inside p b → isect p = some t → t < best → tn ≤ t)
+    (tmin tmax : T) (htmin : ∀ p ∈ F.denRef F.root, ∀ t, isect p = some t → tmin ≤ t) :
+    runB F cap test isect order (F.visitsRef F.root + 1) [(F.root, tmin)] tmax =
+      some ((F.denRef F.root).foldl (step isect) tmax) := by
+  rw [runB_eq F hw.idx cap test isect order hord _ _ _
+    (by intro e he; simp only [List.mem_singleton] at he; subst he; exact hw.1)
+    (by simp only [List.map_cons, List.map_nil, Good, List.length_nil, zero_add]; exact ⟨hcap, trivial⟩)]
+  exact run_root F hw mono test isect order hord C1 C2 tmin tmax htmin
+
 end Flat
 end LightRT.BVH

@@ -113,7 +113,7 @@ def norm(line):
     return " ".join(out)
 
 
-LEGACY = ["-DLRT_TRI_NO_SLAB_ROBUST", "-DLRT_TRI_NO_LEAF_BOX_EXACT"]
+LEGACY = ["-DLRT_TRI_NO_SLAB_ROBUST", "-DLRT_TRI_NO_LEAF_BOX_EXACT", "-DLRT_TRI_NO_BITEXACT", "-DLRT_TRI_NO_WATERTIGHT_TRI"]
 
 
 def build_c(tmp, flags=LEGACY, name="cdiff_c"):

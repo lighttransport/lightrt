@@ -102,6 +102,7 @@ static inline __m128 _mm_cmpeq_ps(__m128 a, __m128 b) {
 static inline __m128 _mm_cmpneq_ps(__m128 a, __m128 b) {
     return vreinterpretq_f32_u32(vmvnq_u32(vceqq_f32(a, b)));
 }
+static inline float _mm_cvtss_f32(__m128 a) { return vgetq_lane_f32(a, 0); }
 
 /* ---- blend / movemask ---- */
 static inline __m128 _mm_blendv_ps(__m128 a, __m128 b, __m128 mask) {

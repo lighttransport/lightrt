@@ -59,16 +59,22 @@ def slab (rc : RayCtx) (lo hi : Fin 3 → F) (tbest : F) : Bool × F :=
 
 def posInf : F := 0x7f800000
 
-/-- `tri_slab_scalar` under `-DLRT_TRI_SLAB_ROBUST`: slab reciprocal `+∞` for
-    `d = ±0` (`rc->sinv`) and the entry bound `min(th, tl)` (operands swapped),
-    so the `0·∞ = NaN` of a parallel ray lying on a plane is dropped. -/
+/-- `TRI_SLAB_K = 1 + 10u` (binary32 `0x3f800005`), the far-value inflation
+    factor of `LRT_TRI_SLAB_INFLATE` (Robust/Slab: `ize_constant_sufficient`). -/
+def slabK : F := (1065353221 : Nat).toUInt32
+
+/-- `tri_slab_scalar` in the default build (`-DLRT_TRI_SLAB_ROBUST` +
+    `LRT_TRI_SLAB_INFLATE`): slab reciprocal `+∞` for `d = ±0` (`rc->sinv`) and
+    the entry bound `min(th, tl)` (operands swapped), so the `0·∞ = NaN` of a
+    parallel ray lying on a plane is dropped; the far value is scaled by
+    `slabK`, which rules out false misses at box edges and corners. -/
 def slabRobust (rc : RayCtx) (lo hi : Fin 3 → F) (tbest : F) : Bool × F :=
   let sinv := fun k => if eqF (rc.dir k) zero then posInf else rc.invd k
   let t := fun (x : F) k => mulBits (subBits x (rc.org k)) (sinv k)
   let tn := fun k => fmin (t (hi k) k) (t (lo k) k)
   let tf := fun k => fmax (t (lo k) k) (t (hi k) k)
   let tnear := fmax (fmax (tn 0) (tn 1)) (fmax (tn 2) rc.tmin)
-  let tfar := fmin (fmin (tf 0) (tf 1)) (fmin (tf 2) tbest)
+  let tfar := mulBits (fmin (fmin (tf 0) (tf 1)) (fmin (tf 2) tbest)) slabK
   (leBits tnear tfar, tnear)
 
 /-- Proposed patch: Ize-style inflation, `tfar ← fl(tfar · K)` (Stage 3, `fpSlab … K`). -/

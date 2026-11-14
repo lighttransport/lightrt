@@ -155,6 +155,57 @@ static int mt64(const double o[3], const double d[3], const double a[3], const d
     *t = tt;
     return 1;
 }
+/* Exact (double) nearest root of the ray on one patch: multi-start Newton on
+ * S(u,v) = o + t d with a central-difference Jacobian; used only to adjudicate
+ * a "C farther than the tessellation" case (near silhouettes and at grazing
+ * angles the 128x128 tessellation is off by more than the tolerance). */
+static void any_eval(const patch_t *P, const double (*q)[3], double u, double v, double S[3]) {
+    if (q) bilin_eval(q, u, v, S); else patch_eval(P, u, v, S);
+}
+static int exact_patch_hit(const patch_t *P, const double (*q)[3], const double o[3], const double d[3],
+                           double *t_out) {
+    double best = 1e300;
+    int hit = 0;
+    for (int a = 0; a <= 12; a++)
+        for (int b = 0; b <= 12; b++) {
+            double u = a / 12.0, v = b / 12.0, S[3];
+            any_eval(P, q, u, v, S);
+            double t = ((S[0] - o[0]) * d[0] + (S[1] - o[1]) * d[1] + (S[2] - o[2]) * d[2]) /
+                       (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            for (int it = 0; it < 60; it++) {
+                any_eval(P, q, u, v, S);
+                double F[3] = {S[0] - o[0] - t * d[0], S[1] - o[1] - t * d[1], S[2] - o[2] - t * d[2]};
+                if (sqrt(F[0] * F[0] + F[1] * F[1] + F[2] * F[2]) < 1e-12) {
+                    if (u >= 0 && u <= 1 && v >= 0 && v <= 1 && t >= 0 && t < best) { best = t; hit = 1; }
+                    break;
+                }
+                double h = 1e-7, Sa[3], Sb[3], du[3], dv[3];
+                any_eval(P, q, u + h, v, Sa); any_eval(P, q, u - h, v, Sb);
+                for (int c = 0; c < 3; c++) du[c] = (Sa[c] - Sb[c]) / (2 * h);
+                any_eval(P, q, u, v + h, Sa); any_eval(P, q, u, v - h, Sb);
+                for (int c = 0; c < 3; c++) dv[c] = (Sa[c] - Sb[c]) / (2 * h);
+                double M[3][3] = {{du[0], dv[0], -d[0]}, {du[1], dv[1], -d[1]}, {du[2], dv[2], -d[2]}};
+                double det = M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1]) -
+                             M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0]) +
+                             M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+                if (fabs(det) < 1e-30) break;
+                double X[3];
+                for (int c = 0; c < 3; c++) {
+                    double N[3][3];
+                    for (int r = 0; r < 3; r++)
+                        for (int k = 0; k < 3; k++) N[r][k] = (k == c) ? F[r] : M[r][k];
+                    X[c] = (N[0][0] * (N[1][1] * N[2][2] - N[1][2] * N[2][1]) -
+                            N[0][1] * (N[1][0] * N[2][2] - N[1][2] * N[2][0]) +
+                            N[0][2] * (N[1][0] * N[2][1] - N[1][1] * N[2][0])) / det;
+                }
+                u -= X[0]; v -= X[1]; t -= X[2];
+                if (fabs(u) > 3 || fabs(v) > 3) break;
+            }
+        }
+    *t_out = best;
+    return hit;
+}
+
 #define TESS 128
 /* nearest hit on a tessellated surface; grid[(TESS+1)^2][3] */
 static int tess_trace(const double (*g)[3], const double o[3], const double d[3], double tmin,
@@ -175,7 +226,7 @@ static int tess_trace(const double (*g)[3], const double o[3], const double d[3]
 /* ---------- per-kind driver ---------- */
 typedef struct {
     const char *name;
-    int hits, rays, mism, mism_graze, tdiff_bad, c_farther;
+    int hits, rays, mism, mism_graze, tdiff_bad, c_farther, ref_artifact, occ_bad;
     double max_dt, max_res, res[1 << 16];
     int nres;
 } stat_t;
@@ -194,15 +245,16 @@ static int finish(stat_t *st, double res_tol, int loose) {
     for (int i = 0; i < st->nres; i++) nbig += st->res[i] > res_tol;
     /* loose: the documented cone fallback (ill-conditioned Newton) is approximate */
     int fail = loose ? nbig > 0.002 * st->hits : st->max_res > res_tol;
+    fail |= st->occ_bad > 0; /* occluded1 disagrees with both C closest-hit and the reference */
     if (loose) fail |= st->c_farther > 0.005 * st->hits || nongraze > 0.005 * st->rays;
     /* strict: C never returns a FARTHER hit than the reference. A NEARER one
      * with a tiny residual is a reference limitation (the 128x128 patch
      * tessellation can miss a silhouette sliver), not a C error. */
     else fail |= st->c_farther > 0 || nongraze > 0.002 * st->rays;
     printf("%-9s rays=%d hits=%d hit/miss-vs-ref=%d (grazing %d) t>tol=%d (C farther %d) max|dt|=%.2e "
-           "residual max=%.2e p99.9=%.2e (>%.0e: %d)%s\n",
+           "residual max=%.2e p99.9=%.2e (>%.0e: %d) tess-artifacts=%d occ-bad=%d%s\n",
            st->name, st->rays, st->hits, st->mism, st->mism_graze, st->tdiff_bad, st->c_farther, st->max_dt,
-           st->max_res, p999, res_tol, nbig, fail ? "  FAIL" : "");
+           st->max_res, p999, res_tol, nbig, st->ref_artifact, st->occ_bad, fail ? "  FAIL" : "");
     return fail;
 }
 
@@ -243,6 +295,10 @@ static int run_tubes(const char *name, lrt_tri_scene *s, tube_t *tub, int n, int
             if (!slab64(o, d, lo, hi, 0, best, &t0, &t1)) continue;
             if (tube_trace(&tub[p], o, d, t0, fmin(t1, best), &th)) { best = th; hk = 1; }
         }
+        /* any-hit must agree with the exact reference on existence (a grazing
+         * disagreement is tolerated like the closest-hit one, below) */
+        int occ = lrt_tri_occluded1(s, &ray);
+        if (occ != hk && occ != k) st.occ_bad++;
         /* grazing: closest approach of the ray to the surface near the C/ref answer */
         st.rays++;
         if (k) {
@@ -366,13 +422,49 @@ static int run_patches(const char *name, lrt_tri_scene *s, patch_t *pt, double (
             st.mism++;
             /* tessellation vs exact surface near a silhouette: count as grazing when
              * the hit that exists is within the tessellation error band of an edge */
-            /* tessellation vs exact surface: only near silhouettes; counted as
-             * grazing up to 0.2% of rays (finish() checks the remainder) */
-            if (st.mism_graze < 0.002 * nrays) st.mism_graze++;
+            /* C missed but the tessellation hit (or the reverse): decide with
+             * the exact roots. A confirmed exact hit that C missed is a real
+             * C miss (fails); otherwise it is a tessellation artifact. A C hit
+             * with no tessellation hit is already checked by its residual. */
+            if (!k && hk) {
+                double et = 1e300;
+                for (int p = 0; p < n; p++) {
+                    double t0, t1, th;
+                    double lo[3] = {plo[p][0] - 1e-3, plo[p][1] - 1e-3, plo[p][2] - 1e-3},
+                           hi[3] = {phi[p][0] + 1e-3, phi[p][1] + 1e-3, phi[p][2] + 1e-3};
+                    if (!slab64(o, d, lo, hi, 0, et, &t0, &t1)) continue;
+                    if (exact_patch_hit(bq ? NULL : &pt[p], bq ? (const double (*)[3])bq[p] : NULL, o, d, &th) &&
+                        th < et)
+                        et = th;
+                }
+                if (et < 1e300) st.c_farther++; /* exact hit exists: C missed it */
+                else { st.ref_artifact++; st.mism_graze++; }
+            } else {
+                st.ref_artifact++;
+                st.mism_graze++;
+            }
         } else if (k) {
             double dt = fabs(h.t - best) * dn;
             if (dt > st.max_dt) st.max_dt = dt;
-            if (dt > 2e-3) { st.tdiff_bad++; if (h.t > best) st.c_farther++; }
+            if (dt > 2e-3) {
+                st.tdiff_bad++;
+                if (h.t > best) {
+                    /* adjudicate with the exact root over every patch the ray's
+                     * box test admits: only a confirmed nearer exact hit counts */
+                    double et = 1e300;
+                    for (int p = 0; p < n; p++) {
+                        double t0, t1, th;
+                        double lo[3] = {plo[p][0] - 1e-3, plo[p][1] - 1e-3, plo[p][2] - 1e-3},
+                               hi[3] = {phi[p][0] + 1e-3, phi[p][1] + 1e-3, phi[p][2] + 1e-3};
+                        if (!slab64(o, d, lo, hi, 0, et, &t0, &t1)) continue;
+                        if (exact_patch_hit(bq ? NULL : &pt[p], bq ? (const double (*)[3])bq[p] : NULL, o, d, &th) &&
+                            th < et)
+                            et = th;
+                    }
+                    if (et < h.t - 2e-3 / dn) st.c_farther++;
+                    else st.ref_artifact++;
+                }
+            }
         }
     }
     free(grid); free(plo); free(phi);

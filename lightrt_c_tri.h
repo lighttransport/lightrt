@@ -17,18 +17,39 @@
 #ifndef LIGHTRT_C_TRI_H
 #define LIGHTRT_C_TRI_H
 
-/* Robustness defaults (see formal/PLAN.md M7). Both are on unless opted out:
+/* Robustness defaults (see formal/PLAN.md M7). All are on unless opted out:
  *  LRT_TRI_SLAB_ROBUST    : no false miss for rays lying on a slab plane
  *                           (opt out: -DLRT_TRI_NO_SLAB_ROBUST)
+ *  LRT_TRI_SLAB_INFLATE   : (with SLAB_ROBUST) the slab far value is scaled by
+ *                           1 + 10u, which rules out false misses of rays
+ *                           touching a box at an edge or corner (Robust/Slab)
+ *                           (opt out: -DLRT_TRI_NO_SLAB_INFLATE)
  *  LRT_TRI_LEAF_BOX_EXACT : node boxes exactly contain the stored triangles
  *                           (opt out: -DLRT_TRI_NO_LEAF_BOX_EXACT)
+ *  LRT_TRI_BITEXACT       : SIMD leaf / det test use the scalar evaluation
+ *                           order, so SIMD traversal == scalar bit for bit
+ *                           (opt out: -DLRT_TRI_NO_BITEXACT)
+ *  LRT_TRI_WATERTIGHT_TRI : watertight (Woop) triangle leaf on exact vertices;
+ *                           no gaps on shared edges. Leaf blocks store v0 v1
+ *                           v2 instead of v0 e1 e2, same size (PLAN.md M17-M20)
+ *                           (opt out: -DLRT_TRI_NO_WATERTIGHT_TRI)
  * Every backend (CPU SIMD, HIP/hiprtc, CUDA, Vulkan) includes this header, so
  * the GPU kernels follow the same default. */
 #if !defined(LRT_TRI_NO_SLAB_ROBUST) && !defined(LRT_TRI_SLAB_ROBUST)
 #define LRT_TRI_SLAB_ROBUST 1
 #endif
+#if defined(LRT_TRI_SLAB_ROBUST) && !defined(LRT_TRI_NO_SLAB_INFLATE) && \
+    !defined(LRT_TRI_SLAB_INFLATE)
+#define LRT_TRI_SLAB_INFLATE 1
+#endif
 #if !defined(LRT_TRI_NO_LEAF_BOX_EXACT) && !defined(LRT_TRI_LEAF_BOX_EXACT)
 #define LRT_TRI_LEAF_BOX_EXACT 1
+#endif
+#if !defined(LRT_TRI_NO_BITEXACT) && !defined(LRT_TRI_BITEXACT)
+#define LRT_TRI_BITEXACT 1
+#endif
+#if !defined(LRT_TRI_NO_WATERTIGHT_TRI) && !defined(LRT_TRI_WATERTIGHT_TRI)
+#define LRT_TRI_WATERTIGHT_TRI 1
 #endif
 
 #include <stddef.h>

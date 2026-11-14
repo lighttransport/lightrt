@@ -358,6 +358,9 @@ __launch_bounds__(64) __global__
             float tnz = HP_TN(tlz, thz), tfz = HP_MAX(tlz, thz);
             float tnear = HP_MAX(HP_MAX(tnx, tny), HP_MAX(tnz, tmin));
             float tfar = HP_MIN(HP_MIN(tfx, tfy), HP_MIN(tfz, best_t));
+#ifdef LRT_TRI_SLAB_INFLATE
+            tfar *= 0x1.00000ap+0f; /* 1 + 10u, as the CPU slab (Robust/Slab) */
+#endif
             if (tnear <= tfar) {
                 int j = nhit++;
                 while (j > 0 && hit_tn[j - 1] > tnear) {
@@ -513,6 +516,9 @@ __launch_bounds__(64) __global__
                                 HP_MAX(HP_TN(tlz, thz), tmin));
             float tfar = HP_MIN(HP_MIN(HP_MAX(tlx, thx), HP_MAX(tly, thy)),
                                HP_MIN(HP_MAX(tlz, thz), tmax));
+#ifdef LRT_TRI_SLAB_INFLATE
+            tfar *= 0x1.00000ap+0f; /* 1 + 10u, as the CPU slab (Robust/Slab) */
+#endif
             if (tnear <= tfar) {
                 /* Stack would overflow (unreachable for scenes accepted by
                  * trace_stack_for). Degrade conservatively: report occluded so
@@ -966,18 +972,37 @@ __device__ __forceinline__ float hp_bez_leaf_dist(const float cp[16], float a, f
     }
     float step = (b - a) / (float)NS;
     float lo = bu - step < a ? a : bu - step, hi = bu + step > b ? b : bu + step;
-    const float g = 0.6180339887f;
-    for (int it = 0; it < 14; it++) {
-        float m1 = hi - g * (hi - lo), m2 = lo + g * (hi - lo);
-        float P1[4], P2[4], d1[4], d2[4], e1[4], e2[4];
-        hp_bez_eval(cp, m1, P1, d1, e1);
-        hp_bez_eval(cp, m2, P2, d2, e2);
-        float a1 = x[0] - P1[0], b1 = x[1] - P1[1], c1 = x[2] - P1[2];
-        float a2 = x[0] - P2[0], b2 = x[1] - P2[1], c2 = x[2] - P2[2];
-        float f1 = sqrtf(a1 * a1 + b1 * b1 + c1 * c1) - (P1[3] > 0.0f ? P1[3] : 0.0f);
-        float f2 = sqrtf(a2 * a2 + b2 * b2 + c2 * c2) - (P2[3] > 0.0f ? P2[3] : 0.0f);
-        if (f1 < f2) { hi = m2; if (f1 < bd) { bd = f1; bu = m1; } }
-        else { lo = m1; if (f2 < bd) { bd = f2; bu = m2; } }
+    /* safeguarded Newton on phi'(u), phi = |x - C(u)| - r(u), bracketed by the
+     * samples around the best one (bisection when a step leaves the bracket);
+     * ~5 evaluations instead of 28 golden-section ones */
+    float u = bu;
+    for (int it = 0; it < 6; it++) {
+        float P[4], dP[4], ddP[4];
+        hp_bez_eval(cp, u, P, dP, ddP);
+        float wx = x[0] - P[0], wy = x[1] - P[1], wz = x[2] - P[2];
+        float wl = sqrtf(wx * wx + wy * wy + wz * wz);
+        if (!(wl > 1e-30f)) break;
+        float r = P[3] > 0.0f ? P[3] : 0.0f;
+        float dr = P[3] > 0.0f ? dP[3] : 0.0f, ddr = P[3] > 0.0f ? ddP[3] : 0.0f;
+        float d = wl - r;
+        if (d < bd) { bd = d; bu = u; }
+        float wd = wx * dP[0] + wy * dP[1] + wz * dP[2];
+        float g1 = -wd / wl - dr;
+        float g2 = (dP[0] * dP[0] + dP[1] * dP[1] + dP[2] * dP[2] -
+                    (wx * ddP[0] + wy * ddP[1] + wz * ddP[2])) / wl -
+                   wd * wd / (wl * wl * wl) - ddr;
+        if (g1 > 0.0f) hi = u; else lo = u;
+        float un = (g2 > 0.0f) ? u - g1 / g2 : 0.5f * (lo + hi);
+        if (!(un > lo && un < hi)) un = 0.5f * (lo + hi);
+        if (fabsf(un - u) < 1e-6f * (b - a)) { u = un; break; }
+        u = un;
+    }
+    {
+        float P[4], dP[4], ddP[4];
+        hp_bez_eval(cp, u, P, dP, ddP);
+        float wx = x[0] - P[0], wy = x[1] - P[1], wz = x[2] - P[2];
+        float d = sqrtf(wx * wx + wy * wy + wz * wz) - (P[3] > 0.0f ? P[3] : 0.0f);
+        if (d < bd) { bd = d; bu = u; }
     }
     *u_best = bu;
     return bd;
@@ -1143,7 +1168,7 @@ __device__ __forceinline__ int hp_bez_leaf_trace(const float cp[16], const float
 __device__ __forceinline__ int hp_bez_leaf_solve(const float cp[16], const float dir[3], float tmin,
                               float best, float a, float b, const float P0p[3],
                               float r0c, const float P3p[3], float r3c,
-                              float *t_out, float *u_out) {
+                              float *t_out, float *u_out, int anyhit) {
     float tseg, s;
     if (!hp_cone_seed(dir, tmin, best, P0p, r0c, P3p, r3c, &tseg, &s)) return 0;
     float th, uh;
@@ -1157,6 +1182,13 @@ __device__ __forceinline__ int hp_bez_leaf_solve(const float cp[16], const float
      * leaf's end balls (u pinned at a or b, where F != 0) are only found by the
      * u-restricted sphere trace below. */
     int inleaf = uh >= a - slack && uh <= b + slack;
+    /* any-hit (shadow rays): any converged, residual-verified surface point in
+     * [tmin, best) with u in [0,1] proves occlusion; nearest-ness is moot */
+    if (anyhit && nr == 1) {
+        *t_out = th;
+        *u_out = uh;
+        return 1;
+    }
     if (nr == 1 && front && inleaf) {
         *t_out = th;
         *u_out = uh;
@@ -1187,7 +1219,7 @@ __device__ __forceinline__ bool hp_bez_one(float ox, float oy, float oz,
                                            float dx, float dy, float dz,
                                            const float cp_in[16], float tmin,
                                            float best_t, float *t_out,
-                                           float *u_out) {
+                                           float *u_out, int anyhit) {
     float cp[16];
     for (int k = 0; k < 4; k++) {
         cp[k * 4 + 0] = cp_in[k * 4 + 0] - ox;
@@ -1260,8 +1292,9 @@ __device__ __forceinline__ bool hp_bez_one(float ox, float oy, float oz,
             if (r0c > 0.0f || r3c > 0.0f) {
                 float P0p[3] = {Pa[0], Pa[1], Pa[2]}, P3p[3] = {Pb[0], Pb[1], Pb[2]};
                 float th, uh;
-                if (hp_bez_leaf_solve(cp, dir, tmin, best, a, b, P0p, r0c, P3p, r3c, &th, &uh)) {
+                if (hp_bez_leaf_solve(cp, dir, tmin, best, a, b, P0p, r0c, P3p, r3c, &th, &uh, anyhit)) {
                     best = th; bu = uh; hit = 1;
+                    if (anyhit) break;
                 }
             }
         } else {
@@ -1478,10 +1511,76 @@ __device__ __forceinline__ bool hp_patch_box(const float *lo, const float *hi,
     }
     return true;
 }
+__device__ __forceinline__ void hp_rbez_eval(const float cp[64], float u,
+        float v, float S[3], float du[3], float dv[3]);
+/* Cell-bounded damped Newton for bicubic (RAT=0) / rational (RAT=1) patches:
+ * device mirror of tri_bezpatch_newton / tri_rbezpatch_newton (returns 1 hit,
+ * 2 converged in-domain root outside [tmin,best), 0 failed in this cell). */
+template <int RAT>
+__device__ __forceinline__ void hp_patch_ev(const float *cp, float u, float v, float S[3],
+                                            float du[3], float dv[3]) {
+    if (RAT) hp_rbez_eval(cp, u, v, S, du, dv); else hp_bezpatch_eval(cp, u, v, S, du, dv);
+}
+template <int RAT>
+__device__ __forceinline__ int hp_patch_newton2(const float *cp, const float *org,
+        const float *dir, float u, float v, float t, float tmin, float best,
+        float *t_o, float *u_o, float *v_o, float cu0, float cu1, float cv0, float cv1) {
+    const float hu = cu1 - cu0, hv = cv1 - cv0;
+    const float ulo = cu0 - 0.5f * hu, uhi = cu1 + 0.5f * hu;
+    const float vlo = cv0 - 0.5f * hv, vhi = cv1 + 0.5f * hv;
+    for (int it = 0; it < 12; it++) {
+        float S[3], du[3], dv[3];
+        hp_patch_ev<RAT>(cp, u, v, S, du, dv);
+        float R[3] = {S[0]-org[0]-t*dir[0], S[1]-org[1]-t*dir[1], S[2]-org[2]-t*dir[2]};
+        float nd[3] = {-dir[0], -dir[1], -dir[2]};
+        float rr = sqrtf(R[0]*R[0]+R[1]*R[1]+R[2]*R[2]);
+        float sl = sqrtf(S[0]*S[0]+S[1]*S[1]+S[2]*S[2]);
+        float det = hp_det3(du, dv, nd);
+        if (rr < 1e-5f*(1.0f+sl)) {
+            if (!(det > -1e-20f && det < 1e-20f)) {
+                float iv = 1.0f/det;
+                float un = u-hp_det3(R, dv, nd)*iv, vn = v-hp_det3(du, R, nd)*iv, tn = t-hp_det3(du, dv, R)*iv;
+                float S2[3], du2[3], dv2[3];
+                hp_patch_ev<RAT>(cp, un, vn, S2, du2, dv2);
+                float R2[3] = {S2[0]-org[0]-tn*dir[0], S2[1]-org[1]-tn*dir[1], S2[2]-org[2]-tn*dir[2]};
+                if (sqrtf(R2[0]*R2[0]+R2[1]*R2[1]+R2[2]*R2[2]) < rr) { u = un; v = vn; t = tn; }
+            }
+            int inwin = u >= ulo && u <= uhi && v >= vlo && v <= vhi;
+            int indom = u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f;
+            if (indom && inwin && t >= tmin && t < best) { *t_o = t; *u_o = u; *v_o = v; return 1; }
+            return (inwin && indom) ? 2 : 0;
+        }
+        if (det > -1e-20f && det < 1e-20f) return 0;
+        float inv = 1.0f/det;
+        float d0 = hp_det3(R, dv, nd)*inv, d1 = hp_det3(du, R, nd)*inv, d2 = hp_det3(du, dv, R)*inv;
+        float sc = 1.0f;
+        if (fabsf(d0) > hu) sc = hu / fabsf(d0);
+        if (fabsf(d1) * sc > hv) sc = hv / fabsf(d1);
+        u -= sc * d0; v -= sc * d1; t -= sc * d2;
+        u = u < ulo ? ulo : (u > uhi ? uhi : u);
+        v = v < vlo ? vlo : (v > vhi ? vhi : v);
+    }
+    return 0;
+}
+/* silhouette inside the cell (n.dir changes sign) -> a nearer root may exist */
+template <int RAT>
+__device__ __forceinline__ bool hp_patch_fold(const float *cp, const float *dir, float u0,
+                                              float u1, float v0, float v1) {
+    int pos = 0, neg = 0;
+    const float cu[5] = {u0, u1, u0, u1, 0.5f * (u0 + u1)};
+    const float cvv[5] = {v0, v0, v1, v1, 0.5f * (v0 + v1)};
+    for (int q = 0; q < 5; q++) {
+        float Sq[3], dq[3], eq[3];
+        hp_patch_ev<RAT>(cp, cu[q], cvv[q], Sq, dq, eq);
+        float nx = dq[1]*eq[2]-dq[2]*eq[1], ny = dq[2]*eq[0]-dq[0]*eq[2], nz = dq[0]*eq[1]-dq[1]*eq[0];
+        if (nx*dir[0]+ny*dir[1]+nz*dir[2] > 0.0f) pos = 1; else neg = 1;
+    }
+    return pos && neg;
+}
 __device__ __forceinline__ bool hp_bezpatch_one(float ox,float oy,float oz,
         float dx,float dy,float dz,float ix,float iy,float iz,const float cp[48],
         float tmin,float best_t,float *t_o,float *u_o,float *v_o) {
-    struct { float u0,u1,v0,v1; int d; } stk[20];
+    struct { float u0,u1,v0,v1; int d; } stk[4 * 7 + 4];
     int sp=0; stk[0].u0=0;stk[0].u1=1;stk[0].v0=0;stk[0].v1=1;stk[0].d=0; sp=1;
     float best=best_t; int hit=0;
     float org[3]={ox,oy,oz}, dir[3]={dx,dy,dz};
@@ -1497,10 +1596,12 @@ __device__ __forceinline__ bool hp_bezpatch_one(float ox,float oy,float oz,
             float dd=dx*dx+dy*dy+dz*dz;
             float t0=((S[0]-ox)*dx+(S[1]-oy)*dy+(S[2]-oz)*dz)/(dd>1e-20f?dd:1e-20f);
             float th,uh,vh;
-            if (hp_bezpatch_newton(cp,org,dir,uc,vc,t0,tmin,best,&th,&uh,&vh)) {
+            int nr = hp_patch_newton2<0>(cp,org,dir,uc,vc,t0,tmin,best,&th,&uh,&vh,u0,u1,v0,v1);
+            if (nr==1) {
                 best=th; *t_o=th; *u_o=uh; *v_o=vh; hit=1;
-            }
-            continue;
+                if (d>=7 || !hp_patch_fold<0>(cp,dir,u0,u1,v0,v1)) continue;
+            } else if (nr==2 || d>=7) continue;
+            /* Newton failed (or a silhouette cell): refine (mirror of the CPU) */
         }
         float um=0.5f*(u0+u1), vm=0.5f*(v0+v1);
         const float U2[2][2]={{u0,um},{um,u1}}, V2[2][2]={{v0,vm},{vm,v1}};
@@ -1570,7 +1671,7 @@ __device__ __forceinline__ bool hp_rbez_one(float ox,float oy,float oz,
         float dx,float dy,float dz,float ix,float iy,float iz,const float cp[64],
         const float dom[4], const uint32_t *toff, const float *tpts, uint32_t tnl,
         float tmin,float best_t,float *t_o,float *u_o,float *v_o) {
-    struct { float u0,u1,v0,v1; int d; } stk[20];
+    struct { float u0,u1,v0,v1; int d; } stk[4 * 7 + 4];
     int sp=0; stk[0].u0=0;stk[0].u1=1;stk[0].v0=0;stk[0].v1=1;stk[0].d=0; sp=1;
     float best=best_t; int hit=0;
     float org[3]={ox,oy,oz}, dir[3]={dx,dy,dz};
@@ -1591,11 +1692,14 @@ __device__ __forceinline__ bool hp_rbez_one(float ox,float oy,float oz,
             float dd=dx*dx+dy*dy+dz*dz;
             float t0=((S[0]-ox)*dx+(S[1]-oy)*dy+(S[2]-oz)*dz)/(dd>1e-20f?dd:1e-20f);
             float th,uh,vh;
-            if (hp_rbez_newton(cp,org,dir,uc,vc,t0,tmin,best,&th,&uh,&vh)) {
+            int nh = hp_patch_newton2<1>(cp,org,dir,uc,vc,t0,tmin,best,&th,&uh,&vh,u0,u1,v0,v1);
+            if (nh==1) {
                 float gu=dom[0]+uh*(dom[1]-dom[0]), gv=dom[2]+vh*(dom[3]-dom[2]);
                 if (hp_trim_inside(toff,tpts,tnl,gu,gv)) {best=th;*t_o=th;*u_o=gu;*v_o=gv;hit=1;}
+                if (d<7 && hp_patch_fold<1>(cp,dir,u0,u1,v0,v1)) nh = 0;
             }
-            continue;
+            if (nh==2 || nh==1 || d>=7) continue;
+            /* Newton failed (or a silhouette cell): refine (mirror of the CPU) */
         }
         float um=0.5f*(u0+u1), vm=0.5f*(v0+v1);
         const float U2[2][2]={{u0,um},{um,u1}}, V2[2][2]={{v0,vm},{vm,v1}};
@@ -1614,7 +1718,7 @@ __device__ __forceinline__ void hp_leaf(const uint32_t *__restrict__ blocks,
                                         float *best_v, uint32_t *best_prim,
                                         const uint32_t *trim_off,
                                         const float *trim_pts,
-                                        uint32_t trim_nloops) {
+                                        uint32_t trim_nloops, int anyhit = 0) {
     if (prim_kind == HIP_PRIM_SPHERE) {
         for (uint32_t l = 0; l < 4u; l++) {
             uint32_t prim = blocks[blk + 16u + l];
@@ -1793,8 +1897,9 @@ __device__ __forceinline__ void hp_leaf(const uint32_t *__restrict__ blocks,
                 cp[k * 4 + 3] = fu(blocks[blk + (uint32_t)(k * 16 + 12) + l]);
             }
             float t, u;
-            if (hp_bez_one(ox, oy, oz, dx, dy, dz, cp, tmin, *best_t, &t, &u)) {
+            if (hp_bez_one(ox, oy, oz, dx, dy, dz, cp, tmin, *best_t, &t, &u, anyhit)) {
                 *best_t = t; *best_u = u; *best_v = 0.0f; *best_prim = prim;
+                if (anyhit) return;
             }
         }
     } else if (prim_kind == HIP_PRIM_QUAD || prim_kind == HIP_PRIM_TETRA) {
@@ -1958,6 +2063,9 @@ __launch_bounds__(64) __global__
                                 HP_MAX(HP_TN(tlz, thz), tmin));
             float tfar = HP_MIN(HP_MIN(HP_MAX(tlx, thx), HP_MAX(tly, thy)),
                                HP_MIN(HP_MAX(tlz, thz), best_t));
+#ifdef LRT_TRI_SLAB_INFLATE
+            tfar *= 0x1.00000ap+0f; /* 1 + 10u, as the CPU slab (Robust/Slab) */
+#endif
             if (tnear <= tfar) {
                 int j = nhit++;
                 while (j > 0 && hit_tn[j - 1] > tnear) {
@@ -2029,7 +2137,7 @@ __launch_bounds__(64) __global__
                 uint32_t bp = LRT_CUDA_NO_HIT;
                 hp_leaf(blocks, (blk0 + b) * bsw, prim_kind, point_type, ox, oy,
                         oz, dx, dy, dz, tmin, &bt, &bu, &bv, &bp, trim_off,
-                        trim_pts, trim_nloops);
+                        trim_pts, trim_nloops, 1);
                 if (bp != LRT_CUDA_NO_HIT) hit = 1u;
             }
             continue;
@@ -2048,6 +2156,9 @@ __launch_bounds__(64) __global__
                                 HP_MAX(HP_TN(tlz, thz), tmin));
             float tfar = HP_MIN(HP_MIN(HP_MAX(tlx, thx), HP_MAX(tly, thy)),
                                HP_MIN(HP_MAX(tlz, thz), tmax));
+#ifdef LRT_TRI_SLAB_INFLATE
+            tfar *= 0x1.00000ap+0f; /* 1 + 10u, as the CPU slab (Robust/Slab) */
+#endif
             if (tnear <= tfar) {
                 if ((uint32_t)sp >= STACK) { hit = 1u; break; }
                 stk_ref[sp++] = nodes[nb + 6u * W + i];
