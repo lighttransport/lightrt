@@ -1,4 +1,5 @@
 #include "bsdf.h"
+#include <pthread.h>
 
 #include <math.h>
 #include <stddef.h>
@@ -1068,6 +1069,74 @@ static v3 eval_reflection(const Layers *L, v3 N, v3 wo, v3 wi, float *pdf) {
     return eval_reflection_split(L, N, wo, wi, pdf, (v3 *)0, (v3 *)0);
 }
 
+/* Optional energy compensation of rough dielectric transmission. A single-scatter microfacet
+ * interface loses the energy of paths that scatter between microfacets (up to about half at
+ * roughness 1). Turquin-style compensation scales the transmitted lobe by 1/E, E being the
+ * interface's single-scatter albedo (reflection + transmission) for the view cosine, roughness
+ * and relative IOR. Because E >= T and R + T/E <= 1 for E = R + T the result never gains energy.
+ * Off by default (the OpenPBR specification does not require it). The albedo is tabulated on
+ * first use for each IOR, under a lock, by VNDF sampling. */
+static int g_ms_dielectric = 0;
+void bsdf_set_dielectric_multiscatter(int enable) { g_ms_dielectric = enable != 0; }
+
+#define MS_TAB_MU 16
+#define MS_TAB_ALPHA 16
+#define MS_TAB_CACHE 64
+typedef struct { int key; float albedo[MS_TAB_ALPHA][MS_TAB_MU]; } MsTable;
+static MsTable g_ms_tables[MS_TAB_CACHE];
+static int g_ms_table_count = 0;
+static pthread_mutex_t g_ms_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static float ms_interface_albedo_sample(float mu, float alpha, float eta, int n) {
+    pcg32 rng; pcg32_seed(&rng, 0x5eed, 7);
+    v3 wo = v3_make(sqrtf(fmaxf(0.0f, 1.0f - mu * mu)), 0.0f, mu);
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        v3 m = sample_conductor_vndf(wo, alpha, alpha, pcg32_f(&rng), pcg32_f(&rng));
+        float cosi = clampf(v3_dot(m, wo), 0.0f, 1.0f);
+        float fr = fresnel_dielectric(cosi, eta);
+        float a2 = alpha * alpha;
+        float root = sqrtf(a2 + (1.0f - a2) * mu * mu);
+        float g1 = 2.0f * mu / (mu + root);
+        v3 wr = v3_sub(v3_scale(m, 2.0f * cosi), wo);
+        if (wr.z > 0.0f && g1 > 0.0f) sum += fr * ggx_G(mu, wr.z, alpha) / g1;
+        float sint2 = eta * eta * (1.0f - cosi * cosi);
+        if (sint2 < 1.0f && g1 > 0.0f) {
+            float cost = sqrtf(fmaxf(0.0f, 1.0f - sint2));
+            v3 wt = v3_normalize(v3_sub(v3_scale(m, eta * cosi - cost), v3_scale(wo, eta)));
+            if (wt.z < 0.0f) sum += (1.0f - fr) * ggx_G(mu, -wt.z, alpha) / g1;
+        }
+    }
+    return (float)(sum / n);
+}
+
+static float ms_dielectric_albedo(float mu, float alpha, float eta) {
+    int key = (int)lrintf(eta * 1000.0f);
+    pthread_mutex_lock(&g_ms_lock);
+    MsTable *t = NULL;
+    for (int i = 0; i < g_ms_table_count; ++i)
+        if (g_ms_tables[i].key == key) { t = &g_ms_tables[i]; break; }
+    if (!t) {
+        if (g_ms_table_count < MS_TAB_CACHE) t = &g_ms_tables[g_ms_table_count++];
+        else t = &g_ms_tables[key & (MS_TAB_CACHE - 1)];   /* evict deterministically */
+        t->key = key;
+        float e = (float)key / 1000.0f;
+        for (int j = 0; j < MS_TAB_ALPHA; ++j)
+            for (int i = 0; i < MS_TAB_MU; ++i)
+                t->albedo[j][i] = ms_interface_albedo_sample(
+                    fmaxf(0.02f, ((float)i + 0.5f) / MS_TAB_MU),
+                    fmaxf(0.02f, (float)j / (MS_TAB_ALPHA - 1)), e, 384);
+    }
+    float fm = clampf(mu * MS_TAB_MU - 0.5f, 0.0f, MS_TAB_MU - 1.001f);
+    float fa = clampf(alpha * (MS_TAB_ALPHA - 1), 0.0f, MS_TAB_ALPHA - 1.001f);
+    int i0 = (int)fm, j0 = (int)fa;
+    float tm = fm - i0, ta = fa - j0;
+    float v = (1 - ta) * ((1 - tm) * t->albedo[j0][i0] + tm * t->albedo[j0][i0 + 1]) +
+              ta * ((1 - tm) * t->albedo[j0 + 1][i0] + tm * t->albedo[j0 + 1][i0 + 1]);
+    pthread_mutex_unlock(&g_ms_lock);
+    return clampf(v, 0.05f, 1.0f);
+}
+
 /* OpenPBR rough transmission, using the visible-normal density and the
  * refraction half-vector Jacobian. eta is incident/transmitted IOR. */
 static v3 eval_rough_transmission(const OpenPBRParams *p, const Layers *L,
@@ -1094,6 +1163,7 @@ static v3 eval_rough_transmission(const OpenPBRParams *p, const Layers *L,
     if (!(*pdf > 0.0f) || !isfinite(*pdf)) { *pdf = 0.0f; return v3_splat(0.0f); }
     float mask = ggx_G(nv, nl, L->alpha)/g1;
     float factor = mask * L->glass_w * (1.0f-fresnel) * density * jacobian / nl;
+    if (g_ms_dielectric) factor /= ms_dielectric_albedo(nv, L->alpha, eta);
     v3 tint = p->transmission_depth > 0.0f ? v3_splat(1.0f) : p->transmission_color;
     tint = v3_mul(tint, coat_substrate_attenuation(L, nv, NULL, NULL));
     if (L->sheen_lobe_count == 0 && L->sheen_w > 0.0f)
@@ -1188,6 +1258,9 @@ int bsdf_sample(const OpenPBRParams *p, v3 Ns, v3 wo, pcg32 *rng, BsdfSample *ou
             float pdf;
             (void)eval_rough_transmission(p, &L, N, wo, wi, eta, &pdf);
             if (!(pdf > 0.0f)) return 0;
+            if (g_ms_dielectric)
+                out->throughput = v3_scale(out->throughput,
+                    1.0f / ms_dielectric_albedo(v3_dot(N, wo), L.alpha, eta));
             out->pdf = pdf;
             out->specular = 0;
         }

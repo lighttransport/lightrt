@@ -328,6 +328,34 @@ int main(void) {
     printf("PASS: OpenPBR glass furnace across both sides and roughness\n");
   }
 
+  /* Optional multiple-scatter compensation: rough transmission gains energy (never above one) and
+   * the default stays uncompensated. */
+  {
+    FurnaceCase c = {"transmission", 0, 0, 0, 0, 0, 1, 0};
+    const v3 n = {0, 0, 1};
+    double energy[2];
+    for (int mode = 0; mode < 2; ++mode) {
+      bsdf_set_dielectric_multiscatter(mode);
+      OpenPBRParams p; set_defaults(&p, &c);
+      p.openpbr_coat_remap = 1; p.base_weight = 0; p.transmission = 1;
+      p.specular_ior = 1.6f; p.specular_roughness = 0.7f;
+      const v3 wo = v3_make(sqrtf(1.0f - 0.7f * 0.7f), 0, 0.7f);
+      pcg32 rng; pcg32_seed(&rng, 77, 5);
+      double sum = 0; const int count = 300000;
+      for (int i = 0; i < count; ++i) {
+        BsdfSample sample;
+        if (bsdf_sample(&p, n, wo, &rng, &sample)) sum += sample.throughput.x;
+      }
+      energy[mode] = sum / count;
+    }
+    bsdf_set_dielectric_multiscatter(0);
+    if (!(energy[1] > energy[0] + 0.03 && energy[1] <= 1.02)) {
+      fprintf(stderr, "FAIL: multiscatter compensation energy %g -> %g\n", energy[0], energy[1]);
+      return 1;
+    }
+    printf("PASS: rough dielectric multiscatter compensation (%.3f -> %.3f)\n", energy[0], energy[1]);
+  }
+
   // Sweep the principal base/specular controls so the furnace bound also
   // covers combinations between the named material fixtures above.
   const v3 sweep_colors[] = {
