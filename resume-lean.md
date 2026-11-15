@@ -141,8 +141,22 @@ Explicitly deferred/recorded (see PLAN.md):
      `B ≤ K E`-style extra hypothesis; with `B ≤ K·E` the constant is
      `(10 B K/δ) E²` for both).
    - 7b-2 `Geom/BezNewton.lean`: Bézier specialization of the `F(u, t)` system
-     (`tri_bez_newton`): Jacobian entries as polynomial sums, conditional on
-     the determinant side condition; final contraction corollary.
+     (`tri_bez_newton`). **Done** — `BezSys` bundles the curve/radius
+     derivative chains; `pd1_bezF`/`pd2_bezF`/`pd1_bezG`/`pd2_bezG` identify
+     the C's `dFdu`/`dFdt`/`dGdu`/`dGdt` as polynomial sums (plus the `1/|R|`
+     entries), `jacDet_bez` is the C's `det`; `bezF_C2Seg`/`bezG_C2Seg` prove
+     the rectangle differentiability parts of `C2Seg` (with
+     `|R|² > 0` from the C's `lenR > 1e-30` guard as hypothesis) and take the
+     eight second-derivative bounds as `PddBounds` hypotheses;
+     `bez_newton_quadratic` is the final contraction corollary and
+     `BezSys.ofCubic` instantiates everything for the actual cubic control-point
+     polynomials (`tri_bez_eval`'s `P`/`dP`/`ddP` expressions, proved via the
+     `bezPoly` polynomial representation); `ofCubic_newton_quadratic` is the
+     monic specialization. Honest limits, mirroring the C: the radius row is
+     modeled unclamped (`max r 0` is not `C²` at the kink), the `dF/du < 0`
+     front-facing-minimum selection and the eps-convergence test are not
+     modeled, `K`/`B` stay hypotheses, and no floating-point analysis of the
+     step is claimed.
    - 7a `Geom/SphereTrace3.lean`: 3D no-overshoot via `Metric.infDist`
      (`lipschitz_infDist_pt`).
    Patch/NURBS stay measured against `primhitcheck` (item 16 decision).

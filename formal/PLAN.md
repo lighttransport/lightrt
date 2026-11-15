@@ -354,3 +354,28 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   not watertight so a `t` bound would buy no conservativity anyway. The
   verified leaf + stage lemmas stand as the bound toolkit; `mtcheck` remains
   the empirical check. `LightRT.lean` imports MTTotal and MTLeaf.
+- **M22 (addendum 4):** 7b-2 (Bézier specialization of the 2D Newton) is
+  **done**: `LightRT/Geom/BezNewton.lean` (~700 lines) proves the concrete
+  contact system `F = (⟨R, C′⟩ + r·r′, |R| − r)` of `tri_bez_newton` for an
+  abstract round-Bézier `BezSys` (curve components `gx..qz`, unclamped radius
+  row `rad..ddr`, `HasDerivAt` hypotheses). The Jacobian entries are the C's
+  own `dFdu`/`dFdt`/`dGdu`/`dGdt` polynomial sums (`pd1_bezF`, `pd2_bezF`,
+  `pd1_bezG`, `pd2_bezG`, the `1/|R|` entries needing `|R| ≠ 0` like the C's
+  `lenR > 1e-30` guard); `jacDet_bez` is literally the C's
+  `det = dFdu·dGdt − dFdt·dGdu`. `bezF_C2Seg` / `bezG_C2Seg`
+  prove the rectangle differentiability halves of `C2Seg` and take the eight
+  second-derivative bounds as `PddBounds` hypotheses (f and g share one `K`,
+  the C's `ddP` scale); second-derivative `K` and Jacobian `B` are *not*
+  derived from the control points (that coefficient chase is out of scope).
+  `bez_newton_quadratic` is the final contraction corollary (via
+  `newton2_step_quadratic`), and `BezSys.ofCubic` instantiates the system for
+  the actual cubic control-point polynomials of `tri_bez_eval`
+  (`P`/`dP`/`ddP` proved equal to derivative polynomials via a `bezPoly`
+  `Polynomial` representation, so no hand-differentiated monomial soup);
+  `ofCubic_newton_quadratic` is the monic specialization. Honest limits:
+  radius row unclamped (the C's `max r 0` is not `C²` at the kink), `dF/du < 0`
+  selection and eps-convergence not modeled, `|R|² > 0` on the rectangle and
+  `K`, `B`, `δ ≤ |det|`, `E ≤ B/K` are hypotheses — the same standing as
+  `newton2_step_quadratic`. Supersedes addendum 2's deferral note.
+  `LightRT.lean` imports `Geom.BezNewton`.
+
