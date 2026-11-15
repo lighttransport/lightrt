@@ -32,3 +32,6 @@ import LightRT.C.Proofs.SlabParallel
 import LightRT.C.Proofs.SlabRobustRefines
 import LightRT.Robust.MTTotal
 import LightRT.Robust.MTLeaf
+import LightRT.Robust.MTCross2
+import LightRT.Robust.MTDot
+import LightRT.Robust.MTT
