@@ -12,7 +12,12 @@
   Building blocks:
     `fl_sub_err_total`  |fl(a - b) - (a - b)| ≤ u|a - b| + eta
     `fl_add_err_total`  |fl(a + b) - (a + b)| ≤ u|a + b| + eta
-    `fl_mul_err_total`  |fl(fl a · fl b) - a·b| ≤ 6u·A·B + 20eta·(A+B+1)
+    `fl_mul_err_total`  |fl(fl a · fl b) - a·b| ≤ 7u·A·B + 9eta·(A+B+1)
+
+  `Robust/MTLeaf.lean` adds `add2_fl_err_total` / `sub2_fl_err_total` for
+  sums and differences of two already-rounded operands (used by the composed
+  Möller–Trumbore stage bounds — not included in this environment's budget).
+
 -/
 import LightRT.FP.TotalErr
 import LightRT.Robust.Total

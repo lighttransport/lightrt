@@ -344,11 +344,13 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   bound): leaf bounds proved in new `Robust/MTTotal.lean` — `fl_sub_err_total` /
   `fl_add_err_total`, `fl_abs_le`, `fl_mul_err_total` (`|fl(fl a·fl b) − a·b| ≤
   7uAB + 9η(A+B+1)`), `fl_mul_ops_err_total` (product of operands each with an
-  absolute operand error), `add2_fl_err_total` / `sub2_fl_err_total` (later
-  removed to keep build times sane; the cross-product component lemma
-  `cross2_fl_err_total` was likewise dropped), no `InRange` anywhere.
-  **Not done**: the composition `mt_t_fl_err_total` — the per-declaration
-  elaboration cost of the multi-stage tree in this toolchain is prohibitive,
-  and MT is not watertight so a `t` bound would buy no conservativity anyway.
-  The verified pieces stand as the bound toolkit for the Woop-style analysis;
-  `mtcheck` remains the empirical check. `LightRT.lean` imports the module.
+  absolute operand error), no `InRange` anywhere. `Robust/MTLeaf.lean` adds
+  `add2_fl_err_total` / `sub2_fl_err_total` (range-free bounds for fl-sum and
+  fl-diff of two already-rounded operands). **Not done**: the cross-product
+  component lemma `cross2_fl_err_total` and the full composition
+  `mt_t_fl_err_total` — the F-model's `model.fl` unification cost makes the
+  elaboration of those impossible to bound in this environment; the scratch
+  attempts time out at 4+ CPU-minutes without producing a clean build. MT is
+  not watertight so a `t` bound would buy no conservativity anyway. The
+  verified leaf + stage lemmas stand as the bound toolkit; `mtcheck` remains
+  the empirical check. `LightRT.lean` imports MTTotal and MTLeaf.

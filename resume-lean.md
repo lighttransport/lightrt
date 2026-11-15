@@ -103,9 +103,11 @@ Explicitly deferred/recorded (see PLAN.md):
   8M lanes / 642k hits, 0 differences (`make formal` gate, 500k iterations).
   Item 3b (range-free MT `t` error bound): `Robust/MTTotal.lean` proves the
   leaf bounds (`fl_mul_err_total`, `fl_mul_ops_err_total`, `fl_sub/add_err_total`,
-  `fl_abs_le`, `eta_eq_def`) with no `InRange`; the composition
-  `mt_t_fl_err_total` is **not proved** (elaboration too costly; MT is not
-  watertight, so a `t` bound would buy no conservativity anyway).
+  `fl_abs_le`, `eta_eq_def`) with no `InRange`, and `Robust/MTLeaf.lean` proves
+  `add2_fl_err_total` / `sub2_fl_err_total`. The composed `mt_t_fl_err_total`
+  (and `cross2_fl_err_total`) are **not proved** — the F-model's `model.fl`
+  unification cost makes the elaboration infeasible in this setting; MT is not
+  watertight, so a `t` bound would buy no conservativity anyway.
 
 ## Remaining items
 
