@@ -192,10 +192,13 @@ Explicitly deferred/recorded (see PLAN.md):
      **the linchpin** — `infDist_bezTubeSet`:
      `Metric.infDist x (bezTubeSet S a b) = max 0 (bezPhiMin S x a b)`
      for `a ≤ b` and `0 ≤ r(u)` on the interval (the `x` inside tube /
-     perpendicular-foot cases). M14's remaining bulk: the trace
-     guarantee through the *sampled* rule and the Newton foot-point
-     convergence proof (`SphereTrace.newton_step_quadratic` is ready),
-     plus floating point of the minimizer (`primhitcheck` covers it).
+     perpendicular-foot cases), plus `stTrace3_bezTube_le_root` (the
+     exact-distance no-overshoot trace corollary: root with
+     `bezPhiMin ≤ 0` ⇒ iterate never passes it, `‖v‖ ≤ 1`). M14's
+     remaining bulk: the trace guarantee through the *sampled* rule and
+     the Newton foot-point convergence proof
+     (`SphereTrace.newton_step_quadratic` is ready), plus floating point
+     of the minimizer (`primhitcheck` covers it).
    Patch/NURBS stay measured against `primhitcheck` (item 16 decision).
 
 ## Resuming prompt
