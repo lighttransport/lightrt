@@ -379,6 +379,18 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   `newton2_step_quadratic`. Supersedes addendum 2's deferral note.
   `LightRT.lean` imports `Geom.BezNewton`.
 
+- **M22 (addendum 7):** the M14 signed-distance model got its first
+  slice: `LightRT/Geom/BezTube.lean` proves `hasDerivAt_bezQ` /
+  `hasDerivAt_bezPhi` (φ(u) = ‖x − C(u)‖ − r(u) differentiable off the
+  curve, derivative `⟨R, C′⟩ / |R| − r′`, the C's `dGdu`-shaped formula),
+  `deriv_bezPhi`, `continuous_bezPhi`, and `phi_min_attained` (the min of
+  φ on `Icc a b` is attained, via `IsCompact_Icc.exists_isMinOn`).
+  Definitions `bezPhi` / `bezQ` / `bezTubeSet` (union of balls
+  `B(C(u), r(u))` over the interval). Not done: `inf_u φ = infDist` to
+  the tube set, the tube trace guarantee through the sampled rule, and
+  the Newton foot-point convergence proof. `LightRT.lean` imports
+  `Geom.BezTube`.
+
 - **M22 (addendum 6):** item 3b (range-free Möller–Trumbore `t` error
   bound) is **done, end-to-end**: `Robust/MTTotal.lean` + `Robust/MTLeaf.lean`
   (leaf/stage bounds: `fl_mul_err_total`, `fl_mul_ops_err_total`,
