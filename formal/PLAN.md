@@ -379,6 +379,22 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   `newton2_step_quadratic`. Supersedes addendum 2's deferral note.
   `LightRT.lean` imports `Geom.BezNewton`.
 
+- **M22 (addendum 6):** item 3b (range-free Möller–Trumbore `t` error
+  bound) is **done, end-to-end**: `Robust/MTTotal.lean` + `Robust/MTLeaf.lean`
+  (leaf/stage bounds: `fl_mul_err_total`, `fl_mul_ops_err_total`,
+  `fl_sub/add_err_total`, `fl_abs_le`, `add2/sub2_fl_err_total`), `Robust/MTCross2.lean`
+  (`fl_pair_mul_bound`, `cross_mul_abs_err`, `cross2_fl_err_total` — the
+  cross-product component as the C rounds it), `Robust/MTDot.lean` (`dot3_fl_err_total`
+  via `num_err_total` with a padded operand bound; `cross_component_err`;
+  `mt_det_err_total` / `mt_num_err_total` with `|dᵢ|,|tvᵢ| ≤ M`, `|e1ᵢ| ≤ A`, `|e2ᵢ| ≤ B`),
+  and `Robust/MTT.lean` (`mt_t_fl_err_total_model`: the composed `t` bound
+  `|t_model − t_exact| ≤ (12u·BMA + (2u+2)·mtNumErr M A B)/a0 + η + 12·BMA·mtDetErr M A B / a0²`,
+  with `a0 ≤ det_exact` and `mtDetErr M A B ≤ a0/2` hypotheses; negative-det
+  class via the sign-flipped ray). All range-free, zero `sorry`; the bound
+  degrades like `1/a0` near det = 0, which is correct for a non-watertight
+  kernel — it buys no conservativity for pruning; `mtcheck` remains the
+  empirical check. `LightRT.lean` imports MTDot and MTT.
+
 - **M22 (addendum 5):** 7a (3D no-overshoot) is **done**:
   `LightRT/Geom/SphereTrace3.lean` proves `infDist_lipschitz` (distance to a
   set is 1-Lipschitz), `infDist_line_lipschitz` (the ray restriction

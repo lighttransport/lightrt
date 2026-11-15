@@ -109,13 +109,22 @@ Explicitly deferred/recorded (see PLAN.md):
   `BITEXACT` SIMD == scalar for MT: new `formal/tools/mtcheck.c` fuzzes
   `tri_packet4_tri` vs the scalar per-lane `tri_isect_lane` — 2M blocks /
   8M lanes / 642k hits, 0 differences (`make formal` gate, 500k iterations).
-  Item 3b (range-free MT `t` error bound): `Robust/MTTotal.lean` proves the
-  leaf bounds (`fl_mul_err_total`, `fl_mul_ops_err_total`, `fl_sub/add_err_total`,
-  `fl_abs_le`, `eta_eq_def`) with no `InRange`, and `Robust/MTLeaf.lean` proves
-  `add2_fl_err_total` / `sub2_fl_err_total`. The composed `mt_t_fl_err_total`
-  (and `cross2_fl_err_total`) are **not proved** — the F-model's `model.fl`
-  unification cost makes the elaboration infeasible in this setting; MT is not
-  watertight, so a `t` bound would buy no conservativity anyway.
+  Item 3b (range-free MT `t` error bound): **done.** `Robust/MTTotal.lean`
+  and `Robust/MTLeaf.lean` prove the leaf/stage bounds (`fl_mul_err_total`,
+  `fl_mul_ops_err_total`, `fl_sub/add_err_total`, `fl_abs_le`, `add2/sub2_fl_err_total`,
+  ...); `Robust/MTCross2.lean` proves `cross2_fl_err_total` (the cross-product
+  component: `|fl(fl a·fl c − fl b·fl d) − (a·c − b·d)| ≤ 7u(AC+BD) + 4η(A+B+C+D+2)`);
+  `Robust/MTDot.lean` proves `dot3_fl_err_total`, `cross_component_err`,
+  `mt_det_err_total` and `mt_num_err_total` (the determinant and numerator
+  stages of `tri_mt_one`, in C op order); `Robust/MTT.lean` composes them
+  into `mt_t_fl_err_total_model` (range-free, no `InRange`):
+  `|t_model − t_exact| ≤ (12u·BMA + (2u+2)·mtNumErr M A B) / a0 + η + 12·BMA·mtDetErr M A B / a0²`,
+  with hypotheses `a0 ≤ |det_exact|` and `mtDetErr M A B ≤ a0/2` (a0 keeps the
+  exact determinant away from zero; the same theorem with `d ↦ −d` covers the
+  negative-det class). Constants reflect the F-model op order of the C; the
+  bound degrades like `1/a0` as det → 0, which is correct for a non-watertight
+  kernel — MT's `t` bound buys no conservativity for `EXACT_NEAREST`-style
+  pruning (MT is not watertight), and `mtcheck` remains the empirical check.
 
 ## Remaining items
 
