@@ -264,5 +264,23 @@ theorem infDist_bezTubeSet (S : BezSys) (x : EuclideanSpace ℝ (Fin 3))
       have hdyC : dist y (curvePt S u) = dist y (curvePt S u) := rfl
       linarith [hbd, e, htri, hyC, dist_comm y (curvePt S u)]
 
+/-- **Sphere trace on the round Bézier tube, exact-distance version**: for a
+    ray with `‖v‖ ≤ 1`, if the tube's `bezPhiMin` at the root is nonpositive
+    (the root lies in the tube, or touches it), the distance-driven trace
+    started at `t ≤ root` never passes `root`. This is the no-overshoot
+    guarantee the C's `tri_bez_leaf` stepping rests on (with the *sampled*
+    distance rule in place of `Metric.infDist`; sampled-mins 1-Lipschitz by
+    `lipschitz1_min`, and the sampled fold overshoots nowhere that the true
+    distance doesn't, cf. `primhitcheck`). -/
+theorem stTrace3_bezTube_le_root (S : BezSys) {a b : ℝ} (hab : a ≤ b)
+    (hrad : ∀ u ∈ Set.Icc a b, 0 ≤ S.rad u)
+    {x₀ v : EuclideanSpace ℝ (Fin 3)} (hv : ‖v‖ ≤ 1) {root : ℝ}
+    (hroot : bezPhiMin S (x₀ + root • v) a b ≤ 0) {t : ℝ} (ht : t ≤ root) (n : ℕ) :
+    stTrace (fun s => Metric.infDist (x₀ + s • v) (bezTubeSet S a b)) t n ≤ root := by
+  have hroot' : Metric.infDist (x₀ + root • v) (bezTubeSet S a b) ≤ 0 := by
+    rw [infDist_bezTubeSet S (x₀ + root • v) hab hrad]
+    exact max_le_iff.mpr ⟨le_refl 0, hroot⟩
+  exact stTrace3_le_root (bezTubeSet S a b) hv hroot' ht n
+
 end
 end LightRT.Geom

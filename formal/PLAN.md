@@ -390,6 +390,10 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   is at distance `≥ min φ` (via the triangle inequality and
   `bezPhi_eq_dist`) and exhibits the perpendicular foot at the
   minimizing parameter `C(u₀) + (r(u₀)/d) • (x − C(u₀))` as a witness.
+  Added (same milestone): `stTrace3_bezTube_le_root` — the
+  exact-distance no-overshoot trace corollary for `bezTubeSet`
+  (`bezPhiMin root ≤ 0` ⇒ iterate never passes it; via
+  `stTrace3_le_root (bezTubeSet ...)` and `infDist_bezTubeSet`).
   Remaining M14 work: the trace guarantee through the sampled rule and
   the Newton foot-point convergence proof.
 
