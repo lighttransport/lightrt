@@ -182,16 +182,20 @@ Explicitly deferred/recorded (see PLAN.md):
      atoms `lipschitz1_min` / `lipschitz1_dist_of_mem` for the *sampled*
      `tri_bez_leaf_dist` fold). Not modeled: the leaf's distance is a
      sampled estimate, not exact `infDist`; `primhitcheck` covers it.
-   - M14 first slice: `Geom/BezTube.lean` — the signed-distance model of
-     the round Bézier tube: `bezPhi` (φ(u) = ‖x − C(u)‖ − r(u) with a
-     `BezSys`), `bezQ`, `bezTubeSet` (union of balls over `[a,b]`),
-     `hasDerivAt_bezQ` / `hasDerivAt_bezPhi` / `deriv_bezPhi` (φ
-     differentiable off the curve, derivative = the C's
-     `⟨R,C′⟩/|R| − r′`), `continuous_bezPhi`, `phi_min_attained`
-     (min on `Icc a b`). **Not done yet**: `inf_u φ = infDist` to the
-     tube set, the trace guarantee with the sampled rule, the Newton
-     foot-point refinement convergence (uses `SphereTrace.newton_step_quadratic`).
-     M14 remains open overall.
+   - M14 signed-distance model: `Geom/BezTube.lean` now proves (working in
+     `EuclideanSpace ℝ (Fin 3)`): `bezPhi` (φ(u) = dist x C(u) − r(u)),
+     `bezQ`, `curvePt` (notation `!₂[gx, gy, gz]`), `bezQ_eq_dist_sq` /
+     `bezPhi_eq_dist` (bridges to `Metric.dist`), `hasDerivAt_bezQ` /
+     `hasDerivAt_bezPhi` / `deriv_bezPhi`, `continuous_bezPhi`,
+     `phi_min_attained` (min on `Icc a b`), `bezPhiMin` /
+     `bezPhiMin_eq` (the attained minimum value), `bezPhiMin_le`, and —
+     **the linchpin** — `infDist_bezTubeSet`:
+     `Metric.infDist x (bezTubeSet S a b) = max 0 (bezPhiMin S x a b)`
+     for `a ≤ b` and `0 ≤ r(u)` on the interval (the `x` inside tube /
+     perpendicular-foot cases). M14's remaining bulk: the trace
+     guarantee through the *sampled* rule and the Newton foot-point
+     convergence proof (`SphereTrace.newton_step_quadratic` is ready),
+     plus floating point of the minimizer (`primhitcheck` covers it).
    Patch/NURBS stay measured against `primhitcheck` (item 16 decision).
 
 ## Resuming prompt

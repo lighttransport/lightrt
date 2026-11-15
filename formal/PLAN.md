@@ -379,6 +379,20 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   `newton2_step_quadratic`. Supersedes addendum 2's deferral note.
   `LightRT.lean` imports `Geom.BezNewton`.
 
+- **M22 (addendum 8):** the linchpin of M14 is done: `Geom/BezTube.lean`
+  (all in `EuclideanSpace ℝ (Fin 3)`, where Mathlib's `dist` is Euclidean)
+  now proves `bezQ_eq_dist_sq` / `bezPhi_eq_dist`, `phi_min_attained`,
+  `bezPhiMin` / `bezPhiMin_eq` / `bezPhiMin_le`, the closed-ball-based
+  `bezTubeSet` with `mem_bezTubeSet_iff`, and **`infDist_bezTubeSet`**:
+  `Metric.infDist x (bezTubeSet S a b) = max 0 (bezPhiMin S x a b)`.
+  Proof strategy: nonpositive-φ case puts `x` inside the tube
+  (`Metric.infDist_zero_of_mem`); positive case shows every tube point
+  is at distance `≥ min φ` (via the triangle inequality and
+  `bezPhi_eq_dist`) and exhibits the perpendicular foot at the
+  minimizing parameter `C(u₀) + (r(u₀)/d) • (x − C(u₀))` as a witness.
+  Remaining M14 work: the trace guarantee through the sampled rule and
+  the Newton foot-point convergence proof.
+
 - **M22 (addendum 7):** the M14 signed-distance model got its first
   slice: `LightRT/Geom/BezTube.lean` proves `hasDerivAt_bezQ` /
   `hasDerivAt_bezPhi` (φ(u) = ‖x − C(u)‖ − r(u) differentiable off the
