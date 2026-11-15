@@ -4,6 +4,7 @@ import LightRT.FP.Binary32
 import LightRT.Geom.Basic
 import LightRT.Geom.SlabReal
 import LightRT.Geom.MTReal
+import LightRT.Geom.BezNewton
 import LightRT.Robust.Slab
 import LightRT.Robust.SlabMissReal
 import LightRT.Robust.Woop
