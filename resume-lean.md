@@ -1,6 +1,6 @@
 # LightRT Lean formalization: remaining items and resume prompt
 
-State as of 2026-11-14, branch `formal-lean` at `fb9ec29` (26 commits on top of
+State as of 2026-11-15, branch `formal-lean` at `b736431` (35 commits on top of
 `7fd2bf7`). Nothing is pushed. The plan and history are in `formal/PLAN.md`
 (milestones M1–M21); repo guidance is in `CLAUDE.md`, section "Formal
 verification".
@@ -157,8 +157,14 @@ Explicitly deferred/recorded (see PLAN.md):
      front-facing-minimum selection and the eps-convergence test are not
      modeled, `K`/`B` stay hypotheses, and no floating-point analysis of the
      step is claimed.
-   - 7a `Geom/SphereTrace3.lean`: 3D no-overshoot via `Metric.infDist`
-     (`lipschitz_infDist_pt`).
+   - 7a `Geom/SphereTrace3.lean`: 3D no-overshoot via `Metric.infDist`.
+     **Done** (`infDist_lipschitz`, `absLipschitz_infDist`,
+     `infDist_line_lipschitz` (‖v‖ ≤ 1 ray restriction),
+     `lipschitz1_infDist_line`, `stTrace3_le_root` (via `stTrace_le_root`),
+     `stTrace3_tube_le_root` (`r`-tube form), and the `AbsLipschitz`
+     atoms `lipschitz1_min` / `lipschitz1_dist_of_mem` for the *sampled*
+     `tri_bez_leaf_dist` fold). Not modeled: the leaf's distance is a
+     sampled estimate, not exact `infDist`; `primhitcheck` covers it.
    Patch/NURBS stay measured against `primhitcheck` (item 16 decision).
 
 ## Resuming prompt
@@ -167,10 +173,13 @@ Explicitly deferred/recorded (see PLAN.md):
 > `/mnt/nvme02/work/lightrt`. Read `resume-lean.md` and `formal/PLAN.md`
 > (M14–M21) first. Run `make formal` to confirm the baseline (0 sorry, all
 > checks PASS). Remaining large items: 3a (range-free slab chain), 4
-> (BITEXACT SIMD == scalar for MT; ISA boundary recorded), 7 (Bézier/patch
-> first-contact: full 2D Newton, Then 3D `infDist` sphere-trace). 3b (MT
-> error bound) and 3c (`tlas_instance_margin` fp64) are **deferred/out of
-> scope** by decision; do not attempt them. For every C change: keep
+> (BITEXACT SIMD == scalar for MT; ISA boundary recorded). 3b (MT error
+> bound) and 3c (`tlas_instance_margin` fp64) are **deferred/out of
+> scope** by decision; do not attempt them. Item 7 is complete:
+> `Geom/Newton2D.lean` (7b-1), `Geom/BezNewton.lean` (7b-2, the
+> `tri_bez_newton` specialization: Jacobian as polynomial sums, C2Seg on a
+> rectangle with `|R|² > 0`, contraction corollary `bez_newton_quadratic`),
+> and `Geom/SphereTrace3.lean` (7a, 3D no-overshoot via `Metric.infDist`). For every C change: keep
 > SIMD bit-identical to scalar (`wtcheck`, incl. the SVE leaf fuzz under
 > qemu), rerun `make formal`, the C suites (`make c_tri_test c_tri_seam_test
 > c_tri_parallel_test`, plus `tests/test_lightrt_c_quadtetra.c` and

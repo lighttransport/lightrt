@@ -379,3 +379,17 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   `newton2_step_quadratic`. Supersedes addendum 2's deferral note.
   `LightRT.lean` imports `Geom.BezNewton`.
 
+- **M22 (addendum 5):** 7a (3D no-overshoot) is **done**:
+  `LightRT/Geom/SphereTrace3.lean` proves `infDist_lipschitz` (distance to a
+  set is 1-Lipschitz), `infDist_line_lipschitz` (the ray restriction
+  `infDist (x₀ + t•v) S` has Lipschitz constant `‖v‖`, so ≤ 1-Lipschitz on a
+  unit ray), `stTrace3_le_root` (starting at `t ≤ root`, the distance-driven
+  trace never passes a `root` with `infDist (x₀ + root • v) S ≤ 0`, via the
+  1D `stTrace_le_root`), `stTrace3_tube_le_root` (the `r`-tube variant for
+  the round Bézier tube), plus the `AbsLipschitz` atoms `lipschitz1_min`
+  (min of two 1-Lipschitz functions) and `lipschitz1_dist_of_mem` — the
+  building blocks of the *sampled* `tri_bez_leaf_dist` fold (repeated
+  `min` closes the sample fold). Not modeled: the leaf's distance is a
+  sampled estimate, not exact `infDist`; `primhitcheck` covers the sampled
+  rule. `LightRT.lean` imports `Geom.SphereTrace3`.
+
