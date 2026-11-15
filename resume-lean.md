@@ -84,10 +84,18 @@ pattern): `clang --target=aarch64-linux-gnu --sysroot=/usr/aarch64-linux-gnu
   `a0 ≤ |e0+e1+e2|`).
 - 3a: `Robust/SlabTotal.fpT_abs_err_total` — range-free error bound for one
   scalar slab parameter (`fl(fl(x−o)·fl(1/d))`), no `InRange`.
-- 7: `Geom/SphereTrace.lean` now also proves the distance-to-point
-  1-Lipschitz atom and the one-Newton-step quadratic contraction
-  (`newton_step_quadratic`). Full 2D Newton and the Bézier signed-distance
-  model remain (PLAN M14/M15).
+- 7: `Geom/Hull.lean` proves box containment; `Geom/SphereTrace.lean`
+  proves the 1D no-overshoot core, the distance-to-point 1-Lipschitz atom,
+  and the one-Newton-step quadratic contraction (`newton_step_quadratic`);
+  `Geom/Newton2D.lean` proves the general 2D Newton quadratic contraction
+  (7b-1); `Geom/BezNewton.lean` proves the `tri_bez_newton` specialization
+  (7b-2: Jacobian as polynomial sums + `1/|R|` entries, `jacDet` = the C's
+  `det`, rectangle `C2Seg` with `|R|² > 0`, contraction corollary
+  `bez_newton_quadratic`, and the `BezSys.ofCubic` control-point-polynomial
+  instance); `Geom/SphereTrace3.lean` proves the 3D no-overshoot via
+  `Metric.infDist` (7a). The signed-distance Bézier model itself
+  (PLAN M14) is not formalized. Patch/NURBS stay measured against
+  `primhitcheck` (item 16 decision).
 
 Explicitly deferred/recorded (see PLAN.md):
 - 3b: range-free Möller–Trumbore `t` error bound — out of scope. The TLAS
