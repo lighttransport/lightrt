@@ -130,12 +130,14 @@ Explicitly deferred/recorded (see PLAN.md):
 
 ### Proofs (Lean), large
 
-3. **Rounding-model hypotheses (done for Woop/key/slab bounds).** Woop `t`
+3. **Rounding-model hypotheses (done for Woop/key/slab/MT bounds).** Woop `t`
    error and the `EXACT_NEAREST` key are range-free (both sign classes).
    `Robust/SlabTotal.lean` now proves the range-free scalar slab-parameter
    error bound `fpT_abs_err_total` (`|fpT − q/d| ≤ 4u|q/d| + 4(1+u)(|q| +
-   |1/d|)η + 2(1+u)η² + η`, no `InRange`). 3b (MT error bound) is **deferred**
-   by decision; 3c (`tlas_instance_margin` fp64) is **out of scope** —
+   |1/d|)η + 2(1+u)η² + η`, no `InRange`). 3b (MT error bound) is **done**
+   (`Robust/MTCross2.lean`, `MTDot.lean`, `MTT.lean`; MT is not watertight,
+   so it buys no `EXACT_NEAREST` conservativity — `mtcheck` remains the check);
+   3c (`tlas_instance_margin` fp64) is **out of scope** —
    `tlascheck` covers it. The `1e-37` dilation floor is proved
    (`fl_add_margin_ge`/`fl_sub_margin_le`); a range-free `slab_no_false_miss`
    needs a non-degeneracy floor and is not attempted (tangent rays admit no
