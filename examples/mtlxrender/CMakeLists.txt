@@ -27,7 +27,17 @@ set(TP_SRC
     ${DEPS}/tiny_gltf_v3.c
     ${TINYEXR_SRC})
 
-add_executable(mtlxrender ${APP_SRC} ${TP_SRC})
+# Keep the standalone CMake product in sync with the verified backend used by
+# the Makefile and the LightUSD integration. These schedules require strict FP.
+set(VERIFIED_SRC verified_float.c verified_math.c verified_eval.c
+    verified_bounds.c verified_ranges.c verified_fixed.c verified_normal.c verified_direction.c verified_single_power.c verified_local_geometry.c verified_vndf.c passive_film.c)
+add_executable(mtlxrender ${APP_SRC} ${TP_SRC} ${VERIFIED_SRC})
+if(MSVC)
+    set_source_files_properties(${VERIFIED_SRC} PROPERTIES COMPILE_OPTIONS "/fp:strict")
+else()
+    set_source_files_properties(${VERIFIED_SRC} PROPERTIES
+        COMPILE_OPTIONS "-fno-fast-math;-frounding-math;-ffp-contract=off")
+endif()
 target_include_directories(mtlxrender PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR} ${LIGHTRT_ROOT} ${DEPS} ${TINYEXR}/include)
 target_compile_definitions(mtlxrender PRIVATE

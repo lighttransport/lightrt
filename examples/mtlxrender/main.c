@@ -14,6 +14,7 @@
 #include "obj_load.h"
 #include "mtlx_doc.h"
 #include "mtlx_eval.h"
+#include "verified_math.h"
 #include "bsdf.h"
 #include "material_bind.h"
 #include "texture.h"
@@ -115,6 +116,7 @@ static void usage(const char *prog) {
         "  --spp <int>            samples per pixel (default 64)\n"
         "  --bounces <int>        max path length (default 8)\n"
         "  --threads <int>        worker threads (default: all cores)\n"
+        "  --verified-math        strict modeled sine/cosine for MaterialX graph evaluation\n"
         "  --ms-dielectric        energy-compensate rough dielectric transmission (Turquin)\n"
         "  --env <file.exr>       lat-long HDRI environment\n"
         "  --env-intensity <f>    env scale (default 1)\n"
@@ -182,6 +184,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--threads")) threads = atoi(NEXT);
         else if (!strcmp(a, "--env")) env_path = NEXT;
         else if (!strcmp(a, "--env-intensity")) env_intensity = (float)atof(NEXT);
+        else if (!strcmp(a, "--verified-math")) {
+            if (!mtlx_verified_math_enable(1)) {
+                fprintf(stderr, "--verified-math requires binary32, nearest/even and gradual underflow\n");
+                return 1;
+            }
+            fprintf(stderr, "MaterialX graph math: strict binary32 sine/cosine\n");
+        }
         else if (!strcmp(a, "--ms-dielectric")) bsdf_set_dielectric_multiscatter(1);
         else if (!strcmp(a, "--env-rotation")) env_rot = (float)atof(NEXT);
         else if (!strcmp(a, "--sky")) sky = 1;

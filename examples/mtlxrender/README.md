@@ -237,3 +237,24 @@ recomputes each and reports per-material RMSE (PASS within `TOL`, default 0.02).
 - SSS defaults to a tinted-diffuse diffusion approximation (accurate for the
   chess set's sub-millimeter mean free path); `--sss-walk` enables a bounded
   random walk.
+
+### Strict graph sine/cosine
+
+`--verified-math` opts MaterialX graph sine/cosine calls into the fixed
+Payne–Hanek/Horner binary32 implementation modeled in the conformance Lean
+project. This includes the trigonometric calls used by graph rotations and
+unified noise. Default graph math continues to use libm. Startup reports the
+selected strict graph backend.
+
+The binary32 sine/cosine model has a proved absolute error bound of `2^-20` for
+all finite inputs. This is not a correctness claim for every graph operation or
+for the remaining angle/normalization/rotation pipeline; those finite-operation
+proof connections are still in progress. Inverse trigonometry and BSDF math
+retain their existing implementations. The backend requires nearest/even,
+gradual underflow, and strict single-precision evaluation, and rejects activation
+when these conditions are unavailable. Its sources compile separately with
+`-fno-fast-math -frounding-math -ffp-contract=off`.
+
+The C adapter can be configured with `mtlx_verified_math_enable(1)` before shading
+threads start; `mtlx_verified_math_enable(0)` restores the reference backend.
+Do not change the process-wide selection while shading threads are running.

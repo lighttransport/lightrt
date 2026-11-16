@@ -1073,9 +1073,11 @@ static v3 eval_reflection(const Layers *L, v3 N, v3 wo, v3 wi, float *pdf) {
  * interface loses the energy of paths that scatter between microfacets (up to about half at
  * roughness 1). Turquin-style compensation scales the transmitted lobe by 1/E, E being the
  * interface's single-scatter albedo (reflection + transmission) for the view cosine, roughness
- * and relative IOR. Because E >= T and R + T/E <= 1 for E = R + T the result never gains energy.
- * Off by default (the OpenPBR specification does not require it). The albedo is tabulated on
- * first use for each IOR, under a lock, by VNDF sampling. */
+ * and relative IOR. For exact nonnegative R,T with 0 < E = R + T <= 1,
+ * R + T/E <= 1. The sampled/interpolated table below is not a certified
+ * enclosure of that exact E, so this diagnostic option has no global energy
+ * guarantee. Off by default (the OpenPBR specification does not require it).
+ * The albedo is tabulated on first use for each IOR, under a lock, by VNDF sampling. */
 static int g_ms_dielectric = 0;
 void bsdf_set_dielectric_multiscatter(int enable) { g_ms_dielectric = enable != 0; }
 

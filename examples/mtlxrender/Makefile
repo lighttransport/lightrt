@@ -29,7 +29,7 @@ BUILD = build$(if $(VK),-vk,)
 APP_SRC = main.c pathtrace.c pathtrace_wf.c raytracer.c raytracer_vk.c \
           bsdf.c env.c framebuffer.c color.c \
           gltf_load.c mesh_build.c obj_load.c mtlx_xml.c mtlx_doc.c mtlx_eval.c \
-          material_bind.c texture.c
+          material_bind.c texture.c verified_float.c verified_math.c verified_eval.c verified_bounds.c verified_ranges.c verified_fixed.c verified_normal.c verified_direction.c verified_single_power.c verified_local_geometry.c verified_vndf.c passive_film.c
 # third-party sources (compiled quietly with -w)
 TP_SRC  = third_party_impl.c \
           $(LIGHTRT)/lightrt_c_tri.c \
@@ -52,6 +52,15 @@ CFLAGS  = $(CSTD) $(OPT) $(SIMD) $(DEFS) $(INCLUDES)
 
 mtlxrender: $(APP_OBJ) $(TP_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+# Keep the certified operation schedule independent of app fast-math settings.
+$(BUILD)/verified_float.o $(BUILD)/verified_math.o $(BUILD)/verified_eval.o $(BUILD)/verified_bounds.o $(BUILD)/verified_ranges.o $(BUILD)/verified_fixed.o $(BUILD)/verified_normal.o $(BUILD)/verified_direction.o $(BUILD)/verified_single_power.o $(BUILD)/verified_local_geometry.o $(BUILD)/verified_vndf.o $(BUILD)/passive_film.o: CFLAGS += -fno-fast-math -frounding-math -ffp-contract=off
+$(BUILD)/verified_float.o $(BUILD)/verified_math.o $(BUILD)/verified_eval.o: verified_float.h verified_math.h verified_trig_constants.h
+
+$(BUILD)/verified_bounds.o: verified_bounds.h verified_float.h
+$(BUILD)/verified_ranges.o: verified_ranges.h verified_bounds.h verified_float.h
+$(BUILD)/main.o: verified_math.h
+$(BUILD)/passive_film.o: passive_film.h
 
 # The shading parameter layout is shared by the app and node tests.
 $(APP_OBJ) $(BUILD)/node_truth.o: mtlx_eval.h
@@ -182,3 +191,15 @@ conductor_mixture: tests/conductor_mixture.c tests/texture_stub.c mtlx_doc.c mtl
 
 test-conductor-anisotropic: mtlxrender
 	python3 tests/conductor_anisotropic_render.py
+
+$(BUILD)/verified_fixed.o: verified_fixed.h
+
+$(BUILD)/verified_normal.o: verified_normal.h verified_normal_program.h verified_normal_float_program.h verified_fixed.h verified_ranges.h verified_bounds.h verified_float.h verified_ndf_power_program.h verified_ndf_density_program.h
+
+$(BUILD)/verified_direction.o: verified_scaled_transmission_program.h verified_surface_program.h verified_transmission_program.h verified_outgoing_program.h verified_world_program.h verified_branch_power_program.h verified_direction.h verified_float.h verified_math.h verified_normal.h verified_bounds.h verified_ranges.h verified_ndf_power_program.h verified_ndf_density_program.h verified_normal_float_program.h
+
+$(BUILD)/verified_single_power.o: verified_single_power.h verified_anisotropic_single_program.h verified_float.h verified_ranges.h verified_normal.h verified_normal_float_program.h
+
+$(BUILD)/verified_local_geometry.o: verified_transmission_horizon_program.h verified_reflection_horizon_program.h verified_world_program.h verified_direction.h verified_single_power.h verified_float.h verified_outgoing_program.h verified_normal_float_program.h verified_ranges.h
+
+$(BUILD)/verified_vndf.o: verified_vndf.h verified_direction.h verified_float.h verified_math.h verified_normal.h
