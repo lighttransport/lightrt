@@ -249,10 +249,14 @@ Explicitly deferred/recorded (see PLAN.md):
 > Continue the LightRT Lean formalization on branch `formal-lean` in
 > `/mnt/nvme02/work/lightrt`. Read `resume-lean.md` and `formal/PLAN.md`
 > (M14–M21) first. Run `make formal` to confirm the baseline (0 sorry, all
-> checks PASS). Remaining large items: 3a (range-free slab chain), 4
-> (BITEXACT SIMD == scalar for MT; ISA boundary recorded). 3b (MT error
-> bound) and 3c (`tlas_instance_margin` fp64) are **deferred/out of
-> scope** by decision; do not attempt them. Item 7 is complete:
+> checks PASS). Remaining large items: 4
+> (BITEXACT SIMD == scalar for MT; ISA boundary recorded and **audited** —
+> see PLAN.md addendum 11: every intrinsic in the Woop leaf is mapped to a
+> model op; the residual ISA assumptions are enumerated and stay empirical
+> via `wtcheck`; closing the boundary would need a vendor ISA semantics
+> model). 3a (slab chain) is **done** (`fpT_abs_err_total`), 3b (MT error
+> bound) is **done** (`MTT.lean`). 3c (`tlas_instance_margin` fp64) is
+> **out of scope** by decision; do not attempt it. Item 7 is complete:
 > `Geom/Newton2D.lean` (7b-1), `Geom/BezNewton.lean` (7b-2, the
 > `tri_bez_newton` specialization: Jacobian as polynomial sums, C2Seg on a
 > rectangle with `|R|² > 0`, contraction corollary `bez_newton_quadratic`),
