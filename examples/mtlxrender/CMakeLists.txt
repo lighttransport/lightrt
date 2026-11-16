@@ -168,3 +168,46 @@ target_include_directories(conductor_mixture PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 target_compile_definitions(conductor_mixture PRIVATE _POSIX_C_SOURCE=200809L)
 target_link_libraries(conductor_mixture PRIVATE m)
 add_test(NAME conductor_mixture COMMAND conductor_mixture)
+
+add_executable(cert_energy tests/cert_energy.c bsdf.c)
+target_include_directories(cert_energy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(cert_energy PRIVATE _POSIX_C_SOURCE=200809L)
+target_link_libraries(cert_energy PRIVATE m)
+add_test(NAME cert_energy COMMAND cert_energy)
+
+add_executable(film_energy tests/film_energy.c bsdf.c)
+target_include_directories(film_energy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(film_energy PRIVATE _POSIX_C_SOURCE=200809L)
+target_link_libraries(film_energy PRIVATE m)
+add_test(NAME film_energy COMMAND film_energy)
+
+add_executable(interior_energy tests/interior_energy.c bsdf.c)
+target_include_directories(interior_energy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(interior_energy PRIVATE _POSIX_C_SOURCE=200809L)
+target_link_libraries(interior_energy PRIVATE m)
+add_test(NAME interior_energy COMMAND interior_energy)
+
+add_executable(conservative_sweep tests/conservative_sweep.c bsdf.c)
+target_include_directories(conservative_sweep PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(conservative_sweep PRIVATE _POSIX_C_SOURCE=200809L)
+target_link_libraries(conservative_sweep PRIVATE m)
+add_test(NAME conservative_sweep COMMAND conservative_sweep)
+set_tests_properties(conservative_sweep PROPERTIES TIMEOUT 600)
+
+add_executable(f32_lobe_error tests/f32_lobe_error.c bsdf.c)
+target_include_directories(f32_lobe_error PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(f32_lobe_error PRIVATE _POSIX_C_SOURCE=200809L)
+target_link_libraries(f32_lobe_error PRIVATE m)
+add_test(NAME f32_lobe_error COMMAND f32_lobe_error)
+
+# Special values (NaN, infinities, signed zero, flags) of the verified binary32 ops
+# versus verif/lean/MtlxSpec/Binary32Special.lean.
+add_executable(vf_special tests/vf_special.c verified_float.c)
+target_include_directories(vf_special PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+if(NOT MSVC)
+    set_source_files_properties(tests/vf_special.c PROPERTIES
+        COMPILE_OPTIONS "-fno-fast-math;-frounding-math;-ffp-contract=off")
+endif()
+target_link_libraries(vf_special PRIVATE m)
+add_test(NAME vf_special COMMAND vf_special)
+set_tests_properties(vf_special PROPERTIES SKIP_RETURN_CODE 77)
