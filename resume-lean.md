@@ -203,6 +203,10 @@ Explicitly deferred/recorded (see PLAN.md):
      sampled trace never passes a root where the sampled min is ≤ 0,
      i.e. some site's ball covers the root — the honest analogue for the
      C's actual stepping function), and
+     `samDist_nonpos_mem_tube` (sampled acceptance is sound: `samDist ≤ 0`
+     ⇒ `x` inside the true tube — the C's leaf never accepts outside it;
+     overshoot remains the sampling-density question), its
+     contrapositive `samDist_pos_of_bezPhiMin_pos`, and
      `exists_bezTube_boundary_point` (IVT: along any segment from an
      outside point to a point in/touching the tube, some intermediate `s`
      has `infDist · (bezTubeSet) = 0` — the trace's boundary-existence

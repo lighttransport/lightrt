@@ -633,5 +633,27 @@ theorem samDist_le_bezPhiMin_add (S : BezSys) (x : EuclideanSpace ℝ (Fin 3))
         rw [← hφ, hφ0]
         linarith [hr_step]
 
+/-- **Sampled acceptance is sound**: if the C's `tri_bez_leaf_dist` fold is
+    nonpositive anywhere, the point is inside the true tube — the site list
+    doesn't matter, only that the continuous min underestimates the fold.
+    (The remaining sampled-rule gap is the step side — overshoot past a
+    tube without accepting — which is the sampling-density question.) -/
+theorem samDist_nonpos_mem_tube (S : BezSys) (x : EuclideanSpace ℝ (Fin 3))
+    {a b : ℝ} (hab : a ≤ b) (hrad : ∀ u ∈ Set.Icc a b, 0 ≤ S.rad u)
+    (sites : List ℝ) (hsites : ∀ u ∈ sites, u ∈ Set.Icc a b) (hne : sites ≠ [])
+    (hsam : samDist S sites x ≤ 0) :
+    x ∈ bezTubeSet S a b := by
+  have hle : bezPhiMin S x a b ≤ 0 := le_trans (bezPhiMin_le_samDist S x hab sites hsites hne) hsam
+  obtain ⟨u₀, hu₀, hφ0⟩ := bezPhiMin_eq S x hab
+  exact mem_bezTubeSet_of_bezPhi_le S x hrad hu₀ (hφ0 ▸ hle)
+
+/-- Contrapositive form: outside the tube, the sampled fold is positive. -/
+theorem samDist_pos_of_bezPhiMin_pos (S : BezSys) (x : EuclideanSpace ℝ (Fin 3))
+    {a b : ℝ} (hab : a ≤ b) (sites : List ℝ)
+    (hsites : ∀ u ∈ sites, u ∈ Set.Icc a b) (hne : sites ≠ [])
+    (hmin : 0 < bezPhiMin S x a b) :
+    0 < samDist S sites x :=
+  lt_of_lt_of_le hmin (bezPhiMin_le_samDist S x hab sites hsites hne)
+
 end
 end LightRT.Geom
