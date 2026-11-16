@@ -202,7 +202,11 @@ Explicitly deferred/recorded (see PLAN.md):
      `lipschitz1_samDist_line` and `stTrace3_samDist_le_root` (the
      sampled trace never passes a root where the sampled min is ≤ 0,
      i.e. some site's ball covers the root — the honest analogue for the
-     C's actual stepping function). Also done: the interior nearest
+     C's actual stepping function), and
+     `exists_bezTube_boundary_point` (IVT: along any segment from an
+     outside point to a point in/touching the tube, some intermediate `s`
+     has `infDist · (bezTubeSet) = 0` — the trace's boundary-existence
+     companion to `stTrace3_bezTube_le_root`). Also done: the interior nearest
      point is a critical point of `φ` — `interior_min_bezPhi_deriv`
      (Fermat), `interior_min_bezPhi_envelope` (the foot-point equation
      `⟨x − C, C′⟩/|x − C| = −r′`), and `bezPhi_min_critical` (min of φ

@@ -282,6 +282,27 @@ theorem stTrace3_bezTube_le_root (S : BezSys) {a b : ℝ} (hab : a ≤ b)
     exact max_le_iff.mpr ⟨le_refl 0, hroot⟩
   exact stTrace3_le_root (bezTubeSet S a b) hv hroot' ht n
 
+/-- **Boundary existence along the ray**: if the trace starts outside the
+    tube (`infDist > 0`) and a `root` ahead is in/touching it, some `s`
+    between them has the distance exactly zero — a first boundary point of
+    the tube along the segment. (IVT; no tube params needed.) -/
+theorem exists_bezTube_boundary_point (S : BezSys) {a b : ℝ}
+    {x₀ v : EuclideanSpace ℝ (Fin 3)} {t₀ root : ℝ} (ht : t₀ < root)
+    (h0 : 0 < Metric.infDist (x₀ + t₀ • v) (bezTubeSet S a b))
+    (hroot : Metric.infDist (x₀ + root • v) (bezTubeSet S a b) ≤ 0) :
+    ∃ s ∈ Set.Icc t₀ root, Metric.infDist (x₀ + s • v) (bezTubeSet S a b) = 0 := by
+  have hgc : Continuous fun s : ℝ => Metric.infDist (x₀ + s • v) (bezTubeSet S a b) := by
+    fun_prop
+  have hcont : ContinuousOn (fun s : ℝ => Metric.infDist (x₀ + s • v) (bezTubeSet S a b))
+      (Set.Icc t₀ root) := hgc.continuousOn
+  have hsub := intermediate_value_Icc' ht.le hcont
+  have hmem : (0:ℝ) ∈ Set.Icc
+      ((fun s : ℝ => Metric.infDist (x₀ + s • v) (bezTubeSet S a b)) root)
+      ((fun s : ℝ => Metric.infDist (x₀ + s • v) (bezTubeSet S a b)) t₀) :=
+    ⟨hroot, h0.le⟩
+  obtain ⟨s, hs, hfs⟩ := hsub hmem
+  exact ⟨s, hs, hfs⟩
+
 /-! ### The interior nearest point is a critical point of `φ`
 
 The `tri_bez_newton` contact solve, the soundness direction: if the
