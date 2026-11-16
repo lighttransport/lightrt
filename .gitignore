@@ -64,3 +64,9 @@ Thumbs.db
 # External dependencies
 deps/
 dep/
+
+# Local C/make test binaries (rebuilt by `make formal` / test targets)
+lightrt_bench_occ
+lightrt_c_*test*
+lightrt_spatial_query_test
+wasm/dist/
