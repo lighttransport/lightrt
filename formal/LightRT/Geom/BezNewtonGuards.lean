@@ -29,6 +29,7 @@
 -/
 import Mathlib
 import LightRT.Geom.BezNewton
+import LightRT.Geom.BezTube
 
 namespace LightRT.Geom
 
@@ -126,6 +127,48 @@ theorem damped_step_range (u t : ℝ) :
     uLo ≤ st.1 ∧ st.1 ≤ uHi := by
   dsimp [guardedStep]
   exact clampU_mem _
+
+
+/-- The algebraic bridge to the 2D contact system. At a point of the ray whose
+    curve parameter is a critical point of the signed distance `φ` AND which
+    lies on the tube boundary (`G = 0`), the contact system's first equation
+    vanishes: `F = 0`. Together with `G = 0` this makes the safeguarded
+    bracket's limit a root of the system `tri_bez_newton` solves, when the
+    ray parameter is the contact parameter. This is the seed/local-root
+    connection needed for M14 phase 3. -/
+theorem bezF_eq_zero_of_critical_of_contact (S : BezSys) {u₀ t : ℝ}
+    (hq : 0 < q S u₀ t) (hG : bezG S u₀ t = 0)
+    (hcrit : deriv (fun u => bezPhi S (!₂[t * S.d 0, t * S.d 1, t * S.d 2]) u) u₀ = 0) :
+    bezF S u₀ t = 0 := by
+  set x : EuclideanSpace ℝ (Fin 3) := !₂[t * S.d 0, t * S.d 1, t * S.d 2]
+  have hqdef : q S u₀ t =
+      (t * S.d 0 - S.gx u₀) ^ 2 + (t * S.d 1 - S.gy u₀) ^ 2 + (t * S.d 2 - S.gz u₀) ^ 2 := by
+    rfl
+  have hbezQ : bezQ S x u₀ = q S u₀ t := by
+    unfold bezQ
+    simp [x, hqdef, Fin.sum_univ_three, pow_two]
+  have hne : bezQ S x u₀ ≠ 0 := by
+    rw [hbezQ]
+    exact ne_of_gt hq
+  have hderiv := deriv_bezPhi S x u₀ hne
+  rw [hcrit] at hderiv
+  have hG' : Real.sqrt (q S u₀ t) = S.rad u₀ := by
+    unfold bezG len at hG
+    rw [hqdef] at hG ⊢
+    linarith
+  have hsqrt : Real.sqrt (bezQ S x u₀) = S.rad u₀ := by rw [hbezQ, hG']
+  have hradpos : 0 < S.rad u₀ := by
+    rw [← hsqrt]
+    exact Real.sqrt_pos.2 (by rw [hbezQ]; exact hq)
+  have hnum : 2 * (x 0 - S.gx u₀) * (-S.px u₀) +
+        (2 * (x 1 - S.gy u₀) * (-S.py u₀) + 2 * (x 2 - S.gz u₀) * (-S.pz u₀)) =
+      -2 * (bezF S u₀ t - S.rad u₀ * S.dr u₀) := by
+    unfold bezF Rx Ry Rz
+    simp [x]
+    ring
+  rw [hnum, hsqrt] at hderiv
+  field_simp [ne_of_gt hradpos] at hderiv
+  nlinarith
 
 end BezSys
 end LightRT.Geom

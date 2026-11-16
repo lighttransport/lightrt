@@ -257,6 +257,12 @@ Explicitly deferred/recorded (see PLAN.md):
   `E ≤ B/K`, `δ ≤ |det|`) and prove guarded convergence; local contraction
   is done, the global 2D refinement is the one open deep item. Floating point
   of the minimizer stays with `primhitcheck`.
+  M14 phase 3 first step landed: `bezF_eq_zero_of_critical_of_contact` —
+  a critical point of `φ` on a ray whose tube-boundary equation `G = 0`
+  holds satisfies `F = 0`, pairing the bracket limit with a genuine root
+  of the 2D contact system. Still open: verifying the local basin hypotheses
+  (`E ≤ B/K`, `δ ≤ |det|`, rectangle containment) at that root and proving
+  guarded convergence.
    Patch/NURBS stay measured against `primhitcheck` (item 16 decision).
 
 ## Resuming prompt
