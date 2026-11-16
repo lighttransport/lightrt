@@ -379,6 +379,28 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   `newton2_step_quadratic`. Supersedes addendum 2's deferral note.
   `LightRT.lean` imports `Geom.BezNewton`.
 
+- **M22 (addendum 10):** the global safeguarded-Newton argument (the C's
+  `tri_bez_leaf_dist` bracket). New `Geom/SafeguardedNewton.lean`:
+  `fsplit`/`seqIter` (bracket split + `n`-fold iteration), `seqLo`/`seqHi`
+  (monotone bracket-end sequences), invariants `seqIter_sign`,
+  `seqIter_in_interval`, `seqIter_width` (width halves: bisection alone
+  suffices), convergence to a common limit `c` (`seqLo_tendsto` via
+  `tendsto_atTop_ciSup`, `seqHi_tendsto`, `limit_unique` via
+  width → 0), and `bracket_root`: from a sign-changing bracket with
+  `ContinuousOn g [a, b]`, the bracket converges to a root of `g`.
+  Instantiated to the Bézier envelope equation: `envelope_continuousOn`
+  (`φ′` continuous where `bezQ ≠ 0`), `bracket_envelope_bezPhi` /
+  `bracket_envelope_bezPhi'` (both sign conventions): whenever `φ′` changes
+  sign on `[a, b]` (the C's sample-detected bracket) and `x` is off the
+  curve, there is a critical point of `φ` — the C's safeguarded loop
+  converges to one from an arbitrary seed. Newton acceleration (quadratic
+  contraction near the limit) is the local half (`ofCubic_newton_quadratic`,
+  M7/M22 addendum 4). The 2D `(u, t)` `tri_bez_newton` polish is the same
+  argument applied to the envelope component of the system plus the
+  existing local contraction theorem. Remaining: the basin-of-attraction
+  refinement for the 2D Newton in full generality (the C's damped-step /
+  `det > 0` guards are modeled but not theorem'd).
+
 - **M22 (addendum 9):** two more M14 slices for the tube model:
   (1) the sampled rule is modeled end-to-end — `samDist` (the `tri_bez_leaf_dist`
   fold, min of `dist x (C u) − r(u)` over `List ℝ` sites; empty list maps
