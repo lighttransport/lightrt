@@ -46,7 +46,7 @@ Each library was cloned and read on 2026-11-10. The `sorry` counts are real toke
 - `key_le_total`: the float node key is `≤ m − 30uM + 3η` (the total rounding model only adds `3η` to `key_le`);
 - `woop_key_le_t_total_model`: for an accepted triangle whose *computed* dominant-axis depths lie in `[m, M]`, `fl(m − fl(2⁻¹⁹M)) ≤ t`, in **both** edge-sign classes (`hsign : (0 ≤ e0 ∧ 0 ≤ e1 ∧ 0 ≤ e2) ∨ (e0 ≤ 0 ∧ e1 ≤ 0 ∧ e2 ≤ 0)`), provided the extra slack fits: `49η(1+M)/a0 + 4η ≤ 0.9uM`. The negative class uses `woop_t_err_total_model_tight_neg` (numerator/denominator flip sign, same bound). For a real scene (`M` not subnormal) that is a projected area `a0 ≳ 50·2⁻¹²⁶(1+M)/M`, the same `1e-37`-scale regime as the dilation floor.
 
-**Item 3, the `1e-37` floor.** `FP/TotalErr.fl_add_margin_ge` / `fl_sub_margin_le` prove that `tlas_dil_origins`' margin `mk = (m + 2⁻²³|o| + 1e-37)(1 + 2⁻²⁰)` is conservative: `o + m ≤ fl(o + fl mk)` and `fl(o − fl mk) ≤ o − m`. The `2⁻²³|o|` term covers the add with `o`, `1 + 2⁻²⁰` the double→float conversion plus that add, and `1e-37` the subnormal absolute error (`η = 2⁻¹⁵⁰`); the C's `mk < 1e38` guard covers overflow with the conservative infinite-origin box. The negative edge-sign class of `woop_key_le_t_total_model` is proved (`ExactPruneTotal.lean`); the range-free scalar slab-parameter error is proved (`Robust/SlabTotal.lean` `fpT_abs_err_total`); the MT `t` error bound is proved (`Robust/MTT.lean` `mt_t_fl_err_total_model`); `tlas_instance_margin` fp64 stays out of scope (`tlascheck` covers it); a range-free `slab_no_false_miss` is unprovable as stated (a tangent ray admits no absolute-error-dominating `K`).
+**Item 3, the `1e-37` floor.** `FP/TotalErr.fl_add_margin_ge` / `fl_sub_margin_le` prove that `tlas_dil_origins`' margin `mk = (m + 2⁻²³|o| + 1e-37)(1 + 2⁻²⁰)` is conservative: `o + m ≤ fl(o + fl mk)` and `fl(o − fl mk) ≤ o − m`. The `2⁻²³|o|` term covers the add with `o`, `1 + 2⁻²⁰` the double→float conversion plus that add, and `1e-37` the subnormal absolute error (`η = 2⁻¹⁵⁰`); the C's `mk < 1e38` guard covers overflow with the conservative infinite-origin box. The negative edge-sign class of `woop_key_le_t_total_model` is proved (`ExactPruneTotal.lean`); the range-free scalar slab-parameter error is proved (`Robust/SlabTotal.lean` `fpT_abs_err_total`); the MT `t` error bound is proved (`Robust/MTT.lean` `mt_t_fl_err_total_model`); `tlas_instance_margin` fp64 stays out of scope (`tlascheck` covers it); a range-free `slab_no_false_miss` is unprovable as stated (a tangent ray admits no absolute-error-dominating `K`); the conditional non-tangent form is now proved: `SlabTotal.slab_no_false_miss_total_of_floor` (parameters `κ ≤ |t_exact|` per slab endpoint, `κT ≤ t`, `θ` from `fpT_rel_of_floor`, and `1 + θ + η/κT ≤ (1 - θ)(1 - u)K`).
 
 Reasons:
 1. MiniC needs an executable, bit-exact semantics that agrees with compiled C. None of the theorems need Flocq-scale generality.
@@ -378,6 +378,17 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   `K`, `B`, `δ ≤ |det|`, `E ≤ B/K` are hypotheses — the same standing as
   `newton2_step_quadratic`. Supersedes addendum 2's deferral note.
   `LightRT.lean` imports `Geom.BezNewton`.
+
+- **M22 (addendum 12):** conditional range-free slab completeness (item 3).
+  `Robust/SlabTotal.lean`: `fpT_eta_slack` (the absolute-error slack of
+  `fpT_abs_err_total`), `fpT_rel_of_floor` (a floor `κ ≤ |t_exact|` converts
+  the absolute bound into `|fpT − t| ≤ θ|t|`, `θ = 4u + slack/κ`) and
+  `slab_no_false_miss_total_of_floor`: with per-endpoint floor κ, a ray-length
+  floor `κT ≤ tmin ≤ t`, θ < 1, and the explicit inflation condition
+  `1 + θ + η/κT ≤ (1−θ)(1−u)K`, every geometric hit is reported by
+  `fpSlab` — **no `InRange`**. The unconditioned statement is unprovable
+  (tangency); this theorem states exactly the hypothesis under which it is
+  true. `LightRT.lean` now imports `Robust.SlabTotal`.
 
 - **M22 (addendum 11):** **SIMD leaf ISA audit** — the exact boundary of
   the model. The watertight leaf kernels in `lightrt_c_tri.c`
