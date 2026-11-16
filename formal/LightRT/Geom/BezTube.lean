@@ -282,5 +282,123 @@ theorem stTrace3_bezTube_le_root (S : BezSys) {a b : ℝ} (hab : a ≤ b)
     exact max_le_iff.mpr ⟨le_refl 0, hroot⟩
   exact stTrace3_le_root (bezTubeSet S a b) hv hroot' ht n
 
+/-! ### The interior nearest point is a critical point of `φ`
+
+The `tri_bez_newton` contact solve, the soundness direction: if the
+minimum of `φ` on `[a, b]` is attained at an interior point and `x` is
+off the curve, the derivative vanishes there — the foot-point (envelope)
+equation `⟨x − C, C′⟩ / |x − C| = −r′` that the C's Newton iterations
+converge on (up to sign conventions). The completeness direction is
+`phi_min_attained`. -/
+theorem interior_min_bezPhi_deriv (S : BezSys) (x : EuclideanSpace ℝ (Fin 3))
+    {a b u₀ : ℝ} (_hab : a ≤ b) (hu : u₀ ∈ Set.Ioo a b)
+    (hmin : ∀ v ∈ Set.Icc a b, bezPhi S x u₀ ≤ bezPhi S x v) :
+    deriv (fun u => bezPhi S x u) u₀ = 0 := by
+  have hnhds : Set.Icc a b ∈ nhds u₀ :=
+    Filter.mem_of_superset (Ioo_mem_nhds hu.1 hu.2) Set.Ioo_subset_Icc_self
+  exact (IsMinOn.isLocalMin (show IsMinOn (fun u => bezPhi S x u) (Set.Icc a b) u₀ from hmin)
+    hnhds).deriv_eq_zero
+
+theorem interior_min_bezPhi_envelope (S : BezSys) (x : EuclideanSpace ℝ (Fin 3))
+    {a b u₀ : ℝ} (hab : a ≤ b) (hu : u₀ ∈ Set.Ioo a b)
+    (hmin : ∀ v ∈ Set.Icc a b, bezPhi S x u₀ ≤ bezPhi S x v) (hne : bezQ S x u₀ ≠ 0) :
+    (2 * (x 0 - S.gx u₀) * (-S.px u₀) +
+        (2 * (x 1 - S.gy u₀) * (-S.py u₀) + 2 * (x 2 - S.gz u₀) * (-S.pz u₀))) /
+          (2 * Real.sqrt (bezQ S x u₀)) - S.dr u₀ = 0 := by
+  have h := interior_min_bezPhi_deriv S x hab hu hmin
+  rwa [deriv_bezPhi S x u₀ hne] at h
+
+/-- **Nearest-point classification over `[a, b]`**: the minimum of `φ` on
+    the interval is attained at either an endpoint of `[a, b]`, a point
+    off the curve where `φ′` vanishes (the C's foot-point condition), or a
+    point on the curve itself (`bezQ = 0`, the degenerate case). -/
+theorem bezPhi_min_critical (S : BezSys) (x : EuclideanSpace ℝ (Fin 3))
+    {a b : ℝ} (hab : a ≤ b) :
+    ∃ u ∈ Set.Icc a b,
+      u = a ∨ u = b ∨ deriv (fun u => bezPhi S x u) u = 0 ∨ bezQ S x u = 0 := by
+  obtain ⟨u, hu, hbest⟩ := phi_min_attained S x hab
+  refine ⟨u, hu, ?_⟩
+  by_cases hne : bezQ S x u = 0
+  · exact Or.inr (Or.inr (Or.inr hne))
+  · by_cases hio : u ∈ Set.Ioo a b
+    · exact Or.inr (Or.inr (Or.inl (interior_min_bezPhi_deriv S x hab hio hbest)))
+    · have h1 := hu.1
+      have h2 := hu.2
+      have hio' : ¬ (a < u ∧ u < b) := by
+        simpa [Set.mem_Ioo] using hio
+      by_cases h : u = a
+      · exact Or.inl h
+      · have hb : u = b := by
+          by_contra hb'
+          exact absurd ⟨lt_of_le_of_ne h1 (Ne.symm h), lt_of_le_of_ne h2 hb'⟩ hio' 
+        exact Or.inr (Or.inl hb)
+
+/-! ### The sampled distance rule (the C's `tri_bez_leaf_dist` fold) -/
+
+/-- The sampled distance from `x` to the tube over `sites`: the min over
+    the sample sites of `dist x (C u) − r(u)` — exactly what
+    `tri_bez_leaf_dist` accumulates. The empty site list is degenerate and
+    maps to `0`. -/
+def samDist (S : BezSys) (sites : List ℝ) (x : EuclideanSpace ℝ (Fin 3)) : ℝ :=
+  match sites with
+  | [] => 0
+  | u :: us =>
+    List.foldr (fun v acc => min (dist x (curvePt S v) - S.rad v) acc)
+      (dist x (curvePt S u) - S.rad u) us
+
+theorem absLipschitz_bezContact (S : BezSys) (u : ℝ) :
+    AbsLipschitz (fun x : EuclideanSpace ℝ (Fin 3) => dist x (curvePt S u) - S.rad u) := by
+  intro x y
+  have h := lipschitz1_dist_of_mem (X := EuclideanSpace ℝ (Fin 3)) (curvePt S u) x y
+  have e : |(dist x (curvePt S u) - S.rad u) - (dist y (curvePt S u) - S.rad u)| =
+      |dist x (curvePt S u) - dist y (curvePt S u)| := by congr 1; ring
+  rw [e]; exact h
+
+theorem absLipschitz_samDist_foldr (S : BezSys) (us : List ℝ) (u : ℝ) :
+    AbsLipschitz (fun x : EuclideanSpace ℝ (Fin 3) =>
+      List.foldr (fun v acc => min (dist x (curvePt S v) - S.rad v) acc)
+        (dist x (curvePt S u) - S.rad u) us) := by
+  induction us generalizing u with
+  | nil => exact absLipschitz_bezContact S u
+  | cons v us ih => exact lipschitz1_min (absLipschitz_bezContact S v) (ih u)
+
+theorem absLipschitz_samDist (S : BezSys) (sites : List ℝ) :
+    AbsLipschitz (fun x : EuclideanSpace ℝ (Fin 3) => samDist S sites x) := by
+  intro x y
+  cases sites with
+  | nil =>
+    show |samDist S [] x - samDist S [] y| ≤ dist x y
+    have e : samDist S [] x = 0 := rfl
+    have e2 : samDist S [] y = 0 := rfl
+    rw [e, e2, sub_self, abs_zero]
+    exact dist_nonneg
+  | cons u us => exact absLipschitz_samDist_foldr S us u x y
+
+/-- The sampled distance along a unit ray is 1-Lipschitz. -/
+theorem lipschitz1_samDist_line (S : BezSys) (sites : List ℝ)
+    {x₀ v : EuclideanSpace ℝ (Fin 3)} (hv : ‖v‖ ≤ 1) :
+    Lipschitz1 fun t => samDist S sites (x₀ + t • v) := by
+  have hg := absLipschitz_samDist S sites
+  intro a b
+  have h := hg (x₀ + a • v) (x₀ + b • v)
+  have d : dist (x₀ + a • v) (x₀ + b • v) = |a - b| * ‖v‖ := by
+    rw [dist_eq_norm_sub, show x₀ + a • v - (x₀ + b • v) = (a - b) • v from by module,
+      norm_smul, Real.norm_eq_abs]
+  rw [d] at h
+  have h4 : |a - b| * ‖v‖ ≤ |a - b| := by nlinarith [hv, abs_nonneg (a - b)]
+  linarith [h, h4]
+
+/-- **No overshoot for the sampled stepping rule**: the trace driven by the
+    `tri_bez_leaf_dist` fold never passes a root where the sampled min is
+    ≤ 0 (some sample site's ball covers the root). This is the honest
+    analogue of the exact-distance guarantee for the C's actual stepping
+    function; whether the sampled fold's roots lie inside the true tube is
+    a sampling-density question, not covered here. -/
+theorem stTrace3_samDist_le_root (S : BezSys) (sites : List ℝ)
+    {x₀ v : EuclideanSpace ℝ (Fin 3)} (hv : ‖v‖ ≤ 1) {root : ℝ}
+    (hroot : samDist S sites (x₀ + root • v) ≤ 0) {t : ℝ} (ht : t ≤ root) (n : ℕ) :
+    stTrace (fun s => samDist S sites (x₀ + s • v)) t n ≤ root :=
+  stTrace_le_root (lipschitz1_samDist_line S sites hv) hroot ht n
+
 end
 end LightRT.Geom

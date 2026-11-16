@@ -379,6 +379,29 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   `newton2_step_quadratic`. Supersedes addendum 2's deferral note.
   `LightRT.lean` imports `Geom.BezNewton`.
 
+- **M22 (addendum 9):** two more M14 slices for the tube model:
+  (1) the sampled rule is modeled end-to-end — `samDist` (the `tri_bez_leaf_dist`
+  fold, min of `dist x (C u) − r(u)` over `List ℝ` sites; empty list maps
+  to `0`), proved `AbsLipschitz` by list induction
+  (`absLipschitz_bezContact`, `absLipschitz_samDist_foldr`,
+  `absLipschitz_samDist`), then `lipschitz1_samDist_line` along unit
+  rays and `stTrace3_samDist_le_root` (the sampled trace never passes a
+  root where the sampled min is ≤ 0 — some site's ball covers the root).
+  What's *not* shown: sampled-min ≥ continuous inf is not relaxed —
+  a root of the sampled fold need not lie inside the true tube without a
+  density bound on `sites`; `primhitcheck` remains the empirical gate.
+  (2) the interior nearest point is a critical point of `φ`:
+  `interior_min_bezPhi_deriv` (Fermat: at an interior min of `φ` with
+  `bezQ ≠ 0`, `φ′ = 0`), `interior_min_bezPhi_envelope` (the foot-point
+  equation `⟨x − C, C′⟩ / |x − C| = −r′`, the C's Newton solve shape),
+  and `bezPhi_min_critical` (the min of `φ` on `[a,b]` is attained at an
+  endpoint, an interior critical point, or on the curve itself). These
+  are the soundness direction of the `tri_bez_newton` model; the
+  contraction core (`ofCubic_newton_quadratic`) was already done in M7/M22
+  addendum 4. Remaining M14 work: the Newton convergence's global
+  argument (basin of attraction / existence of the nearest foot with a
+  nondegenerate Jacobian), which is substantial.
+
 - **M22 (addendum 8):** the linchpin of M14 is done: `Geom/BezTube.lean`
   (all in `EuclideanSpace ℝ (Fin 3)`, where Mathlib's `dist` is Euclidean)
   now proves `bezQ_eq_dist_sq` / `bezPhi_eq_dist`, `phi_min_attained`,
@@ -394,8 +417,16 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   exact-distance no-overshoot trace corollary for `bezTubeSet`
   (`bezPhiMin root ≤ 0` ⇒ iterate never passes it; via
   `stTrace3_le_root (bezTubeSet ...)` and `infDist_bezTubeSet`).
-  Remaining M14 work: the trace guarantee through the sampled rule and
-  the Newton foot-point convergence proof.
+  Added (same milestone): `samDist` — the sampled-distance fold of
+  `tri_bez_leaf_dist` (min of `dist x (C u) − r(u)` over `List ℝ` sites,
+  empty list maps to `0`) — proved `AbsLipschitz` by list induction
+  (`absLipschitz_bezContact`, `absLipschitz_samDist_foldr`,
+  `absLipschitz_samDist`), then `lipschitz1_samDist_line` along unit
+  rays, and `stTrace3_samDist_le_root` (the sampled trace never passes a
+  root where the sampled min is ≤ 0). What's *not* shown: the sampled
+  fold's zero set need not align with the true tube without a density
+  bound on `sites`; `primhitcheck` remains the empirical gate there.
+  Remaining M14 work: the Newton foot-point convergence proof.
 
 - **M22 (addendum 7):** the M14 signed-distance model got its first
   slice: `LightRT/Geom/BezTube.lean` proves `hasDerivAt_bezQ` /
