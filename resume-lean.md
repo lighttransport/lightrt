@@ -141,8 +141,11 @@ Explicitly deferred/recorded (see PLAN.md):
    `tlascheck` covers it. The `1e-37` dilation floor is proved
    (`fl_add_margin_ge`/`fl_sub_margin_le`); a range-free `slab_no_false_miss`
    needs a non-degeneracy floor and is not attempted (tangent rays admit no
-   absolute-error-dominating `K`). `fpT_rel`/`slab_t_err_fma` keep their
-   `InRange` versions.
+   absolute-error-dominating `K`), but the conditional non-tangent form is
+   **proved**: `SlabTotal.slab_no_false_miss_total_of_floor` (floor `κ ≤ |t_exact|`
+   at each slab endpoint, ray-length floor `κT ≤ t`, relative bound `θ` from
+   `fpT_rel_of_floor`, and explicit inflation `1 + θ + η/κT ≤ (1-θ)(1-u)K`),
+   with no `InRange`. `fpT_rel`/`slab_t_err_fma` keep their `InRange` versions.
 4. **A refinement proof for the SIMD watertight leaf (model done; ISA gap
    recorded).** `C/Proofs/SimdLanes.lean` gives the per-lane model (packed lane
    ops, `vWoopK` mirroring `Ref.woopK`, `vWoopK_lane`, `blockBest_*`). The
