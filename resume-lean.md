@@ -251,12 +251,14 @@ Explicitly deferred/recorded (see PLAN.md):
   M14 phases 1-2 are also done: `Geom/BezNewtonGuards.lean` models the C's
   damped step, u-clamp `[-0.05, 1.05]`, det guard and acceptance predicate,
   with their invariants (`accepted_*`, `damped_step_range`,
-  `jacDet_ne_zero_of_guard`, `dampDu_*`, `clampU_*`). The remaining bulk:
-  M14 phases 3-4 — connect the safeguarded bracket seed to
-  `bez_newton_quadratic`'s basin hypotheses (rectangle containment,
-  `E ≤ B/K`, `δ ≤ |det|`) and prove guarded convergence; local contraction
-  is done, the global 2D refinement is the one open deep item. Floating point
-  of the minimizer stays with `primhitcheck`.
+  `jacDet_ne_zero_of_guard`, `dampDu_*`, `clampU_*`). M14 phase 3-4 first
+  slice landed: `newtonIter_tendsto_of_basin` proves that the guarded Newton
+  sequence converges to the root when the local hypotheses hold at every
+  iterate, with `E_{n+1} ≤ (2B²/δ)E_n + (18BK/δ)E_n²` and
+  `Tendsto E atTop (𝓝 0)` (via `tendsto_zero_of_linear_quadratic_contract`).
+  Still open: verifying those hypotheses at the bracket-derived root from
+  explicit control-point bounds. Floating point of the minimizer stays with
+  `primhitcheck`.
   M14 phase 3 first step landed: `bezF_eq_zero_of_critical_of_contact` —
   a critical point of `φ` on a ray whose tube-boundary equation `G = 0`
   holds satisfies `F = 0`, pairing the bracket limit with a genuine root
