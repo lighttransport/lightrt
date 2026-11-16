@@ -395,7 +395,12 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   so the bracket limit pairs with a genuine root `(u, t)` of the 2D system
   when the ray parameter is the contact. The remaining phase 3-4 work: verify
   the local hypotheses (`E ≤ B/K`, `δ ≤ |det|`, rectangle containment) at that
-  root and prove guarded convergence; global 2D refinement stays open.
+  root and prove guarded convergence; phase 3-4 first slice landed:
+  `newtonIter_tendsto_of_basin` — guarded Newton converges to the root when
+  the local hypotheses hold at every iterate, with
+  `E_{n+1} ≤ (2B²/δ)E_n + (18BK/δ)E_n²` and `Tendsto E atTop (𝓝 0)`;
+  verifying those hypotheses at the bracket-derived root remains the open gap;
+  global 2D refinement stays open.
 
 - **M22 (addendum 13):** the ISA boundary is now a **machine-checked
   hypothesis**, not just prose (item 4). New `C/Proofs/SimdLeafISA.lean`:
