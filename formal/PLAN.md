@@ -389,8 +389,13 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   `dampDu_le`, `clampU_mem`, `clampU_eq_of_mem`, `damped_step_range`. The
   float epsilons and the 12-iteration cap remain parameters/outside the
   model; the radius kink stays excluded (interval ends are handled by
-  `bezPhi_min_critical`). The global basin-of-attraction connection to
-  `bez_newton_quadratic` is M14 phases 3-4 and remains open.
+  `bezPhi_min_critical`). M14 phase 3 (first step): `bezF_eq_zero_of_critical_of_contact`
+  — at a ray point where the curve parameter is a critical point of `φ` and
+  `G = 0` (tube boundary), the system's first equation vanishes (`F = 0`),
+  so the bracket limit pairs with a genuine root `(u, t)` of the 2D system
+  when the ray parameter is the contact. The remaining phase 3-4 work: verify
+  the local hypotheses (`E ≤ B/K`, `δ ≤ |det|`, rectangle containment) at that
+  root and prove guarded convergence; global 2D refinement stays open.
 
 - **M22 (addendum 13):** the ISA boundary is now a **machine-checked
   hypothesis**, not just prose (item 4). New `C/Proofs/SimdLeafISA.lean`:
