@@ -390,6 +390,10 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   What's *not* shown: sampled-min ≥ continuous inf is not relaxed —
   a root of the sampled fold need not lie inside the true tube without a
   density bound on `sites`; `primhitcheck` remains the empirical gate.
+  (addendum 9 cont.) `samDist_nonpos_mem_tube`: the C's leaf can never
+  accept outside the true tube — `samDist ≤ 0` ⇒ `x ∈ bezTubeSet`
+  (contrapositive: `samDist_pos_of_bezPhiMin_pos`); overshoot remains the
+  sampling-density question.
   (addendum 9 cont.) `exists_bezTube_boundary_point`: along any segment
   from an outside point to a point in/touching the tube, some intermediate
   `s` has `Metric.infDist (x₀ + s • v) tube = 0` (IVT; the trace's
