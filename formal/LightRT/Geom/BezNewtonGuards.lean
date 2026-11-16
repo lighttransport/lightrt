@@ -401,5 +401,140 @@ theorem newtonIter_tendsto_of_basin_ball (S : BezSys) (a b c d K B δ R : ℝ)
     hroot_bounds.1 hroot_bounds.2.1 hroot_bounds.2.2.1 hroot_bounds.2.2.2.1
     hbasin hcond hseed'
 
+set_option maxHeartbeats 1600000 in
+theorem jacDet_variation_bound {f g : ℝ → ℝ → ℝ} {a b c d K B0 R u₀ t₀ u t : ℝ}
+    (hf : C2Seg f a b c d K) (hg : C2Seg g a b c d K) (hK0 : 0 ≤ K)
+    (hu : u ∈ Set.Icc a b) (hu₀ : u₀ ∈ Set.Icc a b)
+    (ht : t ∈ Set.Icc c d) (ht₀ : t₀ ∈ Set.Icc c d)
+    (hfu : |pd1 f u₀ t₀| ≤ B0) (hfv : |pd2 f u₀ t₀| ≤ B0)
+    (hgu : |pd1 g u₀ t₀| ≤ B0) (hgv : |pd2 g u₀ t₀| ≤ B0)
+    (hR0 : 0 ≤ R) (hKR : K * R ≤ 1)
+    (hE : |u - u₀| + |t - t₀| ≤ R) :
+    |jacDet f g u t - jacDet f g u₀ t₀| ≤ 4 * B0 * K * R + 4 * (K*R)^2 := by
+  have hu1 := pd1_diff_bound hf hK0 hu hu₀ ht ht₀
+  have hu2 := pd2_diff_bound hf hK0 hu hu₀ ht ht₀
+  have hv1 := pd1_diff_bound hg hK0 hu hu₀ ht ht₀
+  have hv2 := pd2_diff_bound hg hK0 hu hu₀ ht ht₀
+  have hsmall1 : K * (|u - u₀| + |t - t₀|) ≤ K * R := mul_le_mul_of_nonneg_left hE hK0
+  have h1 : |pd1 f u t - pd1 f u₀ t₀| ≤ K * R := hu1.trans hsmall1
+  have h2 : |pd2 f u t - pd2 f u₀ t₀| ≤ K * R := hu2.trans hsmall1
+  have h3 : |pd1 g u t - pd1 g u₀ t₀| ≤ K * R := hv1.trans hsmall1
+  have h4 : |pd2 g u t - pd2 g u₀ t₀| ≤ K * R := hv2.trans hsmall1
+  have hb1 : |pd1 f u t| ≤ B0 + K*R := by
+    have := abs_add_le (pd1 f u₀ t₀) (pd1 f u t - pd1 f u₀ t₀)
+    rw [show pd1 f u₀ t₀ + (pd1 f u t - pd1 f u₀ t₀) = pd1 f u t by ring] at this
+    nlinarith [hfu, h1]
+  have hb2 : |pd2 f u t| ≤ B0 + K*R := by
+    have := abs_add_le (pd2 f u₀ t₀) (pd2 f u t - pd2 f u₀ t₀)
+    rw [show pd2 f u₀ t₀ + (pd2 f u t - pd2 f u₀ t₀) = pd2 f u t by ring] at this
+    nlinarith [hfv, h2]
+  have hb3 : |pd1 g u t| ≤ B0 + K*R := by
+    have := abs_add_le (pd1 g u₀ t₀) (pd1 g u t - pd1 g u₀ t₀)
+    rw [show pd1 g u₀ t₀ + (pd1 g u t - pd1 g u₀ t₀) = pd1 g u t by ring] at this
+    nlinarith [hgu, h3]
+  have hb4 : |pd2 g u t| ≤ B0 + K*R := by
+    have := abs_add_le (pd2 g u₀ t₀) (pd2 g u t - pd2 g u₀ t₀)
+    rw [show pd2 g u₀ t₀ + (pd2 g u t - pd2 g u₀ t₀) = pd2 g u t by ring] at this
+    nlinarith [hgv, h4]
+  unfold jacDet
+  have ha1 : |(pd1 f u t - pd1 f u₀ t₀) * pd2 g u t| ≤ (K*R) * (B0 + K*R) := by
+    rw [abs_mul]; exact mul_le_mul h1 hb4 (abs_nonneg _) (mul_nonneg hK0 hR0)
+  have ha2 : |pd1 f u₀ t₀ * (pd2 g u t - pd2 g u₀ t₀)| ≤ B0 * (K*R) := by
+    rw [abs_mul]; exact mul_le_mul hfu h4 (abs_nonneg _) (by nlinarith [abs_nonneg (pd1 f u₀ t₀)])
+  have ha3 : |(pd2 f u t - pd2 f u₀ t₀) * pd1 g u t| ≤ (K*R) * (B0 + K*R) := by
+    rw [abs_mul]; exact mul_le_mul h2 hb3 (abs_nonneg _) (mul_nonneg hK0 hR0)
+  have ha4 : |pd2 f u₀ t₀ * (pd1 g u t - pd1 g u₀ t₀)| ≤ B0 * (K*R) := by
+    rw [abs_mul]; exact mul_le_mul hfv h3 (abs_nonneg _) (by nlinarith [abs_nonneg (pd2 f u₀ t₀)])
+  have hdecomp : pd1 f u t * pd2 g u t - pd2 f u t * pd1 g u t -
+      (pd1 f u₀ t₀ * pd2 g u₀ t₀ - pd2 f u₀ t₀ * pd1 g u₀ t₀) =
+      ((pd1 f u t - pd1 f u₀ t₀) * pd2 g u t + pd1 f u₀ t₀ * (pd2 g u t - pd2 g u₀ t₀)) -
+      ((pd2 f u t - pd2 f u₀ t₀) * pd1 g u t + pd2 f u₀ t₀ * (pd1 g u t - pd1 g u₀ t₀)) := by ring
+  rw [hdecomp, sub_eq_add_neg]
+  have hs1 : |(pd1 f u t - pd1 f u₀ t₀) * pd2 g u t + pd1 f u₀ t₀ * (pd2 g u t - pd2 g u₀ t₀)| ≤
+      (K*R) * (B0 + K*R) + B0 * (K*R) := (abs_add_le _ _).trans (add_le_add ha1 ha2)
+  have hs2 : |(pd2 f u t - pd2 f u₀ t₀) * pd1 g u t + pd2 f u₀ t₀ * (pd1 g u t - pd1 g u₀ t₀)| ≤
+      (K*R) * (B0 + K*R) + B0 * (K*R) := (abs_add_le _ _).trans (add_le_add ha3 ha4)
+  have hlast := abs_add_le
+      ((pd1 f u t - pd1 f u₀ t₀) * pd2 g u t + pd1 f u₀ t₀ * (pd2 g u t - pd2 g u₀ t₀))
+      (-((pd2 f u t - pd2 f u₀ t₀) * pd1 g u t + pd2 f u₀ t₀ * (pd1 g u t - pd1 g u₀ t₀)))
+  rw [abs_neg] at hlast
+  have hKR2 : K * (K * R) ≤ K := by nlinarith [mul_le_mul_of_nonneg_left hKR hK0]
+  have hKR0 : 0 ≤ K * R := mul_nonneg hK0 hR0
+  have hB0 : 0 ≤ B0 := by nlinarith [abs_nonneg (pd1 f u₀ t₀)]
+  have hKR3 : (K * R) * (K * R) ≤ K * R := by nlinarith [mul_le_mul_of_nonneg_left hKR hKR0]
+  nlinarith [hs1, hs2, hlast, hKR2, hKR0, hB0, hKR3]
+
+
+
+/-- Given explicit root data (bounds `B0` on the four root partials, lower
+    bound `det0` on `|det J|` at the root) and a radius `R` satisfying concrete
+    smallness inequalities, the ball hypotheses of
+    `newtonIter_tendsto_of_basin_ball` follow from `PddBounds` and
+    `pd1_diff_bound`/`pd2_diff_bound` — no control-point coefficient chase
+    beyond supplying `B0` and `det0`. This is the quantitative form of M14's
+    remaining basin verification. -/
+theorem basin_ball_of_data (S : BezSys) (a b c d K B0 B det0 δ R : ℝ)
+    (hCF : C2Seg (bezF S) a b c d K) (hCG : C2Seg (bezG S) a b c d K)
+    (hK : 0 < K) (hK0 : 0 ≤ K)
+    {u₀ t₀ : ℝ} (hu₀ : u₀ ∈ Set.Icc a b) (ht₀ : t₀ ∈ Set.Icc c d)
+    (hroot : bezF S u₀ t₀ = 0 ∧ bezG S u₀ t₀ = 0)
+    (hB0F : |pd1 (bezF S) u₀ t₀| ≤ B0) (hB0G : |pd2 (bezF S) u₀ t₀| ≤ B0)
+    (hB0H : |pd1 (bezG S) u₀ t₀| ≤ B0) (hB0I : |pd2 (bezG S) u₀ t₀| ≤ B0)
+    (hdet0 : det0 ≤ |jacDet (bezF S) (bezG S) u₀ t₀|)
+    (hB : B0 + K * R ≤ B) (hδpos : 0 < δ)
+    (hδ_le : δ ≤ det0 - (4 * B0 * K * R + 4 * (K * R) ^ 2))
+    (hR0 : 0 ≤ R) (hKR : K * R ≤ 1)
+    (hrect : ∀ u' t', |u' - u₀| + |t' - t₀| ≤ R →
+      u' ∈ Set.Icc a b ∧ t' ∈ Set.Icc c d) :
+    ∀ u' t', |u' - u₀| + |t' - t₀| ≤ R →
+      |pd1 (bezF S) u' t'| ≤ B ∧ |pd2 (bezF S) u' t'| ≤ B ∧
+      |pd1 (bezG S) u' t'| ≤ B ∧ |pd2 (bezG S) u' t'| ≤ B ∧
+      δ ≤ |jacDet (bezF S) (bezG S) u' t'| := by
+  intro u' t' hball
+  have hr := hrect u' t' hball
+  have hsmall : K * (|u' - u₀| + |t' - t₀|) ≤ K * R :=
+    mul_le_mul_of_nonneg_left hball hK0
+  have hdF := pd1_diff_bound hCF hK0 hr.1 hu₀ hr.2 ht₀
+  have hdG := pd2_diff_bound hCF hK0 hr.1 hu₀ hr.2 ht₀
+  have hdH := pd1_diff_bound hCG hK0 hr.1 hu₀ hr.2 ht₀
+  have hdI := pd2_diff_bound hCG hK0 hr.1 hu₀ hr.2 ht₀
+  have hdF' := hdF.trans hsmall
+  have hdG' := hdG.trans hsmall
+  have hdH' := hdH.trans hsmall
+  have hdI' := hdI.trans hsmall
+  have bnd (h0 : |pd1 (bezF S) u₀ t₀| ≤ B0) (hd : |pd1 (bezF S) u' t' - pd1 (bezF S) u₀ t₀| ≤ K * R) :
+      |pd1 (bezF S) u' t'| ≤ B := by
+    have ha := abs_add_le (pd1 (bezF S) u₀ t₀) (pd1 (bezF S) u' t' - pd1 (bezF S) u₀ t₀)
+    rw [show pd1 (bezF S) u₀ t₀ + (pd1 (bezF S) u' t' - pd1 (bezF S) u₀ t₀) = pd1 (bezF S) u' t' by ring] at ha
+    nlinarith [h0, hd, hB]
+  have b1 := bnd hB0F hdF'
+  -- same pattern for the other three partials
+  have b2 : |pd2 (bezF S) u' t'| ≤ B := by
+    have ha := abs_add_le (pd2 (bezF S) u₀ t₀) (pd2 (bezF S) u' t' - pd2 (bezF S) u₀ t₀)
+    rw [show pd2 (bezF S) u₀ t₀ + (pd2 (bezF S) u' t' - pd2 (bezF S) u₀ t₀) = pd2 (bezF S) u' t' by ring] at ha
+    nlinarith [hB0G, hdG', hB]
+  have b3 : |pd1 (bezG S) u' t'| ≤ B := by
+    have ha := abs_add_le (pd1 (bezG S) u₀ t₀) (pd1 (bezG S) u' t' - pd1 (bezG S) u₀ t₀)
+    rw [show pd1 (bezG S) u₀ t₀ + (pd1 (bezG S) u' t' - pd1 (bezG S) u₀ t₀) = pd1 (bezG S) u' t' by ring] at ha
+    nlinarith [hB0H, hdH', hB]
+  have b4 : |pd2 (bezG S) u' t'| ≤ B := by
+    have ha := abs_add_le (pd2 (bezG S) u₀ t₀) (pd2 (bezG S) u' t' - pd2 (bezG S) u₀ t₀)
+    rw [show pd2 (bezG S) u₀ t₀ + (pd2 (bezG S) u' t' - pd2 (bezG S) u₀ t₀) = pd2 (bezG S) u' t' by ring] at ha
+    nlinarith [hB0I, hdI', hB]
+  have hvar := jacDet_variation_bound hCF hCG hK0 hr.1 hu₀ hr.2 ht₀ hB0F hB0G hB0H hB0I hR0 hKR hball
+  have hdet_lower : δ ≤ |jacDet (bezF S) (bezG S) u' t'| := by
+    have htri : |jacDet (bezF S) (bezG S) u₀ t₀| ≤
+        |jacDet (bezF S) (bezG S) u' t'| +
+          |jacDet (bezF S) (bezG S) u' t' - jacDet (bezF S) (bezG S) u₀ t₀| := by
+      have h := abs_add_le (jacDet (bezF S) (bezG S) u' t')
+        (jacDet (bezF S) (bezG S) u₀ t₀ - jacDet (bezF S) (bezG S) u' t')
+      rw [show jacDet (bezF S) (bezG S) u' t' +
+          (jacDet (bezF S) (bezG S) u₀ t₀ - jacDet (bezF S) (bezG S) u' t') =
+          jacDet (bezF S) (bezG S) u₀ t₀ by ring] at h
+      rw [abs_sub_comm (jacDet (bezF S) (bezG S) u₀ t₀) (jacDet (bezF S) (bezG S) u' t')] at h
+      exact h
+    nlinarith [htri, hdet0, hvar, hδ_le]
+  exact ⟨b1, b2, b3, b4, hdet_lower⟩
+
 end BezSys
 end LightRT.Geom
