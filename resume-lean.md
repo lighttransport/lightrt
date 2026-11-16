@@ -194,11 +194,25 @@ Explicitly deferred/recorded (see PLAN.md):
      for `a ≤ b` and `0 ≤ r(u)` on the interval (the `x` inside tube /
      perpendicular-foot cases), plus `stTrace3_bezTube_le_root` (the
      exact-distance no-overshoot trace corollary: root with
-     `bezPhiMin ≤ 0` ⇒ iterate never passes it, `‖v‖ ≤ 1`). M14's
-     remaining bulk: the trace guarantee through the *sampled* rule and
-     the Newton foot-point convergence proof
-     (`SphereTrace.newton_step_quadratic` is ready), plus floating point
-     of the minimizer (`primhitcheck` covers it).
+     `bezPhiMin ≤ 0` ⇒ iterate never passes it, `‖v‖ ≤ 1`), plus the
+     sampled rule: `samDist` models the C's `tri_bez_leaf_dist` fold
+     (min over sample sites of `dist x (C u) − r(u)`, empty site list is
+     degenerate at `0`), proved `AbsLipschitz` by induction
+     (`absLipschitz_bezContact`, `absLipschitz_samDist_foldr`), giving
+     `lipschitz1_samDist_line` and `stTrace3_samDist_le_root` (the
+     sampled trace never passes a root where the sampled min is ≤ 0,
+     i.e. some site's ball covers the root — the honest analogue for the
+     C's actual stepping function). Also done: the interior nearest
+     point is a critical point of `φ` — `interior_min_bezPhi_deriv`
+     (Fermat), `interior_min_bezPhi_envelope` (the foot-point equation
+     `⟨x − C, C′⟩/|x − C| = −r′`), and `bezPhi_min_critical` (min of φ
+     on `[a,b]` is attained at an endpoint, an interior critical point,
+     or on the curve). The Newton contraction core already landed as
+     `ofCubic_newton_quadratic` (M7/M22 addendum 4). M14's remaining
+     bulk: the global Newton argument (basin of attraction / existence
+     of the nearest foot with nondegenerate Jacobian), the sampled-fold
+     alignment question (sampling density; `primhitcheck` covers it),
+     and floating point of the minimizer (`primhitcheck` covers it).
    Patch/NURBS stay measured against `primhitcheck` (item 16 decision).
 
 ## Resuming prompt
