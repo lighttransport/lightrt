@@ -44,9 +44,9 @@ Each library was cloned and read on 2026-11-10. The `sorry` counts are real toke
 
 **Item 3, C-call-site instantiation.** `BVH/ExactPruneTotal.lean` proves the `InRange`-free replacement for the `EXACT_NEAREST` pruning theorem:
 - `key_le_total`: the float node key is `≤ m − 30uM + 3η` (the total rounding model only adds `3η` to `key_le`);
-- `woop_key_le_t_total_model`: for an accepted triangle whose *computed* dominant-axis depths lie in `[m, M]`, `fl(m − fl(2⁻¹⁹M)) ≤ t` (positive edge-sign class), provided the extra slack fits: `49η(1+M)/a0 + 4η ≤ 0.9uM`. For a real scene (`M` not subnormal) that is a projected area `a0 ≳ 50·2⁻¹²⁶(1+M)/M`, the same `1e-37`-scale regime as the dilation floor.
+- `woop_key_le_t_total_model`: for an accepted triangle whose *computed* dominant-axis depths lie in `[m, M]`, `fl(m − fl(2⁻¹⁹M)) ≤ t`, in **both** edge-sign classes (`hsign : (0 ≤ e0 ∧ 0 ≤ e1 ∧ 0 ≤ e2) ∨ (e0 ≤ 0 ∧ e1 ≤ 0 ∧ e2 ≤ 0)`), provided the extra slack fits: `49η(1+M)/a0 + 4η ≤ 0.9uM`. The negative class uses `woop_t_err_total_model_tight_neg` (numerator/denominator flip sign, same bound). For a real scene (`M` not subnormal) that is a projected area `a0 ≳ 50·2⁻¹²⁶(1+M)/M`, the same `1e-37`-scale regime as the dilation floor.
 
-**Item 3, the `1e-37` floor.** `FP/TotalErr.fl_add_margin_ge` / `fl_sub_margin_le` prove that `tlas_dil_origins`' margin `mk = (m + 2⁻²³|o| + 1e-37)(1 + 2⁻²⁰)` is conservative: `o + m ≤ fl(o + fl mk)` and `fl(o − fl mk) ≤ o − m`. The `2⁻²³|o|` term covers the add with `o`, `1 + 2⁻²⁰` the double→float conversion plus that add, and `1e-37` the subnormal absolute error (`η = 2⁻¹⁵⁰`); the C's `mk < 1e38` guard covers overflow with the conservative infinite-origin box. Remaining for item 3: the negative edge-sign class of `woop_key_le_t_total_model` and the slab/MT ranges.
+**Item 3, the `1e-37` floor.** `FP/TotalErr.fl_add_margin_ge` / `fl_sub_margin_le` prove that `tlas_dil_origins`' margin `mk = (m + 2⁻²³|o| + 1e-37)(1 + 2⁻²⁰)` is conservative: `o + m ≤ fl(o + fl mk)` and `fl(o − fl mk) ≤ o − m`. The `2⁻²³|o|` term covers the add with `o`, `1 + 2⁻²⁰` the double→float conversion plus that add, and `1e-37` the subnormal absolute error (`η = 2⁻¹⁵⁰`); the C's `mk < 1e38` guard covers overflow with the conservative infinite-origin box. The negative edge-sign class of `woop_key_le_t_total_model` is proved (`ExactPruneTotal.lean`); the range-free scalar slab-parameter error is proved (`Robust/SlabTotal.lean` `fpT_abs_err_total`); the MT `t` error bound is proved (`Robust/MTT.lean` `mt_t_fl_err_total_model`); `tlas_instance_margin` fp64 stays out of scope (`tlascheck` covers it); a range-free `slab_no_false_miss` is unprovable as stated (a tangent ray admits no absolute-error-dominating `K`).
 
 Reasons:
 1. MiniC needs an executable, bit-exact semantics that agrees with compiled C. None of the theorems need Flocq-scale generality.
@@ -378,6 +378,61 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   `K`, `B`, `δ ≤ |det|`, `E ≤ B/K` are hypotheses — the same standing as
   `newton2_step_quadratic`. Supersedes addendum 2's deferral note.
   `LightRT.lean` imports `Geom.BezNewton`.
+
+- **M22 (addendum 11):** **SIMD leaf ISA audit** — the exact boundary of
+  the model. The watertight leaf kernels in `lightrt_c_tri.c`
+  (`tri_woop4_lanes` SSE4, `tri_woop8_lanes` AVX2, `tri_woop_sve_core`
+  SVE 8/16) are structurally identical (same expression tree, same
+  association, explicit mul/sub separation, no FMA anywhere in the leaf;
+  `-ffp-contract=off`), and so are the block wrappers' scalar folds.
+  Every intrinsic in the leaf maps to a model operation:
+  - `_mm_loadu_ps`/`_mm256_loadu_ps`/`svld1_f32`, `_mm_store_ps|u_ps`/`_mm256_store_ps`/`svst1_f32`
+    → register load/store; the model abstracts inputs as
+    `v : Fin w → Fin 3 → F` and the C spills `tt, ve, we, det` to scalar memory
+    for the final fold — modeled by `blockBest`;
+  - `_mm_setzero_ps`/`_mm256_setzero_ps`/`svdup_f32(0)`, `_mm_set1_ps`/`svdup_f32`
+    → `vconst`;
+  - `_mm_sub_ps|mul_ps|add_ps|div_ps`/`_mm256_*`/`sv{sub,mul,add,div}_f32_x`
+    → `vsub`/`vmul`/`vadd`/`vdiv` (per-lane binary32, RNE, no FMA);
+  - `_mm_or_ps`/`_mm256_or_ps`/`svorr_b_z` → `vor`; `_mm_and_ps`/`_mm256_and_ps`/`svand_b_z` → `vand`;
+    `_mm_andnot_ps(a, b)` (= `b & ~a`) → `vnot` then `vand`;
+    `svbic_b_z(pg, svcmpne_f32(pg, det, z), svand_b_z(pg, neg, pos))` → same polarity as `(det ≠ 0) ∧ ¬(neg ∧ pos)`;
+  - `_mm_cmplt_ps`/`_mm_cmpgt_ps`/`_mm_cmpge_ps`/`_mm_cmpneq_ps`
+    and AVX2 `_mm256_cmp_ps(_CMP_LT_OQ|_CMP_GT_OQ|_CMP_GE_OQ|_CMP_NEQ_UQ)`
+    and SVE `svcmplt_f32`/`svcmpgt_f32`/`svcmpge_f32`/`svcmpne_f32`
+    → `vlt` (with operand order swapped for the greater-than case, as the
+    model does), `vle`, `veq`;
+  - `_mm_movemask_ps`/`_mm256_movemask_ps`/`svptest_any`
+    → the C bit-packing `(m >> l & 1)` of the per-lane bool into the
+    block-acceptance integer index — lane order 0…w−1 matches `Fin w`;
+    the all-reject early return (`!em` before the divide) is not modeled,
+    but it only short-circuits what the masks would reject anyway;
+  - `_mm256_fmadd_ps`/`_mm256_fmsub_ps`/SSE `_mm_fmadd_ps` — **not used in
+    this leaf** (they appear only in the MT/Bezier paths, under
+    `-ffp-contract=off`); the model's no-FMA assumption holds here by
+    inspection.
+  Ordered comparisons are false on NaN (both ISA `_OQ` and SSE `cmplt`);
+  `_CMP_NEQ_UQ` and SVE `svcmpne_f32` are true on NaN — the same atoms as
+  `FP.Binary32.ltBits/leBits/eqF` (decoded-compare on RNE bit patterns).
+  The fold (`if ((m >> l) & 1 && T[l] < bt) { bt = T[l]; bl = l; }`) is the
+  model's `blockBest` (NO_HIT lanes skipped, strictly-smaller-`t` wins,
+  first/lowest lane on ties), with `*best_u = V[bl] / D[bl]` computed
+  scalar after selection — same operands, same op order, same result.
+  **Residual ISA assumptions (not formalized, vendor guarantee, recorded
+  here as the boundary):** (1) per-element packed ops compute exactly the
+  binary32 lane ops (`mulBits`/`addBits`/`subBits`/`divBits`), RNE;
+  (2) ordered compares are NaN-false; unordered NEQ is NaN-true;
+  (3) movemask/predicates preserve lane-bit order;
+  (4) the compiler contracted nothing and reassociated nothing (guaranteed
+  by `-ffp-contract=off` and single-op expressions; verified bitwise by
+  `wtcheck`, incl. SVE, every `make formal`).
+  **Empirical backstop:** `wtcheck` (in `make formal`) compares
+  `tri_woop4_block`, `tri_woop8_block`, `tri_woop_sve_block` (SVE 8 and 16)
+  plus `_occ` variants against scalar `tri_woop_one` **bit for bit**,
+  including SVE, on edge/degenerate/NaN-ish inputs and bit patterns;
+  ASan/UBSan runs pass. Closing the boundary needs a vendor ISA semantics
+  model (SSE4.1/AVX2/SVE packed ops), which no current tooling provides;
+  item stays empirical.
 
 - **M22 (addendum 10):** the global safeguarded-Newton argument (the C's
   `tri_bez_leaf_dist` bracket). New `Geom/SafeguardedNewton.lean`:
