@@ -226,10 +226,22 @@ Explicitly deferred/recorded (see PLAN.md):
      `curve_dist_le`, `rad_dist_le`, `foldr_min_le_mem`, `samDist_le_mem`.
      The Newton contraction core already landed as
      `ofCubic_newton_quadratic` (M7/M22 addendum 4). M14's remaining
-     bulk: the global Newton argument (basin of attraction / existence
-     of the nearest foot with nondegenerate Jacobian), the sampled-fold
-     alignment question (sampling density; `primhitcheck` covers it),
-     and floating point of the minimizer (`primhitcheck` covers it).
+   - Global safeguarded-Newton argument is now proved (Newton from an arbitrary
+  seed, not just near a root): new `Geom/SafeguardedNewton.lean` —
+  `fsplit`/`seqIter`, monotone `seqLo`/`seqHi` bracket sequences,
+  `seqIter_width` (width halves: bisection alone suffices), convergence to
+  a common limit (`seqLo_tendsto`/`seqHi_tendsto`/`limit_unique`),
+  `bracket_root` (the bracket converges to a root of the sign-changing
+  `ContinuousOn` function). Instantiated to the Bézier envelope:
+  `envelope_continuousOn`, `bracket_envelope_bezPhi` / `'` (both sign
+  conventions) — whenever `φ′` changes sign on `[a, b]` with `x` off the
+  curve, there is a critical point of `φ`, and the C's sample-detected
+  bracket converges to it from an arbitrary seed. Newton acceleration is the
+  local half (`ofCubic_newton_quadratic`, M7/M22 addendum 4).
+  M14's remaining bulk: the full 2D `(u, t)` basin-of-attraction refinement
+  for `tri_bez_newton` with damped-step/`det > 0` guards (the local
+  contraction core is done; the global 2D refinement is the one open deep
+  item), and floating point of the minimizer (`primhitcheck` covers it).
    Patch/NURBS stay measured against `primhitcheck` (item 16 decision).
 
 ## Resuming prompt
