@@ -1,9 +1,9 @@
 # LightRT Lean formalization: remaining items and resume prompt
 
-State as of 2026-11-15, branch `formal-lean` at `b736431` (35 commits on top of
-`7fd2bf7`). Nothing is pushed. The plan and history are in `formal/PLAN.md`
-(milestones M1–M21); repo guidance is in `CLAUDE.md`, section "Formal
-verification".
+State as of 2026-11-17, branch `formal-lean`, pushed to `origin/formal-lean`.
+The formalization document of record is `formal/PLAN.md` (scope, coverage map,
+invariants, gates, boundaries, roadmap). Milestone history is in git history.
+Repo guidance: `CLAUDE.md`, section "Formal verification".
 See also the PLAN entries for the negative-key / tighter-key / `hp_subpatch`
 decisions and item-3's `tlas_dil_origins` `1e-37` floor.
 
@@ -128,171 +128,31 @@ Explicitly deferred/recorded (see PLAN.md):
 
 ## Remaining items
 
-### Proofs (Lean), large
-
-3. **Rounding-model hypotheses (done for Woop/key/slab/MT bounds).** Woop `t`
-   error and the `EXACT_NEAREST` key are range-free (both sign classes).
-   `Robust/SlabTotal.lean` now proves the range-free scalar slab-parameter
-   error bound `fpT_abs_err_total` (`|fpT − q/d| ≤ 4u|q/d| + 4(1+u)(|q| +
-   |1/d|)η + 2(1+u)η² + η`, no `InRange`). 3b (MT error bound) is **done**
-   (`Robust/MTCross2.lean`, `MTDot.lean`, `MTT.lean`; MT is not watertight,
-   so it buys no `EXACT_NEAREST` conservativity — `mtcheck` remains the check);
-   3c (`tlas_instance_margin` fp64) is **out of scope** —
-   `tlascheck` covers it. The `1e-37` dilation floor is proved
-   (`fl_add_margin_ge`/`fl_sub_margin_le`); a range-free `slab_no_false_miss`
-   needs a non-degeneracy floor and is not attempted (tangent rays admit no
-   absolute-error-dominating `K`), but the conditional non-tangent form is
-   **proved**: `SlabTotal.slab_no_false_miss_total_of_floor` (floor `κ ≤ |t_exact|`
-   at each slab endpoint, ray-length floor `κT ≤ t`, relative bound `θ` from
-   `fpT_rel_of_floor`, and explicit inflation `1 + θ + η/κT ≤ (1-θ)(1-u)K`),
-   with no `InRange`. `fpT_rel`/`slab_t_err_fma` keep their `InRange` versions.
-4. **A refinement proof for the SIMD watertight leaf (model done; ISA gap
-   audited and made explicit).** `C/Proofs/SimdLanes.lean` gives the per-lane
-   model (packed lane ops, `vWoopK` mirroring `Ref.woopK`, `vWoopK_lane`,
-   `blockBest_*`); `C/Proofs/SimdLeafISA.lean` packages the audit as the
-   `PackedOps` structure and proves `simd_leaf_eq_scalar_of_isa` — SIMD == scalar
-   *conditional* on the vendor intrinsics satisfying the audited per-lane
-   equations (no instance supplied; `wtcheck` remains the empirical gate).
-   The
-   ISA/intrinsics semantics is a documented model boundary (see PLAN.md), not
-   an axiom; `wtcheck`'s leaf fuzz (400k blocks / 2.7M lanes, incl. SVE 8/16) is
-   the empirical check for the watertight kernel, and the new `mtcheck`
-   fuzz (`make formal` gate) covers the BITEXACT MT packet path vs scalar.
-7. **Curve, patch and point hit correctness (started).** `Geom/Hull.lean`
-   proves box containment; `Geom/SphereTrace.lean` proves the 1D no-overshoot
-   core, the distance-to-point 1-Lipschitz atom, and
-   `newton_step_quadratic`. Remaining (in order):
-   - 7b-1 `Geom/Newton2D.lean`: general 2D Newton quadratic contraction.
-     **Done** (`residual_bound`, `pd1/pd2_diff_bound`, `newton2_step_quadratic`;
-     note the honest `2 B² E` term for the second component in absence of a
-     `B ≤ K E`-style extra hypothesis; with `B ≤ K·E` the constant is
-     `(10 B K/δ) E²` for both).
-   - 7b-2 `Geom/BezNewton.lean`: Bézier specialization of the `F(u, t)` system
-     (`tri_bez_newton`). **Done** — `BezSys` bundles the curve/radius
-     derivative chains; `pd1_bezF`/`pd2_bezF`/`pd1_bezG`/`pd2_bezG` identify
-     the C's `dFdu`/`dFdt`/`dGdu`/`dGdt` as polynomial sums (plus the `1/|R|`
-     entries), `jacDet_bez` is the C's `det`; `bezF_C2Seg`/`bezG_C2Seg` prove
-     the rectangle differentiability parts of `C2Seg` (with
-     `|R|² > 0` from the C's `lenR > 1e-30` guard as hypothesis) and take the
-     eight second-derivative bounds as `PddBounds` hypotheses;
-     `bez_newton_quadratic` is the final contraction corollary and
-     `BezSys.ofCubic` instantiates everything for the actual cubic control-point
-     polynomials (`tri_bez_eval`'s `P`/`dP`/`ddP` expressions, proved via the
-     `bezPoly` polynomial representation); `ofCubic_newton_quadratic` is the
-     monic specialization. Honest limits, mirroring the C: the radius row is
-     modeled unclamped (`max r 0` is not `C²` at the kink), the `dF/du < 0`
-     front-facing-minimum selection and the eps-convergence test are not
-     modeled, `K`/`B` stay hypotheses, and no floating-point analysis of the
-     step is claimed.
-   - 7a `Geom/SphereTrace3.lean`: 3D no-overshoot via `Metric.infDist`.
-     **Done** (`infDist_lipschitz`, `absLipschitz_infDist`,
-     `infDist_line_lipschitz` (‖v‖ ≤ 1 ray restriction),
-     `lipschitz1_infDist_line`, `stTrace3_le_root` (via `stTrace_le_root`),
-     `stTrace3_tube_le_root` (`r`-tube form), and the `AbsLipschitz`
-     atoms `lipschitz1_min` / `lipschitz1_dist_of_mem` for the *sampled*
-     `tri_bez_leaf_dist` fold). Not modeled: the leaf's distance is a
-     sampled estimate, not exact `infDist`; `primhitcheck` covers it.
-   - M14 signed-distance model: `Geom/BezTube.lean` now proves (working in
-     `EuclideanSpace ℝ (Fin 3)`): `bezPhi` (φ(u) = dist x C(u) − r(u)),
-     `bezQ`, `curvePt` (notation `!₂[gx, gy, gz]`), `bezQ_eq_dist_sq` /
-     `bezPhi_eq_dist` (bridges to `Metric.dist`), `hasDerivAt_bezQ` /
-     `hasDerivAt_bezPhi` / `deriv_bezPhi`, `continuous_bezPhi`,
-     `phi_min_attained` (min on `Icc a b`), `bezPhiMin` /
-     `bezPhiMin_eq` (the attained minimum value), `bezPhiMin_le`, and —
-     **the linchpin** — `infDist_bezTubeSet`:
-     `Metric.infDist x (bezTubeSet S a b) = max 0 (bezPhiMin S x a b)`
-     for `a ≤ b` and `0 ≤ r(u)` on the interval (the `x` inside tube /
-     perpendicular-foot cases), plus `stTrace3_bezTube_le_root` (the
-     exact-distance no-overshoot trace corollary: root with
-     `bezPhiMin ≤ 0` ⇒ iterate never passes it, `‖v‖ ≤ 1`), plus the
-     sampled rule: `samDist` models the C's `tri_bez_leaf_dist` fold
-     (min over sample sites of `dist x (C u) − r(u)`, empty site list is
-     degenerate at `0`), proved `AbsLipschitz` by induction
-     (`absLipschitz_bezContact`, `absLipschitz_samDist_foldr`), giving
-     `lipschitz1_samDist_line` and `stTrace3_samDist_le_root` (the
-     sampled trace never passes a root where the sampled min is ≤ 0,
-     i.e. some site's ball covers the root — the honest analogue for the
-     C's actual stepping function), and
-     `samDist_nonpos_mem_tube` (sampled acceptance is sound: `samDist ≤ 0`
-     ⇒ `x` inside the true tube — the C's leaf never accepts outside it;
-     overshoot remains the sampling-density question), its
-     contrapositive `samDist_pos_of_bezPhiMin_pos`, and
-     `exists_bezTube_boundary_point` (IVT: along any segment from an
-     outside point to a point in/touching the tube, some intermediate `s`
-     has `infDist · (bezTubeSet) = 0` — the trace's boundary-existence
-     companion to `stTrace3_bezTube_le_root`). Also done: the interior nearest
-     point is a critical point of `φ` — `interior_min_bezPhi_deriv`
-     (Fermat), `interior_min_bezPhi_envelope` (the foot-point equation
-     `⟨x − C, C′⟩/|x − C| = −r′`), and `bezPhi_min_critical` (min of φ
-     on `[a,b]` is attained at an endpoint, an interior critical point,
-     or on the curve), `bezPhiMin_le_samDist` (for nonempty sites in
-     `[a,b]`, the continuous min bounds the sampled fold below — the
-     sampled fold is an over-estimate of the true distance-to-tube, the
-     sign that makes the C's stepping by it safe in the no-overshoot
-     sense), and the quantitative sandwich `samDist_le_bezPhiMin_add`:
-     `bezPhiMin ≤ samDist ≤ bezPhiMin + (√3·Mx + Mr)·R` for sites with
-     covering radius `R` and per-component derivative bounds `Mx` (curve)
-     and `Mr` (radius), via MVT (`abs_sub_le_of_deriv_bound`),
-     `curve_dist_le`, `rad_dist_le`, `foldr_min_le_mem`, `samDist_le_mem`.
-     The Newton contraction core already landed as
-     `ofCubic_newton_quadratic` (M7/M22 addendum 4). M14's remaining
-   - Global safeguarded-Newton argument is now proved (Newton from an arbitrary
-  seed, not just near a root): new `Geom/SafeguardedNewton.lean` —
-  `fsplit`/`seqIter`, monotone `seqLo`/`seqHi` bracket sequences,
-  `seqIter_width` (width halves: bisection alone suffices), convergence to
-  a common limit (`seqLo_tendsto`/`seqHi_tendsto`/`limit_unique`),
-  `bracket_root` (the bracket converges to a root of the sign-changing
-  `ContinuousOn` function). Instantiated to the Bézier envelope:
-  `envelope_continuousOn`, `bracket_envelope_bezPhi` / `'` (both sign
-  conventions) — whenever `φ′` changes sign on `[a, b]` with `x` off the
-  curve, there is a critical point of `φ`, and the C's sample-detected
-  bracket converges to it from an arbitrary seed. Newton acceleration is the
-  local half (`ofCubic_newton_quadratic`, M7/M22 addendum 4).
-  M14 phases 1-2 are also done: `Geom/BezNewtonGuards.lean` models the C's
-  damped step, u-clamp `[-0.05, 1.05]`, det guard and acceptance predicate,
-  with their invariants (`accepted_*`, `damped_step_range`,
-  `jacDet_ne_zero_of_guard`, `dampDu_*`, `clampU_*`). M14 phase 3-4 first
-  slice landed: `newtonIter_tendsto_of_basin` proves that the guarded Newton
-  sequence converges to the root when the local hypotheses hold at every
-  iterate, with `E_{n+1} ≤ (2B²/δ)E_n + (18BK/δ)E_n²` and
-  `Tendsto E atTop (𝓝 0)` (via `tendsto_zero_of_linear_quadratic_contract`).
-  Still open: verifying those hypotheses at the bracket-derived root from
-  explicit control-point bounds. Floating point of the minimizer stays with
-  `primhitcheck`.
-  M14 phase 3 first step landed: `bezF_eq_zero_of_critical_of_contact` —
-  a critical point of `φ` on a ray whose tube-boundary equation `G = 0`
-  holds satisfies `F = 0`, pairing the bracket limit with a genuine root
-  of the 2D contact system. Still open: verifying the local basin hypotheses
-  (`E ≤ B/K`, `δ ≤ |det|`, rectangle containment) at that root and proving
-  guarded convergence.
-   Patch/NURBS stay measured against `primhitcheck` (item 16 decision).
+The authoritative list is `formal/PLAN.md` §5. Summary: the only open deep
+item is the quantitative M14 basin verification (§5.1); item 4 (SIMD ISA
+instance) and GPU formalization are documented boundaries, not open tasks.
+No CI by decision; formal gates are manual.
 
 ## Resuming prompt
 
 > Continue the LightRT Lean formalization on branch `formal-lean` in
-> `/mnt/nvme02/work/lightrt`. Read `resume-lean.md` and `formal/PLAN.md`
-> (M14–M21) first. Run `make formal` to confirm the baseline (0 sorry, all
-> checks PASS). Remaining large items: 4
-> (BITEXACT SIMD == scalar for MT; ISA boundary recorded and **audited** —
-> see PLAN.md addendum 11: every intrinsic in the Woop leaf is mapped to a
-> model op; the residual ISA assumptions are enumerated and stay empirical
-> via `wtcheck`; closing the boundary would need a vendor ISA semantics
-> model). 3a (slab chain) is **done** (`fpT_abs_err_total`), 3b (MT error
-> bound) is **done** (`MTT.lean`). 3c (`tlas_instance_margin` fp64) is
-> **out of scope** by decision; do not attempt it. Item 7 is complete:
-> `Geom/Newton2D.lean` (7b-1), `Geom/BezNewton.lean` (7b-2, the
-> `tri_bez_newton` specialization: Jacobian as polynomial sums, C2Seg on a
-> rectangle with `|R|² > 0`, contraction corollary `bez_newton_quadratic`),
-> and `Geom/SphereTrace3.lean` (7a, 3D no-overshoot via `Metric.infDist`). For every C change: keep
-> SIMD bit-identical to scalar (`wtcheck`, incl. the SVE leaf fuzz under
-> qemu), rerun `make formal`, the C suites (`make c_tri_test c_tri_seam_test
-> c_tri_parallel_test`, plus `tests/test_lightrt_c_quadtetra.c` and
-> `tests/test_lightrt_c_surfaces.c` built by hand), `make hip_test` (local RX
-> 9070 XT, use `timeout`), `make hip_rtc_test`, `make vk_test`, and
-> `make cuda_full_test` on zen5 (`sm_86`) and b550 (`sm_120`). Those nodes run
-> a GPU miner, so do correctness checks only there. Measure speed on a quiet
-> machine (best of 9, interleaved; `make bench_occ` for the any-hit pipeline).
-> Report measured costs honestly; keep negative results in PLAN.md. Commit
-> when `make formal` passes, ending messages with `Co-Authored-By: Claude 5.5
-> <noreply@anthropic.com>`. `formal/tools` is gitignored (`git add -f`). Do not
-> push. Never submit Perforce changelists.
+> `/mnt/nvme02/work/lightrt` (pushed to `origin/formal-lean`). Read
+> `formal/PLAN.md` (document of record) first, then this file. Run
+> `make formal` to confirm the baseline (0 sorry, all gates PASS).
+>
+> Open work: M14 basin verification — instantiate
+> `newtonIter_tendsto_of_basin_ball` for `ofCubic` by deriving explicit
+> `R, B, δ` from `PddBounds` + a nondegenerate root; keep the conditional
+> convergence theorems as acceptance if the bound chase stalls. See
+> `formal/PLAN.md` §5. Everything else is a recorded boundary (ISA, tangency,
+> fp64 margins, GPU) or empirical gate (`wtcheck`, `primhitcheck`).
+>
+> For every C change: SIMD bit-identical to scalar (`wtcheck`, incl. SVE under
+> qemu), rerun `make formal`, the C suites, `make hip_test` (local RX 9070 XT,
+> use `timeout`), `make hip_rtc_test`, `make vk_test`, and
+> `make cuda_full_test` on zen5 (`sm_86`) and b550 (`sm_120`) — correctness
+> only there (GPU miner). Measure speed on a quiet machine; keep negative
+> results in `formal/PLAN.md`. Commit only when `make formal` passes, ending
+> messages with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+> `formal/tools` is gitignored (`git add -f`). Do not push unless asked;
+> never submit Perforce changelists.
