@@ -147,8 +147,13 @@ Explicitly deferred/recorded (see PLAN.md):
    `fpT_rel_of_floor`, and explicit inflation `1 + θ + η/κT ≤ (1-θ)(1-u)K`),
    with no `InRange`. `fpT_rel`/`slab_t_err_fma` keep their `InRange` versions.
 4. **A refinement proof for the SIMD watertight leaf (model done; ISA gap
-   recorded).** `C/Proofs/SimdLanes.lean` gives the per-lane model (packed lane
-   ops, `vWoopK` mirroring `Ref.woopK`, `vWoopK_lane`, `blockBest_*`). The
+   audited and made explicit).** `C/Proofs/SimdLanes.lean` gives the per-lane
+   model (packed lane ops, `vWoopK` mirroring `Ref.woopK`, `vWoopK_lane`,
+   `blockBest_*`); `C/Proofs/SimdLeafISA.lean` packages the audit as the
+   `PackedOps` structure and proves `simd_leaf_eq_scalar_of_isa` — SIMD == scalar
+   *conditional* on the vendor intrinsics satisfying the audited per-lane
+   equations (no instance supplied; `wtcheck` remains the empirical gate).
+   The
    ISA/intrinsics semantics is a documented model boundary (see PLAN.md), not
    an axiom; `wtcheck`'s leaf fuzz (400k blocks / 2.7M lanes, incl. SVE 8/16) is
    the empirical check for the watertight kernel, and the new `mtcheck`

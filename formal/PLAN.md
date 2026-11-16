@@ -379,6 +379,21 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   `newton2_step_quadratic`. Supersedes addendum 2's deferral note.
   `LightRT.lean` imports `Geom.BezNewton`.
 
+- **M22 (addendum 13):** the ISA boundary is now a **machine-checked
+  hypothesis**, not just prose (item 4). New `C/Proofs/SimdLeafISA.lean`:
+  `PackedOps` packages the audited per-intrinsic semantics (mul/add/sub/div
+  and ordered/equality compares and mask and/or, each with an equation field
+  tying it to the corresponding `FP.Binary32` lane op), the Woop kernel is
+  re-run over abstract ops (`kWoopK`), `kWoopK_eq_model` proves it equals
+  `SimdLanes.vWoopK` under those equations, and
+  `simd_leaf_eq_scalar_of_isa` composes this with `blockBest_woop`: a block
+  result differing from caller's best is a genuine scalar Woop hit in some
+  lane, **conditional on the vendor ops satisfying PackedOps**. The actual
+  SSE4.1/AVX2/SVE `PackedOps` instance is still not supplied (needs a vendor
+  ISA semantics model); `wtcheck`'s fuzz remains the empirical evidence.
+  The assumption boundary is now explicit in Lean, with the audit table in
+  addendum 11 giving the intrinsic → field correspondence.
+
 - **M22 (addendum 12):** conditional range-free slab completeness (item 3).
   `Robust/SlabTotal.lean`: `fpT_eta_slack` (the absolute-error slack of
   `fpT_abs_err_total`), `fpT_rel_of_floor` (a floor `κ ≤ |t_exact|` converts
