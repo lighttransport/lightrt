@@ -73,10 +73,12 @@ $(BUILD)/node_truth.o: tests/node_truth.c | $(BUILD)
 	$(CC) $(CFLAGS) $(WARN) -c $< -o $@
 node_truth: $(TEST_DEPS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-test: pixel_filter mtlxrender conductor_mixture conductor_response node_truth white_furnace bsdf_response eon_response rough_diffuse diffuse_mixture sheen_mixture texture_sampling volume_lobes
+test: cert_energy film_energy pixel_filter mtlxrender conductor_mixture conductor_response node_truth white_furnace bsdf_response eon_response rough_diffuse diffuse_mixture sheen_mixture texture_sampling volume_lobes
 	./pixel_filter
 	./node_truth
 	./white_furnace
+	./cert_energy
+	./film_energy
 	./bsdf_response
 	./conductor_response
 	./conductor_mixture
@@ -98,6 +100,12 @@ test-viewdirection: mtlxrender
 LEAN_SRC = tests/lean_vectors.c tests/texture_stub.c mtlx_doc.c mtlx_xml.c mtlx_eval.c color.c
 pixel_filter: tests/pixel_filter.c pathtrace.h
 	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/pixel_filter.c -lm
+
+film_energy: tests/film_energy.c bsdf.c bsdf.h vecmath.h
+	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/film_energy.c bsdf.c $(LDFLAGS)
+
+cert_energy: tests/cert_energy.c bsdf.c bsdf.h cert_albedo_table.h vecmath.h
+	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/cert_energy.c bsdf.c $(LDFLAGS)
 
 white_furnace: tests/white_furnace.c bsdf.c bsdf.h mtlx_eval.h vecmath.h
 	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/white_furnace.c bsdf.c $(LDFLAGS)
@@ -171,7 +179,7 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 clean:
-	rm -rf build build-vk mtlxrender node_truth pixel_filter white_furnace bsdf_response texture_sampling \
+	rm -rf build build-vk mtlxrender cert_energy film_energy node_truth pixel_filter white_furnace bsdf_response texture_sampling \
 	       texture-sampling.ppm mtlxvk lean_vectors
 
 # Cross-renderer verification against the ASF MaterialX reference (GLSL + OSL).

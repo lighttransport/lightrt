@@ -602,7 +602,11 @@ static int openpbr_transmission_ior_checks(void) {
       float nl=fabsf(sample.wi.z), lv=sqrtf(a2+(1-a2)*nv*nv);
       float ll=sqrtf(a2+(1-a2)*nl*nl);
       float g2=2*nv*nl/(nv*ll+nl*lv), g1=2*nv/(nv+lv);
-      float expected=(1-fresnel)*g2/(g1*pg);
+      /* From inside OpenPBR glass the base specular lobe also gets the glass
+       * branch's probability (interior_glass_rebalance), so the glass branch is
+       * selected with pg/(1+pg) there. */
+      float pg_side=side ? pg/(1.0f+pg) : pg;
+      float expected=(1-fresnel)*g2/(g1*pg_side);
       if(!isfinite(sample.throughput.x) || fabsf(sample.throughput.x-expected)>2e-4f) {
         fprintf(stderr,"FAIL: rough transmission weight side=%d got=%g expected=%g\n",side,sample.throughput.x,expected); return 0;
       }
@@ -612,7 +616,7 @@ static int openpbr_transmission_ior_checks(void) {
       float raw2=v3_dot(raw,raw), nh=sign*h.z, ih=v3_dot(h,sample.wi);
       float denom=(1-nh*nh)+a2*nh*nh;
       float d=a2/(3.14159265358979323846f*denom*denom);
-      float expected_pdf=pg*d*g1*c/nv*fabsf(ih)/(eta*eta*raw2);
+      float expected_pdf=pg_side*d*g1*c/nv*fabsf(ih)/(eta*eta*raw2);
       float evaluated_pdf=0; v3 f=bsdf_eval(&p,n,wo,sample.wi,&evaluated_pdf);
       if(sample.specular || !(expected_pdf>0) ||
          fabsf(sample.pdf-expected_pdf)>2e-4f*expected_pdf+1e-6f ||

@@ -58,6 +58,9 @@ v3 bsdf_materialx_conductor_anisotropic(v3 eta, v3 extinction, float alpha_x,
 
 /* Enable Turquin-style energy compensation of rough dielectric transmission (default off). */
 void bsdf_set_dielectric_multiscatter(int enable);
+/* 0 = reference (default), 1 = conservative certified dielectric compensation */
+void bsdf_set_energy_mode(int mode);
+int bsdf_energy_mode(void);
 
 /* Importance-sample the BSDF. Returns 0 if no valid sample. */
 int bsdf_sample(const OpenPBRParams *p, v3 N, v3 wo, pcg32 *rng, BsdfSample *out);
