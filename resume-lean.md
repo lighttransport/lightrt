@@ -248,10 +248,15 @@ Explicitly deferred/recorded (see PLAN.md):
   curve, there is a critical point of `φ`, and the C's sample-detected
   bracket converges to it from an arbitrary seed. Newton acceleration is the
   local half (`ofCubic_newton_quadratic`, M7/M22 addendum 4).
-  M14's remaining bulk: the full 2D `(u, t)` basin-of-attraction refinement
-  for `tri_bez_newton` with damped-step/`det > 0` guards (the local
-  contraction core is done; the global 2D refinement is the one open deep
-  item), and floating point of the minimizer (`primhitcheck` covers it).
+  M14 phases 1-2 are also done: `Geom/BezNewtonGuards.lean` models the C's
+  damped step, u-clamp `[-0.05, 1.05]`, det guard and acceptance predicate,
+  with their invariants (`accepted_*`, `damped_step_range`,
+  `jacDet_ne_zero_of_guard`, `dampDu_*`, `clampU_*`). The remaining bulk:
+  M14 phases 3-4 — connect the safeguarded bracket seed to
+  `bez_newton_quadratic`'s basin hypotheses (rectangle containment,
+  `E ≤ B/K`, `δ ≤ |det|`) and prove guarded convergence; local contraction
+  is done, the global 2D refinement is the one open deep item. Floating point
+  of the minimizer stays with `primhitcheck`.
    Patch/NURBS stay measured against `primhitcheck` (item 16 decision).
 
 ## Resuming prompt
