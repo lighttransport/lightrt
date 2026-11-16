@@ -400,5 +400,44 @@ theorem stTrace3_samDist_le_root (S : BezSys) (sites : List ℝ)
     stTrace (fun s => samDist S sites (x₀ + s • v)) t n ≤ root :=
   stTrace_le_root (lipschitz1_samDist_line S sites hv) hroot ht n
 
+/-- The continuous min is a lower bound on the sampled fold: for nonempty
+    site lists lying in `[a, b]`, `bezPhiMin` bounds every sample term from
+    below, hence the min. (The honest direction for the sampled fold: it is
+    an *over*-estimate of the true distance-to-tube, which is why the C
+    can step by it without leaving the search — whether one step suffices
+    for no-overshoot is exactly the density question.) -/
+theorem bezPhiMin_le_foldr (S : BezSys) (x : EuclideanSpace ℝ (Fin 3))
+    {a b : ℝ} (hab : a ≤ b) (us : List ℝ) (u : ℝ)
+    (hu : u ∈ Set.Icc a b) (hsites : ∀ w ∈ us, w ∈ Set.Icc a b) :
+    bezPhiMin S x a b ≤
+      List.foldr (fun v acc => min (dist x (curvePt S v) - S.rad v) acc)
+        (dist x (curvePt S u) - S.rad u) us := by
+  induction us generalizing u hu with
+  | nil =>
+    have h := bezPhiMin_le S x hab hu
+    rwa [bezPhi_eq_dist] at h
+  | cons v us ih =>
+    have hv : v ∈ Set.Icc a b := hsites v (by simp)
+    have hrest : ∀ w ∈ us, w ∈ Set.Icc a b := fun w hw => hsites w (by simp [hw])
+    have h1 : bezPhiMin S x a b ≤ dist x (curvePt S v) - S.rad v := by
+      have h := bezPhiMin_le S x hab hv
+      rwa [bezPhi_eq_dist] at h
+    have h2 : bezPhiMin S x a b ≤
+        List.foldr (fun w acc => min (dist x (curvePt S w) - S.rad w) acc)
+          (dist x (curvePt S u) - S.rad u) us :=
+      ih u hu hrest
+    exact le_min h1 h2
+
+theorem bezPhiMin_le_samDist (S : BezSys) (x : EuclideanSpace ℝ (Fin 3))
+    {a b : ℝ} (hab : a ≤ b) (sites : List ℝ)
+    (hsites : ∀ u ∈ sites, u ∈ Set.Icc a b) (hne : sites ≠ []) :
+    bezPhiMin S x a b ≤ samDist S sites x := by
+  cases sites with
+  | nil => exact absurd rfl hne
+  | cons u us =>
+    have hu : u ∈ Set.Icc a b := hsites u (by simp)
+    have hrest : ∀ w ∈ us, w ∈ Set.Icc a b := fun w hw => hsites w (by simp [hw])
+    exact bezPhiMin_le_foldr S x hab us u hu hrest
+
 end
 end LightRT.Geom

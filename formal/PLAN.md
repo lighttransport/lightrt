@@ -390,6 +390,11 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   What's *not* shown: sampled-min ≥ continuous inf is not relaxed —
   a root of the sampled fold need not lie inside the true tube without a
   density bound on `sites`; `primhitcheck` remains the empirical gate.
+  (addendum 9 cont.) `bezPhiMin_le_samDist`: for nonempty site lists in
+  `[a, b]`, `bezPhiMin ≤ samDist` — the sampled fold is an
+  *over-estimate* of the true distance-to-tube (the correct sign for the
+  C stepping by it); the reverse/alignment bound needs a sample-density
+  argument and stays open.
   (2) the interior nearest point is a critical point of `φ`:
   `interior_min_bezPhi_deriv` (Fermat: at an interior min of `φ` with
   `bezQ ≠ 0`, `φ′ = 0`), `interior_min_bezPhi_envelope` (the foot-point
