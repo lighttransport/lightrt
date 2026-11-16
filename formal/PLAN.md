@@ -379,6 +379,19 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   `newton2_step_quadratic`. Supersedes addendum 2's deferral note.
   `LightRT.lean` imports `Geom.BezNewton`.
 
+- **M22 (addendum 14):** M14 phases 1-2 (modeling the C's `tri_bez_newton`
+  guards). New `Geom/BezNewtonGuards.lean`: `uLo/uHi = [-0.05, 1.05]`,
+  `clampU`, `dampDu` (wild `|du| >= 1` steps become ±0.25), `rawStep`
+  (identical to `newton2Step`), `guardedStep` (damp + advance + clamp) and
+  `accepted` (C's residual / `dF/du < 0` minimum / `[tmin, best) × [0,1]`
+  acceptance). Lemmas: `accepted_residual`, `accepted_minimum`,
+  `accepted_range`, `jacDet_ne_zero_of_guard` (det guard), `dampDu_of_small`,
+  `dampDu_le`, `clampU_mem`, `clampU_eq_of_mem`, `damped_step_range`. The
+  float epsilons and the 12-iteration cap remain parameters/outside the
+  model; the radius kink stays excluded (interval ends are handled by
+  `bezPhi_min_critical`). The global basin-of-attraction connection to
+  `bez_newton_quadratic` is M14 phases 3-4 and remains open.
+
 - **M22 (addendum 13):** the ISA boundary is now a **machine-checked
   hypothesis**, not just prose (item 4). New `C/Proofs/SimdLeafISA.lean`:
   `PackedOps` packages the audited per-intrinsic semantics (mul/add/sub/div
