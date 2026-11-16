@@ -439,5 +439,178 @@ theorem bezPhiMin_le_samDist (S : BezSys) (x : EuclideanSpace ℝ (Fin 3))
     have hrest : ∀ w ∈ us, w ∈ Set.Icc a b := fun w hw => hsites w (by simp [hw])
     exact bezPhiMin_le_foldr S x hab us u hu hrest
 
+/-! ### Quantitative sampled-vs-exact distance bound -/
+
+/-- Lagrange's mean value theorem, collected form: a real function whose
+    derivative is bounded by `M` on `[min u v, max u v]` varies by at most
+    `M · |u − v|` between `u` and `v` inside `[a, b]`. -/
+theorem abs_sub_le_of_deriv_bound {a b : ℝ} {M : ℝ} {g p : ℝ → ℝ}
+    (hd : ∀ w : ℝ, HasDerivAt g (p w) w)
+    (hb : ∀ w ∈ Set.Icc a b, |p w| ≤ M)
+    {u v : ℝ} (hu : u ∈ Set.Icc a b) (hv : v ∈ Set.Icc a b) :
+    |g u - g v| ≤ M * |u - v| := by
+  rcases le_total u v with hle | hle
+  · by_cases hune : u = v
+    · simp [hune]
+    · have hlo : u < v := lt_of_le_of_ne hle hune
+      have hcon : ContinuousOn g (Set.Icc u v) :=
+        fun w _ => (hd w).differentiableAt.continuousAt.continuousWithinAt
+      have hdist : DifferentiableOn ℝ g (Set.Ioo u v) :=
+        fun w _ => (hd w).differentiableAt.differentiableWithinAt
+      obtain ⟨ξ, hξ, hMVT⟩ := exists_deriv_eq_slope g hlo hcon hdist
+      have hξu : ξ ∈ Set.Icc u v := ⟨le_of_lt hξ.1, le_of_lt hξ.2⟩
+      have hξa : ξ ∈ Set.Icc a b := ⟨le_trans hu.1 hξu.1, le_trans hξu.2 hv.2⟩
+      have h1 : |p ξ| ≤ M := hb ξ hξa
+      have hdξ : deriv g ξ = p ξ := (hd ξ).deriv
+      have h3 : g v - g u = p ξ * (v - u) := by
+        rw [hMVT] at hdξ
+        exact (div_eq_iff (sub_ne_zero.2 hlo.ne')).mp hdξ
+      have h2 : |g v - g u| ≤ M * |v - u| := by
+        rw [h3, abs_mul]
+        exact mul_le_mul h1 (le_refl _) (abs_nonneg _)
+          (le_trans (abs_nonneg _) h1)
+      rw [abs_sub_comm (g u) (g v), abs_sub_comm u v]
+      exact h2
+  · by_cases hune : u = v
+    · simp [hune]
+    · have hlo : v < u := lt_of_le_of_ne hle (Ne.symm hune)
+      have hcon : ContinuousOn g (Set.Icc v u) :=
+        fun w _ => (hd w).differentiableAt.continuousAt.continuousWithinAt
+      have hdist : DifferentiableOn ℝ g (Set.Ioo v u) :=
+        fun w _ => (hd w).differentiableAt.differentiableWithinAt
+      obtain ⟨ξ, hξ, hMVT⟩ := exists_deriv_eq_slope g hlo hcon hdist
+      have hξu : ξ ∈ Set.Icc v u := ⟨le_of_lt hξ.1, le_of_lt hξ.2⟩
+      have hξa : ξ ∈ Set.Icc a b := ⟨le_trans hv.1 hξu.1, le_trans hξu.2 hu.2⟩
+      have h1 : |p ξ| ≤ M := hb ξ hξa
+      have hdξ : deriv g ξ = p ξ := (hd ξ).deriv
+      have h3 : g u - g v = p ξ * (u - v) := by
+        rw [hMVT] at hdξ
+        exact (div_eq_iff (sub_ne_zero.2 hlo.ne')).mp hdξ
+      rw [h3, abs_mul]
+      exact mul_le_mul h1 (le_refl _) (abs_nonneg _)
+        (le_trans (abs_nonneg _) h1)
+
+/-- The curve is `√3·M`-Lipschitz on the parameter interval when each
+    component derivative is bounded by `M` there. -/
+theorem curve_dist_le (S : BezSys) {a b : ℝ} {Mx : ℝ} (hM : 0 ≤ Mx)
+    (h : ∀ u ∈ Set.Icc a b, |S.px u| ≤ Mx ∧ |S.py u| ≤ Mx ∧ |S.pz u| ≤ Mx)
+    {u v : ℝ} (hu : u ∈ Set.Icc a b) (hv : v ∈ Set.Icc a b) :
+    dist (curvePt S u) (curvePt S v) ≤ Real.sqrt 3 * Mx * |u - v| := by
+  have hx := abs_sub_le_of_deriv_bound (hd := S.hγx) (hb := fun w hw => (h w hw).1) hu hv
+  have hy := abs_sub_le_of_deriv_bound (hd := S.hγy) (hb := fun w hw => (h w hw).2.1) hu hv
+  have hz := abs_sub_le_of_deriv_bound (hd := S.hγz) (hb := fun w hw => (h w hw).2.2) hu hv
+  have d2 : dist (curvePt S u) (curvePt S v) ^ 2 =
+      (S.gx u - S.gx v) ^ 2 + (S.gy u - S.gy v) ^ 2 + (S.gz u - S.gz v) ^ 2 := by
+    rw [EuclideanSpace.dist_sq_eq]
+    simp [Fin.sum_univ_three, Real.dist_eq, sq_abs]
+  have s1 : (S.gx u - S.gx v) ^ 2 ≤ (Mx * |u - v|) ^ 2 := by
+    rw [← sq_abs (S.gx u - S.gx v)]
+    exact pow_le_pow_left₀ (abs_nonneg _) hx 2
+  have s2 : (S.gy u - S.gy v) ^ 2 ≤ (Mx * |u - v|) ^ 2 := by
+    rw [← sq_abs (S.gy u - S.gy v)]
+    exact pow_le_pow_left₀ (abs_nonneg _) hy 2
+  have s3 : (S.gz u - S.gz v) ^ 2 ≤ (Mx * |u - v|) ^ 2 := by
+    rw [← sq_abs (S.gz u - S.gz v)]
+    exact pow_le_pow_left₀ (abs_nonneg _) hz 2
+  have hsq : dist (curvePt S u) (curvePt S v) ^ 2 ≤ 3 * Mx ^ 2 * (u - v) ^ 2 := by
+    rw [d2]
+    have e : (Mx * |u - v|) ^ 2 = Mx ^ 2 * (u - v) ^ 2 := by rw [mul_pow, sq_abs]
+    nlinarith [s1, s2, s3, e]
+  calc dist (curvePt S u) (curvePt S v) =
+        Real.sqrt (dist (curvePt S u) (curvePt S v) ^ 2) := (Real.sqrt_sq dist_nonneg).symm
+    _ ≤ Real.sqrt (3 * Mx ^ 2 * (u - v) ^ 2) := Real.sqrt_le_sqrt hsq
+    _ = Real.sqrt 3 * Mx * |u - v| := by
+        have e : (3:ℝ) * Mx ^ 2 * (u - v) ^ 2 = (Real.sqrt 3 * Mx * |u - v|) ^ 2 := by
+          rw [mul_pow, mul_pow, Real.sq_sqrt (by norm_num : (0:ℝ) ≤ 3), sq_abs]
+        have h1 : (0:ℝ) ≤ Real.sqrt 3 * Mx * |u - v| :=
+          mul_nonneg (mul_nonneg (Real.sqrt_nonneg _) hM) (abs_nonneg _)
+        rw [e, Real.sqrt_sq h1]
+
+theorem rad_dist_le (S : BezSys) {a b : ℝ} {Mr : ℝ}
+    (h : ∀ u ∈ Set.Icc a b, |S.dr u| ≤ Mr) {u v : ℝ} (hu : u ∈ Set.Icc a b)
+    (hv : v ∈ Set.Icc a b) :
+    |S.rad u - S.rad v| ≤ Mr * |u - v| :=
+  abs_sub_le_of_deriv_bound (hd := S.hρ) (hb := h) hu hv
+
+theorem foldr_min_le_base {f : ℝ → ℝ} : ∀ (l : List ℝ) (b : ℝ),
+    List.foldr (fun v acc => min (f v) acc) b l ≤ b := by
+  intro l
+  induction l with
+  | nil => intro b; exact le_refl _
+  | cons v us ih =>
+    intro b
+    simp only [List.foldr]
+    exact le_trans (min_le_right _ _) (ih b)
+
+/-- The `foldr` of `min (f v)` is bounded by any member `f i`. -/
+theorem foldr_min_le_mem {f : ℝ → ℝ} {l : List ℝ} {i : ℝ} {b : ℝ} (hi : i ∈ l) :
+    List.foldr (fun v acc => min (f v) acc) b l ≤ f i := by
+  induction l with
+  | nil => simp at hi
+  | cons v us ih =>
+    by_cases h' : i = v
+    · subst h'
+      simp only [List.foldr]
+      exact min_le_left _ _
+    · have hi' : i ∈ us := by
+        rcases List.mem_cons.mp hi with h | h
+        · exact absurd h h'
+        · exact h
+      simp only [List.foldr]
+      exact le_trans (min_le_right _ _) (ih hi')
+
+theorem samDist_le_mem (S : BezSys) (x : EuclideanSpace ℝ (Fin 3)) (sites : List ℝ)
+    {i : ℝ} (hmem : i ∈ sites) :
+    samDist S sites x ≤ dist x (curvePt S i) - S.rad i := by
+  match sites, hmem with
+  | [], hi => exact absurd hi (by simp)
+  | u :: us, hi =>
+    show List.foldr (fun v acc => min (dist x (curvePt S v) - S.rad v) acc)
+        (dist x (curvePt S u) - S.rad u) us ≤ _
+    rcases List.mem_cons.mp hi with h | h
+    · subst h
+      exact foldr_min_le_base us _
+    · exact foldr_min_le_mem h
+
+/-- **Quantitative sampled-vs-exact bound**: over sites with covering
+    radius `R` on `[a, b]`, the sampled fold is at most
+    `bezPhiMin + (√3·Mx + Mr)·R` — one Bézier-length bound plus one radius
+    slope bound, times how far the site list can be from every point of
+    the interval. -/
+theorem samDist_le_bezPhiMin_add (S : BezSys) (x : EuclideanSpace ℝ (Fin 3))
+    {a b : ℝ} (hab : a ≤ b) (Mx Mr R : ℝ) (hM : 0 ≤ Mx)
+    (hMx : ∀ u ∈ Set.Icc a b,
+      |S.px u| ≤ Mx ∧ |S.py u| ≤ Mx ∧ |S.pz u| ≤ Mx ∧ |S.dr u| ≤ Mr)
+    (sites : List ℝ) (hsites : ∀ u ∈ sites, u ∈ Set.Icc a b) (_hne : sites ≠ [])
+    (hR : ∀ u ∈ Set.Icc a b, ∃ i ∈ sites, |u - i| ≤ R) :
+    samDist S sites x ≤ bezPhiMin S x a b + (Real.sqrt 3 * Mx + Mr) * R := by
+  have Mr_nonneg : 0 ≤ Mr :=
+    le_trans (abs_nonneg _) (hMx a ⟨le_refl a, hab⟩).2.2.2
+  obtain ⟨u₀, hu₀, hφ0⟩ := bezPhiMin_eq S x hab
+  obtain ⟨i, hi, hRi⟩ := hR u₀ hu₀
+  have hsam : samDist S sites x ≤ dist x (curvePt S i) - S.rad i :=
+    samDist_le_mem S x sites hi
+  have hC : dist (curvePt S u₀) (curvePt S i) ≤ Real.sqrt 3 * Mx * |u₀ - i| :=
+    curve_dist_le S hM (fun w hw => ⟨(hMx w hw).1, (hMx w hw).2.1, (hMx w hw).2.2.1⟩) hu₀ (hsites i hi)
+  have hdist_xi : dist x (curvePt S i) ≤ dist x (curvePt S u₀) + Real.sqrt 3 * Mx * |u₀ - i| := by
+    have h := dist_triangle x (curvePt S u₀) (curvePt S i)
+    linarith [h, hC]
+  have hr_rad : S.rad u₀ - S.rad i ≤ Mr * |u₀ - i| := by
+    have h := rad_dist_le S (fun w hw => (hMx w hw).2.2.2) hu₀ (hsites i hi)
+    have h1 := (abs_le.mp h).2
+    linarith
+  have hr_step : (Real.sqrt 3 * Mx + Mr) * |u₀ - i| ≤ (Real.sqrt 3 * Mx + Mr) * R := by
+    apply mul_le_mul_of_nonneg_left hRi
+    have h1 : (0:ℝ) ≤ Real.sqrt 3 * Mx := mul_nonneg (Real.sqrt_nonneg _) hM
+    exact add_nonneg h1 Mr_nonneg
+  have hφ : bezPhi S x u₀ = dist x (curvePt S u₀) - S.rad u₀ := bezPhi_eq_dist S x u₀
+  calc samDist S sites x ≤ dist x (curvePt S i) - S.rad i := hsam
+    _ ≤ (dist x (curvePt S u₀) + Real.sqrt 3 * Mx * |u₀ - i|) -
+          (S.rad u₀ - Mr * |u₀ - i|) := by linarith [hdist_xi, hr_rad]
+    _ = (dist x (curvePt S u₀) - S.rad u₀) + (Real.sqrt 3 * Mx + Mr) * |u₀ - i| := by ring
+    _ ≤ bezPhiMin S x a b + (Real.sqrt 3 * Mx + Mr) * R := by
+        rw [← hφ, hφ0]
+        linarith [hr_step]
+
 end
 end LightRT.Geom

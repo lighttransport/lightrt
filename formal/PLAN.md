@@ -393,8 +393,14 @@ Full verification of the SIMD and GPU kernels is out of scope. They are byte-for
   (addendum 9 cont.) `bezPhiMin_le_samDist`: for nonempty site lists in
   `[a, b]`, `bezPhiMin ≤ samDist` — the sampled fold is an
   *over-estimate* of the true distance-to-tube (the correct sign for the
-  C stepping by it); the reverse/alignment bound needs a sample-density
-  argument and stays open.
+  C stepping by it). And the **quantitative** density bound:
+  `samDist_le_bezPhiMin_add` — for sites covering `[a, b]` with radius
+  `R` and per-component derivative bounds `Mx` (curve) and `Mr` (radius),
+  `samDist x ≤ bezPhiMin S x a b + (√3·Mx + Mr)·R`, via
+  `abs_sub_le_of_deriv_bound` (MVT), `curve_dist_le`, `rad_dist_le`,
+  `foldr_min_le_mem`, `samDist_le_mem`. Together with
+  `bezPhiMin_le_samDist` this sandwiches the sampled fold:
+  `bezPhiMin ≤ samDist ≤ bezPhiMin + (√3·Mx + Mr)·R`.
   (2) the interior nearest point is a critical point of `φ`:
   `interior_min_bezPhi_deriv` (Fermat: at an interior min of `φ` with
   `bezQ ≠ 0`, `φ′ = 0`), `interior_min_bezPhi_envelope` (the foot-point
