@@ -34,6 +34,7 @@ import LightRT.Geom.BezTube
 namespace LightRT.Geom
 
 open Real
+open Filter Topology
 
 namespace BezSys
 
@@ -169,6 +170,145 @@ theorem bezF_eq_zero_of_critical_of_contact (S : BezSys) {u₀ t : ℝ}
   rw [hnum, hsqrt] at hderiv
   field_simp [ne_of_gt hradpos] at hderiv
   nlinarith
+
+
+/-! ### Phase 4: convergence of the Newton iteration inside the basin -/
+
+/-- Quadratic-to-linear error recurrence: if `0 ≤ q < 1` and the seed satisfies
+    `q + C·E₀ < 1`, then `E_{n+1} ≤ q E_n + C E_n²` forces `E_n → 0`.
+    The linear term is the honest `2B²/δ · E` from `newton2_step_quadratic`;
+    when `2B²/δ` is small (well-conditioned root) convergence follows. -/
+theorem tendsto_zero_of_linear_quadratic_contract
+    (E : ℕ → ℝ) (q C c0 : ℝ)
+    (hq0 : 0 ≤ q) (hq1 : q < 1) (hC0 : 0 ≤ C) (hc00 : 0 ≤ c0)
+    (hrec : ∀ n, E (n + 1) ≤ q * E n + C * (E n) ^ 2)
+    (hE0 : E 0 ≤ c0) (hseed : q + C * c0 < 1)
+    (hE_nonneg : ∀ n, 0 ≤ E n) :
+    Tendsto E atTop (𝓝 0) := by
+  let r : ℝ := q + C * c0
+  have hr0 : 0 ≤ r := by dsimp [r]; nlinarith [mul_nonneg hC0 hc00]
+  have hr1 : r < 1 := by dsimp [r] at hseed ⊢; exact hseed
+  have hbound : ∀ n, E n ≤ c0 * r ^ n := by
+    intro n
+    induction n with
+    | zero => simpa using hE0
+    | succ n ih =>
+      have hEn0 := hE_nonneg n
+      have hrpow_le : r ^ n ≤ 1 := by exact pow_le_one₀ hr0 (le_of_lt hr1)
+      have hEnc0 : E n ≤ c0 := le_trans ih (mul_le_of_le_one_right hc00 hrpow_le)
+      have hsq : (E n) ^ 2 ≤ c0 * E n := by
+        rw [pow_two]
+        exact mul_le_mul_of_nonneg_right hEnc0 hEn0
+      have h1 : C * (E n) ^ 2 ≤ C * c0 * E n := by
+        calc C * (E n) ^ 2 ≤ C * (c0 * E n) := mul_le_mul_of_nonneg_left hsq hC0
+          _ = C * c0 * E n := by ring
+      have h2 : E (n + 1) ≤ r * E n := by
+        dsimp [r]
+        nlinarith [hrec n, h1]
+      have h3 : r * E n ≤ r * (c0 * r ^ n) := mul_le_mul_of_nonneg_left ih hr0
+      rw [pow_succ]
+      nlinarith [h2, h3]
+  have hp : Tendsto (fun n : ℕ => c0 * r ^ n) atTop (𝓝 0) := by
+    have hpow : Tendsto (fun n : ℕ => r ^ n) atTop (𝓝 0) :=
+      tendsto_pow_atTop_nhds_zero_of_lt_one hr0 hr1
+    simpa using hpow.const_mul c0
+  exact squeeze_zero hE_nonneg hbound hp
+
+/-- The raw Newton iterates of the contact system from a seed `(u, t)`. -/
+noncomputable def newtonIter (S : BezSys) (u t : ℝ) : ℕ → ℝ × ℝ
+  | 0 => (u, t)
+  | n + 1 =>
+    let st := newtonIter S u t n
+    newton2Step (bezF S) (bezG S) st.1 st.2
+
+@[simp] theorem newtonIter_zero (S : BezSys) (u t : ℝ) : newtonIter S u t 0 = (u, t) := rfl
+
+theorem newtonIter_succ (S : BezSys) (u t : ℝ) (n : ℕ) :
+    newtonIter S u t (n + 1) =
+      newton2Step (bezF S) (bezG S) (newtonIter S u t n).1 (newtonIter S u t n).2 := rfl
+
+/-- **Guarded Newton convergence inside the basin.** Assume a root `(u₀, t₀)`
+    of the contact system and uniform local hypotheses (rectangle containment,
+    partial bounds, det bound) at *every* iterate — this is exactly what
+    "the guarded iterates stay in the basin" means, as a hypothesis. If the
+    condition number term `2B²/δ < 1` and the seed error is small enough, the
+    iterates converge to the root. (The strength of the basin hypothesis is
+    honest: the quantitative verification of it from control-point bounds is
+    the remaining coefficient chase.) -/
+theorem newtonIter_tendsto_of_basin (S : BezSys) (a b c d K B δ : ℝ)
+    (hlene : ∀ u ∈ Set.Icc a b, ∀ t ∈ Set.Icc c d, 0 < S.q u t)
+    (hb : PddBounds S a b c d K) (hK : 0 < K) (hB : 0 ≤ B) (hδ : 0 < δ)
+    {u₀ t₀ u t : ℝ}
+    (hu₀ : u₀ ∈ Set.Icc a b) (ht₀ : t₀ ∈ Set.Icc c d)
+    (hroot : bezF S u₀ t₀ = 0 ∧ bezG S u₀ t₀ = 0)
+    (hAb : |pd1 (bezF S) u₀ t₀| ≤ B) (hBb : |pd2 (bezF S) u₀ t₀| ≤ B)
+    (hCb : |pd1 (bezG S) u₀ t₀| ≤ B) (hDb : |pd2 (bezG S) u₀ t₀| ≤ B)
+    (hbasin : ∀ n,
+      let st := newtonIter S u t n
+      st.1 ∈ Set.Icc a b ∧ st.2 ∈ Set.Icc c d ∧
+      |pd1 (bezF S) st.1 st.2| ≤ B ∧ |pd2 (bezF S) st.1 st.2| ≤ B ∧
+      |pd1 (bezG S) st.1 st.2| ≤ B ∧ |pd2 (bezG S) st.1 st.2| ≤ B ∧
+      δ ≤ |jacDet (bezF S) (bezG S) st.1 st.2| ∧
+      |st.1 - u₀| + |st.2 - t₀| ≤ B / K)
+    (hcond : 2 * B ^ 2 / δ < 1)
+    (hseed : 2 * B ^ 2 / δ + (18 * B * K / δ) * (|u - u₀| + |t - t₀|) < 1) :
+    Tendsto (fun n => (newtonIter S u t n).1) atTop (𝓝 u₀) ∧
+    Tendsto (fun n => (newtonIter S u t n).2) atTop (𝓝 t₀) := by
+  let E : ℕ → ℝ := fun n => |(newtonIter S u t n).1 - u₀| + |(newtonIter S u t n).2 - t₀|
+  let q : ℝ := 2 * B ^ 2 / δ
+  let CC : ℝ := 18 * B * K / δ
+  have hq0 : 0 ≤ q := by dsimp [q]; positivity
+  have hq1 : q < 1 := by dsimp [q] at hcond ⊢; exact hcond
+  have hCC0 : 0 ≤ CC := by dsimp [CC]; positivity
+  have hE0 : E 0 ≤ |u - u₀| + |t - t₀| := by simp [E]
+  have hE_nonneg : ∀ n, 0 ≤ E n := by
+    intro n; dsimp [E]; positivity
+  have hrec : ∀ n, E (n + 1) ≤ q * E n + CC * (E n) ^ 2 := by
+    intro n
+    have hn := hbasin n
+    dsimp only at hn
+    rcases hn with ⟨hun, htn, hU, hV, hW, hZ, hdet, hEn⟩
+    have hstep := bez_newton_quadratic S a b c d K B δ hlene hb hK hB
+      hun hu₀ htn ht₀ hroot hU hV hW hZ hAb hBb hCb hDb hdet hδ hEn
+    dsimp [E]
+    have hnonneg : 0 ≤ E n := hE_nonneg n
+    have hE2_le : (E n) ^ 2 ≤ (B / K) * E n := by
+      have hBK0 : 0 ≤ B / K := div_nonneg hB hK.le
+      rw [pow_two]
+      exact mul_le_mul_of_nonneg_right hEn hnonneg
+    have hstep1 := hstep.1
+    have hstep2 := hstep.2
+    have hEdef : E n = |(newtonIter S u t n).1 - u₀| + |(newtonIter S u t n).2 - t₀| := rfl
+    rw [← hEdef] at hstep1 hstep2
+    have hsum : E (n + 1) ≤ (10 * B * K / δ) * (E n) ^ 2 +
+        (8 * B * K * (E n) ^ 2 + 2 * B ^ 2 * (E n)) / δ := by
+      dsimp [E]
+      exact add_le_add hstep1 hstep2
+    have hsum2 : (10 * B * K / δ) * (E n) ^ 2 +
+        (8 * B * K * (E n) ^ 2 + 2 * B ^ 2 * (E n)) / δ =
+      q * (E n) + CC * (E n) ^ 2 := by
+      dsimp [q, CC]; ring
+    rw [hsum2] at hsum
+    exact hsum
+  have hEseed : q + CC * (|u - u₀| + |t - t₀|) < 1 := by
+    dsimp [q, CC] at hseed ⊢
+    exact hseed
+  have htendE : Tendsto E atTop (𝓝 0) :=
+    tendsto_zero_of_linear_quadratic_contract E q CC (|u - u₀| + |t - t₀|)
+      hq0 hq1 hCC0 (by positivity) hrec hE0 hEseed hE_nonneg
+  have hu_tend : Tendsto (fun n => |(newtonIter S u t n).1 - u₀|) atTop (𝓝 0) := by
+    have hle : ∀ n, |(newtonIter S u t n).1 - u₀| ≤ E n := by
+      intro n; dsimp [E]; linarith [abs_nonneg ((newtonIter S u t n).2 - t₀)]
+    exact squeeze_zero (fun n => abs_nonneg _) hle htendE
+  have ht_tend : Tendsto (fun n => |(newtonIter S u t n).2 - t₀|) atTop (𝓝 0) := by
+    have hle : ∀ n, |(newtonIter S u t n).2 - t₀| ≤ E n := by
+      intro n; dsimp [E]; linarith [abs_nonneg ((newtonIter S u t n).1 - u₀)]
+    exact squeeze_zero (fun n => abs_nonneg _) hle htendE
+  constructor
+  · exact tendsto_iff_dist_tendsto_zero.mpr (by
+      simpa [Real.dist_eq, abs_sub_comm] using hu_tend)
+  · exact tendsto_iff_dist_tendsto_zero.mpr (by
+      simpa [Real.dist_eq, abs_sub_comm] using ht_tend)
 
 end BezSys
 end LightRT.Geom
