@@ -78,11 +78,11 @@ on the miner nodes); no C changes in the formalization-only milestones.
    guard model, algebraic bridge, and two conditional convergence theorems
    (`newtonIter_tendsto_of_basin` with per-iterate hypotheses,
    `newtonIter_tendsto_of_basin_ball` with a single neighbourhood check).
-   Progress: `jacDet_variation_bound` (Lipschitz variation of the Jacobian
-   from `C2Seg`) and `basin_ball_of_data` (the ball hypotheses follow from
-   explicit root data `B0, det0`, radius `R` and concrete smallness
-   inequalities) are proved. Remaining: exhibit such data for `ofCubic` from
-   a nondegenerate root and instantiate `newtonIter_tendsto_of_basin_ball`.
+   Progress: `jacDet_variation_bound` (Lipschitz variation of the Jacobian),
+   `basin_ball_of_data`, and `newtonIter_tendsto_of_root_data` (guarded
+   convergence from explicit root data `B0, det0, R` plus `PddBounds`) are
+   proved. Remaining: supply those data for `ofCubic` from a nondegenerate
+   root (control-point bound chase).
 2. **Item 4 instance** (blocked): needs vendor ISA semantics; stays conditional.
 3. **GPU formalization** (deferred by decision): would require a device-kernel
    semantics and codegen verification; not scheduled.

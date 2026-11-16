@@ -536,5 +536,52 @@ theorem basin_ball_of_data (S : BezSys) (a b c d K B0 B det0 δ R : ℝ)
     nlinarith [htri, hdet0, hvar, hδ_le]
   exact ⟨b1, b2, b3, b4, hdet_lower⟩
 
+
+/-- **M14 convergence from explicit root data.** Given a nondegenerate root of
+    the contact system with bounds `B0` on the four root partials and `det0`
+    on `|det J|`, a radius `R` satisfying concrete inequalities, and a seed in
+    the ball, the guarded Newton iteration converges to the root. This is the
+    instantiated form of `newtonIter_tendsto_of_basin_ball`: the one-off
+    neighbourhood check is discharged by `basin_ball_of_data`. -/
+theorem newtonIter_tendsto_of_root_data (S : BezSys) (a b c d K B0 det0 R : ℝ)
+    (hb : PddBounds S a b c d K)
+    (hlene : ∀ u ∈ Set.Icc a b, ∀ t ∈ Set.Icc c d, 0 < S.q u t)
+    (hK : 0 < K) (hK0 : 0 ≤ K) (hB0 : 0 ≤ B0) (hdet0pos : 0 < det0)
+    {u₀ t₀ u t : ℝ}
+    (hu₀ : u₀ ∈ Set.Icc a b) (ht₀ : t₀ ∈ Set.Icc c d)
+    (hroot : bezF S u₀ t₀ = 0 ∧ bezG S u₀ t₀ = 0)
+    (hB0F : |pd1 (bezF S) u₀ t₀| ≤ B0) (hB0G : |pd2 (bezF S) u₀ t₀| ≤ B0)
+    (hB0H : |pd1 (bezG S) u₀ t₀| ≤ B0) (hB0I : |pd2 (bezG S) u₀ t₀| ≤ B0)
+    (hdet0 : det0 ≤ |jacDet (bezF S) (bezG S) u₀ t₀|)
+    (hR0 : 0 ≤ R) (hKR : K * R ≤ 1)
+    (hvar : 4 * B0 * K * R + 4 * (K * R) ^ 2 ≤ det0 / 2)
+    (hcond : 2 * (B0 + K * R + 1) ^ 2 / (det0 / 2) < 1)
+    (hsmall : 2 * (B0 + K * R + 1) ^ 2 / (det0 / 2) +
+        18 * (B0 + K * R + 1) * K / (det0 / 2) * R < 1)
+    (hrect : ∀ u' t', |u' - u₀| + |t' - t₀| ≤ R →
+      u' ∈ Set.Icc a b ∧ t' ∈ Set.Icc c d)
+    (hseed : |u - u₀| + |t - t₀| ≤ R) :
+    Tendsto (fun n => (newtonIter S u t n).1) atTop (𝓝 u₀) ∧
+    Tendsto (fun n => (newtonIter S u t n).2) atTop (𝓝 t₀) := by
+  have hCF : C2Seg (bezF S) a b c d K := bezF_C2Seg S a b c d K hb
+  have hCG : C2Seg (bezG S) a b c d K := bezG_C2Seg S a b c d K hlene hb
+  let B : ℝ := B0 + K * R + 1
+  let δ : ℝ := det0 / 2
+  have hBpos : 0 ≤ B := by dsimp [B]; positivity
+  have hδpos : 0 < δ := by dsimp [δ]; positivity
+  have hB_bound : B0 + K * R ≤ B := by dsimp [B]; linarith
+  have hδ_le : δ ≤ det0 - (4 * B0 * K * R + 4 * (K * R) ^ 2) := by
+    dsimp [δ]; linarith
+  have hball := basin_ball_of_data S a b c d K B0 B det0 δ R hCF hCG hK hK0 hu₀ ht₀
+    hroot hB0F hB0G hB0H hB0I hdet0 hB_bound hδpos hδ_le hR0 hKR hrect
+  have hBge1 : 1 ≤ B := by dsimp [B]; nlinarith [hB0, mul_nonneg hK0 hR0]
+  have hRK : R ≤ B / K := by
+    have h1 : R ≤ 1 / K := (le_div_iff₀' hK).mpr (by simpa [mul_comm] using hKR)
+    have h2 : (1:ℝ) / K ≤ B / K := div_le_div_of_nonneg_right hBge1 hK.le
+    exact h1.trans h2
+  exact newtonIter_tendsto_of_basin_ball S a b c d K B δ R hlene
+    hb hK hBpos hδpos hu₀ ht₀ hroot hR0 hRK
+    hrect hball hcond hseed hsmall
+
 end BezSys
 end LightRT.Geom
