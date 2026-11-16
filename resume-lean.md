@@ -207,11 +207,16 @@ Explicitly deferred/recorded (see PLAN.md):
      (Fermat), `interior_min_bezPhi_envelope` (the foot-point equation
      `⟨x − C, C′⟩/|x − C| = −r′`), and `bezPhi_min_critical` (min of φ
      on `[a,b]` is attained at an endpoint, an interior critical point,
-     or on the curve), and `bezPhiMin_le_samDist` (for nonempty sites in
+     or on the curve), `bezPhiMin_le_samDist` (for nonempty sites in
      `[a,b]`, the continuous min bounds the sampled fold below — the
      sampled fold is an over-estimate of the true distance-to-tube, the
      sign that makes the C's stepping by it safe in the no-overshoot
-     sense). The Newton contraction core already landed as
+     sense), and the quantitative sandwich `samDist_le_bezPhiMin_add`:
+     `bezPhiMin ≤ samDist ≤ bezPhiMin + (√3·Mx + Mr)·R` for sites with
+     covering radius `R` and per-component derivative bounds `Mx` (curve)
+     and `Mr` (radius), via MVT (`abs_sub_le_of_deriv_bound`),
+     `curve_dist_le`, `rad_dist_le`, `foldr_min_le_mem`, `samDist_le_mem`.
+     The Newton contraction core already landed as
      `ofCubic_newton_quadratic` (M7/M22 addendum 4). M14's remaining
      bulk: the global Newton argument (basin of attraction / existence
      of the nearest foot with nondegenerate Jacobian), the sampled-fold
