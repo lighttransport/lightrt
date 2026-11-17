@@ -83,8 +83,16 @@ on the miner nodes); no C changes in the formalization-only milestones.
    convergence from explicit root data `B0, det0, R` plus `PddBounds`) are
    proved; `exists_radius_of_data` proves the radius conditions are
    satisfiable whenever `4(B0+1)² < det0` (non-vacuity sanity example in
-   `Sanity.lean`). Remaining: supply `B0, det0` for `ofCubic` from a
-   nondegenerate root (control-point bound chase).
+   `Sanity.lean`). The control-point bound chase now lands (`BezBounds.lean`,
+   `BezData.lean`): `bez_root_partial_bounds` bounds the four first partials
+   of any `BezSys` from scalar field bounds; `ofCubic_root_data_B0` supplies
+   `B0` (= `ofCubicB0`) from the Bézier control points and ray direction;
+   `ofCubic_newton_tendsto_of_root_data` feeds that `B0` straight into
+   `newtonIter_tendsto_of_root_data`. The genuine nondegeneracy hypotheses
+   (`PddBounds`, `0 < q` on the rectangle, `det0 ≤ |det J|`, radius/geometry)
+   remain as hypotheses — the acceptance criterion is conditional
+   convergence. A lower bound on `|det J|` cannot be proved for arbitrary
+   control points, so `det0` stays data.
 2. **Item 4 instance** (blocked): needs vendor ISA semantics; stays conditional.
 3. **GPU formalization** (deferred by decision): would require a device-kernel
    semantics and codegen verification; not scheduled.
