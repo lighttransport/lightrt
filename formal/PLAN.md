@@ -81,8 +81,10 @@ on the miner nodes); no C changes in the formalization-only milestones.
    Progress: `jacDet_variation_bound` (Lipschitz variation of the Jacobian),
    `basin_ball_of_data`, and `newtonIter_tendsto_of_root_data` (guarded
    convergence from explicit root data `B0, det0, R` plus `PddBounds`) are
-   proved. Remaining: supply those data for `ofCubic` from a nondegenerate
-   root (control-point bound chase).
+   proved; `exists_radius_of_data` proves the radius conditions are
+   satisfiable whenever `4(B0+1)² < det0` (non-vacuity sanity example in
+   `Sanity.lean`). Remaining: supply `B0, det0` for `ofCubic` from a
+   nondegenerate root (control-point bound chase).
 2. **Item 4 instance** (blocked): needs vendor ISA semantics; stays conditional.
 3. **GPU formalization** (deferred by decision): would require a device-kernel
    semantics and codegen verification; not scheduled.
