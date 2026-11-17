@@ -119,6 +119,8 @@ static void usage(const char *prog) {
         "  --verified-math        strict modeled sine/cosine for MaterialX graph evaluation\n"
         "  --ms-dielectric        energy-compensate rough dielectric transmission (Turquin)\n"
         "  --energy-mode M        reference (default) | conservative (certified glass R/T scale)\n"
+        "  --layering L           physical (default) | graph: OpenPBR graph's layer throughput on\n"
+        "                         transmission (double Fresnel, issues/materialx/02; diagnostic)\n"
         "  --env <file.exr>       lat-long HDRI environment\n"
         "  --env-intensity <f>    env scale (default 1)\n"
         "  --env-rotation <deg>   HDRI azimuth rotation (default 0)\n"
@@ -200,6 +202,12 @@ int main(int argc, char **argv) {
             else if (!strcmp(mode, "conservative")) bsdf_set_energy_mode(1);
             else { fprintf(stderr, "invalid --energy-mode: %s\n", mode); return 1; }
         }
+        else if (!strcmp(a, "--layering")) {
+            const char *mode = NEXT;
+            if (!strcmp(mode, "physical")) bsdf_set_layering_graph(0);
+            else if (!strcmp(mode, "graph")) bsdf_set_layering_graph(1);
+            else { fprintf(stderr, "invalid --layering: %s\n", mode); return 1; }
+        }
         else if (!strcmp(a, "--env-rotation")) env_rot = (float)atof(NEXT);
         else if (!strcmp(a, "--sky")) sky = 1;
         else if (!strcmp(a, "--sun")) sun_on = 1;
@@ -230,6 +238,10 @@ int main(int argc, char **argv) {
     if (ms_dielectric_on && bsdf_energy_mode() == 1) {
         fprintf(stderr, "--ms-dielectric (uncertified diagnostic) cannot be combined with "
                         "--energy-mode conservative\n");
+        return 1;
+    }
+    if (bsdf_layering_graph() && bsdf_energy_mode() == 1) {
+        fprintf(stderr, "--layering graph (diagnostic) cannot be combined with --energy-mode conservative\n");
         return 1;
     }
     if ((!gltf_path && !obj_path) || !mtlx_path) { usage(argv[0]); return 1; }
