@@ -1,6 +1,6 @@
 # LightRT formal verification — PLAN (document of record)
 
-Status: 2026-11-17. Branch `formal-lean` (`origin/formal-lean`), tree clean.
+Status: 2026-11-17. Branch `formal-lean` (local commits ahead of `origin/formal-lean`, not pushed), tree clean.
 `make formal`: PASS end-to-end. `count_sorry --max 0`: 0 sorry.
 Axioms: only `propext`, `Quot.sound`, `Classical.choice`. No `native_decide`.
 
@@ -68,12 +68,15 @@ on the miner nodes); no C changes in the formalization-only milestones.
   stays out of scope (`tlascheck` covers it).
 - **GPU kernels**: out of scope for formalization for now; trusted ports of C,
   validated by the C suites and `cdiff`-family checks.
-- **M14 remainder**: the quantitative verification of the Newton basin
-  hypotheses (see §5); floating point of the minimizer remains `primhitcheck`-gated.
+- **M14 remainder**: the Newton basin hypotheses are discharged conditionally
+  (see §5); `det0` (a lower bound on `|det J|`) is data, not an axiom, since it
+  cannot be proved for arbitrary control points. Floating point of the
+  minimizer remains `primhitcheck`-gated.
 
 ## 5. Roadmap (open)
 
-1. **M14 basin verification (F)** — the one open deep item. Done: local
+1. **M14 basin verification (F)** — **complete** under the acceptance
+   criterion (conditional convergence). Done: local
    contraction (`ofCubic_newton_quadratic`), safeguarded bracket (`bracket_root`),
    guard model, algebraic bridge, and two conditional convergence theorems
    (`newtonIter_tendsto_of_basin` with per-iterate hypotheses,
@@ -92,7 +95,12 @@ on the miner nodes); no C changes in the formalization-only milestones.
    (`PddBounds`, `0 < q` on the rectangle, `det0 ≤ |det J|`, radius/geometry)
    remain as hypotheses — the acceptance criterion is conditional
    convergence. A lower bound on `|det J|` cannot be proved for arbitrary
-   control points, so `det0` stays data.
+   control points, so `det0` stays data. `K` / `PddBounds` are also supplied
+   from the control points now (`BezSecondDeriv.lean` proves closed forms for
+   all eight second partials; `BezKBounds.lean` derives `ofCubicK` and
+   `ofCubic_PddBounds`, and `ofCubic_newton_tendsto_of_control_points`
+   supplies both `B0` and `K`, leaving only `det0`, the length floor, the
+   parameter bounds, and radius/geometry as hypotheses).
 2. **Item 4 instance** (blocked): needs vendor ISA semantics; stays conditional.
 3. **GPU formalization** (deferred by decision): would require a device-kernel
    semantics and codegen verification; not scheduled.
