@@ -37,4 +37,13 @@ example : ¬ BVH.Tree.Contains (fun (_ : Unit) => (⟨fun _ => 0, fun _ => 1⟩ 
   have := (h () (by simp) 0).1
   norm_num at this
 
+
+/-- The radius data for M14's Newton convergence theorem is satisfiable
+    (non-vacuity of `exists_radius_of_data` / `newtonIter_tendsto_of_root_data`). -/
+example : ∃ R > 0, (1:ℝ) * R ≤ 1 ∧
+    4 * 0 * 1 * R + 4 * ((1:ℝ) * R)^2 ≤ 100/2 ∧
+    2 * (0 + 1*R + 1)^2 / (100/2) < 1 ∧
+    2 * (0 + 1*R + 1)^2 / (100/2) + 18 * (0 + 1*R + 1) * 1 / (100/2) * R < 1 := by
+  exact LightRT.Geom.BezSys.exists_radius_of_data 1 0 100 (by norm_num) (by norm_num) (by norm_num)
+
 end LightRT.Sanity

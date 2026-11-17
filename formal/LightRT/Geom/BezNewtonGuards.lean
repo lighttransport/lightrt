@@ -583,5 +583,51 @@ theorem newtonIter_tendsto_of_root_data (S : BezSys) (a b c d K B0 det0 R : ℝ)
     hb hK hBpos hδpos hu₀ ht₀ hroot hR0 hRK
     hrect hball hcond hseed hsmall
 
+
+/-- The explicit radius conditions of `newtonIter_tendsto_of_root_data` are
+    satisfiable whenever the root's determinant dominates the partials
+    (`4(B0+1)² < det0`): by continuity at `R = 0`, a small enough positive
+    radius meets all four inequalities. -/
+theorem exists_radius_of_data (K B0 det0 : ℝ) (_hK : 0 < K) (hB0 : 0 ≤ B0)
+    (hdet : 4 * (B0 + 1) ^ 2 < det0) :
+    ∃ R > 0, K * R ≤ 1 ∧
+    4 * B0 * K * R + 4 * (K * R)^2 ≤ det0/2 ∧
+    2 * (B0 + K*R + 1)^2 / (det0/2) < 1 ∧
+    2 * (B0 + K*R + 1)^2 / (det0/2) + 18 * (B0 + K*R + 1) * K / (det0/2) * R < 1 := by
+  have hdetpos : 0 < det0 := by nlinarith [sq_nonneg (B0+1)]
+  let f1 : ℝ → ℝ := fun R => K * R
+  let f2 : ℝ → ℝ := fun R => 4 * B0 * K * R + 4 * (K * R)^2
+  let f3 : ℝ → ℝ := fun R => 2 * (B0 + K*R + 1)^2 / (det0/2)
+  let f4 : ℝ → ℝ := fun R => f3 R + 18 * (B0 + K*R + 1) * K / (det0/2) * R
+  have hc1 : ContinuousAt f1 0 := by dsimp [f1]; fun_prop
+  have hc2 : ContinuousAt f2 0 := by dsimp [f2]; fun_prop
+  have hc3 : ContinuousAt f3 0 := by dsimp [f3]; fun_prop (disch := positivity)
+  have hc4 : ContinuousAt f4 0 := by dsimp [f4, f3]; fun_prop (disch := positivity)
+  have h1at : f1 0 < 1 := by dsimp [f1]; norm_num
+  have h2at : f2 0 < det0/2 := by dsimp [f2]; norm_num; positivity
+  have hdiv : 4 * (B0 + 1)^2 / det0 < 1 := (div_lt_one hdetpos).mpr hdet
+  have heq : 2 * (B0 + 1)^2 / (det0/2) = 4 * (B0 + 1)^2 / det0 := by field_simp; ring
+  have h3at : f3 0 < 1 := by
+    dsimp [f3]
+    norm_num only [mul_zero, add_zero]
+    rw [heq]
+    simpa using hdiv
+  have h4at : f4 0 < 1 := by
+    dsimp [f4]
+    norm_num only [mul_zero, add_zero, mul_zero]
+    simpa [f3] using h3at
+  have ev1 : ∀ᶠ R in 𝓝 0, f1 R < 1 := hc1.eventually (isOpen_Iio.mem_nhds h1at)
+  have ev2 : ∀ᶠ R in 𝓝 0, f2 R < det0/2 := hc2.eventually (isOpen_Iio.mem_nhds h2at)
+  have ev3 : ∀ᶠ R in 𝓝 0, f3 R < 1 := hc3.eventually (isOpen_Iio.mem_nhds h3at)
+  have ev4 : ∀ᶠ R in 𝓝 0, f4 R < 1 := hc4.eventually (isOpen_Iio.mem_nhds h4at)
+  have ev : ∀ᶠ R in 𝓝[>] (0:ℝ),
+      f1 R < 1 ∧ f2 R < det0/2 ∧ f3 R < 1 ∧ f4 R < 1 ∧ R ∈ Set.Ioi (0:ℝ) := by
+    filter_upwards [ev1.filter_mono inf_le_left, ev2.filter_mono inf_le_left,
+      ev3.filter_mono inf_le_left, ev4.filter_mono inf_le_left, self_mem_nhdsWithin] with R h1 h2 h3 h4 hpos
+    exact ⟨h1, h2, h3, h4, hpos⟩
+  rcases (Filter.Eventually.exists ev) with ⟨R, h1, h2, h3, h4, hRpos⟩
+  refine ⟨R, hRpos, ?_, le_of_lt h2, h3, h4⟩
+  exact le_of_lt h1
+
 end BezSys
 end LightRT.Geom
