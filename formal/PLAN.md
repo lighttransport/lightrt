@@ -91,11 +91,7 @@ on the miner nodes); no C changes in the formalization-only milestones.
    of any `BezSys` from scalar field bounds; `ofCubic_root_data_B0` supplies
    `B0` (= `ofCubicB0`) from the Bézier control points and ray direction;
    `ofCubic_newton_tendsto_of_root_data` feeds that `B0` straight into
-   `newtonIter_tendsto_of_root_data`. The genuine nondegeneracy hypotheses
-   (`PddBounds`, `0 < q` on the rectangle, `det0 ≤ |det J|`, radius/geometry)
-   remain as hypotheses — the acceptance criterion is conditional
-   convergence. A lower bound on `|det J|` cannot be proved for arbitrary
-   control points, so `det0` stays data. `K` / `PddBounds` are also supplied
+   `newtonIter_tendsto_of_root_data`. `K` / `PddBounds` are also supplied
    from the control points now (`BezSecondDeriv.lean` proves closed forms for
    all eight second partials; `BezKBounds.lean` derives `ofCubicK` and
    `ofCubic_PddBounds`, and `ofCubic_newton_tendsto_of_control_points`

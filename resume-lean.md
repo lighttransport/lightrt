@@ -1,6 +1,6 @@
 # LightRT Lean formalization: remaining items and resume prompt
 
-State as of 2026-11-17, branch `formal-lean` (6 local commits ahead of `origin/formal-lean`, not pushed).
+State as of 2026-11-17, branch `formal-lean` (8 local commits ahead of `origin/formal-lean`, not pushed).
 The formalization document of record is `formal/PLAN.md` (scope, coverage map,
 invariants, gates, boundaries, roadmap). Milestone history is in git history.
 Repo guidance: `CLAUDE.md`, section "Formal verification".
@@ -135,15 +135,15 @@ close the control-point bound chase — `bez_root_partial_bounds`,
 `ofCubic_root_data_B0` (explicit `ofCubicB0`) and
 `ofCubic_newton_tendsto_of_root_data` supply `B0` from the control points
 and feed it into `newtonIter_tendsto_of_root_data`; `exists_radius_of_data`
-supplies the radius. What remains as hypotheses are the genuine
-nondegeneracy data (`PddBounds`, `0 < q` on the rectangle, `det0 ≤ |det J|`,
-radius/geometry) — a lower bound on `|det J|` is not provable for arbitrary
-control points. Item 4 (SIMD ISA instance) and GPU formalization are
-documented boundaries, not open tasks. No CI by decision; formal gates are
-manual. `K` / `PddBounds` are now supplied from control points as well
-(`Geom/BezSecondDeriv.lean`, `Geom/BezKBounds.lean`); `ofCubicK` and
-`ofCubic_PddBounds` replace the previous "not claimed" note in
-`BezNewton.lean`.
+supplies the radius. `K` / `PddBounds` are supplied from control points too
+(`Geom/BezSecondDeriv.lean`, `Geom/BezKBounds.lean`: `ofCubicK`,
+`ofCubic_PddBounds`, `ofCubicK_pos`), replacing the previous "not claimed"
+note in `BezNewton.lean`. What remains as hypotheses are the genuine
+nondegeneracy data (`0 < q` / length floor on the rectangle, `det0 ≤ |det J|`,
+parameter bound, radius/geometry) — a lower bound on `|det J|` is not
+provable for arbitrary control points. Item 4 (SIMD ISA instance) and GPU
+formalization are documented boundaries, not open tasks. No CI by decision;
+formal gates are manual.
 
 ## Resuming prompt
 
