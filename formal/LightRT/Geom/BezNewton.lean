@@ -37,8 +37,9 @@
   contraction corollary holds at interior points where the unclamped system is
   `C²`; it says nothing about the accepted outputs' classification.
 
-  Not claimed: explicit `K`/`B` from the control points (a coefficient bound
-  chase), and any floating-point analysis of the step itself.
+  Explicit `B`/`K` from control points are supplied in `BezData.lean` /
+  `BezKBounds.lean`. Not claimed: any floating-point analysis of the step
+  itself.
 -/
 import Mathlib
 import LightRT.Geom.Newton2D

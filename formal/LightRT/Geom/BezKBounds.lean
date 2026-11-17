@@ -434,6 +434,31 @@ theorem ofCubic_PddBounds (c : Fin 4 → Fin 4 → ℝ) (d : Fin 3 → ℝ)
     fun u hu t ht => (hG u hu t ht).1⟩
 
 
+theorem ofCubicK_pos (c : Fin 4 → Fin 4 → ℝ) (d : Fin 3 → ℝ) (Lm T : ℝ)
+    (hLm : 0 < Lm) (hDpos : 0 < dSup d) :
+    0 < ofCubicK c d Lm T := by
+  let M := cSup c
+  let E := edgeSup c
+  let S2 := ddSup c
+  let D3 := dddSup c
+  let D := dSup d
+  let Rb := T * D + M
+  let G22 := 3*D^2/Lm + (3*Rb*D)^2/Lm^3
+  have hD0 : 0 < D := by simpa [D] using hDpos
+  have hD2 : 0 < D^2 := sq_pos_of_pos hD0
+  have hpart : 0 < 3 * D^2 / Lm := div_pos (mul_pos (by norm_num) hD2) hLm
+  have hnonneg : 0 ≤ (3*Rb*D)^2 / Lm^3 := div_nonneg (sq_nonneg _) (le_of_lt (pow_pos hLm _))
+  have hG22 : 0 < G22 := by dsimp [G22]; exact add_pos_of_pos_of_nonneg hpart hnonneg
+  dsimp [ofCubicK]
+  exact lt_of_lt_of_le hG22 ((le_max_left G22
+    (max (3*D*(3*E)/Lm + (3*Rb*(3*E))*(3*Rb*D)/Lm^3)
+      ((3*(3*E)^2 + 3*Rb*(6*S2))/Lm + (3*Rb*(3*E))^2/Lm^3 + 6*S2))).trans
+    (le_max_right
+      (max (18*D*S2) (9*(3*E)*(6*S2) + 3*Rb*(6*D3) + 3*(3*E)*(6*S2) + M*(6*D3)))
+      (max G22
+        (max (3*D*(3*E)/Lm + (3*Rb*(3*E))*(3*Rb*D)/Lm^3)
+          ((3*(3*E)^2 + 3*Rb*(6*S2))/Lm + (3*Rb*(3*E))^2/Lm^3 + 6*S2)))))
+
 /-- **Fully data-supplied M14 convergence.** Both `B0` and `K` are derived
     from the control points (via `ofCubicB0` and `ofCubicK`); what remains as
     hypotheses are nondegeneracy of the root (`det0`, `hroot`), the length
@@ -447,7 +472,7 @@ theorem ofCubic_newton_tendsto_of_control_points
       Lm ≤ (ofCubic c d).len u t)
     (hT0 : 0 ≤ T) (hT : ∀ t ∈ Set.Icc cα dα, |t| ≤ T)
     (hu₀01 : u₀ ∈ Set.Icc 0 1)
-    (hKpos : 0 < ofCubicK c d Lm T)
+    (hDpos : 0 < dSup d)
     (hlene : ∀ u ∈ Set.Icc a b, ∀ t ∈ Set.Icc cα dα, 0 < (ofCubic c d).q u t)
     (hdet0pos : 0 < det0)
     (hu₀ : u₀ ∈ Set.Icc a b) (ht₀ : t₀ ∈ Set.Icc cα dα)
@@ -465,6 +490,7 @@ theorem ofCubic_newton_tendsto_of_control_points
     (hseed : |u - u₀| + |t - t₀| ≤ R) :
     Tendsto (fun n => (newtonIter (ofCubic c d) u t n).1) atTop (𝓝 u₀) ∧
     Tendsto (fun n => (newtonIter (ofCubic c d) u t n).2) atTop (𝓝 t₀) := by
+  have hKpos : 0 < ofCubicK c d Lm T := ofCubicK_pos c d Lm T hLmpos hDpos
   have hbnd := ofCubic_PddBounds c d a b cα dα Lm T ha hb hLmpos hLm_le hT0 hT
   exact ofCubic_newton_tendsto_of_root_data c d a b cα dα (ofCubicK c d Lm T)
       det0 R hu₀01 hbnd hlene hKpos (le_of_lt hKpos) hdet0pos hu₀ ht₀ hroot
