@@ -1,6 +1,6 @@
 # LightRT Lean formalization: remaining items and resume prompt
 
-State as of 2026-11-17, branch `formal-lean` (8 local commits ahead of `origin/formal-lean`, not pushed).
+State as of 2026-11-17, branch `formal-lean` (local commits ahead of `origin/formal-lean`, not pushed).
 The formalization document of record is `formal/PLAN.md` (scope, coverage map,
 invariants, gates, boundaries, roadmap). Milestone history is in git history.
 Repo guidance: `CLAUDE.md`, section "Formal verification".
