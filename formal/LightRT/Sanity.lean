@@ -46,4 +46,23 @@ example : ∃ R > 0, (1:ℝ) * R ≤ 1 ∧
     2 * (0 + 1*R + 1)^2 / (100/2) + 18 * (0 + 1*R + 1) * 1 / (100/2) * R < 1 := by
   exact LightRT.Geom.BezSys.exists_radius_of_data 1 0 100 (by norm_num) (by norm_num) (by norm_num)
 
+
+/-- `ofCubicK` is positive whenever the ray direction has a nonzero lane
+    and the length floor is positive (non-vacuity of `ofCubicK_pos`, hence of
+    `ofCubic_newton_tendsto_of_control_points`'s `K > 0` data). -/
+example : 0 < LightRT.Geom.ofCubicK
+    (fun _ _ => (0:ℝ)) (fun _ : Fin 3 => (1:ℝ)) 1 2 := by
+  apply LightRT.Geom.ofCubicK_pos
+  · norm_num
+  · norm_num [LightRT.Geom.dSup, Finset.sup']
+
+/-- `ofCubicB0` is nonnegative (it bounds absolute values of partials). -/
+example : 0 ≤ LightRT.Geom.ofCubicB0
+    (fun _ _ => (0:ℝ)) (fun _ : Fin 3 => (1:ℝ)) 0 1 := by
+  have hlen : 0 < (LightRT.Geom.BezSys.ofCubic (fun _ _ => (0:ℝ)) (fun _ : Fin 3 => (1:ℝ))).q 0 1 := by
+    norm_num [LightRT.Geom.BezSys.q, LightRT.Geom.BezSys.Rx, LightRT.Geom.BezSys.Ry,
+      LightRT.Geom.BezSys.Rz, LightRT.Geom.BezSys.ofCubic, LightRT.Geom.bezP]
+  exact (LightRT.Geom.ofCubic_root_data_B0 (fun _ _ => (0:ℝ)) (fun _ : Fin 3 => (1:ℝ)) 0 1
+    (by constructor <;> norm_num) hlen).1
+
 end LightRT.Sanity

@@ -99,8 +99,10 @@ on the miner nodes); no C changes in the formalization-only milestones.
    from the control points now (`BezSecondDeriv.lean` proves closed forms for
    all eight second partials; `BezKBounds.lean` derives `ofCubicK` and
    `ofCubic_PddBounds`, and `ofCubic_newton_tendsto_of_control_points`
-   supplies both `B0` and `K`, leaving only `det0`, the length floor, the
-   parameter bounds, and radius/geometry as hypotheses).
+   supplies both `B0` and `K` (including `K > 0` from a nonzero direction via
+   `ofCubicK_pos`), leaving only `det0`, the length floor, the parameter
+   bounds, and radius/geometry as hypotheses; `Sanity.lean` covers their
+   non-vacuity).
 2. **Item 4 instance** (blocked): needs vendor ISA semantics; stays conditional.
 3. **GPU formalization** (deferred by decision): would require a device-kernel
    semantics and codegen verification; not scheduled.
