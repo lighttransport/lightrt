@@ -1,6 +1,6 @@
 # LightRT Lean formalization: remaining items and resume prompt
 
-State as of 2026-11-17, branch `formal-lean`, pushed to `origin/formal-lean`.
+State as of 2026-11-17, branch `formal-lean` (6 local commits ahead of `origin/formal-lean`, not pushed).
 The formalization document of record is `formal/PLAN.md` (scope, coverage map,
 invariants, gates, boundaries, roadmap). Milestone history is in git history.
 Repo guidance: `CLAUDE.md`, section "Formal verification".
@@ -128,24 +128,37 @@ Explicitly deferred/recorded (see PLAN.md):
 
 ## Remaining items
 
-The authoritative list is `formal/PLAN.md` §5. Summary: the only open deep
-item is the quantitative M14 basin verification (§5.1); item 4 (SIMD ISA
-instance) and GPU formalization are documented boundaries, not open tasks.
-No CI by decision; formal gates are manual.
+The authoritative list is `formal/PLAN.md` §5. The quantitative M14 basin
+verification (§5.1) is **complete** under the acceptance criterion
+(conditional convergence): `Geom/BezBounds.lean` and `Geom/BezData.lean`
+close the control-point bound chase — `bez_root_partial_bounds`,
+`ofCubic_root_data_B0` (explicit `ofCubicB0`) and
+`ofCubic_newton_tendsto_of_root_data` supply `B0` from the control points
+and feed it into `newtonIter_tendsto_of_root_data`; `exists_radius_of_data`
+supplies the radius. What remains as hypotheses are the genuine
+nondegeneracy data (`PddBounds`, `0 < q` on the rectangle, `det0 ≤ |det J|`,
+radius/geometry) — a lower bound on `|det J|` is not provable for arbitrary
+control points. Item 4 (SIMD ISA instance) and GPU formalization are
+documented boundaries, not open tasks. No CI by decision; formal gates are
+manual. `K` / `PddBounds` are now supplied from control points as well
+(`Geom/BezSecondDeriv.lean`, `Geom/BezKBounds.lean`); `ofCubicK` and
+`ofCubic_PddBounds` replace the previous "not claimed" note in
+`BezNewton.lean`.
 
 ## Resuming prompt
 
 > Continue the LightRT Lean formalization on branch `formal-lean` in
-> `/mnt/nvme02/work/lightrt` (pushed to `origin/formal-lean`). Read
+> `/mnt/nvme02/work/lightrt` (local commits ahead of `origin/formal-lean`, not pushed). Read
 > `formal/PLAN.md` (document of record) first, then this file. Run
 > `make formal` to confirm the baseline (0 sorry, all gates PASS).
 >
-> Open work: M14 basin verification — instantiate
-> `newtonIter_tendsto_of_basin_ball` for `ofCubic` by deriving explicit
-> `R, B, δ` from `PddBounds` + a nondegenerate root; keep the conditional
-> convergence theorems as acceptance if the bound chase stalls. See
-> `formal/PLAN.md` §5. Everything else is a recorded boundary (ISA, tangency,
-> fp64 margins, GPU) or empirical gate (`wtcheck`, `primhitcheck`).
+> M14 basin verification is complete under the acceptance criterion
+> (conditional convergence); `B0`, the radius, and the concrete-system
+> convergence theorem are all supplied in `Geom/BezBounds.lean` /
+> `Geom/BezData.lean`. See `formal/PLAN.md` §5. Everything else is a recorded
+> boundary (ISA, tangency, fp64 margins, GPU) or empirical gate (`wtcheck`,
+> `primhitcheck`). `B0` and `K` are both derived from control points;
+> `det0`, the length floor, and radius/geometry remain hypotheses.
 >
 > For every C change: SIMD bit-identical to scalar (`wtcheck`, incl. SVE under
 > qemu), rerun `make formal`, the C suites, `make hip_test` (local RX 9070 XT,
