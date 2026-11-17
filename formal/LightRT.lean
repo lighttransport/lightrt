@@ -7,6 +7,8 @@ import LightRT.Geom.MTReal
 import LightRT.Geom.BezNewton
 import LightRT.Geom.BezTube
 import LightRT.Geom.BezNewtonGuards
+import LightRT.Geom.BezBounds
+import LightRT.Geom.BezData
 import LightRT.Geom.SafeguardedNewton
 import LightRT.Geom.SphereTrace3
 import LightRT.Robust.Slab
