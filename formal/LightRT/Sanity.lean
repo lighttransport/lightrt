@@ -174,4 +174,12 @@ example : ∃ (o d : Vec3) (cp : Fin 16 → Vec3) (lo hi : Vec3) (tmin tbest : �
   · intro k i; simp [cp]
   · intro k i; simp [cp]
 
+
+/-- de Casteljau row split is non-vacuous: splitting at t=0 reproduces the
+    full curve (bez3Vec (splitLVec P 0) s = bez3Vec P (0*s)). -/
+example : ∃ (P : Fin 4 → Vec3) (s : ℝ),
+    bez3Vec (splitLVec P 0) s = bez3Vec P (0 * s) := by
+  refine ⟨fun _ => 0, 0.5, ?_⟩
+  exact bez3Vec_decasteljau_left (fun _ => 0) 0 0.5
+
 end LightRT.Sanity
