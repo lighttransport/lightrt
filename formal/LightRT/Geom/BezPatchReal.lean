@@ -379,5 +379,196 @@ theorem abs_bicubic_du_le (cp : Fin 16 → Vec3) (M : ℝ) (hM : ∀ k i, |cp k 
         simpa [mul_assoc] using h123
     _ = 48 * M := by simp; ring
 
+theorem hasDerivAt_bern3' (t : ℝ) (k : Fin 4) :
+    HasDerivAt (fun t => bern3' t k) (bern3'' t k) t := by
+  fin_cases k
+  · change HasDerivAt (fun t => -3 * (1 - t)^2) (6 * (1 - t)) t
+    convert (((hasDerivAt_const t (1:ℝ)).sub (hasDerivAt_id t)).pow 2).const_mul (-3) using 1 <;>
+      (first | (ext x <;> simp [Pi.sub_apply, Pi.pow_apply, id_eq] <;> ring_nf) | (simp [Pi.sub_apply, Pi.pow_apply, id_eq] <;> ring_nf))
+  · change HasDerivAt (fun t => 3 * (1 - t)^2 - 6 * (1 - t) * t) (18 * t - 12) t
+    have h1 := ((hasDerivAt_const t (1:ℝ)).sub (hasDerivAt_id t)).pow 2 |>.const_mul 3
+    have h2 := (((hasDerivAt_const t (1:ℝ)).sub (hasDerivAt_id t)).mul (hasDerivAt_id t)).const_mul 6
+    convert h1.sub h2 using 1 <;> (first | (ext x; simp [Pi.sub_apply, Pi.pow_apply, Pi.mul_apply, id_eq]; ring_nf) | (simp [Pi.sub_apply, Pi.pow_apply, Pi.mul_apply, id_eq]; ring_nf))
+  · change HasDerivAt (fun t => 6 * (1 - t) * t - 3 * t^2) (6 - 18*t) t
+    have h1 := (((hasDerivAt_const t (1:ℝ)).sub (hasDerivAt_id t)).mul (hasDerivAt_id t)).const_mul 6
+    have h2 := (hasDerivAt_id t).pow 2 |>.const_mul 3
+    convert h1.sub h2 using 1 <;> (first | (ext x; simp [Pi.sub_apply, Pi.pow_apply, Pi.mul_apply, id_eq]; ring_nf) | (simp [Pi.sub_apply, Pi.pow_apply, Pi.mul_apply, id_eq]; ring_nf))
+  · change HasDerivAt (fun t => 3 * t^2) (6 * t) t
+    convert ((hasDerivAt_id t).pow 2).const_mul 3 using 1 <;>
+      (first | (ext x <;> simp [Pi.pow_apply, id_eq] <;> ring_nf) | (simp [Pi.pow_apply, id_eq] <;> ring_nf))
+
+
+/-- Partial derivative of the patch with respect to v. -/
+def bicubicEval_dv (cp : Fin 16 → Vec3) (u v : ℝ) : Vec3 :=
+  ∑ k : Fin 16, (bern3 u ⟨k.val % 4, by omega⟩ * bern3' v ⟨k.val / 4, by omega⟩) • cp k
+
+theorem bicubicEval_hasDerivAt_v (cp : Fin 16 → Vec3) (u v : ℝ) :
+    HasDerivAt (fun v => bicubicEval cp u v) (bicubicEval_dv cp u v) v := by
+  unfold bicubicEval bicubicEval_dv bern33
+  convert (HasDerivAt.sum (u := Finset.univ) (fun k hk =>
+    ((hasDerivAt_bern3 v ⟨k.val / 4, by omega⟩).const_mul
+      (bern3 u ⟨k.val % 4, by omega⟩)).smul_const (cp k))) using 1
+  · ext y; simp [bern33, mul_comm] <;> ring_nf
+
+/-- Second partial uu. -/
+def bicubicEval_duu (cp : Fin 16 → Vec3) (u v : ℝ) : Vec3 :=
+  ∑ k : Fin 16, (bern3'' u ⟨k.val % 4, by omega⟩ * bern3 v ⟨k.val / 4, by omega⟩) • cp k
+
+theorem bicubicEval_du_hasDerivAt_u (cp : Fin 16 → Vec3) (u v : ℝ) :
+    HasDerivAt (fun u => bicubicEval_du cp u v) (bicubicEval_duu cp u v) u := by
+  unfold bicubicEval_du bicubicEval_duu
+  convert (HasDerivAt.sum (u := Finset.univ) (fun k hk =>
+    ((hasDerivAt_bern3' u ⟨k.val % 4, by omega⟩).mul_const
+      (bern3 v ⟨k.val / 4, by omega⟩)).smul_const (cp k))) using 1
+  · ext y; simp <;> ring_nf
+
+
+/-- Second partial vv. -/
+def bicubicEval_dvv (cp : Fin 16 → Vec3) (u v : ℝ) : Vec3 :=
+  ∑ k : Fin 16, (bern3 u ⟨k.val % 4, by omega⟩ * bern3'' v ⟨k.val / 4, by omega⟩) • cp k
+
+theorem bicubicEval_dv_hasDerivAt_v (cp : Fin 16 → Vec3) (u v : ℝ) :
+    HasDerivAt (fun v => bicubicEval_dv cp u v) (bicubicEval_dvv cp u v) v := by
+  unfold bicubicEval_dv bicubicEval_dvv
+  convert (HasDerivAt.sum (u := Finset.univ) (fun k hk =>
+    ((hasDerivAt_bern3' v ⟨k.val / 4, by omega⟩).const_mul
+      (bern3 u ⟨k.val % 4, by omega⟩)).smul_const (cp k))) using 1
+  · ext y; simp [mul_comm] <;> ring_nf
+
+/-- Mixed partial uv. -/
+def bicubicEval_duv (cp : Fin 16 → Vec3) (u v : ℝ) : Vec3 :=
+  ∑ k : Fin 16, (bern3' u ⟨k.val % 4, by omega⟩ * bern3' v ⟨k.val / 4, by omega⟩) • cp k
+
+theorem bicubicEval_du_hasDerivAt_v (cp : Fin 16 → Vec3) (u v : ℝ) :
+    HasDerivAt (fun v => bicubicEval_du cp u v) (bicubicEval_duv cp u v) v := by
+  unfold bicubicEval_du bicubicEval_duv
+  convert (HasDerivAt.sum (u := Finset.univ) (fun k hk =>
+    ((hasDerivAt_bern3 v ⟨k.val / 4, by omega⟩).const_mul
+      (bern3' u ⟨k.val % 4, by omega⟩)).smul_const (cp k))) using 1
+  · ext y; simp [mul_comm] <;> ring_nf
+
+theorem bicubicEval_dv_hasDerivAt_u (cp : Fin 16 → Vec3) (u v : ℝ) :
+    HasDerivAt (fun u => bicubicEval_dv cp u v) (bicubicEval_duv cp u v) u := by
+  unfold bicubicEval_dv bicubicEval_duv
+  convert (HasDerivAt.sum (u := Finset.univ) (fun k hk =>
+    ((hasDerivAt_bern3 u ⟨k.val % 4, by omega⟩).mul_const
+      (bern3' v ⟨k.val / 4, by omega⟩)).smul_const (cp k))) using 1
+  · ext y; simp <;> ring_nf
+
+theorem abs_sum_scalar_bound {ι : Type*} [Fintype ι] (f : ι → ℝ) (B : ℝ)
+    (h : ∀ k, |f k| ≤ B) : |∑ k, f k| ≤ Fintype.card ι * B := by
+  calc |∑ k, f k| ≤ ∑ k, |f k| := Finset.abs_sum_le_sum_abs _ _
+    _ ≤ ∑ k : ι, B := Finset.sum_le_sum (fun k hk => h k)
+    _ = Fintype.card ι * B := by simp
+
+theorem abs_bicubic_du_le2 (cp : Fin 16 → Vec3) (M : ℝ) (hM : ∀ k i, |cp k i| ≤ M) (hM0 : 0 ≤ M)
+    {u v : ℝ} (hu0:0≤u) (hu1:u≤1) (hv0:0≤v) (hv1:v≤1) (a : Fin 3) :
+    |(bicubicEval_du cp u v) a| ≤ 48 * M := by
+  unfold bicubicEval_du
+  simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+  calc |∑ k : Fin 16, (bern3' u ⟨k.val % 4, by omega⟩ * bern3 v ⟨k.val / 4, by omega⟩) * cp k a|
+      ≤ 16 * (3 * M) := by
+        apply abs_sum_scalar_bound
+        intro k
+        rw [abs_mul, abs_mul]
+        have h1 := abs_bern3'_le hu0 hu1 ⟨k.val % 4, by omega⟩
+        have h2 := bern3_nonneg hv0 hv1 ⟨k.val / 4, by omega⟩
+        have h2' : |bern3 v ⟨k.val / 4, by omega⟩| ≤ 1 := by
+          rw [abs_of_nonneg h2]
+          exact bern3_le_one hv0 hv1 ⟨k.val / 4, by omega⟩
+        have h12 : |bern3' u ⟨k.val % 4, by omega⟩| * |bern3 v ⟨k.val / 4, by omega⟩| ≤ 3 * 1 :=
+          mul_le_mul h1 h2' (abs_nonneg _) (by norm_num)
+        have h123 := mul_le_mul h12 (hM k a) (abs_nonneg _) (by norm_num : 0 ≤ (3:ℝ)*1)
+        simpa [mul_assoc] using h123
+    _ = 48 * M := by ring
+
+theorem abs_bicubic_dv_le (cp : Fin 16 → Vec3) (M : ℝ) (hM : ∀ k i, |cp k i| ≤ M) (hM0 : 0 ≤ M)
+    {u v : ℝ} (hu0:0≤u) (hu1:u≤1) (hv0:0≤v) (hv1:v≤1) (a : Fin 3) :
+    |(bicubicEval_dv cp u v) a| ≤ 48 * M := by
+  unfold bicubicEval_dv
+  simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+  calc |∑ k : Fin 16, (bern3 u ⟨k.val % 4, by omega⟩ * bern3' v ⟨k.val / 4, by omega⟩) * cp k a|
+      ≤ 16 * (3 * M) := by
+        apply abs_sum_scalar_bound
+        intro k
+        rw [abs_mul, abs_mul]
+        have h1 := bern3_nonneg hu0 hu1 ⟨k.val % 4, by omega⟩
+        have h1' : |bern3 u ⟨k.val % 4, by omega⟩| ≤ 1 := by
+          rw [abs_of_nonneg h1]
+          exact bern3_le_one hu0 hu1 ⟨k.val % 4, by omega⟩
+        have h2 := abs_bern3'_le hv0 hv1 ⟨k.val / 4, by omega⟩
+        have h12 : |bern3 u ⟨k.val % 4, by omega⟩| * |bern3' v ⟨k.val / 4, by omega⟩| ≤ 1 * 3 :=
+          mul_le_mul h1' h2 (abs_nonneg _) (by norm_num)
+        have h123 := mul_le_mul h12 (hM k a) (abs_nonneg _) (by norm_num : 0 ≤ (1:ℝ)*3)
+        simpa [mul_assoc] using h123
+    _ = 48 * M := by ring
+
+theorem abs_bicubic_uv_le (cp : Fin 16 → Vec3) (M : ℝ) (hM : ∀ k i, |cp k i| ≤ M) (hM0 : 0 ≤ M)
+    {u v : ℝ} (hu0:0≤u) (hu1:u≤1) (hv0:0≤v) (hv1:v≤1) (a : Fin 3) :
+    |(bicubicEval_duv cp u v) a| ≤ 144 * M := by
+  unfold bicubicEval_duv
+  simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+  calc |∑ k : Fin 16, (bern3' u ⟨k.val % 4, by omega⟩ * bern3' v ⟨k.val / 4, by omega⟩) * cp k a|
+      ≤ 16 * (9 * M) := by
+        apply abs_sum_scalar_bound
+        intro k
+        rw [abs_mul, abs_mul]
+        have h1 := abs_bern3'_le hu0 hu1 ⟨k.val % 4, by omega⟩
+        have h2 := abs_bern3'_le hv0 hv1 ⟨k.val / 4, by omega⟩
+        have h12 : |bern3' u ⟨k.val % 4, by omega⟩| * |bern3' v ⟨k.val / 4, by omega⟩| ≤ 3 * 3 :=
+          mul_le_mul h1 h2 (abs_nonneg _) (by norm_num)
+        have h123 := mul_le_mul h12 (hM k a) (abs_nonneg _) (by norm_num : 0 ≤ (3:ℝ)*3)
+        nlinarith [h123]
+    _ = 144 * M := by ring
+
+theorem abs_bicubic_vv_le (cp : Fin 16 → Vec3) (M : ℝ) (hM : ∀ k i, |cp k i| ≤ M) (hM0 : 0 ≤ M)
+    {u v : ℝ} (hu0:0≤u) (hu1:u≤1) (hv0:0≤v) (hv1:v≤1) (a : Fin 3) :
+    |(bicubicEval_dvv cp u v) a| ≤ 192 * M := by
+  unfold bicubicEval_dvv
+  simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+  calc |∑ k : Fin 16, (bern3 u ⟨k.val % 4, by omega⟩ * bern3'' v ⟨k.val / 4, by omega⟩) * cp k a|
+      ≤ 16 * (12 * M) := by
+        apply abs_sum_scalar_bound
+        intro k
+        rw [abs_mul, abs_mul]
+        have h1 := bern3_nonneg hu0 hu1 ⟨k.val % 4, by omega⟩
+        have h1' : |bern3 u ⟨k.val % 4, by omega⟩| ≤ 1 := by
+          rw [abs_of_nonneg h1]
+          exact bern3_le_one hu0 hu1 ⟨k.val % 4, by omega⟩
+        have h2 := abs_bern3''_le hv0 hv1 ⟨k.val / 4, by omega⟩
+        have h12 : |bern3 u ⟨k.val % 4, by omega⟩| * |bern3'' v ⟨k.val / 4, by omega⟩| ≤ 1 * 12 :=
+          mul_le_mul h1' h2 (abs_nonneg _) (by norm_num)
+        have h123 := mul_le_mul h12 (hM k a) (abs_nonneg _) (by norm_num : 0 ≤ (1:ℝ)*12)
+        simpa [mul_assoc] using h123
+    _ = 192 * M := by ring
+
+theorem patchF_hasDerivAt_u (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) :
+    HasDerivAt (fun u => patchF o d cp t u v) ((bicubicEval_du cp u v) 0) u := by
+  unfold patchF bezPatchContact bicubicEval bicubicEval_du
+  simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul, Matrix.cons_val_zero]
+  convert (HasDerivAt.sum (u := Finset.univ) (fun k hk =>
+    ((hasDerivAt_bern3 u ⟨k.val % 4, by omega⟩).mul_const
+      (bern3 v ⟨k.val / 4, by omega⟩)).mul_const (cp k 0))).sub_const ((o 0) + t * (d 0)) using 1
+  · ext y <;> simp [bern33] <;> ring_nf
+
+theorem patchF_hasDerivAt_v (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) :
+    HasDerivAt (fun v => patchF o d cp t u v) ((bicubicEval_dv cp u v) 0) v := by
+  unfold patchF bezPatchContact bicubicEval bicubicEval_dv
+  simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul, Matrix.cons_val_zero]
+  convert (HasDerivAt.sum (u := Finset.univ) (fun k hk =>
+    ((hasDerivAt_bern3 v ⟨k.val / 4, by omega⟩).const_mul
+      (bern3 u ⟨k.val % 4, by omega⟩)).mul_const (cp k 0))).sub_const ((o 0) + t * (d 0)) using 1
+  · ext y
+    simp [bern33, Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+
+theorem pd1_patchF (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) :
+    pd1 (patchF o d cp t) u v = (bicubicEval_du cp u v) 0 :=
+  (patchF_hasDerivAt_u o d cp t u v).deriv
+
+theorem pd2_patchF (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) :
+    pd2 (patchF o d cp t) u v = (bicubicEval_dv cp u v) 0 :=
+  (patchF_hasDerivAt_v o d cp t u v).deriv
+
+
 end
 end LightRT.Geom

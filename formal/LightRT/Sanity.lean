@@ -228,4 +228,11 @@ example : ∃ (o d : Vec3) (cp : Fin 16 → Vec3) (t : ℝ),
     simp [patchF, patchG, bezPatchContact, bicubicEval,
       LightRT.Geom.Hull.bern33, LightRT.Geom.Hull.bern3]
 
+
+/-- The patch partial formulas are non-vacuous: on the zero patch the u-partial
+    of patchF vanishes. -/
+example (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) (hM : ∀ k i, cp k i = 0) :
+    pd1 (patchF o d cp t) u v = (bicubicEval_du cp u v) 0 := by
+  exact pd1_patchF o d cp t u v
+
 end LightRT.Sanity
