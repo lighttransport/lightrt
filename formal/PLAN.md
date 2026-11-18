@@ -133,7 +133,12 @@ a decision change; Tier 3 is closed or maintenance.
    a converged Newton contact to a genuine hit no smaller than the nearest.
    `bezpatch_newton_quadratic` instantiates Newton2D contraction at the patch
    contact system (`patchF`/`patchG`); deriving C2Seg and partial/determinant
-   bounds from control points is the remaining chase. Note: `c2lean` lacks `sqrtf`
+   bounds from control points is the remaining chase. Partial progress:
+   `bern3'_vec`/`bern3''_vec` with `abs_bern3'_le ≤ 3`, `abs_bern3''_le ≤ 12` on
+   `[0,1]`, `bern3_le_one`, and `abs_bicubic_du_le` (the u-partial bound from
+   control points, `≤ 48·M`). Full C2Seg construction and the determinant lower
+   bound remain open (the latter, as in M14, cannot be proved for arbitrary
+   control points and stays data). Note: `c2lean` lacks `sqrtf`
    support, so translating `tri_point_isect_one` needs a tool extension
    (Tier 1.2 dependency).
 2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates only the
