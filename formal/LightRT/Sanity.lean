@@ -161,4 +161,17 @@ example : ∃ (cp : Fin 16 → Vec3) (u v : ℝ),
   refine ⟨fun _ => 0, 0, 0, ?_⟩
   simp [bicubicEval, LightRT.Geom.Hull.bern33, LightRT.Geom.Hull.bern3]
 
+
+/-- Culling completeness is non-vacuous: the corner control point is in its
+    own control box, so a ray hitting it also hits the box. -/
+example : ∃ (o d : Vec3) (cp : Fin 16 → Vec3) (lo hi : Vec3) (tmin tbest : ℝ),
+    HitsBezPatchRay o d cp tmin tbest ∧
+    (∀ k i, lo i ≤ cp k i) ∧ (∀ k i, cp k i ≤ hi i) := by
+  let cp : Fin 16 → Vec3 := fun _ => 0
+  refine ⟨0, 0, cp, 0, 0, 0, 10, ?_, ?_, ?_⟩
+  · refine ⟨0, by norm_num, 0, by norm_num, 0, by norm_num, by norm_num, ?_⟩
+    simp [bicubicEval, LightRT.Geom.Hull.bern33, LightRT.Geom.Hull.bern3, cp]
+  · intro k i; simp [cp]
+  · intro k i; simp [cp]
+
 end LightRT.Sanity
