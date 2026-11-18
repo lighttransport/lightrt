@@ -138,7 +138,9 @@ The authoritative roadmap is `formal/PLAN.md` §5 (three tiers). Summary:
   `Geom/{CylinderReal,CapsuleReal}.lean` and ellipse points in
   `Geom/EllipseReal.lean`, and the cubic-Bézier first-contact contract in
   `Geom/BezFirstContact.lean`, and SDF sphere-trace convergence in
-  `Geom/SphereTraceConvergence.lean` too. Next: parametric surfaces;
+  `Geom/SphereTraceConvergence.lean`, and bilinear-patch soundness in
+  `Geom/BilinearSurface.lean` too. Next: bilinear completeness, Bezier/NURBS
+  surfaces;
   acceptance = soundness/completeness/nearest over ℝ + non-vacuity examples.
   (2) `c2lean` coverage expansion — translate further scalar kernels and prove
   `*_refines`. (3) Bézier/patch intersector contract (M15/M16) — abstract

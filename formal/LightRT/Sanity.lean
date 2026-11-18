@@ -133,4 +133,10 @@ example : ∃ L ≤ (1:ℝ), Tendsto (fun n => stTrace (fun t : ℝ => 1 - t) 0 
     intro s h0 h1; linarith
   exact stTrace_tendsto_contact hf (by norm_num : 1 - (1:ℝ) ≤ 0) (by norm_num : (0:ℝ) ≤ 1) hnonneg
 
+
+/-- The bilinear surface predicate is non-vacuous: (u,v)=(0,0) gives q00. -/
+example : ∃ (q00 q10 q11 q01 p : Vec3), OnBilinearSurface q00 q10 q11 q01 p := by
+  refine ⟨0, 0, 0, 0, 0, 0, by norm_num, 0, by norm_num, ?_⟩
+  simp [bilinEval]
+
 end LightRT.Sanity
