@@ -142,8 +142,9 @@ The authoritative roadmap is `formal/PLAN.md` §5 (three tiers). Summary:
   `Geom/BilinearSurface.lean` (soundness + completeness), and bicubic Bezier
   patch soundness/culling (both directions) in `Geom/BezPatchReal.lean` too.
   plus the vector row-level de Casteljau split in `Geom/BezPatchReal.lean`.
-  plus nearest-hit existence in `Geom/BezPatchReal.lean`. Next: Newton2D
-  patch contact instantiation, NURBS;
+  plus the Newton-contact-to-nearest-hit bridge and bezpatch_newton_quadratic
+  (Newton2D contraction on the patch contact system) in `Geom/BezPatchReal.lean`.
+  Next: C2/bound chase for that instantiation, NURBS;
   acceptance = soundness/completeness/nearest over ℝ + non-vacuity examples.
   (2) `c2lean` coverage expansion — translate further scalar kernels and prove
   `*_refines`. (3) Bézier/patch intersector contract (M15/M16) — abstract
