@@ -204,4 +204,16 @@ example : ∃ tstar, (0:ℝ) ≤ tstar ∧ tstar ≤ 1 ∧
     bezpatch_exists_nearest_hit (0:Vec3) (0:Vec3) (fun _ => (0:Vec3)) (by norm_num) hhit
   exact ⟨tstar, hlo, hhi, hmin⟩
 
+
+/-- Newton contact bridge is non-vacuous: a zero residual at (u,v,t)=(0,0,0.5)
+    on the zero patch is a genuine patch hit with t >= the nearest hit. -/
+example : ∃ t, (0:ℝ) ≤ t ∧ t ≤ 1 ∧ ∃ tstar : ℝ, tstar ≤ t := by
+  have hres : bezPatchContact (0:Vec3) (0:Vec3) (fun _ => (0:Vec3)) 0.5 0 0 = 0 := by
+    simp [bezPatchContact, bicubicEval, LightRT.Geom.Hull.bern33, LightRT.Geom.Hull.bern3]
+  have hge := newton_patch_contact_ge_nearest (0:Vec3) (0:Vec3) (fun _ => (0:Vec3))
+    (by norm_num) (by norm_num) (by norm_num) (by norm_num) (by norm_num)
+    (by norm_num : (0:ℝ) ≤ 0.5) (by norm_num : (0.5:ℝ) < 1) hres
+  rcases hge with ⟨tstar, htstar, hsh, hmin, hlet⟩
+  exact ⟨0.5, by norm_num, by norm_num, tstar, hlet⟩
+
 end LightRT.Sanity

@@ -126,7 +126,11 @@ a decision change; Tier 3 is closed or maintenance.
    bezpatch_exists_nearest_hit (a hit implies a minimal hit parameter exists,
    via compactness of the closed hit-parameter set with a cheap finite-sum
    continuity proof). Full subdivision-plus-Newton completeness (Newton2D
-   instantiation) and NURBS/trimmed-NURBS surfaces remain open. Note: `c2lean` lacks `sqrtf`
+   instantiation) and NURBS/trimmed-NURBS surfaces remain open. The Newton-to-
+   hit bridge is in place: `newton2Step_at_root` (Newton is a fixed point at a
+   root), `bezPatchContact` (the patch contact residual), and
+   `newton_patch_hit_of_contact_zero` / `newton_patch_contact_ge_nearest` tie
+   a converged Newton contact to a genuine hit no smaller than the nearest. Note: `c2lean` lacks `sqrtf`
    support, so translating `tri_point_isect_one` needs a tool extension
    (Tier 1.2 dependency).
 2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates only the
