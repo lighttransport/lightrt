@@ -190,4 +190,18 @@ example : ∃ (cp : Fin 16 → Vec3) (s v : ℝ),
   refine ⟨fun _ => 0, 0.5, 0.5, ?_⟩
   exact bicubic_split_left (fun _ => 0) 1 0.5 0.5
 
+
+/-- Nearest-hit existence is non-vacuous: the degenerate zero patch hit by the
+    zero ray at t=0.5 has a minimal hit parameter. -/
+example : ∃ tstar, (0:ℝ) ≤ tstar ∧ tstar ≤ 1 ∧
+    (∀ t, (0:ℝ) ≤ t → t ≤ 1 →
+      (∃ u ∈ Set.Icc (0:ℝ) 1, ∃ v ∈ Set.Icc (0:ℝ) 1,
+        (0:Vec3) + t • (0:Vec3) = bicubicEval (fun _ => (0:Vec3)) u v) → tstar ≤ t) := by
+  have hhit : HitsBezPatchRay (0:Vec3) (0:Vec3) (fun _ => (0:Vec3)) 0 1 := by
+    refine ⟨0, by norm_num, 0, by norm_num, 0.5, by norm_num, by norm_num, ?_⟩
+    simp [bicubicEval, LightRT.Geom.Hull.bern33, LightRT.Geom.Hull.bern3]
+  obtain ⟨tstar, _, hlo, hhi, hmin⟩ :=
+    bezpatch_exists_nearest_hit (0:Vec3) (0:Vec3) (fun _ => (0:Vec3)) (by norm_num) hhit
+  exact ⟨tstar, hlo, hhi, hmin⟩
+
 end LightRT.Sanity

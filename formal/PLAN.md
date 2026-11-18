@@ -122,8 +122,11 @@ a decision change; Tier 3 is closed or maintenance.
    `bez3Vec_decasteljau_left` give the vector-valued de Casteljau split of each
    patch control row, and bicubicEval_eq_rows / bicubic_split_left give the
    full tensor de Casteljau split (Fin 16 reindexed as Fin 4 x Fin 4 via
-   finProdFinEquiv, avoiding the slow global simp). Full subdivision-plus-
-   Newton completeness and NURBS/trimmed-NURBS surfaces remain open. Note: `c2lean` lacks `sqrtf`
+   finProdFinEquiv, avoiding the slow global simp), and
+   bezpatch_exists_nearest_hit (a hit implies a minimal hit parameter exists,
+   via compactness of the closed hit-parameter set with a cheap finite-sum
+   continuity proof). Full subdivision-plus-Newton completeness (Newton2D
+   instantiation) and NURBS/trimmed-NURBS surfaces remain open. Note: `c2lean` lacks `sqrtf`
    support, so translating `tri_point_isect_one` needs a tool extension
    (Tier 1.2 dependency).
 2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates only the
