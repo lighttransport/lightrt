@@ -98,9 +98,11 @@ a decision change; Tier 3 is closed or maintenance.
    Coverage so far: triangle/MT (`MTReal`), sphere + quad/tetra (`PrimReal`),
    point sphere (via `sphereReal`), ray-facing/oriented point discs
    (`PointReal`), flat curve (ray-facing ribbon = quad via `quadReal`), SDF
-   sphere/box (via `sphereReal` / `SlabReal` respectively). Still open:
-   round-linear/cubic-Bézier curves, ellipse points, SDF sphere-trace
-   composition, and the parametric surfaces. Note: `c2lean` lacks `sqrtf`
+   sphere/box (via `sphereReal` / `SlabReal` respectively). `CylinderReal`
+   adds finite ray-cylinder side soundness/completeness; `CapsuleReal`
+   composes it with two end spheres (nearest of three components, with
+   soundness/completeness). Still open: cubic-Bézier curves, ellipse points,
+   SDF sphere-trace composition, and the parametric surfaces. Note: `c2lean` lacks `sqrtf`
    support, so translating `tri_point_isect_one` needs a tool extension
    (Tier 1.2 dependency).
 2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates only the
