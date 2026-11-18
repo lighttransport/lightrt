@@ -130,7 +130,10 @@ a decision change; Tier 3 is closed or maintenance.
    hit bridge is in place: `newton2Step_at_root` (Newton is a fixed point at a
    root), `bezPatchContact` (the patch contact residual), and
    `newton_patch_hit_of_contact_zero` / `newton_patch_contact_ge_nearest` tie
-   a converged Newton contact to a genuine hit no smaller than the nearest. Note: `c2lean` lacks `sqrtf`
+   a converged Newton contact to a genuine hit no smaller than the nearest.
+   `bezpatch_newton_quadratic` instantiates Newton2D contraction at the patch
+   contact system (`patchF`/`patchG`); deriving C2Seg and partial/determinant
+   bounds from control points is the remaining chase. Note: `c2lean` lacks `sqrtf`
    support, so translating `tri_point_isect_one` needs a tool extension
    (Tier 1.2 dependency).
 2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates only the
