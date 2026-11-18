@@ -135,8 +135,8 @@ The authoritative roadmap is `formal/PLAN.md` §5 (three tiers). Summary:
   quad/tetra via two/four MT hits), soundness/completeness/nearest + non-vacuity
   done; point discs (ray-facing/oriented) in `Geom/PointReal.lean` too.
   cylinder side + capsule (cylinder + 2 end spheres) in
-  `Geom/{CylinderReal,CapsuleReal}.lean` too. Next: cubic-Bézier curves, SDF,
-  surfaces;
+  `Geom/{CylinderReal,CapsuleReal}.lean` and ellipse points in
+  `Geom/EllipseReal.lean` too. Next: cubic-Bézier curves, SDF, surfaces;
   acceptance = soundness/completeness/nearest over ℝ + non-vacuity examples.
   (2) `c2lean` coverage expansion — translate further scalar kernels and prove
   `*_refines`. (3) Bézier/patch intersector contract (M15/M16) — abstract

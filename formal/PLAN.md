@@ -101,8 +101,10 @@ a decision change; Tier 3 is closed or maintenance.
    sphere/box (via `sphereReal` / `SlabReal` respectively). `CylinderReal`
    adds finite ray-cylinder side soundness/completeness; `CapsuleReal`
    composes it with two end spheres (nearest of three components, with
-   soundness/completeness). Still open: cubic-Bézier curves, ellipse points,
-   SDF sphere-trace composition, and the parametric surfaces. Note: `c2lean` lacks `sqrtf`
+   soundness/completeness) and `Geom/EllipseReal.lean` covers ellipse points
+   (plane intersection + elliptical-bound test, soundness/completeness).
+   Still open: cubic-Bézier curves, SDF sphere-trace composition, and the
+   parametric surfaces. Note: `c2lean` lacks `sqrtf`
    support, so translating `tri_point_isect_one` needs a tool extension
    (Tier 1.2 dependency).
 2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates only the
