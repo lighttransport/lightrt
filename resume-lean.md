@@ -128,22 +128,23 @@ Explicitly deferred/recorded (see PLAN.md):
 
 ## Remaining items
 
-The authoritative list is `formal/PLAN.md` §5. The quantitative M14 basin
-verification (§5.1) is **complete** under the acceptance criterion
-(conditional convergence): `Geom/BezBounds.lean` and `Geom/BezData.lean`
-close the control-point bound chase — `bez_root_partial_bounds`,
-`ofCubic_root_data_B0` (explicit `ofCubicB0`) and
-`ofCubic_newton_tendsto_of_root_data` supply `B0` from the control points
-and feed it into `newtonIter_tendsto_of_root_data`; `exists_radius_of_data`
-supplies the radius. `K` / `PddBounds` are supplied from control points too
-(`Geom/BezSecondDeriv.lean`, `Geom/BezKBounds.lean`: `ofCubicK`,
-`ofCubic_PddBounds`, `ofCubicK_pos`), replacing the previous "not claimed"
-note in `BezNewton.lean`. What remains as hypotheses are the genuine
-nondegeneracy data (`0 < q` / length floor on the rectangle, `det0 ≤ |det J|`,
-parameter bound, radius/geometry) — a lower bound on `|det J|` is not
-provable for arbitrary control points. Item 4 (SIMD ISA instance) and GPU
-formalization are documented boundaries, not open tasks. No CI by decision;
-formal gates are manual.
+The authoritative roadmap is `formal/PLAN.md` §5 (three tiers). Summary:
+
+- **Tier 1 (open work):** (1) primitive intersector soundness over ℝ — start with
+  ray–sphere and quad/tetra (two MT triangles) in `Geom/PrimReal.lean`, building on
+  `Geom/Hull.lean` (containment) and `Geom/MTReal.lean` (quad/tetra via MT);
+  acceptance = soundness/completeness/nearest over ℝ + non-vacuity examples.
+  (2) `c2lean` coverage expansion — translate further scalar kernels and prove
+  `*_refines`. (3) Bézier/patch intersector contract (M15/M16) — abstract
+  soundness of adaptive subdivision + bounded Newton, analogous to the M14 chain.
+- **Tier 2 (boundaries, do not attempt without new tooling/decision):** SIMD ISA
+  semantics (`wtcheck` gate), GPU formalization, fp64 `tlas_instance_margin`
+  (`tlascheck` gate), slab completeness at tangency (unprovable), Bézier-minimizer
+  FP (`primhitcheck` gate).
+- **Tier 3 (closed):** M14 basin verification is complete (conditional
+  convergence); `B0`, `K`, radii, and the convergence theorem are supplied from
+  control points in `Geom/Bez{Data,KBounds,...}.lean`. Sanity/doc consistency is
+  maintenance. No CI by decision; formal gates are manual.
 
 ## Resuming prompt
 
@@ -152,13 +153,13 @@ formal gates are manual.
 > `formal/PLAN.md` (document of record) first, then this file. Run
 > `make formal` to confirm the baseline (0 sorry, all gates PASS).
 >
-> M14 basin verification is complete under the acceptance criterion
-> (conditional convergence); `B0`, the radius, and the concrete-system
-> convergence theorem are all supplied in `Geom/BezBounds.lean` /
-> `Geom/BezData.lean`. See `formal/PLAN.md` §5. Everything else is a recorded
-> boundary (ISA, tangency, fp64 margins, GPU) or empirical gate (`wtcheck`,
-> `primhitcheck`). `B0` and `K` are both derived from control points;
-> `det0`, the length floor, and radius/geometry remain hypotheses.
+> M14 basin verification is complete (conditional convergence); `B0` and `K`
+> are supplied from control points. The open work is Tier 1 of `formal/PLAN.md` §5,
+> starting with primitive intersector soundness over ℝ (`Geom/PrimReal.lean`:
+> ray–sphere and quad/tetra via MTReal), then `c2lean` coverage expansion, then
+> the Bézier/patch intersector contract. Everything else is a recorded boundary
+> (ISA, tangency, fp64 margins, GPU) or empirical gate (`wtcheck`,
+> `primhitcheck`). Run `make formal` to confirm the baseline.
 >
 > For every C change: SIMD bit-identical to scalar (`wtcheck`, incl. SVE under
 > qemu), rerun `make formal`, the C suites, `make hip_test` (local RX 9070 XT,

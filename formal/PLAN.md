@@ -73,35 +73,51 @@ on the miner nodes); no C changes in the formalization-only milestones.
   cannot be proved for arbitrary control points. Floating point of the
   minimizer remains `primhitcheck`-gated.
 
-## 5. Roadmap (open)
+## 5. Roadmap
 
-1. **M14 basin verification (F)** — **complete** under the acceptance
-   criterion (conditional convergence). Done: local
-   contraction (`ofCubic_newton_quadratic`), safeguarded bracket (`bracket_root`),
-   guard model, algebraic bridge, and two conditional convergence theorems
-   (`newtonIter_tendsto_of_basin` with per-iterate hypotheses,
-   `newtonIter_tendsto_of_basin_ball` with a single neighbourhood check).
-   Progress: `jacDet_variation_bound` (Lipschitz variation of the Jacobian),
-   `basin_ball_of_data`, and `newtonIter_tendsto_of_root_data` (guarded
-   convergence from explicit root data `B0, det0, R` plus `PddBounds`) are
-   proved; `exists_radius_of_data` proves the radius conditions are
-   satisfiable whenever `4(B0+1)² < det0` (non-vacuity sanity example in
-   `Sanity.lean`). The control-point bound chase now lands (`BezBounds.lean`,
-   `BezData.lean`): `bez_root_partial_bounds` bounds the four first partials
-   of any `BezSys` from scalar field bounds; `ofCubic_root_data_B0` supplies
-   `B0` (= `ofCubicB0`) from the Bézier control points and ray direction;
-   `ofCubic_newton_tendsto_of_root_data` feeds that `B0` straight into
-   `newtonIter_tendsto_of_root_data`. `K` / `PddBounds` are also supplied
-   from the control points now (`BezSecondDeriv.lean` proves closed forms for
-   all eight second partials; `BezKBounds.lean` derives `ofCubicK` and
-   `ofCubic_PddBounds`, and `ofCubic_newton_tendsto_of_control_points`
-   supplies both `B0` and `K` (including `K > 0` from a nonzero direction via
-   `ofCubicK_pos`), leaving only `det0`, the length floor, the parameter
-   bounds, and radius/geometry as hypotheses; `Sanity.lean` covers their
-   non-vacuity).
-2. **Item 4 instance** (blocked): needs vendor ISA semantics; stays conditional.
-3. **GPU formalization** (deferred by decision): would require a device-kernel
-   semantics and codegen verification; not scheduled.
+The open roadmap is organized into three tiers. Tier 1 is actionable formalization
+work; Tier 2 records boundaries that must not be attempted without new tooling or
+a decision change; Tier 3 is closed or maintenance.
+
+### Tier 1 — Open formalization work
+
+1. **Primitive intersector soundness over ℝ.** The C kernel exposes ~20 non-triangle
+   scalar intersectors (sphere, quad/tetra, point, round-linear/flat curves, cubic
+   Bézier, SDF, bilinear/Bézier/NURBS/trimmed-NURBS surfaces). `Geom/Hull.lean`
+   proves their box containment, but none has a soundness/completeness/nearest
+   theorem over ℝ, and none is `c2lean`-translated. Start with the simple scalar
+   families — ray–sphere and quad/tetra (two MT triangles) — in `Geom/PrimReal.lean`,
+   composing the existing `Geom/MTReal.lean` results for quad/tetra. Then expand
+   family by family (points, curves, surfaces). Acceptance: for each family, a
+   soundness+completeness+nearest theorem over ℝ and non-vacuity examples; a
+   `*_refines` theorem once the scalar C function is translated.
+2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates only the
+   scalar triangle core (`tri_minf/maxf`, `tri_slab_scalar`, `tri_mt_one`,
+   `tri_ray_setup`, `tri_woop_one`, `tri_exn_key`). Translate additional *scalar*
+   kernels (e.g. `tri_woop_one_hp`, the primitive scalar intersectors from item 1)
+   and prove their `*_refines` theorems. Mechanical, independently committable;
+   directly grows the C↔Lean equivalence surface. Acceptance: each new translated
+   function has a passing `c2lean --check` and a refinement theorem.
+3. **Bézier/patch intersector contract (M15/M16).** The cubic-Bézier and surface
+   intersectors use adaptive subdivision + bounded Newton. Formalize the abstract
+   contract (sampled acceptance sound; no missed nearest) analogous to the M14
+   chain (`Geom/BezTube.lean`, `Geom/BezNewton*.lean`, `Geom/BezData.lean`,
+   `Geom/BezKBounds.lean`). High effort; scope each surface kind before starting.
+   Acceptance: an abstract soundness theorem per intersector strategy; FP of the
+   solve itself remains the Tier 2 empirical boundary.
+
+### Tier 2 — Documented boundaries (do not attempt without new tooling/a decision)
+
+- **SIMD ISA semantics**: `PackedOps` makes the intrinsic→model hypothesis machine-checked, and `simd_leaf_eq_scalar_of_isa` is conditional on it. No vendor SSE4.1/AVX2/SVE semantics model exists; `wtcheck` is the empirical gate.
+- **GPU formalization**: CUDA/HIP/Vulkan kernels are trusted ports of C, validated by the C suites and `cdiff`-family checks; out of scope for formalization for now.
+- **`tlas_instance_margin` fp64 ρ/σ bound**: unproved, covered by `tlascheck` empirically.
+- **Slab completeness at tangency**: unprovable (no error-dominating K); the conditional non-tangent form (`slab_no_false_miss_total_of_floor`) is proved.
+- **Bézier Newton minimizer floating point**: remains `primhitcheck`-gated.
+
+### Tier 3 — Closed / maintenance
+
+- **M14 (Newton/basin verification)**: complete under the conditional-convergence acceptance criterion. Local quadratic contraction, safeguarded bracket, algebraic bridge, guarded basin convergence, `exists_radius_of_data`, control-point supply of `B0` (`ofCubicB0`) and `K` (`ofCubicK`/`ofCubic_PddBounds`/`ofCubicK_pos`), and `ofCubic_newton_tendsto_of_control_points`. `Sanity.lean` covers non-vacuity. `det0` stays data (no provable lower bound for arbitrary control points).
+- **Sanity and doc consistency**: `Sanity.lean` examples and this document-of-record are maintained as part of each milestone, not tracked as separate roadmap items.
 
 ## 6. Conventions
 
