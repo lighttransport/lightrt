@@ -828,4 +828,12 @@ theorem newton2_step_quadratic {f g : ℝ → ℝ → ℝ} {a b c d K B δ : ℝ
       _ = (8 * B * K * E ^ 2 + 2 * B ^ 2 * E) / δ := rfl
   exact ⟨e1', e2'⟩
 
+theorem newton2Step_at_root {f g : ℝ → ℝ → ℝ} {u t : ℝ}
+    (hf : f u t = 0) (hg : g u t = 0) :
+    newton2Step f g u t = (u, t) := by
+  unfold newton2Step jacDet
+  rw [hf, hg]
+  simp
+
+
 end LightRT.Geom

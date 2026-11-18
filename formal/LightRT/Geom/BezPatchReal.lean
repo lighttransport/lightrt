@@ -232,5 +232,40 @@ theorem bezpatch_exists_nearest_hit (o d : Vec3) (cp : Fin 16 → Vec3) {tmin tb
     rcases ht with ⟨u, hu, v, hv, hpt⟩
     exact hmin (show (u, v, t) ∈ S from ⟨hu, hv, ⟨htmin, htbest⟩, hpt⟩)
 
+def bezPatchContact (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) : Vec3 :=
+  bicubicEval cp u v - (o + t • d)
+
+/-- A converged Newton contact (`F = 0`) is a genuine patch hit. -/
+theorem newton_patch_hit_of_contact_zero (o d : Vec3) (cp : Fin 16 → Vec3) {tmin tbest u v t : ℝ}
+    (hu0 : 0 ≤ u) (hu1 : u ≤ 1) (hv0 : 0 ≤ v) (hv1 : v ≤ 1)
+    (htmin : tmin ≤ t) (htbest : t < tbest)
+    (hres : bezPatchContact o d cp t u v = 0) :
+    HitsBezPatchRay o d cp tmin tbest := by
+  apply hitsBezPatchRay_of_accept o d cp hu0 hu1 hv0 hv1 htmin htbest
+  unfold bezPatchContact at hres
+  exact (sub_eq_zero.mp hres).symm
+
+/-- A converged Newton contact parameter is no smaller than the nearest hit. -/
+theorem newton_patch_contact_ge_nearest (o d : Vec3) (cp : Fin 16 → Vec3) {tmin tbest u v t : ℝ}
+    (hab : tmin ≤ tbest)
+    (hu0 : 0 ≤ u) (hu1 : u ≤ 1) (hv0 : 0 ≤ v) (hv1 : v ≤ 1)
+    (htmin : tmin ≤ t) (htbest : t < tbest)
+    (hres : bezPatchContact o d cp t u v = 0) :
+    ∃ tstar, tstar ∈ Set.Icc tmin tbest ∧
+      (∃ u' ∈ Set.Icc (0:ℝ) 1, ∃ v' ∈ Set.Icc (0:ℝ) 1,
+        o + tstar • d = bicubicEval cp u' v') ∧
+      (∀ s, s ∈ Set.Icc tmin tbest →
+        (∃ u' ∈ Set.Icc (0:ℝ) 1, ∃ v' ∈ Set.Icc (0:ℝ) 1,
+          o + s • d = bicubicEval cp u' v') → tstar ≤ s) ∧
+      tstar ≤ t := by
+  have hhit := newton_patch_hit_of_contact_zero o d cp hu0 hu1 hv0 hv1 htmin htbest hres
+  obtain ⟨tstar, hsh, hslo, hshi, hmin⟩ := bezpatch_exists_nearest_hit o d cp hab hhit
+  refine ⟨tstar, ⟨hslo, hshi⟩, hsh, ?_, ?_⟩
+  · intro s hs hsh'
+    exact hmin s hs.1 hs.2 hsh'
+  · exact hmin t htmin (le_of_lt htbest) ⟨u, ⟨hu0, hu1⟩, v, ⟨hv0, hv1⟩, by
+      unfold bezPatchContact at hres
+      exact (sub_eq_zero.mp hres).symm⟩
+
 end
 end LightRT.Geom
