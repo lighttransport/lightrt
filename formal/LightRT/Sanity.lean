@@ -65,4 +65,12 @@ example : 0 ≤ LightRT.Geom.ofCubicB0
   exact (LightRT.Geom.ofCubic_root_data_B0 (fun _ _ => (0:ℝ)) (fun _ : Fin 3 => (1:ℝ)) 0 1
     (by constructor <;> norm_num) hlen).1
 
+
+/-- The sphere hit predicate is satisfiable (a ray from the origin along +x
+    hits the unit sphere centred at (2,0,0) at t=1). -/
+example : HitsSphereAt (fun _ => (0:ℝ)) (fun i => if i = 0 then 1 else 0)
+    (fun i => if i = 0 then 2 else 0) 1 0 10 1 := by
+  unfold HitsSphereAt OnSphere distSq
+  norm_num [dotProduct, Fin.sum_univ_three]
+
 end LightRT.Sanity
