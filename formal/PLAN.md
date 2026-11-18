@@ -120,7 +120,9 @@ a decision change; Tier 3 is closed or maintenance.
    completeness (`bezpatch_cull_complete`: a true hit is never culled; together
    the two make the subdivision AABB cull exact). `bez3Vec` and
    `bez3Vec_decasteljau_left` give the vector-valued de Casteljau split of each
-   patch control row (the subdivision building block). Full subdivision-plus-
+   patch control row, and bicubicEval_eq_rows / bicubic_split_left give the
+   full tensor de Casteljau split (Fin 16 reindexed as Fin 4 x Fin 4 via
+   finProdFinEquiv, avoiding the slow global simp). Full subdivision-plus-
    Newton completeness and NURBS/trimmed-NURBS surfaces remain open. Note: `c2lean` lacks `sqrtf`
    support, so translating `tri_point_isect_one` needs a tool extension
    (Tier 1.2 dependency).

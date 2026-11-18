@@ -142,7 +142,7 @@ The authoritative roadmap is `formal/PLAN.md` §5 (three tiers). Summary:
   `Geom/BilinearSurface.lean` (soundness + completeness), and bicubic Bezier
   patch soundness/culling (both directions) in `Geom/BezPatchReal.lean` too.
   plus the vector row-level de Casteljau split in `Geom/BezPatchReal.lean`.
-  Next: full tensor split, subdivision+Newton patch completeness, NURBS;
+  Next: subdivision+Newton patch completeness, NURBS;
   acceptance = soundness/completeness/nearest over ℝ + non-vacuity examples.
   (2) `c2lean` coverage expansion — translate further scalar kernels and prove
   `*_refines`. (3) Bézier/patch intersector contract (M15/M16) — abstract

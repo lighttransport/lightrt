@@ -182,4 +182,12 @@ example : ∃ (P : Fin 4 → Vec3) (s : ℝ),
   refine ⟨fun _ => 0, 0.5, ?_⟩
   exact bez3Vec_decasteljau_left (fun _ => 0) 0 0.5
 
+
+/-- Full tensor de Casteljau split is non-vacuous: splitting at t=1 gives the
+    full patch, and splitting at t=0 gives the corner. -/
+example : ∃ (cp : Fin 16 → Vec3) (s v : ℝ),
+    bicubicEval (splitBicubicU cp 1) s v = bicubicEval cp (1 * s) v := by
+  refine ⟨fun _ => 0, 0.5, 0.5, ?_⟩
+  exact bicubic_split_left (fun _ => 0) 1 0.5 0.5
+
 end LightRT.Sanity
