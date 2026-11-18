@@ -85,10 +85,12 @@ a decision change; Tier 3 is closed or maintenance.
    scalar intersectors (sphere, quad/tetra, point, round-linear/flat curves, cubic
    Bézier, SDF, bilinear/Bézier/NURBS/trimmed-NURBS surfaces). `Geom/Hull.lean`
    proves their box containment, but none has a soundness/completeness/nearest
-   theorem over ℝ, and none is `c2lean`-translated. Start with the simple scalar
-   families — ray–sphere and quad/tetra (two MT triangles) — in `Geom/PrimReal.lean`,
-   composing the existing `Geom/MTReal.lean` results for quad/tetra. Then expand
-   family by family (points, curves, surfaces). Acceptance: for each family, a
+   theorem over ℝ, and none is `c2lean`-translated. `Geom/PrimReal.lean` now
+   proves soundness+completeness+nearest over ℝ for ray–sphere (analytic nearest
+   root) and quad/tetra (nearest of two/four MT triangle hits, composing
+   `Geom/MTReal.lean`), with a `Sanity.lean` non-vacuity example. Next: expand
+   family by family (points, round-linear/flat/cubic-Bézier curves, SDF, and the
+   parametric surfaces). Acceptance: for each family, a
    soundness+completeness+nearest theorem over ℝ and non-vacuity examples; a
    `*_refines` theorem once the scalar C function is translated.
 2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates only the
