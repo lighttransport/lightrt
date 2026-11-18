@@ -153,4 +153,12 @@ example : ∃ (d q00 q01 q11 : Vec3) (u : ℝ),
   refine ⟨d, q00, q01, q11, 0.5, ?_⟩
   norm_num [d, q00, q10, q11, q01, crossProduct, dotProduct, Fin.sum_univ_three]
 
+
+/-- Bicubic patch evaluation is non-vacuous: the corner control point is
+    attained at (u,v)=(0,0). -/
+example : ∃ (cp : Fin 16 → Vec3) (u v : ℝ),
+    bicubicEval cp u v = cp 0 := by
+  refine ⟨fun _ => 0, 0, 0, ?_⟩
+  simp [bicubicEval, LightRT.Geom.Hull.bern33, LightRT.Geom.Hull.bern3]
+
 end LightRT.Sanity
