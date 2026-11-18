@@ -99,4 +99,24 @@ example : HitsEllipseAt (fun _ => (0:ℝ)) (fun i => if i = 0 then 1 else 0)
     (fun i => if i = 2 then 1 else 0) 1 1 0 10 2 := by
   norm_num [HitsEllipseAt, OnEllipse, dotProduct, Fin.sum_univ_three]
 
+
+/-- `HitsBezTubeRay` is satisfiable: the zero-direction ray from the curve's
+    start point lies in the tube at the start parameter. -/
+example : ∃ (S : LightRT.Geom.BezSys) (a b tmin tbest : ℝ),
+    a ≤ b ∧ tmin ≤ 0 ∧ 0 < tbest ∧
+    LightRT.Geom.HitsBezTubeRay S a b tmin tbest
+      (LightRT.Geom.curvePt S a) (0 : EuclideanSpace ℝ (Fin 3)) := by
+  let S : LightRT.Geom.BezSys := LightRT.Geom.BezSys.ofCubic
+    (fun _ _ => (0:ℝ)) (fun _ : Fin 3 => (1:ℝ))
+  refine ⟨S, 0, 1, -1, 1, by norm_num, by norm_num, by norm_num, ?_⟩
+  refine ⟨0, by norm_num, by norm_num, ?_⟩
+  have hrad : ∀ u ∈ Set.Icc (0:ℝ) 1, 0 ≤ S.rad u := by
+    intro u hu
+    simp [S, LightRT.Geom.BezSys.ofCubic, LightRT.Geom.bezP]
+  have hphi : LightRT.Geom.bezPhi S (LightRT.Geom.curvePt S 0) 0 ≤ 0 := by
+    simp [S, LightRT.Geom.curvePt, LightRT.Geom.BezSys.ofCubic,
+      LightRT.Geom.bezP, LightRT.Geom.bezPhi, LightRT.Geom.bezQ]
+  simpa using LightRT.Geom.mem_bezTubeSet_of_bezPhi_le S
+    (LightRT.Geom.curvePt S 0) hrad (by norm_num : (0:ℝ) ∈ Set.Icc 0 1) hphi
+
 end LightRT.Sanity

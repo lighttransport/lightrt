@@ -103,7 +103,9 @@ a decision change; Tier 3 is closed or maintenance.
    composes it with two end spheres (nearest of three components, with
    soundness/completeness) and `Geom/EllipseReal.lean` covers ellipse points
    (plane intersection + elliptical-bound test, soundness/completeness).
-   Still open: cubic-Bézier curves, SDF sphere-trace composition, and the
+   `Geom/BezFirstContact.lean` composes the chain into a first-contact contract
+   (`HitsBezTubeRay`, sampled acceptance sound, exact/sampled no-overshoot,
+   boundary existence). Still open: SDF sphere-trace composition and the
    parametric surfaces. Note: `c2lean` lacks `sqrtf`
    support, so translating `tri_point_isect_one` needs a tool extension
    (Tier 1.2 dependency).
