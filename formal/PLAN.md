@@ -110,8 +110,11 @@ a decision change; Tier 3 is closed or maintenance.
    a contact `L` with `f L = 0`). `Geom/BilinearSurface.lean` begins the
    parametric-surface family: the `tri_bilin_one` coplanarity quadratic +
    Cramer solve, with soundness (a reported hit is a genuine surface point
-   in the unit square) and the dual-basis reconstruction identity. Still open:
-   bilinear completeness, Bezier/NURBS/trimmed-NURBS surfaces. Note: `c2lean` lacks `sqrtf`
+   in the unit square) and the dual-basis reconstruction identity.
+   `bilinReal_complete` closes the other half: a geometric hit (point on the
+   surface with `(u,v)` in the unit square, nondegenerate ruling) implies
+   `bilinReal` reports a genuine hit. Still open: Bezier/NURBS/trimmed-NURBS
+   surfaces. Note: `c2lean` lacks `sqrtf`
    support, so translating `tri_point_isect_one` needs a tool extension
    (Tier 1.2 dependency).
 2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates only the

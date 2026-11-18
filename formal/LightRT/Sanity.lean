@@ -139,4 +139,18 @@ example : ∃ (q00 q10 q11 q01 p : Vec3), OnBilinearSurface q00 q10 q11 q01 p :=
   refine ⟨0, 0, 0, 0, 0, 0, by norm_num, 0, by norm_num, ?_⟩
   simp [bilinEval]
 
+
+/-- Bilinear completeness' nondegeneracy hypothesis is satisfiable: a flat
+    unit patch in z=0 and a ray along +z gives a positive ruling denominator. -/
+example : ∃ (d q00 q01 q11 : Vec3) (u : ℝ),
+    0 < (crossProduct d (q01 - q00 + u • (q11 - (fun i => if i = 0 then 1 else 0) - q01 + q00))) ⬝ᵥ
+      (crossProduct d (q01 - q00 + u • (q11 - (fun i => if i = 0 then 1 else 0) - q01 + q00))) := by
+  let d : Vec3 := fun i => if i = 2 then 1 else 0
+  let q00 : Vec3 := fun i => 0
+  let q10 : Vec3 := fun i => if i = 0 then 1 else 0
+  let q11 : Vec3 := fun i => if i = 0 then 1 else if i = 1 then 1 else 0
+  let q01 : Vec3 := fun i => if i = 1 then 1 else 0
+  refine ⟨d, q00, q01, q11, 0.5, ?_⟩
+  norm_num [d, q00, q10, q11, q01, crossProduct, dotProduct, Fin.sum_univ_three]
+
 end LightRT.Sanity
