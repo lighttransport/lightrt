@@ -90,7 +90,9 @@ a decision change; Tier 3 is closed or maintenance.
    root) and quad/tetra (nearest of two/four MT triangle hits, composing
    `Geom/MTReal.lean`), with a `Sanity.lean` non-vacuity example. Next: expand
    family by family (points, round-linear/flat/cubic-Bézier curves, SDF, and the
-   parametric surfaces). Acceptance: for each family, a
+   parametric surfaces). `Geom/PointReal.lean` now covers point discs (ray-facing
+   and oriented; point spheres reuse `sphereReal`). Next: curves (round-linear,
+   flat via `quadReal`, cubic Bézier), SDF, surfaces. Acceptance: for each family, a
    soundness+completeness+nearest theorem over ℝ and non-vacuity examples; a
    `*_refines` theorem once the scalar C function is translated.
 2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates only the
