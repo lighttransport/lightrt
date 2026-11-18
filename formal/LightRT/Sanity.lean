@@ -73,4 +73,11 @@ example : HitsSphereAt (fun _ => (0:ℝ)) (fun i => if i = 0 then 1 else 0)
   unfold HitsSphereAt OnSphere distSq
   norm_num [dotProduct, Fin.sum_univ_three]
 
+
+/-- The ray-facing disc hit predicate is satisfiable (origin ray along +x,
+    centre (2,0,0), radius 1: hits at t=2). -/
+example : HitsRayDiscAt (fun _ => (0:ℝ)) (fun i => if i = 0 then 1 else 0)
+    (fun i => if i = 0 then 2 else 0) 1 0 10 2 := by
+  norm_num [HitsRayDiscAt, OnRayDisc, distSq, dotProduct, Fin.sum_univ_three]
+
 end LightRT.Sanity
