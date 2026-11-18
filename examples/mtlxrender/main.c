@@ -15,6 +15,7 @@
 #include "mtlx_doc.h"
 #include "mtlx_eval.h"
 #include "verified_math.h"
+#include "passive_film.h"
 #include "bsdf.h"
 #include "material_bind.h"
 #include "texture.h"
@@ -199,7 +200,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--energy-mode")) {
             const char *mode = NEXT;
             if (!strcmp(mode, "reference")) bsdf_set_energy_mode(0);
-            else if (!strcmp(mode, "conservative")) bsdf_set_energy_mode(1);
+            else if (!strcmp(mode, "conservative")) {
+                bsdf_set_energy_mode(1);
+                /* Proved passive channel model for thin films in this mode only. */
+                bsdf_set_conservative_film_fn(mtlx_passive_film);
+            }
             else { fprintf(stderr, "invalid --energy-mode: %s\n", mode); return 1; }
         }
         else if (!strcmp(a, "--layering")) {
