@@ -8,6 +8,7 @@
 import Mathlib
 import LightRT.Geom.Hull
 import LightRT.Geom.Basic
+import LightRT.Geom.Newton2D
 
 namespace LightRT.Geom
 noncomputable section
@@ -266,6 +267,39 @@ theorem newton_patch_contact_ge_nearest (o d : Vec3) (cp : Fin 16 → Vec3) {tmi
   · exact hmin t htmin (le_of_lt htbest) ⟨u, ⟨hu0, hu1⟩, v, ⟨hv0, hv1⟩, by
       unfold bezPatchContact at hres
       exact (sub_eq_zero.mp hres).symm⟩
+
+def patchF (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) : ℝ :=
+  (bezPatchContact o d cp t u v) 0
+
+def patchG (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) : ℝ :=
+  (bezPatchContact o d cp t u v) 1
+
+/-- Newton2D quadratic contraction instantiated at the patch contact system.
+    The C2/bounds hypotheses are the standing Newton2D data (as in
+    `ofCubic_newton_quadratic`); deriving them from control points is the
+    remaining coefficient bound chase. -/
+theorem bezpatch_newton_quadratic (o d : Vec3) (cp : Fin 16 → Vec3) (t : ℝ)
+    (a b c dv K B δ : ℝ)
+    (hF : C2Seg (patchF o d cp t) a b c dv K)
+    (hG : C2Seg (patchG o d cp t) a b c dv K)
+    (hK : 0 < K) (hB : 0 ≤ B)
+    {u₀ v₀ u v : ℝ}
+    (hu : u ∈ Set.Icc a b) (hu₀ : u₀ ∈ Set.Icc a b)
+    (hv : v ∈ Set.Icc c dv) (hv₀ : v₀ ∈ Set.Icc c dv)
+    (hroot : patchF o d cp t u₀ v₀ = 0 ∧ patchG o d cp t u₀ v₀ = 0)
+    (hUb : |pd1 (patchF o d cp t) u v| ≤ B) (hVb : |pd2 (patchF o d cp t) u v| ≤ B)
+    (hWb : |pd1 (patchG o d cp t) u v| ≤ B) (hZb : |pd2 (patchG o d cp t) u v| ≤ B)
+    (hAb : |pd1 (patchF o d cp t) u₀ v₀| ≤ B) (hBb : |pd2 (patchF o d cp t) u₀ v₀| ≤ B)
+    (hCb : |pd1 (patchG o d cp t) u₀ v₀| ≤ B) (hDb : |pd2 (patchG o d cp t) u₀ v₀| ≤ B)
+    (hden : δ ≤ |jacDet (patchF o d cp t) (patchG o d cp t) u v|) (hδ : 0 < δ)
+    (hE : |u - u₀| + |v - v₀| ≤ B / K) :
+    |(newton2Step (patchF o d cp t) (patchG o d cp t) u v).1 - u₀| ≤
+        (10 * B * K / δ) * (|u - u₀| + |v - v₀|) ^ 2 ∧
+    |(newton2Step (patchF o d cp t) (patchG o d cp t) u v).2 - v₀| ≤
+        (8 * B * K * (|u - u₀| + |v - v₀|) ^ 2 + 2 * B ^ 2 *
+          (|u - u₀| + |v - v₀|)) / δ :=
+  newton2_step_quadratic hF hG hK hB hu hu₀ hv hv₀ hroot
+    hUb hVb hWb hZb hAb hBb hCb hDb hden hδ hE
 
 end
 end LightRT.Geom
