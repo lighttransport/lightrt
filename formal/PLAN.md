@@ -95,6 +95,14 @@ a decision change; Tier 3 is closed or maintenance.
    flat via `quadReal`, cubic Bézier), SDF, surfaces. Acceptance: for each family, a
    soundness+completeness+nearest theorem over ℝ and non-vacuity examples; a
    `*_refines` theorem once the scalar C function is translated.
+   Coverage so far: triangle/MT (`MTReal`), sphere + quad/tetra (`PrimReal`),
+   point sphere (via `sphereReal`), ray-facing/oriented point discs
+   (`PointReal`), flat curve (ray-facing ribbon = quad via `quadReal`), SDF
+   sphere/box (via `sphereReal` / `SlabReal` respectively). Still open:
+   round-linear/cubic-Bézier curves, ellipse points, SDF sphere-trace
+   composition, and the parametric surfaces. Note: `c2lean` lacks `sqrtf`
+   support, so translating `tri_point_isect_one` needs a tool extension
+   (Tier 1.2 dependency).
 2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates only the
    scalar triangle core (`tri_minf/maxf`, `tri_slab_scalar`, `tri_mt_one`,
    `tri_ray_setup`, `tri_woop_one`, `tri_exn_key`). Translate additional *scalar*
