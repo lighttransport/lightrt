@@ -113,8 +113,11 @@ a decision change; Tier 3 is closed or maintenance.
    in the unit square) and the dual-basis reconstruction identity.
    `bilinReal_complete` closes the other half: a geometric hit (point on the
    surface with `(u,v)` in the unit square, nondegenerate ruling) implies
-   `bilinReal` reports a genuine hit. Still open: Bezier/NURBS/trimmed-NURBS
-   surfaces. Note: `c2lean` lacks `sqrtf`
+   `bilinReal` reports a genuine hit. `Geom/BezPatchReal.lean` starts the
+   bicubic Bezier patch: tensor Bernstein evaluation, control-hull containment,
+   continuity and u-partial derivative, ray/patch hit soundness, and culling
+   soundness (a ray missing the control hull cannot hit the patch). Still open:
+   bicubic patch completeness, NURBS/trimmed-NURBS surfaces. Note: `c2lean` lacks `sqrtf`
    support, so translating `tri_point_isect_one` needs a tool extension
    (Tier 1.2 dependency).
 2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates only the
