@@ -301,5 +301,83 @@ theorem bezpatch_newton_quadratic (o d : Vec3) (cp : Fin 16 → Vec3) (t : ℝ)
   newton2_step_quadratic hF hG hK hB hu hu₀ hv hv₀ hroot
     hUb hVb hWb hZb hAb hBb hCb hDb hden hδ hE
 
+/-- Second derivative of a cubic Bernstein weight. -/
+def bern3'' (t : ℝ) (k : Fin 4) : ℝ :=
+  match k with
+  | ⟨0, _⟩ => 6 * (1 - t)
+  | ⟨1, _⟩ => 18 * t - 12
+  | ⟨2, _⟩ => 6 - 18 * t
+  | ⟨_, _⟩ => 6 * t
+
+theorem bern3'_vec (t : ℝ) (k : Fin 4) :
+    bern3' t k = ![-(3*(1-t)^2), 3*(1-t)^2 - 6*(1-t)*t,
+                     6*(1-t)*t - 3*t^2, 3*t^2] k := by
+  fin_cases k
+  · change -3*(1-t)^2 = _; simp
+  · change 3*(1-t)^2 - 6*(1-t)*t = _; simp
+  · change 6*(1-t)*t - 3*t^2 = _; simp
+  · change 3*t^2 = _; simp
+
+theorem abs_bern3'_le {t : ℝ} (h0:0≤t) (h1:t≤1) (k:Fin 4) : |bern3' t k| ≤ 3 := by
+  rw [bern3'_vec]
+  fin_cases k <;> simp
+  · exact abs_le.mpr ⟨by linarith, by linarith⟩
+  · ring_nf
+    apply abs_le.mpr; constructor
+    · nlinarith [sq_nonneg (3*t-2)]
+    · have hmul : t*(3*t-4) ≤ 0 := mul_nonpos_of_nonneg_of_nonpos h0 (by nlinarith)
+      nlinarith
+  · ring_nf
+    apply abs_le.mpr; constructor
+    · nlinarith [sq_nonneg (3*t-1)]
+    · have hmul : (3*t+1)*(t-1) ≤ 0 := mul_nonpos_of_nonneg_of_nonpos (by positivity) (by linarith)
+      nlinarith
+  · exact abs_le.mpr ⟨by linarith, by linarith⟩
+
+theorem bern3''_vec (t : ℝ) (k : Fin 4) :
+    bern3'' t k = ![6*(1-t), 18*t-12, 6-18*t, 6*t] k := by
+  fin_cases k
+  · change 6*(1-t) = _; simp
+  · change 18*t-12 = _; simp
+  · change 6-18*t = _; simp
+  · change 6*t = _; simp
+
+theorem abs_bern3''_le {t : ℝ} (h0:0≤t) (h1:t≤1) (k:Fin 4) : |bern3'' t k| ≤ 12 := by
+  rw [bern3''_vec]
+  fin_cases k <;> simp
+  · have h : |1 - t| ≤ 2 := abs_le.mpr ⟨by linarith, by linarith⟩
+    nlinarith
+  · exact abs_le.mpr ⟨by linarith, by linarith⟩
+  · exact abs_le.mpr ⟨by linarith, by linarith⟩
+  · have h : |t| ≤ 2 := abs_le.mpr ⟨by linarith, by linarith⟩
+    nlinarith
+
+theorem bern3_le_one {t:ℝ} (h0:0≤t) (h1:t≤1) (k:Fin 4) : bern3 t k ≤ 1 := by
+  fin_cases k <;> simp [bern3] <;> nlinarith [sq_nonneg t, sq_nonneg (1-t)]
+
+
+theorem abs_bicubic_du_le (cp : Fin 16 → Vec3) (M : ℝ) (hM : ∀ k i, |cp k i| ≤ M) (hM0 : 0 ≤ M)
+    {u v : ℝ} (hu0:0≤u) (hu1:u≤1) (hv0:0≤v) (hv1:v≤1) (a : Fin 3) :
+    |(bicubicEval_du cp u v) a| ≤ 48 * M := by
+  unfold bicubicEval_du
+  simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+  calc |∑ k : Fin 16, (bern3' u ⟨k.val % 4, by omega⟩ * bern3 v ⟨k.val / 4, by omega⟩) * cp k a|
+      ≤ ∑ k : Fin 16, |(bern3' u ⟨k.val % 4, by omega⟩ * bern3 v ⟨k.val / 4, by omega⟩) * cp k a| :=
+        Finset.abs_sum_le_sum_abs _ _
+    _ ≤ ∑ k : Fin 16, (3 * M) := by
+        apply Finset.sum_le_sum; intro k hk
+        rw [abs_mul, abs_mul]
+        have h1 := abs_bern3'_le hu0 hu1 ⟨k.val % 4, by omega⟩
+        have h2 := bern3_nonneg hv0 hv1 ⟨k.val / 4, by omega⟩
+        have h2' : |bern3 v ⟨k.val / 4, by omega⟩| ≤ 1 := by
+          rw [abs_of_nonneg h2]
+          exact bern3_le_one hv0 hv1 ⟨k.val / 4, by omega⟩
+        have h12 : |bern3' u ⟨k.val % 4, by omega⟩| * |bern3 v ⟨k.val / 4, by omega⟩| ≤ 3 * 1 :=
+          mul_le_mul h1 h2' (abs_nonneg _) (by norm_num)
+        have h123 : (|bern3' u ⟨k.val % 4, by omega⟩| * |bern3 v ⟨k.val / 4, by omega⟩|) * |cp k a| ≤ (3*1) * M :=
+          mul_le_mul h12 (hM k a) (abs_nonneg _) (by norm_num)
+        simpa [mul_assoc] using h123
+    _ = 48 * M := by simp; ring
+
 end
 end LightRT.Geom
