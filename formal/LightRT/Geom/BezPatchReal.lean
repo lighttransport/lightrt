@@ -123,5 +123,59 @@ theorem bez3Vec_decasteljau_left (P : Fin 4 → Vec3) (t s : ℝ) :
   change Hull.bez3 (fun i => splitLVec P t i a) s = Hull.bez3 (fun i => P i a) (t * s)
   exact Hull.decasteljau_left (fun i => P i a) t s
 
+def patchRows (cp : Fin 16 → Vec3) (j : Fin 4) : Fin 4 → Vec3 :=
+  fun i => cp ⟨j.val * 4 + i.val, by omega⟩
+
+def bicubicEval_rows (cp : Fin 16 → Vec3) (u v : ℝ) : Vec3 :=
+  ∑ j : Fin 4, bern3 v j • bez3Vec (patchRows cp j) u
+
+theorem bern33_ji (u v : ℝ) (j i : Fin 4) :
+    bern33 u v ⟨j.val * 4 + i.val, by omega⟩ = bern3 u i * bern3 v j := by
+  have h1 : i.val % 4 = i.val := Nat.mod_eq_of_lt i.isLt
+  have h2 : (j.val * 4 + i.val) / 4 = j.val := by omega
+  simp [bern33, h1, h2]
+
+theorem fin_idx_eq (j i : Fin 4) :
+    finProdFinEquiv (j, i) = (⟨j.val * 4 + i.val, by omega⟩ : Fin 16) := by
+  apply Fin.ext
+  simp [finProdFinEquiv]
+  omega
+
+theorem bicubicEval_eq_rows (cp : Fin 16 → Vec3) (u v : ℝ) :
+    bicubicEval cp u v = bicubicEval_rows cp u v := by
+  unfold bicubicEval bicubicEval_rows bez3Vec
+  rw [← Equiv.sum_comp (finProdFinEquiv (m:=4) (n:=4))]
+  simp only [Fintype.sum_prod_type]
+  apply Finset.sum_congr rfl
+  intro j hj
+  rw [Finset.smul_sum]
+  apply Finset.sum_congr rfl
+  intro i hi
+  rw [fin_idx_eq, bern33_ji]
+  simp [patchRows, smul_smul, mul_comm, mul_assoc]
+
+
+/-- Split a bicubic patch's control net in the u direction at t (left half). -/
+def splitBicubicU (cp : Fin 16 → Vec3) (t : ℝ) : Fin 16 → Vec3 :=
+  fun k => splitLVec (patchRows cp ⟨k.val / 4, by omega⟩) t ⟨k.val % 4, by omega⟩
+
+/-- Full tensor de Casteljau split: the left u-subpatch evaluated at `s` equals
+    the original patch at `t*s`. -/
+theorem bicubic_split_left (cp : Fin 16 → Vec3) (t s v : ℝ) :
+    bicubicEval (splitBicubicU cp t) s v = bicubicEval cp (t * s) v := by
+  rw [bicubicEval_eq_rows (splitBicubicU cp t) s v, bicubicEval_eq_rows cp (t * s) v]
+  unfold bicubicEval_rows
+  apply Finset.sum_congr rfl
+  intro j hj
+  congr 1
+  have hrows : patchRows (splitBicubicU cp t) j = splitLVec (patchRows cp j) t := by
+    ext i a
+    simp [patchRows, splitBicubicU]
+    have h1 : (j.val * 4 + i.val) / 4 = j.val := by omega
+    have h2 : (j.val * 4 + i.val) % 4 = i.val := by omega
+    simp [h1, h2, Nat.mod_eq_of_lt i.isLt]
+  rw [hrows]
+  exact bez3Vec_decasteljau_left (patchRows cp j) t s
+
 end
 end LightRT.Geom
