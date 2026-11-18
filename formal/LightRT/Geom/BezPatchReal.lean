@@ -102,5 +102,14 @@ theorem bicubicEval_hasDerivAt_u (cp : Fin 16 → Vec3) (u v : ℝ) :
       (bern3 v ⟨k.val / 4, by omega⟩)).smul_const (cp k))) using 1
   · ext y; simp [bern33] <;> ring_nf
 
+theorem bezpatch_cull_complete (o d : Vec3) (cp : Fin 16 → Vec3) (lo hi : Vec3)
+    (hlo : ∀ k i, lo i ≤ cp k i) (hhi : ∀ k i, cp k i ≤ hi i)
+    {tmin tbest : ℝ} (hhit : HitsBezPatchRay o d cp tmin tbest) :
+    ∃ t, tmin ≤ t ∧ t < tbest ∧ Box.Mem ⟨lo, hi⟩ (o + t • d) := by
+  rcases hhit with ⟨u, hu, v, hv, t, htmin, htbest, hpt⟩
+  refine ⟨t, htmin, htbest, ?_⟩
+  rw [hpt]
+  exact bicubicEval_in_box cp lo hi hlo hhi hu.1 hu.2 hv.1 hv.2
+
 end
 end LightRT.Geom
