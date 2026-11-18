@@ -8,6 +8,7 @@ import LightRT.Geom.PrimReal
 import LightRT.Geom.PointReal
 import LightRT.Geom.CylinderReal
 import LightRT.Geom.CapsuleReal
+import LightRT.Geom.EllipseReal
 import LightRT.Geom.BezNewton
 import LightRT.Geom.BezTube
 import LightRT.Geom.BezNewtonGuards

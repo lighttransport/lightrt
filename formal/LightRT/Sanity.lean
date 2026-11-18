@@ -88,4 +88,15 @@ example : HitsCylinderSideAt (fun _ => (0:ℝ)) (fun i => if i = 0 then 1 else 0
     (fun i => if i = 0 then 2 else if i = 1 then 1 else 0) 1 0 10 3 := by
   norm_num [HitsCylinderSideAt, OnCylinderSide, perpSq, perpTo, dotProduct, Fin.sum_univ_three]
 
+
+/-- The ellipse point predicate is satisfiable: a ray from origin along +x
+    hits the ellipse centred at (2,0,0), normal +x, axes +y/+z (ru=rv=1)
+    at t=2. -/
+example : HitsEllipseAt (fun _ => (0:ℝ)) (fun i => if i = 0 then 1 else 0)
+    (fun i => if i = 0 then 2 else 0)
+    (fun i => if i = 0 then 1 else 0)
+    (fun i => if i = 1 then 1 else 0)
+    (fun i => if i = 2 then 1 else 0) 1 1 0 10 2 := by
+  norm_num [HitsEllipseAt, OnEllipse, dotProduct, Fin.sum_univ_three]
+
 end LightRT.Sanity
