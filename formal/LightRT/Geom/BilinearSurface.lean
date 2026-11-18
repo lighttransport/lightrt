@@ -201,5 +201,159 @@ theorem bilinReal_sound {o d q00 q10 q11 q01 : Vec3} {tmin tbest t u v : ℝ}
     ⟨hs.2.2.1, hs.2.2.2.1⟩, hpt⟩
 
 
+theorem bilin_pa_dot_n_of_point {o d q00 q10 q11 q01 : Vec3} {t u v : ℝ}
+    (hpt : o + t • d = bilinEval q00 q10 q11 q01 u v) :
+    (q00 - o + u • (q10 - q00)) ⬝ᵥ
+      crossProduct d (q01 - q00 + u • (q11 - q10 - q01 + q00)) = 0 := by
+  let e10 := q10 - q00
+  let e00 := q01 - q00
+  let dd := q11 - q10 - q01 + q00
+  let Q0 := q00 - o
+  let pa := Q0 + u • e10
+  let D := e00 + u • dd
+  let n := crossProduct d D
+  have heq : t • d = pa + v • D := by
+    have h0 : t • d = bilinEval q00 q10 q11 q01 u v - o := by
+      rw [← hpt]
+      abel
+    rw [h0]
+    dsimp [bilinEval, pa, D, e10, e00, dd, Q0]
+    ext i
+    simp [Pi.add_apply, Pi.smul_apply, smul_eq_mul]
+    ring
+  have hd : d ⬝ᵥ n = 0 := by
+    dsimp [n]
+    simp [dotProduct, cross_apply, Fin.sum_univ_three]
+    ring
+  have hD : D ⬝ᵥ n = 0 := by
+    dsimp [n]
+    simp [dotProduct, cross_apply, Fin.sum_univ_three]
+    ring
+  have hh := congrArg (fun x : Vec3 => x ⬝ᵥ n) heq
+  rw [smul_dotProduct, add_dotProduct, smul_dotProduct, hd, hD] at hh
+  -- hh : t * 0 = pa·n + v*0 -> 0 = pa·n
+  simpa [pa, Q0, e10, D, e00, dd, n] using hh.symm
+
+
+/-- A geometric bilinear hit gives a nonpositive ray parameter and the Cramer
+    formulas, hence `bilinSolve` reports it (assuming the ruling is not
+    parallel to the ray). -/
+theorem bilinSolve_of_point {o d q00 q10 q11 q01 : Vec3} {t u v : ℝ}
+    (hden : 0 < (crossProduct d (q01 - q00 + u • (q11 - q10 - q01 + q00))) ⬝ᵥ
+      (crossProduct d (q01 - q00 + u • (q11 - q10 - q01 + q00))))
+    (hu0 : 0 ≤ u) (hu1 : u ≤ 1) (hv0 : 0 ≤ v) (hv1 : v ≤ 1)
+    {tmin tbest : ℝ} (htmin : tmin ≤ t) (htbest : t < tbest)
+    (hpt : o + t • d = bilinEval q00 q10 q11 q01 u v) :
+    bilinSolve d (q00 - o) (q10 - q00) (q01 - q00) (q11 - q10 - q01 + q00)
+      tmin tbest u = some (t, u, v) := by
+  unfold bilinSolve
+  dsimp only
+  set e10 := q10 - q00
+  set e00 := q01 - q00
+  set dd := q11 - q10 - q01 + q00
+  set Q0 := q00 - o
+  set pa := Q0 + u • e10
+  set D := e00 + u • dd
+  set n := crossProduct d D
+  set den := n ⬝ᵥ n
+  have hdenpos : 0 < den := by simpa [den, n, D, e00, dd] using hden
+  have hden0 : den ≠ 0 := ne_of_gt hdenpos
+  rw [if_neg (not_le.mpr hdenpos)]
+  have heq : t • d = pa + v • D := by
+    have h0 : t • d = bilinEval q00 q10 q11 q01 u v - o := by
+      rw [← hpt]
+      abel
+    rw [h0]
+    dsimp [bilinEval, pa, D, e10, e00, dd, Q0]
+    ext i
+    simp [Pi.add_apply, Pi.smul_apply, smul_eq_mul]
+    ring
+  have hcrossD : crossProduct (t • d - v • D) D = t • n := by
+    dsimp [n]
+    ext i
+    fin_cases i <;>
+      simp [cross_apply, Pi.sub_apply, Pi.smul_apply, smul_eq_mul, Fin.sum_univ_three] <;>
+      ring
+  have hcrossd : crossProduct (t • d - v • D) d = v • n := by
+    dsimp [n]
+    ext i
+    fin_cases i <;>
+      simp [cross_apply, Pi.sub_apply, Pi.smul_apply, smul_eq_mul, Fin.sum_univ_three] <;>
+      ring
+  have heq' : t • d - v • D = pa := by
+    rw [sub_eq_iff_eq_add]
+    exact heq
+  have htd : t = (crossProduct pa D ⬝ᵥ n) / den := by
+    have hh := congrArg (fun x : Vec3 => crossProduct x D ⬝ᵥ n) heq'
+    rw [hcrossD] at hh
+    simp only [smul_dotProduct] at hh
+    field_simp [hden0]
+    simpa [den] using hh
+  have hvd : v = (crossProduct pa d ⬝ᵥ n) / den := by
+    have hh := congrArg (fun x : Vec3 => crossProduct x d ⬝ᵥ n) heq'
+    rw [hcrossd] at hh
+    simp only [smul_dotProduct] at hh
+    field_simp [hden0]
+    simpa [den] using hh
+  rw [← htd, ← hvd]
+  rw [if_pos ⟨hv0, hv1, htmin, htbest⟩]
+
+theorem bilin_quad_of_pa (d Q0 e10 e00 dd : Vec3) (u : ℝ)
+    (h : (Q0 + u • e10) ⬝ᵥ crossProduct d (e00 + u • dd) = 0) :
+    (e10 ⬝ᵥ crossProduct d dd) * u ^ 2 +
+      (Q0 ⬝ᵥ crossProduct d dd + e10 ⬝ᵥ crossProduct d e00) * u +
+      (Q0 ⬝ᵥ crossProduct d e00) = 0 := by
+  have heq : (Q0 + u • e10) ⬝ᵥ crossProduct d (e00 + u • dd) =
+      (Q0 ⬝ᵥ crossProduct d e00) +
+        (Q0 ⬝ᵥ crossProduct d dd + e10 ⬝ᵥ crossProduct d e00) * u +
+        (e10 ⬝ᵥ crossProduct d dd) * u ^ 2 := by
+    simp [dotProduct, cross_apply, Fin.sum_univ_three, Pi.add_apply, Pi.smul_apply, smul_eq_mul]
+    ring
+  rw [heq] at h
+  ring_nf at h ⊢
+  exact h
+
+theorem bilinReal_complete {o d q00 q10 q11 q01 : Vec3} {tmin tbest t u v : ℝ}
+    (hA : (q10 - q00) ⬝ᵥ crossProduct d (q11 - q10 - q01 + q00) ≠ 0)
+    (hden : 0 < (crossProduct d (q01 - q00 + u • (q11 - q10 - q01 + q00))) ⬝ᵥ
+      (crossProduct d (q01 - q00 + u • (q11 - q10 - q01 + q00))))
+    (hu0 : 0 ≤ u) (hu1 : u ≤ 1) (hv0 : 0 ≤ v) (hv1 : v ≤ 1)
+    (htmin : tmin ≤ t) (htbest : t < tbest)
+    (hpt : o + t • d = bilinEval q00 q10 q11 q01 u v) :
+    ∃ (t' u' v' : ℝ), bilinReal o d q00 q10 q11 q01 tmin tbest = some (t', u', v') := by
+  let e10 := q10 - q00
+  let e00 := q01 - q00
+  let dd := q11 - q10 - q01 + q00
+  let Q0 := q00 - o
+  let A := e10 ⬝ᵥ crossProduct d dd
+  let B := Q0 ⬝ᵥ crossProduct d dd + e10 ⬝ᵥ crossProduct d e00
+  let C := Q0 ⬝ᵥ crossProduct d e00
+  let results := (quadRootsList A B C 0 2).filter (fun u => u ≤ 1)
+  have hA' : A ≠ 0 := by
+    intro hz
+    apply hA
+    dsimp [A, e10, dd] at hz
+    ring_nf at hz ⊢
+    exact hz
+  have hpa := bilin_pa_dot_n_of_point hpt
+  have hquad : A * u ^ 2 + B * u + C = 0 := by
+    dsimp [A, B, C, e10, e00, dd, Q0]
+    exact bilin_quad_of_pa d (q00 - o) (q10 - q00) (q01 - q00)
+      (q11 - q10 - q01 + q00) u hpa
+  have hult2 : u < 2 := by linarith
+  have hu_roots : u ∈ quadRootsList A B C 0 2 :=
+    quadRootsList_complete hA' hquad hu0 hult2
+  have hu_results : u ∈ results := by
+    unfold results
+    simp [hu_roots, hu1]
+  have hsolve : bilinSolve d Q0 e10 e00 dd tmin tbest u = some (t, u, v) := by
+    simpa [Q0, e10, e00, dd] using bilinSolve_of_point hden hu0 hu1 hv0 hv1 htmin htbest hpt
+  have hmem : some (t, u, v) ∈ results.map (bilinSolve d Q0 e10 e00 dd tmin tbest) := by
+    exact List.mem_map.mpr ⟨u, hu_results, hsolve⟩
+  obtain ⟨⟨t', u', v'⟩, hres⟩ := firstSome_exists hmem
+  exact ⟨t', u', v', by
+    unfold bilinReal
+    simpa only [e10, e00, dd, Q0, A, B, C, results] using hres⟩
+
 end
 end LightRT.Geom
