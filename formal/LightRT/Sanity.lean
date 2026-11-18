@@ -8,6 +8,7 @@ import LightRT
 
 namespace LightRT.Sanity
 open LightRT.Geom LightRT.FP LightRT.Robust
+open Filter Topology
 
 /-- A concrete ray that geometrically hits a concrete box (premise of
     `slab_no_false_miss` is inhabited). -/
@@ -118,5 +119,18 @@ example : ∃ (S : LightRT.Geom.BezSys) (a b tmin tbest : ℝ),
       LightRT.Geom.bezP, LightRT.Geom.bezPhi, LightRT.Geom.bezQ]
   simpa using LightRT.Geom.mem_bezTubeSet_of_bezPhi_le S
     (LightRT.Geom.curvePt S 0) hrad (by norm_num : (0:ℝ) ∈ Set.Icc 0 1) hphi
+
+
+/-- Sphere-trace convergence is non-vacuous: for `f t = 1 - t` on `[0,1]`,
+    the trace from 0 converges to the contact at 1. -/
+example : ∃ L ≤ (1:ℝ), Tendsto (fun n => stTrace (fun t : ℝ => 1 - t) 0 n) atTop (𝓝 L) ∧
+    (1 - L) = 0 := by
+  have hf : Lipschitz1 (fun t : ℝ => 1 - t) := by
+    intro x y
+    have heq : (1 - x) - (1 - y) = y - x := by ring
+    rw [heq, abs_sub_comm]
+  have hnonneg : ∀ s, (0:ℝ) ≤ s → s ≤ 1 → 0 ≤ 1 - s := by
+    intro s h0 h1; linarith
+  exact stTrace_tendsto_contact hf (by norm_num : 1 - (1:ℝ) ≤ 0) (by norm_num : (0:ℝ) ≤ 1) hnonneg
 
 end LightRT.Sanity

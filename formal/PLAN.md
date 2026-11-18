@@ -105,8 +105,10 @@ a decision change; Tier 3 is closed or maintenance.
    (plane intersection + elliptical-bound test, soundness/completeness).
    `Geom/BezFirstContact.lean` composes the chain into a first-contact contract
    (`HitsBezTubeRay`, sampled acceptance sound, exact/sampled no-overshoot,
-   boundary existence). Still open: SDF sphere-trace composition and the
-   parametric surfaces. Note: `c2lean` lacks `sqrtf`
+   boundary existence). `Geom/SphereTraceConvergence.lean` adds the convergence
+   half (`stTrace_tendsto_contact`: an SDF-like 1-Lipschitz trace converges to
+   a contact `L` with `f L = 0`). Still open: parametric surfaces
+   (bilinear/Bezier/NURBS/trimmed-NURBS). Note: `c2lean` lacks `sqrtf`
    support, so translating `tri_point_isect_one` needs a tool extension
    (Tier 1.2 dependency).
 2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates only the
