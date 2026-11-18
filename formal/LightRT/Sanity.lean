@@ -80,4 +80,12 @@ example : HitsRayDiscAt (fun _ => (0:ℝ)) (fun i => if i = 0 then 1 else 0)
     (fun i => if i = 0 then 2 else 0) 1 0 10 2 := by
   norm_num [HitsRayDiscAt, OnRayDisc, distSq, dotProduct, Fin.sum_univ_three]
 
+
+/-- The cylinder-side hit predicate is satisfiable: ray from the origin along
+    +x hits the radius-1 cylinder of axis (2,-1,0)->(2,1,0) at t=3. -/
+example : HitsCylinderSideAt (fun _ => (0:ℝ)) (fun i => if i = 0 then 1 else 0)
+    (fun i => if i = 0 then 2 else if i = 1 then -1 else 0)
+    (fun i => if i = 0 then 2 else if i = 1 then 1 else 0) 1 0 10 3 := by
+  norm_num [HitsCylinderSideAt, OnCylinderSide, perpSq, perpTo, dotProduct, Fin.sum_univ_three]
+
 end LightRT.Sanity
