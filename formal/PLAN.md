@@ -118,8 +118,10 @@ a decision change; Tier 3 is closed or maintenance.
    continuity and u-partial derivative, ray/patch hit soundness, and culling
    soundness (a ray missing the control hull cannot hit the patch) and culling
    completeness (`bezpatch_cull_complete`: a true hit is never culled; together
-   the two make the subdivision AABB cull exact). Full subdivision-plus-Newton
-   completeness and NURBS/trimmed-NURBS surfaces remain open. Note: `c2lean` lacks `sqrtf`
+   the two make the subdivision AABB cull exact). `bez3Vec` and
+   `bez3Vec_decasteljau_left` give the vector-valued de Casteljau split of each
+   patch control row (the subdivision building block). Full subdivision-plus-
+   Newton completeness and NURBS/trimmed-NURBS surfaces remain open. Note: `c2lean` lacks `sqrtf`
    support, so translating `tri_point_isect_one` needs a tool extension
    (Tier 1.2 dependency).
 2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates only the

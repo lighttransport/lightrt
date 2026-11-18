@@ -111,5 +111,17 @@ theorem bezpatch_cull_complete (o d : Vec3) (cp : Fin 16 → Vec3) (lo hi : Vec3
   rw [hpt]
   exact bicubicEval_in_box cp lo hi hlo hhi hu.1 hu.2 hv.1 hv.2
 
+def bez3Vec (P : Fin 4 → Vec3) (t : ℝ) : Vec3 :=
+  ∑ i : Fin 4, bern3 t i • P i
+
+def splitLVec (P : Fin 4 → Vec3) (t : ℝ) : Fin 4 → Vec3 :=
+  fun i a => splitL (fun j => P j a) t i
+
+theorem bez3Vec_decasteljau_left (P : Fin 4 → Vec3) (t s : ℝ) :
+    bez3Vec (splitLVec P t) s = bez3Vec P (t * s) := by
+  ext a
+  change Hull.bez3 (fun i => splitLVec P t i a) s = Hull.bez3 (fun i => P i a) (t * s)
+  exact Hull.decasteljau_left (fun i => P i a) t s
+
 end
 end LightRT.Geom
