@@ -130,9 +130,10 @@ Explicitly deferred/recorded (see PLAN.md):
 
 The authoritative roadmap is `formal/PLAN.md` §5 (three tiers). Summary:
 
-- **Tier 1 (open work):** (1) primitive intersector soundness over ℝ — start with
-  ray–sphere and quad/tetra (two MT triangles) in `Geom/PrimReal.lean`, building on
-  `Geom/Hull.lean` (containment) and `Geom/MTReal.lean` (quad/tetra via MT);
+- **Tier 1 (open work):** (1) primitive intersector soundness over ℝ —
+  `Geom/PrimReal.lean` has sphere + quad/tetra (sphere via analytic nearest root;
+  quad/tetra via two/four MT hits), soundness/completeness/nearest + non-vacuity
+  done. Next: points, curves (round-linear/flat/cubic-Bézier), SDF, surfaces;
   acceptance = soundness/completeness/nearest over ℝ + non-vacuity examples.
   (2) `c2lean` coverage expansion — translate further scalar kernels and prove
   `*_refines`. (3) Bézier/patch intersector contract (M15/M16) — abstract
