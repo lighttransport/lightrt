@@ -177,5 +177,60 @@ theorem bicubic_split_left (cp : Fin 16 → Vec3) (t s v : ℝ) :
   rw [hrows]
   exact bez3Vec_decasteljau_left (patchRows cp j) t s
 
+theorem continuous_bicubicEval_cheap (cp : Fin 16 → Vec3) :
+    Continuous (fun p : ℝ × ℝ => bicubicEval cp p.1 p.2) := by
+  unfold bicubicEval bern33 bern3
+  apply continuous_finset_sum
+  intro k hk
+  fun_prop
+
+/-- Parameter triples for ray/patch hits. -/
+def BezPatchHitParams (o d : Vec3) (cp : Fin 16 → Vec3) (tmin tbest : ℝ) :
+    Set (ℝ × ℝ × ℝ) :=
+  {p | p.1 ∈ Set.Icc (0:ℝ) 1 ∧ p.2.1 ∈ Set.Icc (0:ℝ) 1 ∧
+       p.2.2 ∈ Set.Icc tmin tbest ∧ o + p.2.2 • d = bicubicEval cp p.1 p.2.1}
+
+theorem bezpatch_exists_nearest_hit (o d : Vec3) (cp : Fin 16 → Vec3) {tmin tbest : ℝ}
+    (hab : tmin ≤ tbest) (hhit : HitsBezPatchRay o d cp tmin tbest) :
+    ∃ tstar, (∃ u ∈ Set.Icc (0:ℝ) 1, ∃ v ∈ Set.Icc (0:ℝ) 1,
+              o + tstar • d = bicubicEval cp u v) ∧
+         tmin ≤ tstar ∧ tstar ≤ tbest ∧
+         (∀ t, tmin ≤ t → t ≤ tbest →
+            (∃ u ∈ Set.Icc (0:ℝ) 1, ∃ v ∈ Set.Icc (0:ℝ) 1,
+              o + t • d = bicubicEval cp u v) → tstar ≤ t) := by
+  let S := BezPatchHitParams o d cp tmin tbest
+  have hclosed : IsClosed S := by
+    unfold S BezPatchHitParams
+    have h1 : Continuous (fun p : ℝ × ℝ × ℝ => o + p.2.2 • d) := by
+      exact continuous_const.add ((continuous_snd.comp continuous_snd).smul continuous_const)
+    have h2 : Continuous (fun p : ℝ × ℝ × ℝ => bicubicEval cp p.1 p.2.1) := by
+      unfold bicubicEval bern33 bern3
+      apply continuous_finset_sum
+      intro k hk
+      fun_prop
+    have hz : IsClosed {p : ℝ × ℝ × ℝ | o + p.2.2 • d = bicubicEval cp p.1 p.2.1} :=
+      isClosed_eq h1 h2
+    have hbox : IsClosed ({p : ℝ × ℝ × ℝ |
+        p.1 ∈ Set.Icc (0:ℝ) 1 ∧ p.2.1 ∈ Set.Icc (0:ℝ) 1 ∧ p.2.2 ∈ Set.Icc tmin tbest}) := by
+      change IsClosed ((Set.Icc (0:ℝ) 1) ×ˢ ((Set.Icc (0:ℝ) 1) ×ˢ (Set.Icc tmin tbest)))
+      exact isClosed_Icc.prod (isClosed_Icc.prod isClosed_Icc)
+    simpa [Set.setOf_and, Set.inter_assoc] using hbox.inter hz
+  let K : Set (ℝ × ℝ × ℝ) := Set.Icc (0:ℝ) 1 ×ˢ (Set.Icc (0:ℝ) 1 ×ˢ Set.Icc tmin tbest)
+  have hK : IsCompact K := isCompact_Icc.prod (isCompact_Icc.prod isCompact_Icc)
+  have hsub : S ⊆ K := by intro p hp; exact ⟨hp.1, hp.2.1, hp.2.2.1⟩
+  have hcomp : IsCompact S := hK.of_isClosed_subset hclosed hsub
+  have hne : S.Nonempty := by
+    rcases hhit with ⟨u, hu, v, hv, t, htmin, htbest, hpt⟩
+    exact ⟨(u, v, t), hu, hv, ⟨htmin, le_of_lt htbest⟩, hpt⟩
+  have hcont_t : ContinuousOn (fun p : ℝ × ℝ × ℝ => p.2.2) S := (continuous_snd.comp continuous_snd).continuousOn
+  obtain ⟨pstar, hpstar, hmin⟩ := hcomp.exists_isMinOn hne hcont_t
+  refine ⟨pstar.2.2, ?_, ?_, ?_, ?_⟩
+  · exact ⟨pstar.1, hpstar.1, pstar.2.1, hpstar.2.1, hpstar.2.2.2⟩
+  · exact hpstar.2.2.1.1
+  · exact hpstar.2.2.1.2
+  · intro t htmin htbest ht
+    rcases ht with ⟨u, hu, v, hv, hpt⟩
+    exact hmin (show (u, v, t) ∈ S from ⟨hu, hv, ⟨htmin, htbest⟩, hpt⟩)
+
 end
 end LightRT.Geom
