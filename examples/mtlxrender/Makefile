@@ -101,8 +101,8 @@ LEAN_SRC = tests/lean_vectors.c tests/texture_stub.c mtlx_doc.c mtlx_xml.c mtlx_
 pixel_filter: tests/pixel_filter.c pathtrace.h
 	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/pixel_filter.c -lm
 
-film_energy: tests/film_energy.c bsdf.c bsdf.h vecmath.h
-	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/film_energy.c bsdf.c $(LDFLAGS)
+film_energy: tests/film_energy.c bsdf.c bsdf.h vecmath.h passive_film.c passive_film.h
+	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/film_energy.c bsdf.c passive_film.c $(LDFLAGS)
 
 cert_energy: tests/cert_energy.c bsdf.c bsdf.h cert_albedo_table.h vecmath.h
 	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/cert_energy.c bsdf.c $(LDFLAGS)
