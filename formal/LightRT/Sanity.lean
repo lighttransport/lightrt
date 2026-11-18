@@ -216,4 +216,16 @@ example : ∃ t, (0:ℝ) ≤ t ∧ t ≤ 1 ∧ ∃ tstar : ℝ, tstar ≤ t := b
   rcases hge with ⟨tstar, htstar, hsh, hmin, hlet⟩
   exact ⟨0.5, by norm_num, by norm_num, tstar, hlet⟩
 
+
+/-- The patch Newton instantiation is usable: at a root, the contraction bound
+    gives zero error (via newton2Step_at_root and the quadratic theorem's shape). -/
+example : ∃ (o d : Vec3) (cp : Fin 16 → Vec3) (t : ℝ),
+    o + (0:ℝ) • d = bicubicEval cp 0 0 →
+    newton2Step (patchF o d cp t) (patchG o d cp t) 0 0 = (0, 0) := by
+  refine ⟨0, 0, fun _ => 0, 0, ?_⟩
+  intro _
+  apply newton2Step_at_root <;>
+    simp [patchF, patchG, bezPatchContact, bicubicEval,
+      LightRT.Geom.Hull.bern33, LightRT.Geom.Hull.bern3]
+
 end LightRT.Sanity
