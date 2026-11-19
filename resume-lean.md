@@ -148,8 +148,9 @@ The authoritative roadmap is `formal/PLAN.md` §5 (three tiers). Summary:
   partial/second-partial bounds, patchF/patchG C2Seg assembly (K=192M), and
   bezpatch_newton_quadratic_of_controls (B/K supplied from the control net);
   the determinant lower bound stays necessarily data. BezPatchConvergence.lean
-  adds patchNewtonIter + basin convergence + cell_center_in_basin; full
-  subdivision-tree completeness is still open. Next: subdivision-plus-
+  adds patchNewtonIter + basin convergence + cell_center_in_basin + the
+  control-point-supplied basin (patch_basin_ball_of_data,
+  patch_newtonIter_tendsto_of_root_data); delta stays data. Next: subdivision-plus-
   Newton completeness, NURBS;
   acceptance = soundness/completeness/nearest over ℝ + non-vacuity examples.
   (2) `c2lean` coverage expansion — sqrtf support done (lrt_sqrtf.h ISA sqrt on
