@@ -105,6 +105,9 @@ a decision change; Tier 3 is closed or maintenance.
    (plane intersection + elliptical-bound test, soundness/completeness).
    `Geom/RoundLinear.lean` defines swept-ball round-linear and ray-facing flat
    ribbon tube sets with hit soundness (completeness/nearest pending).
+   `Geom/BezCurveReal.lean` gives the cubic-Bezier curve hit API: sampled
+   acceptance soundness, completeness (boundary existence) and nearest-hit
+   existence (closedness hypothesis), composing BezTube/BezFirstContact.
    `Geom/BezFirstContact.lean` composes the chain into a first-contact contract
    (`HitsBezTubeRay`, sampled acceptance sound, exact/sampled no-overshoot,
    boundary existence). `Geom/SphereTraceConvergence.lean` adds the convergence
