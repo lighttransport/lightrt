@@ -1,6 +1,7 @@
 # LightRT Lean formalization: remaining items and resume prompt
 
-State as of 2026-11-17, branch `formal-lean` (local commits ahead of `origin/formal-lean`, not pushed).
+State as of 2026-11-20, branch `formal-lean` (local commits ahead of
+`origin/formal-lean`, not pushed).
 The formalization document of record is `formal/PLAN.md` (scope, coverage map,
 invariants, gates, boundaries, roadmap). Milestone history is in git history.
 Repo guidance: `CLAUDE.md`, section "Formal verification".
@@ -9,15 +10,17 @@ decisions and item-3's `tlas_dil_origins` `1e-37` floor.
 
 ## Current state
 
-`make formal` passes with 0 `sorry` and axioms limited to `propext`,
-`Quot.sound` and `Classical.choice`. It runs:
+`make formal` passes with 0 `sorry` and 889 theorems closed, axioms limited to
+`propext`, `Quot.sound` and `Classical.choice`. It runs:
 
-- `lake build` (now includes `C/GenExn.lean`, `C/Proofs/ExnKeyRefines.lean`,
-  `BVH/KBest.lean`, `FP/TotalErr.lean`)
+- `lake build` (includes `C/GenExn.lean`, `C/Proofs/ExnKeyRefines.lean`,
+  `BVH/KBest.lean`, `FP/TotalErr.lean`, and the new `Geom/{BezPatchConvergence,
+  BezPatchSubdivision,NURBSKnots,NURBSReal,Trim,RoundLinear,BezCurveReal,
+  SDFReal,IntersectorContract}.lean`)
 - `c2lean --check` (`Gen.lean` legacy, `GenRobust.lean` default, `GenExn.lean`
   with `-DLRT_TRI_EXACT_NEAREST`)
 - the sorry and axiom checks
-- `cdiff`
+- `cdiff` (incl. `sph` vectors: real C hardware sqrt vs MiniC `sqrtBits`)
 - `bvhcheck.py`: Lean mirror of the MT leaf; every variant opts out of the
   watertight leaf
 - `tlascheck`, with and without `EXACT_NEAREST`
@@ -74,109 +77,78 @@ pattern): `clang --target=aarch64-linux-gnu --sysroot=/usr/aarch64-linux-gnu
   triangles, interleaved above); benchmarked with `make bench_occ`.
 - 15/16/17: decisions recorded in PLAN.md (keep `hp_subpatch`; accept the
   Bézier exact-solve cost; keep degenerate triangles).
-- 3: `FP/TotalErr.lean` range-free `|rneR x − x| ≤ u|x| + 2⁻¹⁵⁰` and the
-  `1e-37` dilation-floor margin (`fl_add_margin_ge`, `fl_sub_margin_le`);
+- 3: `FP/TotalErr.lean` range-free rounding error and `1e-37` floor margin;
   `Robust/Total.lean` `num_err_total` / `den_bounds_total` /
-  `quot_bounds_total(_tight)` / `woop_t_err_total(_model)(_tight)` (full
-  range-free Woop `t` error, `η/a0` slack); `BVH/ExactPruneTotal.lean`
-  `key_le_total` and `woop_key_le_t_total_model` (the C `EXACT_NEAREST`
-  call-site instantiation, now both edge-sign classes, `hsign`,
-  `a0 ≤ |e0+e1+e2|`).
-- 3a: `Robust/SlabTotal.fpT_abs_err_total` — range-free error bound for one
-  scalar slab parameter (`fl(fl(x−o)·fl(1/d))`), no `InRange`.
-- 7: `Geom/Hull.lean` proves box containment; `Geom/SphereTrace.lean`
-  proves the 1D no-overshoot core, the distance-to-point 1-Lipschitz atom,
-  and the one-Newton-step quadratic contraction (`newton_step_quadratic`);
-  `Geom/Newton2D.lean` proves the general 2D Newton quadratic contraction
-  (7b-1); `Geom/BezNewton.lean` proves the `tri_bez_newton` specialization
-  (7b-2: Jacobian as polynomial sums + `1/|R|` entries, `jacDet` = the C's
-  `det`, rectangle `C2Seg` with `|R|² > 0`, contraction corollary
-  `bez_newton_quadratic`, and the `BezSys.ofCubic` control-point-polynomial
-  instance); `Geom/SphereTrace3.lean` proves the 3D no-overshoot via
-  `Metric.infDist` (7a). The signed-distance Bézier model itself
-  (PLAN M14) is not formalized. Patch/NURBS stay measured against
-  `primhitcheck` (item 16 decision).
+  `quot_bounds_total(_tight)` / `woop_t_err_total(_model)(_tight)`;
+  `BVH/ExactPruneTotal.lean` `key_le_total` / `woop_key_le_t_total_model`.
+- 3a: `Robust/SlabTotal.fpT_abs_err_total` (range-free slab-parameter error).
+- 7: `Geom/Hull.lean` box containment; `Geom/SphereTrace.lean` 1D no-overshoot
+  + 1-Lipschitz + one-step contraction; `Geom/Newton2D.lean` general 2D Newton
+  quadratic contraction; `Geom/BezNewton.lean` `tri_bez_newton` specialization;
+  `Geom/SphereTrace3.lean` 3D no-overshoot via `Metric.infDist`.
 
 Explicitly deferred/recorded (see PLAN.md):
-- 3b: range-free Möller–Trumbore `t` error bound — out of scope. The TLAS
-  world-hit incidence theorem instantiates `ε := woop_t_err` (watertight BLAS
-  only); MT scenes are unsupported by it.
-- 3c: `tlas_instance_margin`'s fp64 `ρ/σ` bound — unproved, covered by
-  `tlascheck` empirically.
-- 4: ISA/intrinsics semantics gap — documented model boundary (packed ops are
-  `FP.Binary32` lane ops); exhaustively checked for this kernel by
-  `wtcheck`'s leaf fuzz (incl. SVE 8/16), not an axiom.
-  `BITEXACT` SIMD == scalar for MT: new `formal/tools/mtcheck.c` fuzzes
-  `tri_packet4_tri` vs the scalar per-lane `tri_isect_lane` — 2M blocks /
-  8M lanes / 642k hits, 0 differences (`make formal` gate, 500k iterations).
-  Item 3b (range-free MT `t` error bound): **done.** `Robust/MTTotal.lean`
-  and `Robust/MTLeaf.lean` prove the leaf/stage bounds (`fl_mul_err_total`,
-  `fl_mul_ops_err_total`, `fl_sub/add_err_total`, `fl_abs_le`, `add2/sub2_fl_err_total`,
-  ...); `Robust/MTCross2.lean` proves `cross2_fl_err_total` (the cross-product
-  component: `|fl(fl a·fl c − fl b·fl d) − (a·c − b·d)| ≤ 7u(AC+BD) + 4η(A+B+C+D+2)`);
-  `Robust/MTDot.lean` proves `dot3_fl_err_total`, `cross_component_err`,
-  `mt_det_err_total` and `mt_num_err_total` (the determinant and numerator
-  stages of `tri_mt_one`, in C op order); `Robust/MTT.lean` composes them
-  into `mt_t_fl_err_total_model` (range-free, no `InRange`):
-  `|t_model − t_exact| ≤ (12u·BMA + (2u+2)·mtNumErr M A B) / a0 + η + 12·BMA·mtDetErr M A B / a0²`,
-  with hypotheses `a0 ≤ |det_exact|` and `mtDetErr M A B ≤ a0/2` (a0 keeps the
-  exact determinant away from zero; the same theorem with `d ↦ −d` covers the
-  negative-det class). Constants reflect the F-model op order of the C; the
-  bound degrades like `1/a0` as det → 0, which is correct for a non-watertight
-  kernel — MT's `t` bound buys no conservativity for `EXACT_NEAREST`-style
-  pruning (MT is not watertight), and `mtcheck` remains the empirical check.
+- 3b (range-free MT `t` error): **done** — `Robust/MTTotal.lean`, `MTLeaf.lean`,
+  `MTCross2.lean`, `MTDot.lean`, `MTT.lean` compose `mt_t_fl_err_total_model`
+  (range-free, no `InRange`; `a0 ≤ |det_exact|` and det-error bound as data).
+- 3c: `tlas_instance_margin` fp64 `ρ/σ` bound — unproved, `tlascheck` empirical.
+- 4: ISA/intrinsics semantics gap — documented model boundary; `wtcheck` leaf
+  fuzz incl. SVE 8/16; `mtcheck.c` fuzzes SIMD == scalar (2M blocks / 8M lanes
+  / 642k hits, 0 differences); not an axiom.
 
-## Status (2026-11-20)
+## Completed in the 2026-11-20 Tier 1 push (commits `0163b1b`–`6a632e6`)
 
-The five remaining Tier 1 items were advanced and validated (make formal PASS,
-0 sorry, axiom allowlist unchanged; commits through 786e81f, nothing pushed):
-patch Newton basin supplied from control points (δ data); NURBS knot-insertion
-foundation (degree-0 refinement, degree-1 Boehm, surface Bezier extraction;
-general-degree insertion open); trimmed-NURBS even-odd parity and finite
-nearest-visible search; round/flat tube soundness, cubic-Bezier
-soundness/completeness/nearest and SDF trace API; and the M15/M16 abstract
-curve/surface contracts. Remaining sub-items are noted in PLAN.md §5.
+- **c2lean / sqrt**: `lrt_sqrtf.h` (ISA sqrt on SSE2/AVX2/NEON), `sqrtf` → MiniC
+  `Expr.sqrt`, `FP.Binary32.sqrtBits` (integer RNE model, `#guard`-checked),
+  `EvE.sqrt'`, `cdiff` `sph` vectors; `C/Proofs/SphereDistRefines.lean`
+  (`tri_sphere_dist_f_refines`), `SmallKernelsRefines.lean`
+  (`tri_surface_area`, `tri_longest_axis`).
+- **Patch basin from control points**: `Geom/BezPatchConvergence.lean` —
+  `patch_basin_ball_of_data`, `patch_newtonIter_tendsto_of_basin_ball`,
+  `patch_newtonIter_tendsto_of_root_data`,
+  `patch_subdivision_no_missed_nearest_of_root_data`, `cell_center_in_basin`.
+  δ (determinant lower bound) and the cell seed distance stay data.
+- **Patch subdivision**: `Geom/BezPatchSubdivision.lean` — `transposeCP`,
+  `bicubicEval_transpose`, `splitBicubicV`, `PatchCell` / `Represents` with u/v
+  split preservation, `cell_not_culled_of_hit`, `cell_contact_eq`.
+- **NURBS foundation**: `Geom/NURBSKnots.lean` — Cox–de Boor `bsplineBasis`,
+  Bezier-knot = Bernstein identity (degree 3), partition of unity, B-spline =
+  Bezier curve, `insertKnot` + degree-0 refinement, degree-1 Boehm
+  (`boehm1_preserves`), surface Bezier extraction (`bezKnot_ratEval`).
+- **Trimmed NURBS**: `Geom/Trim.lean` — even-odd crossing, unit-square Jordan
+  parity, `nearestVisibleT` finite scan + reject-and-continue.
+- **Curves / SDF**: `Geom/RoundLinear.lean` (round/flat tube hit soundness +
+  nearest-hit existence with closedness hypothesis), `Geom/BezCurveReal.lean`
+  (cubic-Bezier soundness/completeness/nearest), `Geom/SDFReal.lean` (trace
+  soundness/no-overshoot/boundary).
+- **M15/M16 contracts**: `Geom/IntersectorContract.lean` — curve and surface
+  abstract contract APIs.
 
 ## Remaining items
 
-The authoritative roadmap is `formal/PLAN.md` §5 (three tiers). Summary:
+The authoritative roadmap is `formal/PLAN.md` §5 (three tiers). Concrete
+remaining sub-items from the 2026-11-20 push:
 
-- **Tier 1 (open work):** (1) primitive intersector soundness over ℝ —
-  `Geom/PrimReal.lean` has sphere + quad/tetra (sphere via analytic nearest root;
-  quad/tetra via two/four MT hits), soundness/completeness/nearest + non-vacuity
-  done; point discs (ray-facing/oriented) in `Geom/PointReal.lean` too.
-  cylinder side + capsule (cylinder + 2 end spheres) in
-  `Geom/{CylinderReal,CapsuleReal}.lean` and ellipse points in
-  `Geom/EllipseReal.lean`, and the cubic-Bézier first-contact contract in
-  `Geom/BezFirstContact.lean`, and SDF sphere-trace convergence in
-  `Geom/SphereTraceConvergence.lean`, and bilinear-patch soundness in
-  `Geom/BilinearSurface.lean` (soundness + completeness), and bicubic Bezier
-  patch soundness/culling (both directions) in `Geom/BezPatchReal.lean` too.
-  plus the vector row-level de Casteljau split in `Geom/BezPatchReal.lean`.
-  plus the Newton-contact-to-nearest-hit bridge and bezpatch_newton_quadratic
-  (Newton2D contraction on the patch contact system) in `Geom/BezPatchReal.lean`.
-  The C2/bound chase is done: Bernstein derivative bounds, componentwise
-  partial/second-partial bounds, patchF/patchG C2Seg assembly (K=192M), and
-  bezpatch_newton_quadratic_of_controls (B/K supplied from the control net);
-  the determinant lower bound stays necessarily data. BezPatchConvergence.lean
-  adds patchNewtonIter + basin convergence + cell_center_in_basin + the
-  control-point-supplied basin (patch_basin_ball_of_data,
-  patch_newtonIter_tendsto_of_root_data), and the upgraded
-  patch_subdivision_no_missed_nearest_of_root_data; delta and the cell seed
-  distance stay data. Next: subdivision-plus-
-  Newton completeness, NURBS;
-  acceptance = soundness/completeness/nearest over ℝ + non-vacuity examples.
-  (2) `c2lean` coverage expansion — sqrtf support done (lrt_sqrtf.h ISA sqrt on
-  SSE2/AVX2/NEON, FP.Binary32.sqrtBits model, EvE.sqrt', cdiff sph vectors);
-  tri_sphere_dist_f_refines is proved in C/Proofs/SphereDistRefines.lean;
-  tri_surface_area/tri_longest_axis refinements in SmallKernelsRefines.lean.
-  Translate further scalar kernels and prove their `*_refines`. (3) Bézier/patch intersector contract (M15/M16) — abstract
-  soundness of adaptive subdivision + bounded Newton, analogous to the M14 chain.
-- **Tier 2 (boundaries, do not attempt without new tooling/decision):** SIMD ISA
+- **Tier 1, patch surfaces**: unconditional basin verification from control
+  points (the full M14-style coefficient chase for the patch Newton basin —
+  currently the seed distance and δ are data); general-degree exactness of the
+  no-missed contract. δ stays data for arbitrary control points by decision.
+- **Tier 1, NURBS**: general-degree Boehm insertion / Cox–de Boor refinement
+  equation (only degree 0 and degree 1 are proved; degree 3 Bezier extraction
+  via `bezKnot_ratEval` is done); full tensor-product general knot insertion.
+- **Tier 1, trimmed NURBS**: general crossing-number parity (only the unit
+  square is proved); closedness of the swept tube so the nearest-visible-hit
+  existence hypothesis is discharged; trim loops beyond the finite candidate
+  list.
+- **Tier 1, curves/SDF**: completeness for round-linear / flat curves (only
+  soundness + nearest-hit existence with a closedness hypothesis are proved);
+  tube-set closedness proof.
+- **Tier 1, c2lean**: translate further scalar kernels and prove `*_refines`.
+- **Tier 2 (boundaries, do not attempt without new tooling/decision)**: SIMD ISA
   semantics (`wtcheck` gate), GPU formalization, fp64 `tlas_instance_margin`
   (`tlascheck` gate), slab completeness at tangency (unprovable), Bézier-minimizer
   FP (`primhitcheck` gate).
-- **Tier 3 (closed):** M14 basin verification is complete (conditional
+- **Tier 3 (closed)**: M14 basin verification is complete (conditional
   convergence); `B0`, `K`, radii, and the convergence theorem are supplied from
   control points in `Geom/Bez{Data,KBounds,...}.lean`. Sanity/doc consistency is
   maintenance. No CI by decision; formal gates are manual.
@@ -186,15 +158,17 @@ The authoritative roadmap is `formal/PLAN.md` §5 (three tiers). Summary:
 > Continue the LightRT Lean formalization on branch `formal-lean` in
 > `/mnt/nvme02/work/lightrt` (local commits ahead of `origin/formal-lean`, not pushed). Read
 > `formal/PLAN.md` (document of record) first, then this file. Run
-> `make formal` to confirm the baseline (0 sorry, all gates PASS).
+> `make formal` to confirm the baseline (0 sorry, all gates PASS, axiom allowlist unchanged).
 >
-> M14 basin verification is complete (conditional convergence); `B0` and `K`
-> are supplied from control points. The open work is Tier 1 of `formal/PLAN.md` §5,
-> starting with primitive intersector soundness over ℝ (`Geom/PrimReal.lean`:
-> ray–sphere and quad/tetra via MTReal), then `c2lean` coverage expansion, then
-> the Bézier/patch intersector contract. Everything else is a recorded boundary
-> (ISA, tangency, fp64 margins, GPU) or empirical gate (`wtcheck`,
-> `primhitcheck`). Run `make formal` to confirm the baseline.
+> The 2026-11-20 Tier 1 push is committed through `6a632e6`: patch Newton basin
+> from control points (δ data), Bezier subdivision + cull safety + abstract
+> no-missed contract, NURBS foundation (degree-0/1 knot insertion, surface
+> Bezier extraction), trim loops + finite nearest-visible scan, curve/SDF soundness
+> APIs, and M15/M16 contracts. The concrete remaining sub-items are listed above
+> under "Remaining items" — start with the most tractable (e.g. round/flat tube
+> closedness, general-degree Boehm refinement, general crossing parity). Everything
+> else is a recorded boundary (ISA, tangency, fp64 margins, GPU) or empirical gate
+> (`wtcheck`, `primhitcheck`).
 >
 > For every C change: SIMD bit-identical to scalar (`wtcheck`, incl. SVE under
 > qemu), rerun `make formal`, the C suites, `make hip_test` (local RX 9070 XT,
