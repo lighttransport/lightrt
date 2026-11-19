@@ -162,8 +162,10 @@ a decision change; Tier 3 is closed or maintenance.
    Translate additional *scalar* kernels (e.g. `tri_woop_one_hp`, the primitive
    scalar intersectors from item 1) and prove their `*_refines` theorems.
    Acceptance: each new translated function has a passing `c2lean --check` and a
-   refinement theorem. (A `tri_sphere_dist_f` `*_refines` proof is still pending;
-   the translation, model and differential test are complete.)
+   refinement theorem. `tri_sphere_dist_f_refines` is proved in
+   `C/Proofs/SphereDistRefines.lean` (ExS symbolic execution with an explicit
+   post-`set` witness state, plus a `callFunc` wrapper); the model, translation
+   and differential test are all covered.
 3. **Bézier/patch intersector contract (M15/M16).** The cubic-Bézier and surface
    intersectors use adaptive subdivision + bounded Newton. Formalize the abstract
    contract (sampled acceptance sound; no missed nearest) analogous to the M14
