@@ -79,5 +79,60 @@ theorem unit_square_crossing_center :
     crossingNumber [Prod.mk (0:ℝ) 0, Prod.mk 1 0, Prod.mk 1 1, Prod.mk 0 1] (1/2) (1/2) % 2 = 1 := by
   norm_num [crossingNumber, edgeCross, edgeSpansY, edgeCrossX]
 
+
+/-- Scan a finite list of candidate hits `(u,v,t)` and keep the smallest `t`
+    among the trim-visible ones. Uses classical decidability of visibility. -/
+noncomputable def nearestVisibleT (R : TrimRegion) : List (ℝ × ℝ × ℝ) → Option ℝ
+  | [] => none
+  | (u,v,t) :: rest =>
+      match nearestVisibleT R rest with
+      | none => if trimVisible R u v then some t else none
+      | some m => if trimVisible R u v then some (min t m) else some m
+
+/-- If the scan returns `none`, no hit in the list is trim-visible. -/
+theorem nearestVisibleT_none (R : TrimRegion) (hits : List (ℝ × ℝ × ℝ))
+    (h : nearestVisibleT R hits = none) :
+    ¬ (∃ u v t, (u, v, t) ∈ hits ∧ trimVisible R u v) := by
+  classical
+  induction hits with
+  | nil => simp
+  | cons hd rest ih =>
+    rcases hd with ⟨u, v, t⟩
+    by_cases hvis : trimVisible R u v
+    · cases hmv : nearestVisibleT R rest with
+      | none =>
+          have hh : nearestVisibleT R ((u,v,t)::rest) = some t := by simp [nearestVisibleT, hvis, hmv]
+          rw [hh] at h
+          contradiction
+      | some m =>
+          have hh : nearestVisibleT R ((u,v,t)::rest) = some (min t m) := by simp [nearestVisibleT, hvis, hmv]
+          rw [hh] at h
+          contradiction
+    · intro hbad
+      rcases hbad with ⟨uu, vv, tt, hmem, hv⟩
+      simp at hmem
+      rcases hmem with hsame | hmem
+      · rcases hsame with ⟨rfl, rfl, rfl⟩
+        exact hvis hv
+      · have hrest : nearestVisibleT R rest = none := by
+          by_contra hn
+          cases hm2 : nearestVisibleT R rest with
+          | none => exact hn hm2
+          | some mm =>
+              have hh : nearestVisibleT R ((u,v,t)::rest) = some mm := by simp [nearestVisibleT, hvis, hm2]
+              rw [hh] at h
+              contradiction
+        exact ih hrest ⟨uu, vv, tt, hmem, hv⟩
+
+/-- **Reject-and-continue soundness.** If a hit is not trim-visible, skipping
+    it does not change the result of the nearest-visible scan. -/
+theorem nearestVisibleT_skip_invisible (R : TrimRegion) (u v t : ℝ)
+    (hvis : ¬ trimVisible R u v) (hits : List (ℝ × ℝ × ℝ)) :
+    nearestVisibleT R ((u,v,t) :: hits) = nearestVisibleT R hits := by
+  classical
+  cases hm : nearestVisibleT R hits with
+  | none => simp [nearestVisibleT, hvis, hm]
+  | some m => simp [nearestVisibleT, hvis, hm]
+
 end
 end LightRT.Geom

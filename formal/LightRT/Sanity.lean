@@ -369,4 +369,11 @@ example : inLoop [Prod.mk (0:ℝ) 0, Prod.mk 1 0, Prod.mk 1 1, Prod.mk 0 1] (1/2
   unfold inLoop
   exact unit_square_crossing_center
 
+
+/-- Reject-and-continue is non-vacuous: an invisible hit is skipped. -/
+example (R : TrimRegion) (u v t : ℝ) (hvis : ¬ trimVisible R u v)
+    (hits : List (ℝ × ℝ × ℝ)) :
+    nearestVisibleT R ((u,v,t)::hits) = nearestVisibleT R hits := by
+  exact nearestVisibleT_skip_invisible R u v t hvis hits
+
 end LightRT.Sanity
