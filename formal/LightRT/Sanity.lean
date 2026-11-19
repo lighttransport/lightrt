@@ -376,4 +376,16 @@ example (R : TrimRegion) (u v t : ℝ) (hvis : ¬ trimVisible R u v)
     nearestVisibleT R ((u,v,t)::hits) = nearestVisibleT R hits := by
   exact nearestVisibleT_skip_invisible R u v t hvis hits
 
+
+/-- Round-linear and flat curve hit predicates are non-vacuous. -/
+example (o d p0 p1 : Vec3) (r0 r1 tmin tbest t : ℝ)
+    (h : OnRoundLinear p0 p1 r0 r1 (o + t • d)) (htmin : tmin ≤ t) (htbest : t < tbest) :
+    HitsRoundLinear o d p0 p1 r0 r1 tmin tbest t :=
+  hitsRoundLinear_of_sample o d p0 p1 r0 r1 tmin tbest t htmin htbest h
+
+example (o d p0 p1 b : Vec3) (r0 r1 tmin tbest t : ℝ)
+    (h : OnFlatLinear p0 p1 r0 r1 d b (o + t • d)) (htmin : tmin ≤ t) (htbest : t < tbest) :
+    HitsFlatLinear o d p0 p1 r0 r1 b tmin tbest t :=
+  hitsFlatLinear_of_sample o d p0 p1 r0 r1 b tmin tbest t htmin htbest h
+
 end LightRT.Sanity
