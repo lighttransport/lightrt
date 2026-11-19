@@ -139,5 +139,52 @@ theorem bsplineBasis_zero_refinement (U : ℕ → ℝ) (k : ℕ) (u x : ℝ)
     have h3 : i + 1 - 1 = i := by omega
     simp [insertKnot, hik', h1, h2, h4, h5, h3]
 
+
+/-- Partition of unity for the degree-1 refined Bezier knot vector. -/
+theorem bezKnot1_refined_sum (t u : ℝ) (ht0 : 0 < t) (ht1 : t < 1)
+    (hu0 : 0 ≤ u) (hu1 : u < 1) :
+    bsplineBasis (insertKnot (bezKnot 1) 1 t) 0 1 u +
+    bsplineBasis (insertKnot (bezKnot 1) 1 t) 1 1 u +
+    bsplineBasis (insertKnot (bezKnot 1) 1 t) 2 1 u = 1 := by
+  simp [bsplineBasis, insertKnot, bezKnot]
+  by_cases hut : u < t
+  · have htu : ¬ t ≤ u := by linarith
+    simp [hut, htu, hu0, hu1]
+    field_simp [ne_of_gt ht0]
+    ring
+  · have htu : t ≤ u := le_of_not_gt hut
+    simp [hut, htu, hu0, hu1]
+    field_simp [ne_of_gt (sub_pos.mpr ht1)]
+    ring
+
+/-- Boehm control points for inserting knot `t` into the degree-1 Bezier
+    knot vector over control points `P₀, P₁`. -/
+def boehm1 (P : Fin 2 → Vec3) (t : ℝ) : Fin 3 → Vec3 :=
+  ![P 0, (1-t) • P 0 + t • P 1, P 1]
+
+theorem boehm1_preserves (P : Fin 2 → Vec3) (t : ℝ) (ht0 : 0 < t) (ht1 : t < 1)
+    (u : ℝ) (hu0 : 0 ≤ u) (hu1 : u < 1) :
+    bsplineCurve (insertKnot (bezKnot 1) 1 t)
+      (fun i => if h : i < 3 then boehm1 P t ⟨i, h⟩ else 0) 1 2 u =
+      bsplineCurve (bezKnot 1) (fun i => if h : i < 2 then P ⟨i, h⟩ else 0) 1 1 u := by
+  -- unfold both curves
+  unfold bsplineCurve
+  rw [Finset.sum_range_succ, Finset.sum_range_succ, Finset.sum_range_succ]
+  rw [Finset.sum_range_succ, Finset.sum_range_succ]
+  simp only [bsplineBasis, insertKnot, bezKnot]
+  -- case split u < t
+  by_cases hut : u < t
+  · have htu : ¬ t ≤ u := by linarith
+    simp [hut, htu, ht0.le, ht1.le, hu0, hu1, boehm1]
+    ext i
+    simp only [Pi.add_apply, Pi.smul_apply, smul_eq_mul]
+    field_simp [ne_of_gt ht0]
+    ring
+  · have htu : t ≤ u := le_of_not_gt hut
+    simp [hut, htu, ht0.le, ht1.le, hu0, hu1, boehm1]
+    ext i
+    simp only [Pi.add_apply, Pi.smul_apply, smul_eq_mul]
+    field_simp [ne_of_gt (sub_pos.mpr ht1)]
+    ring
 end
 end LightRT.Geom

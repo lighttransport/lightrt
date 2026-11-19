@@ -151,7 +151,8 @@ a decision change; Tier 3 is closed or maintenance.
    nearest-untrimmed-hit search and knot insertion are not yet formalized
    (subdivision-plus-Newton completeness is now covered abstractly above).
    `Geom/NURBSKnots.lean` lays the B-spline foundation: Cox–de Boor basis,
-   knot insertion (`insertKnot`) with the degree-0 refinement equation,
+   knot insertion (`insertKnot`) with the degree-0 refinement equation and
+   degree-1 Boehm curve preservation (`boehm1_preserves`),
    the cubic Bezier knot vector giving exactly the Bernstein basis, partition
    of unity, and B-spline-curve = Bezier-curve on `[0,1)` (the right endpoint
    is excluded by the half-open knot convention). Full knot insertion /

@@ -342,4 +342,14 @@ example (U : ℕ → ℝ) (k : ℕ) (u x : ℝ) (hlo : U k ≤ u) (hhi : u < U (
       bsplineBasis (insertKnot U k u) k 0 x + bsplineBasis (insertKnot U k u) (k+1) 0 x := by
   exact (bsplineBasis_zero_refinement U k u x hlo hhi).2.1
 
+
+/-- Boehm knot insertion is non-vacuous: inserting a knot into the linear
+    Bezier knot vector preserves the curve for every interior knot. -/
+example (P : Fin 2 → Vec3) (t u : ℝ) (ht0 : 0 < t) (ht1 : t < 1)
+    (hu0 : 0 ≤ u) (hu1 : u < 1) :
+    bsplineCurve (insertKnot (bezKnot 1) 1 t)
+      (fun i => if h : i < 3 then boehm1 P t ⟨i, h⟩ else 0) 1 2 u =
+      bsplineCurve (bezKnot 1) (fun i => if h : i < 2 then P ⟨i, h⟩ else 0) 1 1 u := by
+  exact boehm1_preserves P t ht0 ht1 u hu0 hu1
+
 end LightRT.Sanity
