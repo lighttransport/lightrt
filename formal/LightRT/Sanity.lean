@@ -260,4 +260,22 @@ example (P : Fin 16 → Vec3) (u v : ℝ) :
     ratEval (fun _ => (1:ℝ)) P u v = bicubicEval P u v := by
   exact ratEval_const_weight 1 one_ne_zero P u v
 
+
+/-- Rational-patch nearest-hit existence is non-vacuous: the zero net with a
+    zero ray at t=0.5 has a minimal hit parameter. -/
+example : ∃ tstar, (0:ℝ) ≤ tstar ∧ tstar ≤ 1 ∧
+    (∀ t, (0:ℝ) ≤ t → t ≤ 1 →
+      (∃ u ∈ Set.Icc (0:ℝ) 1, ∃ v ∈ Set.Icc (0:ℝ) 1,
+        (0:Vec3) + t • (0:Vec3) =
+          ratEval (fun _ : Fin 16 => (1:ℝ)) (fun _ : Fin 16 => (0:Vec3)) u v) → tstar ≤ t) := by
+  have hhit : HitsRatPatchRay (0:Vec3) (0:Vec3)
+      (fun _ : Fin 16 => (1:ℝ)) (fun _ : Fin 16 => (0:Vec3)) 0 1 := by
+    refine ⟨0, by norm_num, 0, by norm_num, 0.5, by norm_num, by norm_num, ?_⟩
+    simp [ratEval_zero_P (fun _ : Fin 16 => (1:ℝ)) (fun _ => by norm_num)]
+  obtain ⟨tstar, _, hlo, hhi, hmin⟩ :=
+    ratpatch_exists_nearest_hit (0:Vec3) (0:Vec3)
+      (fun _ : Fin 16 => (1:ℝ)) (fun _ : Fin 16 => (0:Vec3))
+      (fun _ => by norm_num) (by norm_num) hhit
+  exact ⟨tstar, hlo, hhi, hmin⟩
+
 end LightRT.Sanity
