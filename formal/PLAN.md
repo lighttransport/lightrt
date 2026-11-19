@@ -147,7 +147,8 @@ a decision change; Tier 3 is closed or maintenance.
    convex-combination identity, control-hull containment, hit soundness /
    culling, continuity, uniform-weight reduction to the Bezier patch), but
    `Geom/Trim.lean` models (u,v) trim loops (outer + holes) with the even–odd
-   crossing rule and proves the trim invariant / hole rejection; the full
+   crossing rule and proves the trim invariant, hole rejection, edge-cross
+   bound and the unit-square crossing parity (Jordan case); the full
    nearest-untrimmed-hit search and knot insertion are not yet formalized
    (subdivision-plus-Newton completeness is now covered abstractly above).
    `Geom/NURBSKnots.lean` lays the B-spline foundation: Cox–de Boor basis,
