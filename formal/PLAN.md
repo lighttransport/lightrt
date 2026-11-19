@@ -147,16 +147,23 @@ a decision change; Tier 3 is closed or maintenance.
    convex-combination identity, control-hull containment, hit soundness /
    culling, continuity, uniform-weight reduction to the Bezier patch), but
    knot vectors, trimmed-NURBS (u,v) trim loops and the subdivision-plus-Newton
-   completeness are not yet formalized. Note: `c2lean` lacks `sqrtf`
-   support, so translating `tri_point_isect_one` needs a tool extension
-   (Tier 1.2 dependency).
-2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates only the
+   completeness are not yet formalized.
+2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates the
    scalar triangle core (`tri_minf/maxf`, `tri_slab_scalar`, `tri_mt_one`,
-   `tri_ray_setup`, `tri_woop_one`, `tri_exn_key`). Translate additional *scalar*
-   kernels (e.g. `tri_woop_one_hp`, the primitive scalar intersectors from item 1)
-   and prove their `*_refines` theorems. Mechanical, independently committable;
-   directly grows the C↔Lean equivalence surface. Acceptance: each new translated
-   function has a passing `c2lean --check` and a refinement theorem.
+   `tri_ray_setup`, `tri_woop_one`, `tri_exn_key`) plus `tri_sphere_dist_f`
+   (the ray/sphere distance helper that exercises `sqrtf`). `sqrtf` support is
+   now in place: the C kernel uses `lrt_sqrtf` (`lrt_sqrtf.h`, the ISA's
+   correctly-rounded SQRTSS on x86 SSE2/AVX/AVX2 and `vsqrt.f32` on ARM64 NEON,
+   no libm call; `make test_lrt_sqrtf` checks bit-exactness vs libm over 200k+
+   patterns); c2lean maps `sqrtf`/`lrt_sqrtf` to MiniC `Expr.sqrt`; the semantics
+   executes `FP.Binary32.sqrtBits` (integer algorithm, `#guard`-checked);
+   `EvE.sqrt'` is the refinement lemma; `cdiff.py` includes `sph` vectors that
+   compare the real C sqrt with the MiniC model end-to-end (0 mismatches).
+   Translate additional *scalar* kernels (e.g. `tri_woop_one_hp`, the primitive
+   scalar intersectors from item 1) and prove their `*_refines` theorems.
+   Acceptance: each new translated function has a passing `c2lean --check` and a
+   refinement theorem. (A `tri_sphere_dist_f` `*_refines` proof is still pending;
+   the translation, model and differential test are complete.)
 3. **Bézier/patch intersector contract (M15/M16).** The cubic-Bézier and surface
    intersectors use adaptive subdivision + bounded Newton. Formalize the abstract
    contract (sampled acceptance sound; no missed nearest) analogous to the M14

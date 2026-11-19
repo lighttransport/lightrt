@@ -46,6 +46,7 @@ FUNCTIONS = [
     "tri_mt_one",
     "tri_ray_setup",
     "tri_woop_one",
+    "tri_sphere_dist_f",
 ]
 
 # Extra functions that exist only in a particular configuration's preprocessor
@@ -406,6 +407,12 @@ class FnTranslator:
                 die("fabsf arity", n)
             # fabsf(x) == copysignf(x, +1.0f), exact at the bit level.
             return f"(.copysign {args[0]} (.const (.f32 1065353216)))"
+        if name in ("sqrtf", "lrt_sqrtf", "__builtin_sqrtf"):
+            if len(args) != 1:
+                die("sqrtf arity", n)
+            # Every supported target's scalar sqrt instruction is specified
+            # correctly rounded (IEEE-754 RNE); modelled by FP.Binary32.sqrtBits.
+            return f"(.sqrt {args[0]})"
         if name in ("__builtin_inff",):  # INFINITY (robust slab reciprocal)
             if args:
                 die("__builtin_inff arity", n)

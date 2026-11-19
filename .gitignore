@@ -11,6 +11,7 @@ __pycache__/
 # Compiled executables
 lightrt_example
 lightrt_benchmark
+lrt_sqrtf_test
 obj_bvh_bench
 test_spatial_query
 viewer/viewer

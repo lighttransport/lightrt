@@ -86,6 +86,13 @@ def vec_woop(r):
     return "woop" + vec_mt(r)[2:]
 
 
+def vec_sph(r):
+    """Ray/sphere distance: o, d, c (3 floats each) + radius. Exercises the
+    correctly-rounded sqrt path in tri_sphere_dist_f."""
+    vals = [rnd(r) for _ in range(9)] + [abs(rnd(r, 0.2))]
+    return "sph " + " ".join(f"{bits(fl(v)):08x}" for v in vals)
+
+
 def vec_degenerate(r):
     """MT with v1 = v0 or v2 = v0 (zero edge), Woop with any two vertices equal:
     both must MISS (Robust/Degenerate.lean). Copies are numerically equal; a
@@ -217,6 +224,7 @@ def main():
         r = random.Random(args.seed)
         gens = [vec_slab, vec_mt, vec_woop, vec_slabr, vec_degenerate]
         tagged = [gens[k % 5](r) for k in range(args.n)]
+        sph_lines = [vec_sph(r) for _ in range(max(64, args.n // 4))]
         deg = [l.startswith("deg") for l in tagged]
         lines = [l[3:] if d else l for l, d in zip(tagged, deg)]
         inp = "\n".join(lines) + "\n"
@@ -244,7 +252,21 @@ def main():
         hits = sum(1 for c, d in zip(cout, deg) if c.startswith("1 ") and not d)
         print(f"{len(lines)} vectors ({sum(rob)} default-build robust slab, {sum(deg)} degenerate: "
               f"{sum(deg) - degbad} miss as proved), {bad} mismatches, {hits} MT/Woop hits")
-        return 1 if bad else 0
+        # sqrt path: real C (hardware sqrtss) vs MiniC (sqrtBits), end to end.
+        sinp = "\n".join(sph_lines) + "\n"
+        scout = run([cexe], sinp)
+        slout = run(lexe, sinp)
+        if len(scout) != len(sph_lines) or len(slout) != len(sph_lines):
+            print(f"sph output length mismatch: C={len(scout)} MiniC={len(slout)}")
+            return 1
+        sbad = 0
+        for line, c, l in zip(sph_lines, scout, slout):
+            if norm(c) != norm(l):
+                sbad += 1
+                if sbad <= 5:
+                    print("SPH MISMATCH\n  in:   ", line, "\n  C:    ", c, "\n  MiniC:", l)
+        print(f"{len(sph_lines)} sqrt vectors, {sbad} mismatches")
+        return 1 if (bad or sbad) else 0
 
 
 if __name__ == "__main__":

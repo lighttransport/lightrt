@@ -158,6 +158,11 @@ c_tri_test: $(C_TRI_TEST_SRC)
 	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -o lightrt_c_tri_test $^ -lm -lpthread
 	@echo "Built lightrt_c_tri_test (run: ./lightrt_c_tri_test)"
 
+# Bit-exactness of our ISA sqrtf (SSE2/AVX2/NEON) against libm sqrtf.
+test_lrt_sqrtf: tests/test_lrt_sqrtf.c lrt_sqrtf.h
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -o lrt_sqrtf_test tests/test_lrt_sqrtf.c -lm
+	./lrt_sqrtf_test
+
 # Seam (watertightness) test of the main triangle leaf: default build reports the
 # Moller-Trumbore leak count (-DLRT_TRI_NO_WATERTIGHT_TRI); the _wt build (the
 # default watertight leaf) requires 0.
@@ -294,7 +299,7 @@ info_cuda:
 	@echo "CUDA_ARCH: $(CUDA_ARCH)"
 	@echo "CUDA_FLAGS: $(CUDA_FLAGS)"
 
-.PHONY: cuda_full_test hip_rtc_test c_tri_parallel_test c_tri_seam_test all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip cuda_test info_cuda formal bench_occ
+.PHONY: cuda_full_test hip_rtc_test c_tri_parallel_test c_tri_seam_test test_lrt_sqrtf all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip cuda_test info_cuda formal bench_occ
 
 # Lean 4 formal verification (formal/): build specs+proofs, check the c2lean
 # translation is up to date, the sorry budget, the axiom allowlist, and run
