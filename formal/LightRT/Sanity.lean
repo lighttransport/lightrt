@@ -410,4 +410,13 @@ example (o d : Vec3) (cp : Fin 16 → Vec3) {tmin tbest u v t : ℝ}
     HitsBezPatchRay o d cp tmin tbest :=
   surface_contract_sound o d cp hu0 hu1 hv0 hv1 htmin htbest hres
 
+
+/-- Round/flat nearest-hit existence is non-vacuous given a closed hit set. -/
+example (o d p0 p1 : Vec3) (r0 r1 tmin tbest : ℝ)
+    (hc : IsClosed {t : ℝ | HitsRoundLinear o d p0 p1 r0 r1 tmin tbest t})
+    (hh : ∃ t, HitsRoundLinear o d p0 p1 r0 r1 tmin tbest t) :
+    ∃ tstar, HitsRoundLinear o d p0 p1 r0 r1 tmin tbest tstar ∧
+      ∀ t, HitsRoundLinear o d p0 p1 r0 r1 tmin tbest t → tstar ≤ t :=
+  roundLinear_exists_nearest_hit o d p0 p1 r0 r1 tmin tbest hc hh
+
 end LightRT.Sanity
