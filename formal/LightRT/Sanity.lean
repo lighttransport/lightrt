@@ -352,4 +352,15 @@ example (P : Fin 2 → Vec3) (t u : ℝ) (ht0 : 0 < t) (ht1 : t < 1)
       bsplineCurve (bezKnot 1) (fun i => if h : i < 2 then P ⟨i, h⟩ else 0) 1 1 u := by
   exact boehm1_preserves P t ht0 ht1 u hu0 hu1
 
+
+/-- Bezier extraction for surfaces: rational evaluation over the Bezier knot
+    vector agrees with the rational bicubic patch of NURBSReal. -/
+example (w : Fin 16 → ℝ) (P : Fin 16 → Vec3) (u v : ℝ)
+    (hu0 : 0 ≤ u) (hu1 : u < 1) (hv0 : 0 ≤ v) (hv1 : v < 1) :
+    (fun i => (∑ k : Fin 16,
+        (bsplineBasis (bezKnot 3) (k.val % 4) 3 u *
+         bsplineBasis (bezKnot 3) (k.val / 4) 3 v * w k) • P k i) /
+      (∑ k : Fin 16, LightRT.Geom.Hull.bern33 u v k * w k)) = ratEval w P u v := by
+  exact bezKnot_ratEval w P u v hu0 hu1 hv0 hv1
+
 end LightRT.Sanity
