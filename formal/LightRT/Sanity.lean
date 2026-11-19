@@ -246,4 +246,18 @@ example (o d : Vec3) (t : ℝ) :
     C2Seg (patchG o d (fun _ : Fin 16 => (0 : Vec3)) t) 0 1 0 1 192 := by
   simpa using patchG_C2Seg o d (fun _ : Fin 16 => (0 : Vec3)) t 1 (by simp) (by norm_num)
 
+
+/-- The rational patch point lies in the control-net box (non-vacuous with
+    positive weights), and uniform weights recover the Bézier patch. -/
+example (P : Fin 16 → Vec3) (lo hi : Vec3)
+    (hw : ∀ k : Fin 16, (1 : ℝ) > 0)
+    (hlo : ∀ k i, lo i ≤ P k i) (hhi : ∀ k i, P k i ≤ hi i)
+    {u v : ℝ} (hu0:0≤u) (hu1:u≤1) (hv0:0≤v) (hv1:v≤1) :
+    Box.Mem ⟨lo, hi⟩ (ratEval (fun _ => (1:ℝ)) P u v) := by
+  exact ratEval_in_box (fun _ => (1:ℝ)) P lo hi hw hlo hhi hu0 hu1 hv0 hv1
+
+example (P : Fin 16 → Vec3) (u v : ℝ) :
+    ratEval (fun _ => (1:ℝ)) P u v = bicubicEval P u v := by
+  exact ratEval_const_weight 1 one_ne_zero P u v
+
 end LightRT.Sanity
