@@ -315,4 +315,17 @@ example (cp : Fin 16 → Vec3) (M : ℝ) (hM : ∀ k i, |cp k i| ≤ M) :
     ∀ k i, |(⟨0, 1, 0, 1, cp⟩ : PatchCell).cp k i| ≤ M := by
   exact hM
 
+
+/-- B-spline foundation for NURBS: the Bezier knot vector gives the Bernstein
+    basis, partition of unity, and the Bezier curve. -/
+example (u : ℝ) (hu0 : 0 ≤ u) (hu1 : u < 1) :
+    bsplineBasis (bezKnot 3) 0 3 u + bsplineBasis (bezKnot 3) 1 3 u +
+    bsplineBasis (bezKnot 3) 2 3 u + bsplineBasis (bezKnot 3) 3 3 u = 1 := by
+  exact bezKnot_sum u hu0 hu1
+
+example (P : Fin 4 → Vec3) (u : ℝ) (hu0 : 0 ≤ u) (hu1 : u < 1) :
+    bsplineCurve (bezKnot 3) (fun i => if h : i < 4 then P ⟨i, h⟩ else 0) 3 3 u =
+      bez3Vec P u := by
+  exact bezKnot_curve P u hu0 hu1
+
 end LightRT.Sanity
