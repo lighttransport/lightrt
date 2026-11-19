@@ -278,4 +278,13 @@ example : ∃ tstar, (0:ℝ) ≤ tstar ∧ tstar ≤ 1 ∧
       (fun _ => by norm_num) (by norm_num) hhit
   exact ⟨tstar, hlo, hhi, hmin⟩
 
+
+/-- The c2lean sqrtf model is non-vacuous and matches the ISA on sample points:
+    sqrt(1)=1, sqrt(2) nearest-even, sqrt(-0)=-0, sqrt(-inf)=default NaN. -/
+example : LightRT.FP.Binary32.sqrtBits 0x3f800000 = 0x3f800000 := by decide +kernel
+example : LightRT.FP.Binary32.sqrtBits 0x40000000 = 0x3fb504f3 := by decide +kernel
+example : LightRT.FP.Binary32.sqrtBits 0x80000000 = 0x80000000 := by decide +kernel
+example : LightRT.FP.Binary32.sqrtBits 0xff800000 = 0xffc00000 := by decide +kernel
+example : LightRT.C.Ref.sqrt 0x40000000 = 0x3fb504f3 := by decide +kernel
+
 end LightRT.Sanity

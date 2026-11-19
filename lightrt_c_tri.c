@@ -25,9 +25,15 @@
 #endif
 
 #include "lightrt_c_tri.h"
+#include "lrt_sqrtf.h"
 
 #include <float.h>
 #include <math.h>
+/* Route every scalar sqrtf through the ISA's correctly-rounded sqrt
+ * instruction (see lrt_sqrtf.h).  Bit-identical to libm sqrtf on all
+ * supported targets; the formal c2lean translator maps lrt_sqrtf to the
+ * MiniC `sqrt` operation. */
+#define sqrtf lrt_sqrtf
 #include <stdio.h> /* serialization (fopen/fread/fwrite) */
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -939,6 +945,24 @@ static void tri_aligned_free(void *p) {
 
 static inline float tri_minf(float a, float b) { return a < b ? a : b; }
 static inline float tri_maxf(float a, float b) { return a > b ? a : b; }
+
+/* Scalar ray/sphere nearest-hit distance. This is the exact fp32 core of the
+ * sphere point primitive (tri_point_isect_one, sphere branch) factored into a
+ * translatable helper: it exercises the correctly-rounded sqrt path that the
+ * c2lean bridge models as `FP.Binary32.sqrtBits`. Returns -1 on a miss.
+ *
+ * Kept here as the smallest kernel that makes c2lean's sqrtf support
+ * end-to-end testable (Tier 1.2); the main intersectors call sqrtf directly. */
+static inline float tri_sphere_dist_f(const float *o, const float *d,
+                                      const float *c, float r) {
+    float ex = c[0] - o[0], ey = c[1] - o[1], ez = c[2] - o[2];
+    float proj = ex * d[0] + ey * d[1] + ez * d[2];
+    float l2 = ex * ex + ey * ey + ez * ez;
+    float perp2 = l2 - proj * proj;
+    float disc = r * r - perp2;
+    if (disc < 0.0f) return -1.0f;
+    return proj - sqrtf(disc);
+}
 /* LRT_TRI_EXACT_NEAREST: closest-hit node tests never depend on the current
  * best hit (box test against tmax, children pushed with tnear = tmin), so the
  * tnear-vs-hit-t comparison that can cull a nearer hit at the ulp level never

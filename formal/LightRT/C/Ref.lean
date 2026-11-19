@@ -21,6 +21,8 @@ def detEps : F := 0x2b8cbccc    -- 1e-12f
 
 def neg (a : F) : F := a ^^^ 0x80000000
 def copysign (a b : F) : F := (a &&& 0x7fffffff) ||| (b &&& 0x80000000)
+/-- `lrt_sqrtf` / `sqrtf`: correctly-rounded IEEE binary32 square root. -/
+def sqrt (a : F) : F := sqrtBits a
 def eqF (a b : F) : Bool := leBits a b && leBits b a
 /-- `tri_minf(a, b) = a < b ? a : b` (NaN-asymmetric, as in C). -/
 def fmin (a b : F) : F := if ltBits a b then a else b
@@ -85,6 +87,18 @@ def slabInflated (rc : RayCtx) (lo hi : Fin 3 → F) (tbest K : F) : Bool :=
   let tnear := fmax (fmax (tn 0) (tn 1)) (fmax (tn 2) rc.tmin)
   let tfar := mulBits (fmin (fmin (tf 0) (tf 1)) (fmin (tf 2) tbest)) K
   leBits tnear tfar
+
+/-- `tri_sphere_dist_f`: nearest ray/sphere hit distance (scalar fp32 core).
+    Returns -1 when the discriminant is negative. -/
+def sphereDistF (o d c : Fin 3 → F) (r : F) : F :=
+  let ex := subBits (c 0) (o 0)
+  let ey := subBits (c 1) (o 1)
+  let ez := subBits (c 2) (o 2)
+  let proj := addBits (addBits (mulBits ex (d 0)) (mulBits ey (d 1))) (mulBits ez (d 2))
+  let l2 := addBits (addBits (mulBits ex ex) (mulBits ey ey)) (mulBits ez ez)
+  let perp2 := subBits l2 (mulBits proj proj)
+  let disc := subBits (mulBits r r) perp2
+  if ltBits disc zero then neg one else subBits proj (sqrt disc)
 
 /-! `tri_mt_one`, split into its intermediate values (same evaluation order as the C). -/
 def mtE1 (v0 v1 : Fin 3 → F) (k : Fin 3) : F := subBits (v1 k) (v0 k)
