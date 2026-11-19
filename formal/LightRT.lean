@@ -13,6 +13,7 @@ import LightRT.Geom.BezFirstContact
 import LightRT.Geom.SphereTraceConvergence
 import LightRT.Geom.BilinearSurface
 import LightRT.Geom.BezPatchReal
+import LightRT.Geom.NURBSReal
 import LightRT.Geom.BezNewton
 import LightRT.Geom.BezTube
 import LightRT.Geom.BezNewtonGuards

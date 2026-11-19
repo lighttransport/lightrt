@@ -142,7 +142,12 @@ a decision change; Tier 3 is closed or maintenance.
    the control net. The determinant lower bound δ remains necessarily data (as
    M14's `det0`): no lower bound on |det J| is provable for arbitrary control
    points. Full subdivision-plus-Newton completeness and NURBS/trimmed-NURBS
-   surfaces remain open. Note: `c2lean` lacks `sqrtf`
+   surfaces remain open; `Geom/NURBSReal.lean` models the rational bicubic
+   patch produced by NURBS Bezier extraction (positive-weight denominator,
+   convex-combination identity, control-hull containment, hit soundness /
+   culling, continuity, uniform-weight reduction to the Bezier patch), but
+   knot vectors, trimmed-NURBS (u,v) trim loops and the subdivision-plus-Newton
+   completeness are not yet formalized. Note: `c2lean` lacks `sqrtf`
    support, so translating `tri_point_isect_one` needs a tool extension
    (Tier 1.2 dependency).
 2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates only the
