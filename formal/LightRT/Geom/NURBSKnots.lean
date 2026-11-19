@@ -8,8 +8,10 @@
 -/
 import Mathlib
 import LightRT.Geom.BezPatchReal
+import LightRT.Geom.NURBSReal
 
 namespace LightRT.Geom
+open LightRT.Geom.Hull
 noncomputable section
 
 /-- Cox–de Boor B-spline basis function `N_{i,p}` over a knot vector `U`.
@@ -186,5 +188,34 @@ theorem boehm1_preserves (P : Fin 2 → Vec3) (t : ℝ) (ht0 : 0 < t) (ht1 : t <
     simp only [Pi.add_apply, Pi.smul_apply, smul_eq_mul]
     field_simp [ne_of_gt (sub_pos.mpr ht1)]
     ring
+
+/-- Tensor-product rational B-spline evaluation over the cubic Bezier knot
+    vector equals the rational bicubic evaluation `ratEval` of NURBSReal.
+    This is the surface form of Bezier extraction: for a NURBS patch whose
+    knot vectors are Bezier knot vectors, no knot insertion is needed. -/
+theorem bezKnot_ratEval (w : Fin 16 → ℝ) (P : Fin 16 → Vec3) (u v : ℝ)
+    (hu0 : 0 ≤ u) (hu1 : u < 1) (hv0 : 0 ≤ v) (hv1 : v < 1) :
+    (fun i => (∑ k : Fin 16,
+        (bsplineBasis (bezKnot 3) (k.val % 4) 3 u *
+         bsplineBasis (bezKnot 3) (k.val / 4) 3 v * w k) • P k i) /
+      (∑ k : Fin 16, bern33 u v k * w k)) = ratEval w P u v := by
+  have hbasisU (j : ℕ) (hj : j < 4) :
+      bsplineBasis (bezKnot 3) j 3 u = bern3 u ⟨j, hj⟩ := by
+    interval_cases j <;> simp [Hull.bern3,
+      bezKnot_basis0 u hu0 hu1, bezKnot_basis1 u hu0 hu1,
+      bezKnot_basis2 u hu0 hu1, bezKnot_basis3 u hu0 hu1]
+  have hbasisV (j : ℕ) (hj : j < 4) :
+      bsplineBasis (bezKnot 3) j 3 v = bern3 v ⟨j, hj⟩ := by
+    interval_cases j <;> simp [Hull.bern3,
+      bezKnot_basis0 v hv0 hv1, bezKnot_basis1 v hv0 hv1,
+      bezKnot_basis2 v hv0 hv1, bezKnot_basis3 v hv0 hv1]
+  ext i
+  unfold ratEval ratWeight
+  apply congrArg (fun z => z / (∑ k : Fin 16, bern33 u v k * w k))
+  apply Finset.sum_congr rfl
+  intro k hk
+  rw [hbasisU (k.val % 4) (by omega), hbasisV (k.val / 4) (by omega)]
+  simp [bern33, Pi.smul_apply, smul_eq_mul, mul_assoc]
+
 end
 end LightRT.Geom
