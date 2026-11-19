@@ -151,7 +151,9 @@ a decision change; Tier 3 is closed or maintenance.
 2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates the
    scalar triangle core (`tri_minf/maxf`, `tri_slab_scalar`, `tri_mt_one`,
    `tri_ray_setup`, `tri_woop_one`, `tri_exn_key`) plus `tri_sphere_dist_f`
-   (the ray/sphere distance helper that exercises `sqrtf`). `sqrtf` support is
+   (the ray/sphere distance helper that exercises `sqrtf`), `tri_surface_area`
+   and `tri_longest_axis` (box helpers). Their `*_refines` theorems are in
+   `C/Proofs/{SphereDist,SmallKernels}Refines.lean`. `sqrtf` support is
    now in place: the C kernel uses `lrt_sqrtf` (`lrt_sqrtf.h`, the ISA's
    correctly-rounded SQRTSS on x86 SSE2/AVX/AVX2 and `vsqrt.f32` on ARM64 NEON,
    no libm call; `make test_lrt_sqrtf` checks bit-exactness vs libm over 200k+
