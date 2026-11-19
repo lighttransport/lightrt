@@ -401,4 +401,13 @@ example {f : ℝ → ℝ} (hf : Lipschitz1 f) {root t : ℝ} (hr : f root ≤ 0)
     ∃ L ≤ root, Tendsto (fun n => stTrace f t n) atTop (𝓝 L) ∧ f L = 0 :=
   sdf_trace_sound hf hr ht hn
 
+
+/-- Intersector contracts are non-vacuous by composition. -/
+example (o d : Vec3) (cp : Fin 16 → Vec3) {tmin tbest u v t : ℝ}
+    (hu0 : 0 ≤ u) (hu1 : u ≤ 1) (hv0 : 0 ≤ v) (hv1 : v ≤ 1)
+    (htmin : tmin ≤ t) (htbest : t < tbest)
+    (hres : bezPatchContact o d cp t u v = 0) :
+    HitsBezPatchRay o d cp tmin tbest :=
+  surface_contract_sound o d cp hu0 hu1 hv0 hv1 htmin htbest hres
+
 end LightRT.Sanity
