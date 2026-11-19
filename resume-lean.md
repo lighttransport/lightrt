@@ -150,7 +150,9 @@ The authoritative roadmap is `formal/PLAN.md` §5 (three tiers). Summary:
   the determinant lower bound stays necessarily data. BezPatchConvergence.lean
   adds patchNewtonIter + basin convergence + cell_center_in_basin + the
   control-point-supplied basin (patch_basin_ball_of_data,
-  patch_newtonIter_tendsto_of_root_data); delta stays data. Next: subdivision-plus-
+  patch_newtonIter_tendsto_of_root_data), and the upgraded
+  patch_subdivision_no_missed_nearest_of_root_data; delta and the cell seed
+  distance stay data. Next: subdivision-plus-
   Newton completeness, NURBS;
   acceptance = soundness/completeness/nearest over ℝ + non-vacuity examples.
   (2) `c2lean` coverage expansion — sqrtf support done (lrt_sqrtf.h ISA sqrt on
