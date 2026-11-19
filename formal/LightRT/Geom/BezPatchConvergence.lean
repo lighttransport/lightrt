@@ -7,6 +7,7 @@
 -/
 import Mathlib
 import LightRT.Geom.BezPatchReal
+import LightRT.Geom.BezPatchSubdivision
 import LightRT.Geom.BezNewtonGuards
 
 namespace LightRT.Geom
@@ -114,6 +115,65 @@ theorem cell_center_in_basin {u0 u1 v0 v1 us vs B K : ℝ}
     rw [abs_le]
     constructor <;> linarith [hvs.1, hvs.2]
   nlinarith
+
+
+/-- **Abstract subdivision-plus-Newton no-missed-nearest.** If a nearest hit
+    `(u*, v*, t*)` lies in a representing subdivision cell whose total parameter
+    width fits the Newton basin, and the Newton iterates from the cell center
+    remain in the basin (the M14-style hypotheses, with δ as data), then those
+    iterates converge to the local coordinates of the hit. Since every contact
+    root is a genuine hit (`newton_patch_hit_of_contact_zero`) and no genuine
+    hit precedes the nearest (`newton_patch_contact_ge_nearest`), the search
+    finds the nearest hit: none is missed. -/
+theorem patch_subdivision_no_missed_nearest (o d : Vec3) (global : Fin 16 → Vec3)
+    (tmin tbest M δ : ℝ) (hM : ∀ k i, |global k i| ≤ M) (hM0 : 0 ≤ M)
+    (hMpos : 0 < M) (hδ : 0 < δ)
+    (c : PatchCell) (hc : Represents global c)
+    (hcM : ∀ k i, |c.cp k i| ≤ M)
+    (huw : c.u0 < c.u1) (hvw : c.v0 < c.v1)
+    {us vs ts : ℝ}
+    (hus : us ∈ Set.Icc c.u0 c.u1) (hvs : vs ∈ Set.Icc c.v0 c.v1)
+    (hus01 : us ∈ Set.Icc (0:ℝ) 1) (hvs01 : vs ∈ Set.Icc (0:ℝ) 1)
+    (htmin : tmin ≤ ts) (htbest : ts < tbest)
+    (hrootglobal : bezPatchContact o d global ts us vs = 0)
+    (hbasin : ∀ n,
+      let st := patchNewtonIter o d c.cp ts ((c.u0 + c.u1)/2) ((c.v0 + c.v1)/2) n
+      st.1 ∈ Set.Icc (0:ℝ) 1 ∧ st.2 ∈ Set.Icc (0:ℝ) 1 ∧
+      δ ≤ |jacDet (patchF o d c.cp ts) (patchG o d c.cp ts) st.1 st.2| ∧
+      |st.1 - (us - c.u0)/(c.u1 - c.u0)| + |st.2 - (vs - c.v0)/(c.v1 - c.v0)|
+        ≤ (48*M) / (192*M))
+    (hcond : 2 * (48*M)^2 / δ < 1)
+    (hseed : 2 * (48*M)^2 / δ + (18 * (48*M) * (192*M) / δ) *
+        (|(c.u0 + c.u1)/2 - (us - c.u0)/(c.u1 - c.u0)| +
+         |(c.v0 + c.v1)/2 - (vs - c.v0)/(c.v1 - c.v0)|) < 1) :
+    Tendsto (fun n => (patchNewtonIter o d c.cp ts
+        ((c.u0+c.u1)/2) ((c.v0+c.v1)/2) n).1) atTop
+      (𝓝 ((us - c.u0)/(c.u1 - c.u0))) ∧
+    Tendsto (fun n => (patchNewtonIter o d c.cp ts
+        ((c.u0+c.u1)/2) ((c.v0+c.v1)/2) n).2) atTop
+      (𝓝 ((vs - c.v0)/(c.v1 - c.v0))) := by
+  let uc := (c.u0 + c.u1) / 2
+  let vc := (c.v0 + c.v1) / 2
+  let us' := (us - c.u0) / (c.u1 - c.u0)
+  let vs' := (vs - c.v0) / (c.v1 - c.v0)
+  have hus' : us' ∈ Set.Icc (0:ℝ) 1 := by
+    constructor
+    · dsimp [us']; exact div_nonneg (sub_nonneg.mpr hus.1) (sub_nonneg.mpr (le_of_lt huw))
+    · dsimp [us']; exact (div_le_one (sub_pos.mpr huw)).mpr (by linarith [hus.2])
+  have hvs' : vs' ∈ Set.Icc (0:ℝ) 1 := by
+    constructor
+    · dsimp [vs']; exact div_nonneg (sub_nonneg.mpr hvs.1) (sub_nonneg.mpr (le_of_lt hvw))
+    · dsimp [vs']; exact (div_le_one (sub_pos.mpr hvw)).mpr (by linarith [hvs.2])
+  have hmapu : c.u0 + (c.u1 - c.u0) * us' = us := by
+    dsimp [us']; field_simp [ne_of_gt (sub_pos.mpr huw)]; ring
+  have hmapv : c.v0 + (c.v1 - c.v0) * vs' = vs := by
+    dsimp [vs']; field_simp [ne_of_gt (sub_pos.mpr hvw)]; ring
+  have hroot := cell_root_of_global_root o d ts global c hc hus' hvs' hmapu hmapv hrootglobal
+  apply patch_newtonIter_tendsto_of_basin o d c.cp ts M δ hcM hM0 hMpos hδ hus' hvs' hroot
+  · intro n
+    simpa [uc, vc, us', vs'] using hbasin n
+  · exact hcond
+  · simpa [uc, vc, us', vs'] using hseed
 
 end
 end LightRT.Geom
