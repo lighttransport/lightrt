@@ -334,4 +334,12 @@ example (R : TrimRegion) (u v : ℝ) (h : TrimLoop) (hh : h ∈ R.holes)
     (hin : inLoop h u v) : ¬ trimVisible R u v := by
   exact hole_hit_rejected R h hh hin
 
+
+/-- Knot insertion foundation is non-vacuous: inserting a knot inside a span
+    splits the degree-0 B-spline basis function at that span. -/
+example (U : ℕ → ℝ) (k : ℕ) (u x : ℝ) (hlo : U k ≤ u) (hhi : u < U (k+1)) :
+    bsplineBasis U k 0 x =
+      bsplineBasis (insertKnot U k u) k 0 x + bsplineBasis (insertKnot U k u) (k+1) 0 x := by
+  exact (bsplineBasis_zero_refinement U k u x hlo hhi).2.1
+
 end LightRT.Sanity

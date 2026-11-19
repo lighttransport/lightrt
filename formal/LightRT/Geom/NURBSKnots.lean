@@ -76,5 +76,68 @@ theorem bezKnot_curve (P : Fin 4 → Vec3) (u : ℝ) (hu0 : 0 ≤ u) (hu1 : u < 
     bezKnot_basis2 u hu0 hu1, bezKnot_basis3 u hu0 hu1]
   simp [bez3Vec, Hull.bern3, Fin.sum_univ_four]
 
+
+/-- Insert a new knot `u` into knot vector `U` after index `k`, producing
+    `Ū = [U₀..U_k, u, U_{k+1}..]`. -/
+def insertKnot (U : ℕ → ℝ) (k : ℕ) (u : ℝ) : ℕ → ℝ :=
+  fun j => if j ≤ k then U j else if j = k + 1 then u else U (j - 1)
+
+@[simp] theorem insertKnot_le {U : ℕ → ℝ} (u : ℝ) {k j : ℕ} (h : j ≤ k) :
+    insertKnot U k u j = U j := by simp [insertKnot, h]
+
+@[simp] theorem insertKnot_mid {U : ℕ → ℝ} (u : ℝ) {k : ℕ} :
+    insertKnot U k u (k+1) = u := by simp [insertKnot]
+
+@[simp] theorem insertKnot_gt {U : ℕ → ℝ} (u : ℝ) {k j : ℕ} (h : k + 1 < j) :
+    insertKnot U k u j = U (j-1) := by
+  have hnot : ¬ j ≤ k := by omega
+  have hne : ¬ j = k + 1 := by omega
+  simp [insertKnot, hnot, hne]
+
+/-- **Degree-0 B-spline refinement.** Inserting a knot `u` in `[U_k, U_{k+1})`
+    splits the support of `N_{k,0}` into two and leaves all other degree-0
+    basis functions (shifted) unchanged. -/
+theorem bsplineBasis_zero_refinement (U : ℕ → ℝ) (k : ℕ) (u x : ℝ)
+    (hlo : U k ≤ u) (hhi : u < U (k+1)) :
+    (∀ i < k, bsplineBasis (insertKnot U k u) i 0 x = bsplineBasis U i 0 x) ∧
+    bsplineBasis U k 0 x =
+      bsplineBasis (insertKnot U k u) k 0 x + bsplineBasis (insertKnot U k u) (k+1) 0 x ∧
+    (∀ i, k < i → bsplineBasis U i 0 x = bsplineBasis (insertKnot U k u) (i+1) 0 x) := by
+  constructor
+  · intro i hi
+    simp [bsplineBasis]
+    have hik : i ≤ k := by omega
+    have hi1 : i + 1 ≤ k := by omega
+    simp [insertKnot, hik, hi1]
+  constructor
+  · simp [bsplineBasis]
+    have h1 : k ≤ k := le_rfl
+    have h2 : ¬ k + 1 ≤ k := by omega
+    have h3 : k + 1 = k + 1 := rfl
+    have h4 : ¬ k + 2 ≤ k := by omega
+    have h5 : ¬ k + 2 = k + 1 := by omega
+    have h6 : k + 2 - 1 = k + 1 := by omega
+    by_cases hxU : U k ≤ x ∧ x < U (k+1)
+    · have hsplit : (U k ≤ x ∧ x < u) ∨ (u ≤ x ∧ x < U (k+1)) := by
+        by_cases hxu : x < u
+        · exact Or.inl ⟨hxU.1, hxu⟩
+        · exact Or.inr ⟨le_of_not_gt hxu, hxU.2⟩
+      rcases hsplit with h | h <;> simp [hxU, h]
+    · have hn1 : ¬ (U k ≤ x ∧ x < u) := by
+        intro h; exact hxU ⟨h.1, lt_trans h.2 hhi⟩
+      have hn2 : ¬ (u ≤ x ∧ x < U (k+1)) := by
+        intro h; exact hxU ⟨le_trans hlo h.1, h.2⟩
+      simp [hxU, hn1, hn2]
+    -- unused old branch
+  · intro i hi
+    simp [bsplineBasis]
+    have hik' : i ≠ k := by omega
+    have h1 : ¬ i + 1 ≤ k := by omega
+    have h2 : ¬ i + 1 = k + 1 := by omega
+    have h4 : ¬ i + 1 = k := by omega
+    have h5 : ¬ i + 1 < k := by omega
+    have h3 : i + 1 - 1 = i := by omega
+    simp [insertKnot, hik', h1, h2, h4, h5, h3]
+
 end
 end LightRT.Geom
