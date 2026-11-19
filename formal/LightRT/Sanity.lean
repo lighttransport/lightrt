@@ -302,4 +302,10 @@ example : bicubicEval (splitBicubicV (fun _ : Fin 16 => (0 : Vec3)) (1/2 : ℝ))
   rw [bicubic_split_v_left]
   simp [bicubicEval, LightRT.Geom.Hull.bern33, LightRT.Geom.Hull.bern3]
 
+
+/-- Subdivision cell representation and cull safety are non-vacuous: the root
+    cell represents its own patch. -/
+example (cp : Fin 16 → Vec3) : Represents cp ⟨0, 1, 0, 1, cp⟩ := by
+  exact root_represents cp
+
 end LightRT.Sanity
