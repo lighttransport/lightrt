@@ -235,4 +235,15 @@ example (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) (hM : ∀ k i, cp k i 
     pd1 (patchF o d cp t) u v = (bicubicEval_du cp u v) 0 := by
   exact pd1_patchF o d cp t u v
 
+
+/-- The patch C2Seg constructors are non-vacuous: the zero control net (M = 1)
+    supplies a valid C2Seg for patchF and patchG with K = 192. -/
+example (o d : Vec3) (t : ℝ) :
+    C2Seg (patchF o d (fun _ : Fin 16 => (0 : Vec3)) t) 0 1 0 1 192 := by
+  simpa using patchF_C2Seg o d (fun _ : Fin 16 => (0 : Vec3)) t 1 (by simp) (by norm_num)
+
+example (o d : Vec3) (t : ℝ) :
+    C2Seg (patchG o d (fun _ : Fin 16 => (0 : Vec3)) t) 0 1 0 1 192 := by
+  simpa using patchG_C2Seg o d (fun _ : Fin 16 => (0 : Vec3)) t 1 (by simp) (by norm_num)
+
 end LightRT.Sanity

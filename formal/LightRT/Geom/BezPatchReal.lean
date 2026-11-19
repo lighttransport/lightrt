@@ -570,5 +570,299 @@ theorem pd2_patchF (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) :
   (patchF_hasDerivAt_v o d cp t u v).deriv
 
 
+/-- HasDerivAt for `u ↦ pd1 patchF u v` (derivative = pdd11). -/
+theorem pd1_patchF_hasDerivAt_u (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) :
+    HasDerivAt (fun u => pd1 (patchF o d cp t) u v)
+      ((bicubicEval_duu cp u v) 0) u := by
+  rw [show (fun u => pd1 (patchF o d cp t) u v) =
+      (fun u => (bicubicEval_du cp u v) 0) by
+    funext u; exact pd1_patchF o d cp t u v]
+  -- derivative of (fun u => (bicubicEval_du cp u v) 0) is (bicubicEval_duu cp u v) 0
+  unfold bicubicEval_du bicubicEval_duu
+  simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+  convert (HasDerivAt.sum (u := Finset.univ) (fun k hk =>
+    ((hasDerivAt_bern3' u ⟨k.val % 4, by omega⟩).mul_const
+      (bern3 v ⟨k.val / 4, by omega⟩)).mul_const (cp k 0))) using 1
+  · ext y; simp <;> ring_nf
+
+/-- HasDerivAt for `v ↦ pd1 patchF u v` (derivative = pdd12). -/
+theorem pd1_patchF_hasDerivAt_v (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) :
+    HasDerivAt (fun v => pd1 (patchF o d cp t) u v)
+      ((bicubicEval_duv cp u v) 0) v := by
+  rw [show (fun v => pd1 (patchF o d cp t) u v) =
+      (fun v => (bicubicEval_du cp u v) 0) by
+    funext v; exact pd1_patchF o d cp t u v]
+  unfold bicubicEval_du bicubicEval_duv
+  simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+  convert (HasDerivAt.sum (u := Finset.univ) (fun k hk =>
+    ((hasDerivAt_bern3 v ⟨k.val / 4, by omega⟩).const_mul
+      (bern3' u ⟨k.val % 4, by omega⟩)).mul_const (cp k 0))) using 1
+  · ext y
+    simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+
+
+theorem pd2_patchF_hasDerivAt_u (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) :
+    HasDerivAt (fun u => pd2 (patchF o d cp t) u v)
+      ((bicubicEval_duv cp u v) 0) u := by
+  rw [show (fun u => pd2 (patchF o d cp t) u v) =
+      (fun u => (bicubicEval_dv cp u v) 0) by
+    funext u; exact pd2_patchF o d cp t u v]
+  unfold bicubicEval_dv bicubicEval_duv
+  simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+  convert (HasDerivAt.sum (u := Finset.univ) (fun k hk =>
+    ((hasDerivAt_bern3 u ⟨k.val % 4, by omega⟩).mul_const
+      (bern3' v ⟨k.val / 4, by omega⟩)).mul_const (cp k 0))) using 1
+  · ext y; simp <;> ring_nf
+
+theorem pd2_patchF_hasDerivAt_v (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) :
+    HasDerivAt (fun v => pd2 (patchF o d cp t) u v)
+      ((bicubicEval_dvv cp u v) 0) v := by
+  rw [show (fun v => pd2 (patchF o d cp t) u v) =
+      (fun v => (bicubicEval_dv cp u v) 0) by
+    funext v; exact pd2_patchF o d cp t u v]
+  unfold bicubicEval_dv bicubicEval_dvv
+  simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+  convert (HasDerivAt.sum (u := Finset.univ) (fun k hk =>
+    ((hasDerivAt_bern3' v ⟨k.val / 4, by omega⟩).const_mul
+      (bern3 u ⟨k.val % 4, by omega⟩)).mul_const (cp k 0))) using 1
+  · ext y
+    simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+
+theorem abs_bicubic_du_uu_le (cp : Fin 16 → Vec3) (M : ℝ) (hM : ∀ k i, |cp k i| ≤ M) (hM0 : 0 ≤ M)
+    {u v : ℝ} (hu0:0≤u) (hu1:u≤1) (hv0:0≤v) (hv1:v≤1) (a : Fin 3) :
+    |(bicubicEval_duu cp u v) a| ≤ 192 * M := by
+  unfold bicubicEval_duu
+  simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+  calc |∑ k : Fin 16, (bern3'' u ⟨k.val % 4, by omega⟩ * bern3 v ⟨k.val / 4, by omega⟩) * cp k a|
+      ≤ 16 * (12 * M) := by
+        apply abs_sum_scalar_bound
+        · intro k
+          rw [abs_mul, abs_mul]
+          have h1 := abs_bern3''_le hu0 hu1 ⟨k.val % 4, by omega⟩
+          have h2 := bern3_nonneg hv0 hv1 ⟨k.val / 4, by omega⟩
+          have h2' : |bern3 v ⟨k.val / 4, by omega⟩| ≤ 1 := by
+            rw [abs_of_nonneg h2]
+            exact bern3_le_one hv0 hv1 ⟨k.val / 4, by omega⟩
+          have h12 : |bern3'' u ⟨k.val % 4, by omega⟩| * |bern3 v ⟨k.val / 4, by omega⟩| ≤ 12 * 1 :=
+            mul_le_mul h1 h2' (abs_nonneg _) (by norm_num)
+          have h123 := mul_le_mul h12 (hM k a) (abs_nonneg _) (by norm_num : 0 ≤ (12:ℝ)*1)
+          simpa [mul_assoc] using h123
+    _ = 192 * M := by ring
+
+
+theorem patchG_hasDerivAt_u (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) :
+    HasDerivAt (fun u => patchG o d cp t u v) ((bicubicEval_du cp u v) 1) u := by
+  unfold patchG bezPatchContact bicubicEval bicubicEval_du
+  simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul, Matrix.cons_val_one]
+  convert (HasDerivAt.sum (u := Finset.univ) (fun k hk =>
+    ((hasDerivAt_bern3 u ⟨k.val % 4, by omega⟩).mul_const
+      (bern3 v ⟨k.val / 4, by omega⟩)).mul_const (cp k 1))).sub_const ((o 1) + t * (d 1)) using 1
+  · ext y <;> simp [bern33] <;> ring_nf
+
+theorem patchG_hasDerivAt_v (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) :
+    HasDerivAt (fun v => patchG o d cp t u v) ((bicubicEval_dv cp u v) 1) v := by
+  unfold patchG bezPatchContact bicubicEval bicubicEval_dv
+  simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul, Matrix.cons_val_one]
+  convert (HasDerivAt.sum (u := Finset.univ) (fun k hk =>
+    ((hasDerivAt_bern3 v ⟨k.val / 4, by omega⟩).const_mul
+      (bern3 u ⟨k.val % 4, by omega⟩)).mul_const (cp k 1))).sub_const ((o 1) + t * (d 1)) using 1
+  · ext y
+    simp [bern33, Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+
+theorem pd1_patchG (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) :
+    pd1 (patchG o d cp t) u v = (bicubicEval_du cp u v) 1 :=
+  (patchG_hasDerivAt_u o d cp t u v).deriv
+
+theorem pd2_patchG (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) :
+    pd2 (patchG o d cp t) u v = (bicubicEval_dv cp u v) 1 :=
+  (patchG_hasDerivAt_v o d cp t u v).deriv
+
+
+/-- HasDerivAt for `u ↦ pd1 patchG u v` (derivative = pdd11). -/
+theorem pd1_patchG_hasDerivAt_u (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) :
+    HasDerivAt (fun u => pd1 (patchG o d cp t) u v)
+      ((bicubicEval_duu cp u v) 1) u := by
+  rw [show (fun u => pd1 (patchG o d cp t) u v) =
+      (fun u => (bicubicEval_du cp u v) 1) by
+    funext u; exact pd1_patchG o d cp t u v]
+  -- derivative of (fun u => (bicubicEval_du cp u v) 1) is (bicubicEval_duu cp u v) 1
+  unfold bicubicEval_du bicubicEval_duu
+  simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+  convert (HasDerivAt.sum (u := Finset.univ) (fun k hk =>
+    ((hasDerivAt_bern3' u ⟨k.val % 4, by omega⟩).mul_const
+      (bern3 v ⟨k.val / 4, by omega⟩)).mul_const (cp k 1))) using 1
+  · ext y; simp <;> ring_nf
+
+/-- HasDerivAt for `v ↦ pd1 patchG u v` (derivative = pdd12). -/
+theorem pd1_patchG_hasDerivAt_v (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) :
+    HasDerivAt (fun v => pd1 (patchG o d cp t) u v)
+      ((bicubicEval_duv cp u v) 1) v := by
+  rw [show (fun v => pd1 (patchG o d cp t) u v) =
+      (fun v => (bicubicEval_du cp u v) 1) by
+    funext v; exact pd1_patchG o d cp t u v]
+  unfold bicubicEval_du bicubicEval_duv
+  simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+  convert (HasDerivAt.sum (u := Finset.univ) (fun k hk =>
+    ((hasDerivAt_bern3 v ⟨k.val / 4, by omega⟩).const_mul
+      (bern3' u ⟨k.val % 4, by omega⟩)).mul_const (cp k 1))) using 1
+  · ext y
+    simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+
+
+theorem pd2_patchG_hasDerivAt_u (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) :
+    HasDerivAt (fun u => pd2 (patchG o d cp t) u v)
+      ((bicubicEval_duv cp u v) 1) u := by
+  rw [show (fun u => pd2 (patchG o d cp t) u v) =
+      (fun u => (bicubicEval_dv cp u v) 1) by
+    funext u; exact pd2_patchG o d cp t u v]
+  unfold bicubicEval_dv bicubicEval_duv
+  simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+  convert (HasDerivAt.sum (u := Finset.univ) (fun k hk =>
+    ((hasDerivAt_bern3 u ⟨k.val % 4, by omega⟩).mul_const
+      (bern3' v ⟨k.val / 4, by omega⟩)).mul_const (cp k 1))) using 1
+  · ext y; simp <;> ring_nf
+
+theorem pd2_patchG_hasDerivAt_v (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) :
+    HasDerivAt (fun v => pd2 (patchG o d cp t) u v)
+      ((bicubicEval_dvv cp u v) 1) v := by
+  rw [show (fun v => pd2 (patchG o d cp t) u v) =
+      (fun v => (bicubicEval_dv cp u v) 1) by
+    funext v; exact pd2_patchG o d cp t u v]
+  unfold bicubicEval_dv bicubicEval_dvv
+  simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+  convert (HasDerivAt.sum (u := Finset.univ) (fun k hk =>
+    ((hasDerivAt_bern3' v ⟨k.val / 4, by omega⟩).const_mul
+      (bern3 u ⟨k.val % 4, by omega⟩)).mul_const (cp k 1))) using 1
+  · ext y
+    simp only [Finset.sum_apply, Pi.smul_apply, smul_eq_mul]
+
+/-- C2Seg for the patch contact function patchG on [0,1]^2, with K = 192*M. -/
+theorem patchG_C2Seg (o d : Vec3) (cp : Fin 16 → Vec3) (t M : ℝ)
+    (hM : ∀ k i, |cp k i| ≤ M) (hM0 : 0 ≤ M) :
+    C2Seg (patchG o d cp t) 0 1 0 1 (192*M) where
+  row := by
+    intro v hv u hu
+    exact (patchG_hasDerivAt_u o d cp t u v).differentiableAt.differentiableWithinAt
+  col := by
+    intro u hu v hv
+    exact (patchG_hasDerivAt_v o d cp t u v).differentiableAt.differentiableWithinAt
+  row₁ := by
+    intro v hv u hu
+    exact (pd1_patchG_hasDerivAt_u o d cp t u v).differentiableAt.differentiableWithinAt
+  col₁ := by
+    intro u hu v hv
+    exact (pd1_patchG_hasDerivAt_v o d cp t u v).differentiableAt.differentiableWithinAt
+  row₂ := by
+    intro v hv u hu
+    exact (pd2_patchG_hasDerivAt_u o d cp t u v).differentiableAt.differentiableWithinAt
+  col₂ := by
+    intro u hu v hv
+    exact (pd2_patchG_hasDerivAt_v o d cp t u v).differentiableAt.differentiableWithinAt
+  b₁₁ := by
+    intro u hu v hv
+    rw [show pdd11 (patchG o d cp t) u v = (bicubicEval_duu cp u v) 1 from
+      (pd1_patchG_hasDerivAt_u o d cp t u v).deriv]
+    exact abs_bicubic_du_uu_le cp M hM hM0 hu.1 hu.2 hv.1 hv.2 1
+  b₁₂ := by
+    intro u hu v hv
+    rw [show pdd12 (patchG o d cp t) u v = (bicubicEval_duv cp u v) 1 from
+      (pd1_patchG_hasDerivAt_v o d cp t u v).deriv]
+    exact (abs_bicubic_uv_le cp M hM hM0 hu.1 hu.2 hv.1 hv.2 1).trans (by nlinarith [hM0])
+  b₂₁ := by
+    intro u hu v hv
+    rw [show pdd21 (patchG o d cp t) u v = (bicubicEval_duv cp u v) 1 from
+      (pd2_patchG_hasDerivAt_u o d cp t u v).deriv]
+    exact (abs_bicubic_uv_le cp M hM hM0 hu.1 hu.2 hv.1 hv.2 1).trans (by nlinarith [hM0])
+  b₂₂ := by
+    intro u hu v hv
+    rw [show pdd22 (patchG o d cp t) u v = (bicubicEval_dvv cp u v) 1 from
+      (pd2_patchG_hasDerivAt_v o d cp t u v).deriv]
+    exact abs_bicubic_vv_le cp M hM hM0 hu.1 hu.2 hv.1 hv.2 1
+
+
+/-- C2Seg for the patch contact function patchF on [0,1]^2, with K = 192*M. -/
+theorem patchF_C2Seg (o d : Vec3) (cp : Fin 16 → Vec3) (t M : ℝ)
+    (hM : ∀ k i, |cp k i| ≤ M) (hM0 : 0 ≤ M) :
+    C2Seg (patchF o d cp t) 0 1 0 1 (192*M) where
+  row := by
+    intro v hv u hu
+    exact (patchF_hasDerivAt_u o d cp t u v).differentiableAt.differentiableWithinAt
+  col := by
+    intro u hu v hv
+    exact (patchF_hasDerivAt_v o d cp t u v).differentiableAt.differentiableWithinAt
+  row₁ := by
+    intro v hv u hu
+    exact (pd1_patchF_hasDerivAt_u o d cp t u v).differentiableAt.differentiableWithinAt
+  col₁ := by
+    intro u hu v hv
+    exact (pd1_patchF_hasDerivAt_v o d cp t u v).differentiableAt.differentiableWithinAt
+  row₂ := by
+    intro v hv u hu
+    exact (pd2_patchF_hasDerivAt_u o d cp t u v).differentiableAt.differentiableWithinAt
+  col₂ := by
+    intro u hu v hv
+    exact (pd2_patchF_hasDerivAt_v o d cp t u v).differentiableAt.differentiableWithinAt
+  b₁₁ := by
+    intro u hu v hv
+    rw [show pdd11 (patchF o d cp t) u v = (bicubicEval_duu cp u v) 0 from
+      (pd1_patchF_hasDerivAt_u o d cp t u v).deriv]
+    exact abs_bicubic_du_uu_le cp M hM hM0 hu.1 hu.2 hv.1 hv.2 0
+  b₁₂ := by
+    intro u hu v hv
+    rw [show pdd12 (patchF o d cp t) u v = (bicubicEval_duv cp u v) 0 from
+      (pd1_patchF_hasDerivAt_v o d cp t u v).deriv]
+    exact (abs_bicubic_uv_le cp M hM hM0 hu.1 hu.2 hv.1 hv.2 0).trans (by nlinarith [hM0])
+  b₂₁ := by
+    intro u hu v hv
+    rw [show pdd21 (patchF o d cp t) u v = (bicubicEval_duv cp u v) 0 from
+      (pd2_patchF_hasDerivAt_u o d cp t u v).deriv]
+    exact (abs_bicubic_uv_le cp M hM hM0 hu.1 hu.2 hv.1 hv.2 0).trans (by nlinarith [hM0])
+  b₂₂ := by
+    intro u hu v hv
+    rw [show pdd22 (patchF o d cp t) u v = (bicubicEval_dvv cp u v) 0 from
+      (pd2_patchF_hasDerivAt_v o d cp t u v).deriv]
+    exact abs_bicubic_vv_le cp M hM hM0 hu.1 hu.2 hv.1 hv.2 0
+
+
+/-- `bezpatch_newton_quadratic` with C2Seg and partial bounds derived from the
+    16 control points: only the determinant lower bound δ and the ball radius
+    remain as data (the former necessarily so, as in M14). -/
+theorem bezpatch_newton_quadratic_of_controls (o d : Vec3) (cp : Fin 16 → Vec3)
+    (t M δ : ℝ) (hM : ∀ k i, |cp k i| ≤ M) (hM0 : 0 ≤ M)
+    (hMpos : 0 < M) {u₀ v₀ u v : ℝ}
+    (hu : u ∈ Set.Icc (0:ℝ) 1) (hu₀ : u₀ ∈ Set.Icc (0:ℝ) 1)
+    (hv : v ∈ Set.Icc (0:ℝ) 1) (hv₀ : v₀ ∈ Set.Icc (0:ℝ) 1)
+    (hroot : patchF o d cp t u₀ v₀ = 0 ∧ patchG o d cp t u₀ v₀ = 0)
+    (hden : δ ≤ |jacDet (patchF o d cp t) (patchG o d cp t) u v|) (hδ : 0 < δ)
+    (hE : |u - u₀| + |v - v₀| ≤ 48*M / (192*M)) :
+    |(newton2Step (patchF o d cp t) (patchG o d cp t) u v).1 - u₀| ≤
+        (10 * (48*M) * (192*M) / δ) * (|u - u₀| + |v - v₀|) ^ 2 ∧
+    |(newton2Step (patchF o d cp t) (patchG o d cp t) u v).2 - v₀| ≤
+        (8 * (48*M) * (192*M) * (|u - u₀| + |v - v₀|) ^ 2 + 2 * (48*M)^2 *
+          (|u - u₀| + |v - v₀|)) / δ := by
+  apply bezpatch_newton_quadratic o d cp t 0 1 0 1 (192*M) (48*M) δ
+      (patchF_C2Seg o d cp t M hM hM0) (patchG_C2Seg o d cp t M hM hM0)
+      (by positivity) (by positivity) hu hu₀ hv hv₀ hroot
+  · rw [pd1_patchF]
+    exact abs_bicubic_du_le cp M hM hM0 hu.1 hu.2 hv.1 hv.2 0
+  · rw [pd2_patchF]
+    exact abs_bicubic_dv_le cp M hM hM0 hu.1 hu.2 hv.1 hv.2 0
+  · rw [pd1_patchG]
+    exact abs_bicubic_du_le cp M hM hM0 hu.1 hu.2 hv.1 hv.2 1
+  · rw [pd2_patchG]
+    exact abs_bicubic_dv_le cp M hM hM0 hu.1 hu.2 hv.1 hv.2 1
+  · rw [pd1_patchF]
+    exact abs_bicubic_du_le cp M hM hM0 hu₀.1 hu₀.2 hv₀.1 hv₀.2 0
+  · rw [pd2_patchF]
+    exact abs_bicubic_dv_le cp M hM hM0 hu₀.1 hu₀.2 hv₀.1 hv₀.2 0
+  · rw [pd1_patchG]
+    exact abs_bicubic_du_le cp M hM hM0 hu₀.1 hu₀.2 hv₀.1 hv₀.2 1
+  · rw [pd2_patchG]
+    exact abs_bicubic_dv_le cp M hM hM0 hu₀.1 hu₀.2 hv₀.1 hv₀.2 1
+  · exact hden
+  · exact hδ
+  · exact hE
+
+
 end
 end LightRT.Geom

@@ -132,15 +132,17 @@ a decision change; Tier 3 is closed or maintenance.
    `newton_patch_hit_of_contact_zero` / `newton_patch_contact_ge_nearest` tie
    a converged Newton contact to a genuine hit no smaller than the nearest.
    `bezpatch_newton_quadratic` instantiates Newton2D contraction at the patch
-   contact system (`patchF`/`patchG`); deriving C2Seg and partial/determinant
-   bounds from control points is the remaining chase. Partial progress:
-   `bern3'_vec`/`bern3''_vec` with `abs_bern3'_le ≤ 3`, `abs_bern3''_le ≤ 12` on
-   `[0,1]`, `bern3_le_one`, and `abs_bicubic_du_le` (the u-partial bound from
-   control points, `≤ 48·M`). This turn adds the v/mixed/second-partial
-   HasDerivAt lemmas, componentwise bounds (dv ≤48M, uv ≤144M, vv ≤192M), and
-   pd1/pd2 formulas for patchF. Full C2Seg assembly and the determinant lower
-   bound remain open (the latter, as in M14, cannot be proved for arbitrary
-   control points and stays data). Note: `c2lean` lacks `sqrtf`
+   contact system (`patchF`/`patchG`). The control-point bound chase is now
+   complete: Bernstein derivative bounds (`abs_bern3'_le ≤ 3`,
+   `abs_bern3''_le ≤ 12`), componentwise partial/second-partial bounds
+   (du/dv ≤48M, uv ≤144M, duu/dvv ≤192M), pd1/pd2 formulas and their
+   second-order HasDerivAt lemmas for both patchF and patchG, full `patchF_C2Seg`
+   / `patchG_C2Seg` assembly (K = 192·M), and
+   `bezpatch_newton_quadratic_of_controls`, which supplies B = 48·M and K from
+   the control net. The determinant lower bound δ remains necessarily data (as
+   M14's `det0`): no lower bound on |det J| is provable for arbitrary control
+   points. Full subdivision-plus-Newton completeness and NURBS/trimmed-NURBS
+   surfaces remain open. Note: `c2lean` lacks `sqrtf`
    support, so translating `tri_point_isect_one` needs a tool extension
    (Tier 1.2 dependency).
 2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates only the
