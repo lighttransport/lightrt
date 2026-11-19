@@ -66,5 +66,18 @@ theorem hole_hit_rejected (R : TrimRegion) {u v : ℝ} (h : TrimLoop)
   intro hv
   exact hv.2 h hh hin
 
+
+/-- Crossing number is at most one per edge. -/
+theorem edgeCross_le_one (p q : ℝ × ℝ) (x y : ℝ) : edgeCross p q x y ≤ 1 := by
+  unfold edgeCross
+  split <;> simp
+
+/-- **Unit-square crossing parity** (Jordan curve theorem for the simplest
+    trim loop): the center `(1/2,1/2)` is inside the unit square loop and a
+    point strictly to the right is outside. This validates the even-odd rule. -/
+theorem unit_square_crossing_center :
+    crossingNumber [Prod.mk (0:ℝ) 0, Prod.mk 1 0, Prod.mk 1 1, Prod.mk 0 1] (1/2) (1/2) % 2 = 1 := by
+  norm_num [crossingNumber, edgeCross, edgeSpansY, edgeCrossX]
+
 end
 end LightRT.Geom

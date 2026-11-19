@@ -363,4 +363,10 @@ example (w : Fin 16 → ℝ) (P : Fin 16 → Vec3) (u v : ℝ)
       (∑ k : Fin 16, LightRT.Geom.Hull.bern33 u v k * w k)) = ratEval w P u v := by
   exact bezKnot_ratEval w P u v hu0 hu1 hv0 hv1
 
+
+/-- Even-odd trim rule is non-vacuous: the unit-square loop contains its center. -/
+example : inLoop [Prod.mk (0:ℝ) 0, Prod.mk 1 0, Prod.mk 1 1, Prod.mk 0 1] (1/2) (1/2) := by
+  unfold inLoop
+  exact unit_square_crossing_center
+
 end LightRT.Sanity
