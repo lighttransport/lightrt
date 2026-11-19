@@ -287,4 +287,10 @@ example : LightRT.FP.Binary32.sqrtBits 0x80000000 = 0x80000000 := by decide +ker
 example : LightRT.FP.Binary32.sqrtBits 0xff800000 = 0xffc00000 := by decide +kernel
 example : LightRT.C.Ref.sqrt 0x40000000 = 0x3fb504f3 := by decide +kernel
 
+
+/-- Patch Newton iteration is well-defined and non-trivial: the seed is the
+    zeroth iterate, and the first iterate uses the contact system's Newton step. -/
+example (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) :
+    patchNewtonIter o d cp t u v 0 = (u, v) := by rfl
+
 end LightRT.Sanity

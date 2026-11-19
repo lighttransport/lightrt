@@ -147,7 +147,9 @@ The authoritative roadmap is `formal/PLAN.md` §5 (three tiers). Summary:
   The C2/bound chase is done: Bernstein derivative bounds, componentwise
   partial/second-partial bounds, patchF/patchG C2Seg assembly (K=192M), and
   bezpatch_newton_quadratic_of_controls (B/K supplied from the control net);
-  the determinant lower bound stays necessarily data. Next: subdivision-plus-
+  the determinant lower bound stays necessarily data. BezPatchConvergence.lean
+  adds patchNewtonIter + basin convergence + cell_center_in_basin; full
+  subdivision-tree completeness is still open. Next: subdivision-plus-
   Newton completeness, NURBS;
   acceptance = soundness/completeness/nearest over ℝ + non-vacuity examples.
   (2) `c2lean` coverage expansion — sqrtf support done (lrt_sqrtf.h ISA sqrt on
