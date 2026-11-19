@@ -328,4 +328,10 @@ example (P : Fin 4 → Vec3) (u : ℝ) (hu0 : 0 ≤ u) (hu1 : u < 1) :
       bez3Vec P u := by
   exact bezKnot_curve P u hu0 hu1
 
+
+/-- Trim invariant is non-vacuous: a hit inside a declared hole is rejected. -/
+example (R : TrimRegion) (u v : ℝ) (h : TrimLoop) (hh : h ∈ R.holes)
+    (hin : inLoop h u v) : ¬ trimVisible R u v := by
+  exact hole_hit_rejected R h hh hin
+
 end LightRT.Sanity

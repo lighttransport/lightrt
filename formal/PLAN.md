@@ -146,7 +146,9 @@ a decision change; Tier 3 is closed or maintenance.
    patch produced by NURBS Bezier extraction (positive-weight denominator,
    convex-combination identity, control-hull containment, hit soundness /
    culling, continuity, uniform-weight reduction to the Bezier patch), but
-   knot vectors, trimmed-NURBS (u,v) trim loops are not yet formalized
+   `Geom/Trim.lean` models (u,v) trim loops (outer + holes) with the even–odd
+   crossing rule and proves the trim invariant / hole rejection; the full
+   nearest-untrimmed-hit search and knot insertion are not yet formalized
    (subdivision-plus-Newton completeness is now covered abstractly above).
    `Geom/NURBSKnots.lean` lays the B-spline foundation: Cox–de Boor basis,
    the cubic Bezier knot vector giving exactly the Bernstein basis, partition
