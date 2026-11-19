@@ -126,6 +126,17 @@ Explicitly deferred/recorded (see PLAN.md):
   kernel — MT's `t` bound buys no conservativity for `EXACT_NEAREST`-style
   pruning (MT is not watertight), and `mtcheck` remains the empirical check.
 
+## Status (2026-11-20)
+
+The five remaining Tier 1 items were advanced and validated (make formal PASS,
+0 sorry, axiom allowlist unchanged; commits through 786e81f, nothing pushed):
+patch Newton basin supplied from control points (δ data); NURBS knot-insertion
+foundation (degree-0 refinement, degree-1 Boehm, surface Bezier extraction;
+general-degree insertion open); trimmed-NURBS even-odd parity and finite
+nearest-visible search; round/flat tube soundness, cubic-Bezier
+soundness/completeness/nearest and SDF trace API; and the M15/M16 abstract
+curve/surface contracts. Remaining sub-items are noted in PLAN.md §5.
+
 ## Remaining items
 
 The authoritative roadmap is `formal/PLAN.md` §5 (three tiers). Summary:

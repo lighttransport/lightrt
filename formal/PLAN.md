@@ -81,6 +81,24 @@ a decision change; Tier 3 is closed or maintenance.
 
 ### Tier 1 — Open formalization work
 
+**Status (2026-11-20).** The five remaining Tier 1 items advanced to the
+following state, each validated by `make formal` (0 sorry, all gates green,
+axiom allowlist unchanged) and committed with the required trailer:
+- **Patch Newton basin from control points**: DONE (δ stays data, as M14) --
+  `patch_basin_ball_of_data`, `patch_newtonIter_tendsto_of_root_data`,
+  `patch_subdivision_no_missed_nearest_of_root_data`.
+- **NURBS knot insertion / Bezier extraction**: FOUNDATION DONE -- degree-0
+  refinement, degree-1 Boehm preservation, surface `bezKnot_ratEval`;
+  general-degree Boehm insertion remains open.
+- **Trimmed-NURBS search**: DONE (finite-candidate form) -- even-odd crossing
+  parity, `nearestVisibleT`, reject-and-continue.
+- **Curve/SDF soundness over ℝ**: DONE -- round/flat tube hit soundness,
+  cubic-Bezier soundness/completeness/nearest, SDF soundness/no-overshoot/boundary;
+  round/flat completeness+nearest remain open.
+- **M15/M16 abstract contracts**: DONE -- `IntersectorContract.lean` curve and
+  surface contract APIs.
+FP of the solve stays a Tier 2 `primhitcheck` boundary throughout.
+
 1. **Primitive intersector soundness over ℝ.** The C kernel exposes ~20 non-triangle
    scalar intersectors (sphere, quad/tetra, point, round-linear/flat curves, cubic
    Bézier, SDF, bilinear/Bézier/NURBS/trimmed-NURBS surfaces). `Geom/Hull.lean`
