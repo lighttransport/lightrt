@@ -16,6 +16,7 @@ import LightRT.Geom.BezPatchReal
 import LightRT.Geom.BezPatchConvergence
 import LightRT.Geom.BezPatchSubdivision
 import LightRT.Geom.NURBSReal
+import LightRT.Geom.NURBSKnots
 import LightRT.Geom.BezNewton
 import LightRT.Geom.BezTube
 import LightRT.Geom.BezNewtonGuards

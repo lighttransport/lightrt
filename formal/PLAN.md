@@ -146,8 +146,13 @@ a decision change; Tier 3 is closed or maintenance.
    patch produced by NURBS Bezier extraction (positive-weight denominator,
    convex-combination identity, control-hull containment, hit soundness /
    culling, continuity, uniform-weight reduction to the Bezier patch), but
-   knot vectors, trimmed-NURBS (u,v) trim loops and the subdivision-plus-Newton
-   completeness are not yet formalized.
+   knot vectors, trimmed-NURBS (u,v) trim loops are not yet formalized
+   (subdivision-plus-Newton completeness is now covered abstractly above).
+   `Geom/NURBSKnots.lean` lays the B-spline foundation: Cox–de Boor basis,
+   the cubic Bezier knot vector giving exactly the Bernstein basis, partition
+   of unity, and B-spline-curve = Bezier-curve on `[0,1)` (the right endpoint
+   is excluded by the half-open knot convention). Full knot insertion /
+   Bezier extraction remains open.
 2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates the
    scalar triangle core (`tri_minf/maxf`, `tri_slab_scalar`, `tri_mt_one`,
    `tri_ray_setup`, `tri_woop_one`, `tri_exn_key`) plus `tri_sphere_dist_f`
