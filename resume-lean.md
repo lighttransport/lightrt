@@ -144,7 +144,11 @@ The authoritative roadmap is `formal/PLAN.md` §5 (three tiers). Summary:
   plus the vector row-level de Casteljau split in `Geom/BezPatchReal.lean`.
   plus the Newton-contact-to-nearest-hit bridge and bezpatch_newton_quadratic
   (Newton2D contraction on the patch contact system) in `Geom/BezPatchReal.lean`.
-  Next: C2/bound chase for that instantiation, NURBS;
+  The C2/bound chase is done: Bernstein derivative bounds, componentwise
+  partial/second-partial bounds, patchF/patchG C2Seg assembly (K=192M), and
+  bezpatch_newton_quadratic_of_controls (B/K supplied from the control net);
+  the determinant lower bound stays necessarily data. Next: subdivision-plus-
+  Newton completeness, NURBS;
   acceptance = soundness/completeness/nearest over ℝ + non-vacuity examples.
   (2) `c2lean` coverage expansion — translate further scalar kernels and prove
   `*_refines`. (3) Bézier/patch intersector contract (M15/M16) — abstract
