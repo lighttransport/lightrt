@@ -420,5 +420,66 @@ example (K B0 det0 : ℝ) (hK : 0 < K) (hB0 : 0 ≤ B0)
       2 * (B0 + K*R + 1)^2 / (det0/2) + 18 * (B0 + K*R + 1) * K / (det0/2) * R < 1 := by
   exact BezSys.exists_radius_of_data K B0 det0 hK hB0 hdet
 
+
+/-- **No-missed-nearest with the basin supplied from root data.** Combines
+    `cell_root_of_global_root` with `patch_newtonIter_tendsto_of_root_data`:
+    given a nearest hit in a representing cell, the Newton iterates from the
+    cell center converge to the local coordinates of that hit. The partial
+    bounds B0 and C2/K come from the control net; the seed-in-ball distance
+    remains a cell-geometry hypothesis and δ stays data. -/
+theorem patch_subdivision_no_missed_nearest_of_root_data (o d : Vec3)
+    (global : Fin 16 → Vec3) (tmin tbest M B0 det0 R : ℝ)
+    (hM : ∀ k i, |global k i| ≤ M) (hM0 : 0 ≤ M) (hMpos : 0 < M)
+    (hB0 : 0 ≤ B0) (hdet0pos : 0 < det0)
+    (c : PatchCell) (hc : Represents global c) (hcM : ∀ k i, |c.cp k i| ≤ M)
+    (huw : c.u0 < c.u1) (hvw : c.v0 < c.v1)
+    {us vs ts : ℝ}
+    (hus : us ∈ Set.Icc c.u0 c.u1) (hvs : vs ∈ Set.Icc c.v0 c.v1)
+    (hus01 : us ∈ Set.Icc (0:ℝ) 1) (hvs01 : vs ∈ Set.Icc (0:ℝ) 1)
+    (htmin : tmin ≤ ts) (htbest : ts < tbest)
+    (hrootglobal : bezPatchContact o d global ts us vs = 0)
+    (hroot_partial :
+      |pd1 (patchF o d c.cp ts) ((us - c.u0)/(c.u1-c.u0)) ((vs - c.v0)/(c.v1-c.v0))| ≤ B0 ∧
+      |pd2 (patchF o d c.cp ts) ((us - c.u0)/(c.u1-c.u0)) ((vs - c.v0)/(c.v1-c.v0))| ≤ B0 ∧
+      |pd1 (patchG o d c.cp ts) ((us - c.u0)/(c.u1-c.u0)) ((vs - c.v0)/(c.v1-c.v0))| ≤ B0 ∧
+      |pd2 (patchG o d c.cp ts) ((us - c.u0)/(c.u1-c.u0)) ((vs - c.v0)/(c.v1-c.v0))| ≤ B0)
+    (hdet0 : det0 ≤ |jacDet (patchF o d c.cp ts) (patchG o d c.cp ts)
+      ((us - c.u0)/(c.u1-c.u0)) ((vs - c.v0)/(c.v1-c.v0))|)
+    (hBbound_root : B0 + (192*M)*R ≤ 48*M)
+    (hR0 : 0 ≤ R) (hKR : (192*M) * R ≤ 1)
+    (hvar : 4 * B0 * (192*M) * R + 4 * ((192*M) * R)^2 ≤ det0 / 2)
+    (hcond : 2 * (48*M)^2 / (det0/2) < 1)
+    (hsmall : 2 * (48*M)^2 / (det0/2) +
+        18 * (48*M) * (192*M) / (det0/2) * R < 1)
+    (hrect : ∀ u' v', |u' - ((us - c.u0)/(c.u1-c.u0))| + |v' - ((vs - c.v0)/(c.v1-c.v0))| ≤ R →
+      u' ∈ Set.Icc (0:ℝ) 1 ∧ v' ∈ Set.Icc (0:ℝ) 1)
+    (hseed : |(c.u0+c.u1)/2 - (us - c.u0)/(c.u1-c.u0)| +
+             |(c.v0+c.v1)/2 - (vs - c.v0)/(c.v1-c.v0)| ≤ R) :
+    Tendsto (fun n => (patchNewtonIter o d c.cp ts ((c.u0+c.u1)/2) ((c.v0+c.v1)/2) n).1) atTop
+      (𝓝 ((us - c.u0)/(c.u1-c.u0))) ∧
+    Tendsto (fun n => (patchNewtonIter o d c.cp ts ((c.u0+c.u1)/2) ((c.v0+c.v1)/2) n).2) atTop
+      (𝓝 ((vs - c.v0)/(c.v1-c.v0))) := by
+  let us' := (us - c.u0)/(c.u1-c.u0)
+  let vs' := (vs - c.v0)/(c.v1-c.v0)
+  have hus' : us' ∈ Set.Icc (0:ℝ) 1 := by
+    constructor
+    · dsimp [us']; exact div_nonneg (sub_nonneg.mpr hus.1) (sub_nonneg.mpr (le_of_lt huw))
+    · dsimp [us']; exact (div_le_one (sub_pos.mpr huw)).mpr (by linarith [hus.2])
+  have hvs' : vs' ∈ Set.Icc (0:ℝ) 1 := by
+    constructor
+    · dsimp [vs']; exact div_nonneg (sub_nonneg.mpr hvs.1) (sub_nonneg.mpr (le_of_lt hvw))
+    · dsimp [vs']; exact (div_le_one (sub_pos.mpr hvw)).mpr (by linarith [hvs.2])
+  have hmapu : c.u0 + (c.u1 - c.u0) * us' = us := by
+    dsimp [us']; field_simp [ne_of_gt (sub_pos.mpr huw)]; ring
+  have hmapv : c.v0 + (c.v1 - c.v0) * vs' = vs := by
+    dsimp [vs']; field_simp [ne_of_gt (sub_pos.mpr hvw)]; ring
+  have hroot := cell_root_of_global_root o d ts global c hc hus' hvs' hmapu hmapv hrootglobal
+  exact patch_newtonIter_tendsto_of_root_data o d c.cp ts M B0 det0 R hcM hM0 hMpos hB0 hdet0pos
+    hus' hvs' hroot (by simpa [us', vs'] using hroot_partial.1)
+      (by simpa [us', vs'] using hroot_partial.2.1)
+      (by simpa [us', vs'] using hroot_partial.2.2.1)
+      (by simpa [us', vs'] using hroot_partial.2.2.2) (by simpa [us', vs'] using hdet0)
+    hBbound_root hR0 hKR hvar hcond hsmall (by simpa [us', vs'] using hrect) (by simpa [us', vs'] using hseed)
+
 end
 end LightRT.Geom
