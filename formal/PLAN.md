@@ -108,6 +108,8 @@ a decision change; Tier 3 is closed or maintenance.
    `Geom/BezCurveReal.lean` gives the cubic-Bezier curve hit API: sampled
    acceptance soundness, completeness (boundary existence) and nearest-hit
    existence (closedness hypothesis), composing BezTube/BezFirstContact.
+   `Geom/SDFReal.lean` adds the SDF intersector API: trace soundness,
+   no-overshoot and boundary existence, composing the sphere-trace chain.
    `Geom/BezFirstContact.lean` composes the chain into a first-contact contract
    (`HitsBezTubeRay`, sampled acceptance sound, exact/sampled no-overshoot,
    boundary existence). `Geom/SphereTraceConvergence.lean` adds the convergence

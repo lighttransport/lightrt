@@ -394,4 +394,11 @@ example (S : BezSys) (a b tmin tbest : ℝ) (x₀ v : EuclideanSpace ℝ (Fin 3)
     (h : HitsBezCurveRay S a b tmin tbest x₀ v t) :
     tmin ≤ t ∧ t < tbest := ⟨h.1, h.2.1⟩
 
+
+/-- SDF sphere-trace API is non-vacuous. -/
+example {f : ℝ → ℝ} (hf : Lipschitz1 f) {root t : ℝ} (hr : f root ≤ 0) (ht : t ≤ root)
+    (hn : ∀ s, t ≤ s → s ≤ root → 0 ≤ f s) :
+    ∃ L ≤ root, Tendsto (fun n => stTrace f t n) atTop (𝓝 L) ∧ f L = 0 :=
+  sdf_trace_sound hf hr ht hn
+
 end LightRT.Sanity
