@@ -47,6 +47,8 @@ FUNCTIONS = [
     "tri_ray_setup",
     "tri_woop_one",
     "tri_sphere_dist_f",
+    "tri_surface_area",
+    "tri_longest_axis",
 ]
 
 # Extra functions that exist only in a particular configuration's preprocessor

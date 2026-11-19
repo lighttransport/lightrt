@@ -153,7 +153,8 @@ The authoritative roadmap is `formal/PLAN.md` §5 (three tiers). Summary:
   (2) `c2lean` coverage expansion — sqrtf support done (lrt_sqrtf.h ISA sqrt on
   SSE2/AVX2/NEON, FP.Binary32.sqrtBits model, EvE.sqrt', cdiff sph vectors);
   tri_sphere_dist_f_refines is proved in C/Proofs/SphereDistRefines.lean;
-  translate further scalar kernels and prove their `*_refines`. (3) Bézier/patch intersector contract (M15/M16) — abstract
+  tri_surface_area/tri_longest_axis refinements in SmallKernelsRefines.lean.
+  Translate further scalar kernels and prove their `*_refines`. (3) Bézier/patch intersector contract (M15/M16) — abstract
   soundness of adaptive subdivision + bounded Newton, analogous to the M14 chain.
 - **Tier 2 (boundaries, do not attempt without new tooling/decision):** SIMD ISA
   semantics (`wtcheck` gate), GPU formalization, fp64 `tlas_instance_margin`

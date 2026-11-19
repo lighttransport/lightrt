@@ -8,6 +8,7 @@
 import LightRT.C.Proofs.MTRefines
 import LightRT.C.Proofs.RaySetupRefines
 import LightRT.C.Proofs.SphereDistRefines
+import LightRT.C.Proofs.SmallKernelsRefines
 import LightRT.C.Proofs.SlabFP
 import LightRT.Robust.Slab
 import LightRT.Geom.MTReal
