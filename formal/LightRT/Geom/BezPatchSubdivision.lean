@@ -151,5 +151,33 @@ theorem cell_not_culled_of_hit (o d : Vec3) (tmin tbest : ℝ)
   apply hmiss t htmin htbest
   rw [hpt, ← hrep]
   exact bicubicEval_in_box c.cp lo hi hlo hhi hs0 hs1 hr0 hr1
+
+/-- A representing cell has the same contact residual as the global patch at
+    corresponding parameters (the ray point is the same). -/
+theorem cell_contact_eq (o d : Vec3) (t : ℝ) (global : Fin 16 → Vec3) (c : PatchCell)
+    (hc : Represents global c) {s r : ℝ}
+    (hs : s ∈ Set.Icc (0:ℝ) 1) (hr : r ∈ Set.Icc (0:ℝ) 1) :
+    bezPatchContact o d c.cp t s r =
+      bezPatchContact o d global t
+        (c.u0 + (c.u1 - c.u0) * s) (c.v0 + (c.v1 - c.v0) * r) := by
+  unfold bezPatchContact
+  rw [hc s hs r hr]
+
+/-- If the global patch has a contact root at a point inside a representing
+    cell, the cell's contact system has a root at the corresponding local
+    parameter. -/
+theorem cell_root_of_global_root (o d : Vec3) (t : ℝ)
+    (global : Fin 16 → Vec3) (c : PatchCell) (hc : Represents global c)
+    {u v s r : ℝ} (hs : s ∈ Set.Icc (0:ℝ) 1) (hr : r ∈ Set.Icc (0:ℝ) 1)
+    (hmapu : c.u0 + (c.u1 - c.u0) * s = u)
+    (hmapv : c.v0 + (c.v1 - c.v0) * r = v)
+    (hroot : bezPatchContact o d global t u v = 0) :
+    patchF o d c.cp t s r = 0 ∧ patchG o d c.cp t s r = 0 := by
+  have hc_eq := cell_contact_eq o d t global c hc hs hr
+  rw [hmapu, hmapv, hroot] at hc_eq
+  constructor
+  · have := congrFun hc_eq (0 : Fin 3); simpa [patchF, bezPatchContact] using this
+  · have := congrFun hc_eq (1 : Fin 3); simpa [patchG, bezPatchContact] using this
+
 end
 end LightRT.Geom

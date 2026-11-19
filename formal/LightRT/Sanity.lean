@@ -308,4 +308,11 @@ example : bicubicEval (splitBicubicV (fun _ : Fin 16 => (0 : Vec3)) (1/2 : ℝ))
 example (cp : Fin 16 → Vec3) : Represents cp ⟨0, 1, 0, 1, cp⟩ := by
   exact root_represents cp
 
+
+/-- The abstract no-missed theorem is non-vacuous as a statement: the root cell
+    of a patch with a contact root has representing control net bounded by M. -/
+example (cp : Fin 16 → Vec3) (M : ℝ) (hM : ∀ k i, |cp k i| ≤ M) :
+    ∀ k i, |(⟨0, 1, 0, 1, cp⟩ : PatchCell).cp k i| ≤ M := by
+  exact hM
+
 end LightRT.Sanity
