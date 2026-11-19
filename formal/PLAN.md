@@ -93,8 +93,8 @@ axiom allowlist unchanged) and committed with the required trailer:
 - **Trimmed-NURBS search**: DONE (finite-candidate form) -- even-odd crossing
   parity, `nearestVisibleT`, reject-and-continue.
 - **Curve/SDF soundness over ℝ**: DONE -- round/flat tube hit soundness,
-  cubic-Bezier soundness/completeness/nearest, SDF soundness/no-overshoot/boundary;
-  round/flat completeness+nearest remain open.
+  cubic-Bezier soundness/completeness/nearest, SDF soundness/no-overshoot/boundary,
+  round/flat nearest-hit existence (closedness hypothesis).
 - **M15/M16 abstract contracts**: DONE -- `IntersectorContract.lean` curve and
   surface contract APIs.
 FP of the solve stays a Tier 2 `primhitcheck` boundary throughout.
