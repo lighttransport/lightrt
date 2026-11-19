@@ -20,6 +20,7 @@ import LightRT.Geom.NURBSKnots
 import LightRT.Geom.Trim
 import LightRT.Geom.RoundLinear
 import LightRT.Geom.BezCurveReal
+import LightRT.Geom.SDFReal
 import LightRT.Geom.BezNewton
 import LightRT.Geom.BezTube
 import LightRT.Geom.BezNewtonGuards
