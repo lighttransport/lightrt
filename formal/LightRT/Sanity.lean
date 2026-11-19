@@ -293,4 +293,13 @@ example : LightRT.C.Ref.sqrt 0x40000000 = 0x3fb504f3 := by decide +kernel
 example (o d : Vec3) (cp : Fin 16 → Vec3) (t u v : ℝ) :
     patchNewtonIter o d cp t u v 0 = (u, v) := by rfl
 
+
+/-- The v-split is non-vacuous: on the zero patch it stays zero, and the
+    transpose is involutive. -/
+example (cp : Fin 16 → Vec3) : transposeCP (transposeCP cp) = cp := by
+  exact transposeCP_involutive cp
+example : bicubicEval (splitBicubicV (fun _ : Fin 16 => (0 : Vec3)) (1/2 : ℝ)) 0 0 = 0 := by
+  rw [bicubic_split_v_left]
+  simp [bicubicEval, LightRT.Geom.Hull.bern33, LightRT.Geom.Hull.bern3]
+
 end LightRT.Sanity
