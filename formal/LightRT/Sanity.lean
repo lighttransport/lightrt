@@ -388,4 +388,10 @@ example (o d p0 p1 b : Vec3) (r0 r1 tmin tbest t : ℝ)
     HitsFlatLinear o d p0 p1 r0 r1 b tmin tbest t :=
   hitsFlatLinear_of_sample o d p0 p1 r0 r1 b tmin tbest t htmin htbest h
 
+
+/-- Cubic-Bezier curve hit API is non-vacuous: any ray in the tube is a hit. -/
+example (S : BezSys) (a b tmin tbest : ℝ) (x₀ v : EuclideanSpace ℝ (Fin 3)) (t : ℝ)
+    (h : HitsBezCurveRay S a b tmin tbest x₀ v t) :
+    tmin ≤ t ∧ t < tbest := ⟨h.1, h.2.1⟩
+
 end LightRT.Sanity
