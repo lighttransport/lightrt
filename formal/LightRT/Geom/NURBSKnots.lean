@@ -233,5 +233,47 @@ theorem bezKnot_ratEval (w : Fin 16 → ℝ) (P : Fin 16 → Vec3) (u v : ℝ)
   rw [hterm k]
   simp [Pi.smul_apply, smul_eq_mul, mul_assoc]
 
+theorem bezKnot_basis0_deg2 (u : ℝ) (hu0 : 0 ≤ u) (hu1 : u < 1) :
+    bsplineBasis (bezKnot 2) 0 2 u = (1-u)^2 := by
+  simp [bsplineBasis, bezKnot, hu0, hu1]
+  ring
+
+theorem bezKnot_basis1_deg2 (u : ℝ) (hu0 : 0 ≤ u) (hu1 : u < 1) :
+    bsplineBasis (bezKnot 2) 1 2 u = 2*u*(1-u) := by
+  simp [bsplineBasis, bezKnot, hu0, hu1]
+  ring
+
+theorem bezKnot_basis2_deg2 (u : ℝ) (hu0 : 0 ≤ u) (hu1 : u < 1) :
+    bsplineBasis (bezKnot 2) 2 2 u = u^2 := by
+  simp [bsplineBasis, bezKnot, hu0, hu1]
+  ring
+
+def boehm2 (P : Fin 3 → Vec3) (t : ℝ) : Fin 4 → Vec3 :=
+  ![P 0, (1-t) • P 0 + t • P 1, (1-t) • P 1 + t • P 2, P 2]
+
+/-- Degree-2 Boehm knot insertion preserves the Bezier curve. -/
+theorem boehm2_preserves (P : Fin 3 → Vec3) (t : ℝ) (ht0 : 0 < t) (ht1 : t < 1)
+    (u : ℝ) (hu0 : 0 ≤ u) (hu1 : u < 1) :
+    bsplineCurve (insertKnot (bezKnot 2) 2 t) (fun i => if h : i < 4 then boehm2 P t ⟨i,h⟩ else 0) 2 3 u =
+      bsplineCurve (bezKnot 2) (fun i => if h : i < 3 then P ⟨i,h⟩ else 0) 2 2 u := by
+  ext coord
+  unfold bsplineCurve
+  -- expand the sums over Fin 3 / Fin 4
+  simp only [Finset.sum_range_succ, Finset.sum_range_zero]
+  -- evaluate old basis
+  rw [bezKnot_basis0_deg2 u hu0 hu1, bezKnot_basis1_deg2 u hu0 hu1, bezKnot_basis2_deg2 u hu0 hu1]
+  -- evaluate new basis by case split on u < t
+  by_cases htu : u < t
+  · have ht_le : ¬ t ≤ u := by linarith
+    simp [bsplineBasis, insertKnot, bezKnot, htu, hu0, hu1, ht0.le, ht1.le,
+          ht_le, boehm2] at *
+    field_simp [ne_of_gt ht0]
+    ring
+  · have ht_le : t ≤ u := le_of_not_gt htu
+    simp [bsplineBasis, insertKnot, bezKnot, htu, hu0, hu1, ht0.le, ht1.le,
+          ht_le, boehm2] at *
+    field_simp [ne_of_gt ht0]
+    ring
+
 end
 end LightRT.Geom

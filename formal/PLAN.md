@@ -91,8 +91,9 @@ axiom allowlist unchanged) and committed with the required trailer:
   `patch_basin_ball_of_data`, `patch_newtonIter_tendsto_of_root_data`,
   `patch_subdivision_no_missed_nearest_of_root_data`.
 - **NURBS knot insertion / Bezier extraction**: FOUNDATION DONE -- degree-0
-  refinement, degree-1 Boehm preservation, surface `bezKnot_ratEval`;
-  general-degree Boehm insertion remains open.
+  refinement, degree-1 and degree-2 Boehm preservation (`boehm1_preserves`,
+  `boehm2_preserves`), degree-2 Bernstein basis, surface `bezKnot_ratEval`;
+  general-degree Boehm insertion / Cox–de Boor refinement induction remains open.
 - **Trimmed-NURBS search**: DONE (finite-candidate form) -- even-odd crossing
   parity, `nearestVisibleT` (with `nearestVisibleT_spec`: a returned parameter
   is a visible hit and is minimal among visible hits), reject-and-continue.
