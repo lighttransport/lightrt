@@ -129,7 +129,8 @@ Explicitly deferred/recorded (see PLAN.md):
   tube sets proved closed as compact images, nearest-hit existence unconditional),
   `Geom/BezCurveReal.lean` (cubic-Bezier soundness/completeness/nearest, bezTubeSet
   closed, unconditional nearest-hit existence), `Geom/SDFReal.lean` (trace
-  soundness/no-overshoot/boundary, sphere SDF 1-Lipschitz; curve-capsule via
+  soundness/no-overshoot/boundary, sphere and torus SDF 1-Lipschitz (box open);
+  curve-capsule via
   CapsuleReal). RoundLinear.lean additionally has rlcReal /
   flatReal nearest-hit models, tapered box containment and the flat-ribbon to
   two-MT-triangle connection.
