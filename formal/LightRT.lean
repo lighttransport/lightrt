@@ -34,6 +34,7 @@ import LightRT.Geom.SafeguardedNewton
 import LightRT.Geom.SphereTrace3
 import LightRT.Robust.Slab
 import LightRT.Robust.SlabTotal
+import LightRT.Robust.SlabLimit
 import LightRT.Robust.SlabMissReal
 import LightRT.Robust.Woop
 import LightRT.BVH.Tree

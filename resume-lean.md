@@ -164,8 +164,11 @@ remaining sub-items from the 2026-11-20 push:
 - **Tier 1, c2lean**: translate further scalar kernels and prove `*_refines`.
 - **Tier 2 (boundaries, do not attempt without new tooling/decision)**: SIMD ISA
   semantics (`wtcheck` gate), GPU formalization, fp64 `tlas_instance_margin`
-  (`tlascheck` gate), slab completeness at tangency (unprovable), Bézier-minimizer
-  FP (`primhitcheck` gate).
+  (`tlascheck` gate), Bézier-minimizer FP (`primhitcheck` gate). Slab tangency is
+  now a **closed** boundary: `Robust/SlabLimit.lean` proves the impossibility
+  (`fpT_no_uniform_relative`, `slab_no_uniform_inflation`,
+  `slab_hit_box_no_endpoint_theta`), so the floor is a proved necessity, not an
+  open gap.
 - **Tier 3 (closed)**: M14 basin verification is complete (conditional
   convergence); `B0`, `K`, radii, and the convergence theorem are supplied from
   control points in `Geom/Bez{Data,KBounds,...}.lean`. Sanity/doc consistency is
@@ -185,8 +188,8 @@ remaining sub-items from the 2026-11-20 push:
 > APIs, and M15/M16 contracts. The concrete remaining sub-items are listed above
 > under "Remaining items" — start with the most tractable (e.g. round/flat tube
 > closedness). Everything
-> else is a recorded boundary (ISA, tangency, fp64 margins, GPU) or empirical gate
-> (`wtcheck`, `primhitcheck`).
+> else is a recorded boundary (ISA, fp64 margins, GPU; tangency is now a proved
+> limitation in `Robust/SlabLimit.lean`) or empirical gate (`wtcheck`, `primhitcheck`).
 >
 > For every C change: SIMD bit-identical to scalar (`wtcheck`, incl. SVE under
 > qemu), rerun `make formal`, the C suites, `make hip_test` (local RX 9070 XT,
