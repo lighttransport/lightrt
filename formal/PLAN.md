@@ -136,6 +136,10 @@ FP of the solve stays a Tier 2 `primhitcheck` boundary throughout.
    existence (closedness hypothesis), composing BezTube/BezFirstContact.
    `Geom/SDFReal.lean` adds the SDF intersector API: trace soundness,
    no-overshoot and boundary existence, composing the sphere-trace chain.
+   `Geom/RoundLinear.lean` also gives the round-linear / flat intersector models
+   `rlcReal` / `flatReal` (nearest swept-tube hit) with sound/complete/nearest,
+   tapered-radius box containment, and the flat-ribbon/two-MT-triangle connection
+   (`inQuad_flat_of_onFlatLinear`).
    `Geom/BezFirstContact.lean` composes the chain into a first-contact contract
    (`HitsBezTubeRay`, sampled acceptance sound, exact/sampled no-overshoot,
    boundary existence). `Geom/SphereTraceConvergence.lean` adds the convergence
