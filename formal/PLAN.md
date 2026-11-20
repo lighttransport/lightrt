@@ -176,8 +176,10 @@ FP of the solve stays a Tier 2 `primhitcheck` boundary throughout.
    finProdFinEquiv, avoiding the slow global simp), and
    bezpatch_exists_nearest_hit (a hit implies a minimal hit parameter exists,
    via compactness of the closed hit-parameter set with a cheap finite-sum
-   continuity proof). Full subdivision-plus-Newton completeness (Newton2D
-   instantiation) and NURBS/trimmed-NURBS surfaces remain open. The Newton-to-
+   continuity proof). Newton2D instantiation, the patch basin supplied from
+   control points, and the abstract subdivision-plus-Newton / adaptive-search
+   contracts are in place; NURBS/trimmed-NURBS surface models are below.
+   The Newton-to-
    hit bridge is in place: `newton2Step_at_root` (Newton is a fixed point at a
    root), `bezPatchContact` (the patch contact residual), and
    `newton_patch_hit_of_contact_zero` / `newton_patch_contact_ge_nearest` tie
@@ -192,8 +194,8 @@ FP of the solve stays a Tier 2 `primhitcheck` boundary throughout.
    `bezpatch_newton_quadratic_of_controls`, which supplies B = 48·M and K from
    the control net. The determinant lower bound δ remains necessarily data (as
    M14's `det0`): no lower bound on |det J| is provable for arbitrary control
-   points. Full subdivision-plus-Newton completeness and NURBS/trimmed-NURBS
-   surfaces remain open; `Geom/NURBSReal.lean` models the rational bicubic
+   points. `Geom/AdaptiveSearch.lean` supplies the abstract adaptive-search
+   contract; `Geom/NURBSReal.lean` models the rational bicubic
    patch produced by NURBS Bezier extraction (positive-weight denominator,
    convex-combination identity, control-hull containment, hit soundness /
    culling, continuity, uniform-weight reduction to the Bezier patch), but
@@ -201,9 +203,9 @@ FP of the solve stays a Tier 2 `primhitcheck` boundary throughout.
    crossing rule and proves the trim invariant, hole rejection, edge-cross
    bound, the unit-square crossing parity (Jordan case), and the finite
    nearest-visible scan with reject-and-continue soundness
-   (`nearestVisibleT_spec`); the full general crossing-number theory and knot
-   insertion are not yet formalized (subdivision-plus-Newton completeness is
-   now covered abstractly above).
+   (`nearestVisibleT_spec`), bridge additivity (`crossingNumber_append`) and
+   cyclic rotation invariance (`crossingNumberClosed_rotate`); general knot
+   insertion is in `NURBSKnots.lean` below.
    `Geom/NURBSKnots.lean` lays the B-spline foundation: Cox–de Boor basis,
    knot insertion (`insertKnot`) with the degree-0 refinement equation and
    degree-1 Boehm curve preservation (`boehm1_preserves`), and the surface
@@ -212,8 +214,12 @@ FP of the solve stays a Tier 2 `primhitcheck` boundary throughout.
    NURBSReal -- no Bernstein denominator remains in the statement),
    the cubic Bezier knot vector giving exactly the Bernstein basis, partition
    of unity, and B-spline-curve = Bezier-curve on `[0,1)` (the right endpoint
-   is excluded by the half-open knot convention). Full knot insertion /
-   Bezier extraction remains open.
+   is excluded by the half-open knot convention). The general-degree
+   Cox--de Boor refinement (`bsplineBasis_refine`), general Boehm insertion
+   (`boehm_preserves`), iterated insertion / Bezier-extraction foundation
+   (`boehm_iterate`) and tensor-product insertion + ratEval connection
+   (`tensorBspline_insert_u/_v`, `rationalTensorBezier_eq_ratEval`) are now
+   proved here.
 2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates the
    scalar triangle core (`tri_minf/maxf`, `tri_slab_scalar`, `tri_mt_one`,
    `tri_ray_setup`, `tri_woop_one`, `tri_exn_key`) plus `tri_sphere_dist_f`
