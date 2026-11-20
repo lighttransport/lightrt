@@ -124,6 +124,88 @@ theorem nearestVisibleT_none (R : TrimRegion) (hits : List (ℝ × ℝ × ℝ))
               contradiction
         exact ih hrest ⟨uu, vv, tt, hmem, hv⟩
 
+/-- **Nearest-visible-hit specification.** If the scan returns `some m`, then
+    `m` is the parameter of a trim-visible hit in the list and no trim-visible
+    hit has a smaller parameter. Rejected (invisible) hits are skipped, so the
+    search continues past holes. This is the positive half of the finite
+    nearest-untrimmed-hit search. -/
+theorem nearestVisibleT_spec (R : TrimRegion) (hits : List (ℝ × ℝ × ℝ)) {m : ℝ}
+    (hm : nearestVisibleT R hits = some m) :
+    (∃ u v, (u, v, m) ∈ hits ∧ trimVisible R u v) ∧
+    (∀ t', (∃ u v, (u, v, t') ∈ hits ∧ trimVisible R u v) → m ≤ t') := by
+  classical
+  revert m
+  induction hits with
+  | nil =>
+      intro m hm
+      simp [nearestVisibleT] at hm
+  | cons hd rest ih =>
+      intro m hm
+      rcases hd with ⟨u, v, t⟩
+      by_cases hvis : trimVisible R u v
+      · cases hmv : nearestVisibleT R rest with
+        | none =>
+            have hm_eq : t = m := by simpa [nearestVisibleT, hvis, hmv] using hm
+            subst m
+            constructor
+            · exact ⟨u, v, by simp, hvis⟩
+            · intro t' ht'
+              rcases ht' with ⟨uu, vv, hmem, hv'⟩
+              simp at hmem
+              rcases hmem with hsame | hmem
+              · rcases hsame with ⟨rfl, rfl, rfl⟩
+                exact le_rfl
+              · exfalso
+                have hnone := nearestVisibleT_none R rest hmv
+                exact hnone ⟨uu, vv, t', hmem, hv'⟩
+        | some mr =>
+            have hm_eq : min t mr = m := by simpa [nearestVisibleT, hvis, hmv] using hm
+            subst m
+            have hs := ih hmv
+            by_cases hle : t ≤ mr
+            · rw [min_eq_left hle]
+              constructor
+              · exact ⟨u, v, by simp, hvis⟩
+              · intro t' ht'
+                rcases ht' with ⟨uu, vv, hmem, hv'⟩
+                simp at hmem
+                rcases hmem with hsame | hmem
+                · rcases hsame with ⟨rfl, rfl, rfl⟩
+                  exact le_rfl
+                · exact le_trans hle (hs.2 t' ⟨uu, vv, hmem, hv'⟩)
+            · rw [min_eq_right (le_of_not_ge hle)]
+              constructor
+              · rcases hs.1 with ⟨uu, vv, hmem, hv'⟩
+                exact ⟨uu, vv, by simp [hmem], hv'⟩
+              · intro t' ht'
+                rcases ht' with ⟨uu, vv, hmem, hv'⟩
+                simp at hmem
+                rcases hmem with hsame | hmem
+                · rcases hsame with ⟨rfl, rfl, rfl⟩
+                  exact le_of_not_ge hle
+                · exact hs.2 t' ⟨uu, vv, hmem, hv'⟩
+      · cases hmv : nearestVisibleT R rest with
+        | none =>
+            have hh : nearestVisibleT R ((u,v,t)::rest) = none := by
+              simp [nearestVisibleT, hvis, hmv]
+            rw [hh] at hm
+            contradiction
+        | some mr =>
+            have hm_eq : mr = m := by simpa [nearestVisibleT, hvis, hmv] using hm
+            subst m
+            have hs := ih hmv
+            constructor
+            · rcases hs.1 with ⟨uu, vv, hmem, hv'⟩
+              exact ⟨uu, vv, by simp [hmem], hv'⟩
+            · intro t' ht'
+              rcases ht' with ⟨uu, vv, hmem, hv'⟩
+              simp at hmem
+              rcases hmem with hsame | hmem
+              · rcases hsame with ⟨rfl, rfl, rfl⟩
+                exfalso
+                exact hvis hv'
+              · exact hs.2 t' ⟨uu, vv, hmem, hv'⟩
+
 /-- **Reject-and-continue soundness.** If a hit is not trim-visible, skipping
     it does not change the result of the nearest-visible scan. -/
 theorem nearestVisibleT_skip_invisible (R : TrimRegion) (u v t : ℝ)
