@@ -453,11 +453,10 @@ theorem patch_subdivision_no_missed_nearest_of_root_data (o d : Vec3)
         18 * (48*M) * (192*M) / (det0/2) * R < 1)
     (hrect : ∀ u' v', |u' - ((us - c.u0)/(c.u1-c.u0))| + |v' - ((vs - c.v0)/(c.v1-c.v0))| ≤ R →
       u' ∈ Set.Icc (0:ℝ) 1 ∧ v' ∈ Set.Icc (0:ℝ) 1)
-    (hseed : |(c.u0+c.u1)/2 - (us - c.u0)/(c.u1-c.u0)| +
-             |(c.v0+c.v1)/2 - (vs - c.v0)/(c.v1-c.v0)| ≤ R) :
-    Tendsto (fun n => (patchNewtonIter o d c.cp ts ((c.u0+c.u1)/2) ((c.v0+c.v1)/2) n).1) atTop
+    (hsizeR : (1 : ℝ) ≤ R) :
+    Tendsto (fun n => (patchNewtonIter o d c.cp ts (1/2) (1/2) n).1) atTop
       (𝓝 ((us - c.u0)/(c.u1-c.u0))) ∧
-    Tendsto (fun n => (patchNewtonIter o d c.cp ts ((c.u0+c.u1)/2) ((c.v0+c.v1)/2) n).2) atTop
+    Tendsto (fun n => (patchNewtonIter o d c.cp ts (1/2) (1/2) n).2) atTop
       (𝓝 ((vs - c.v0)/(c.v1-c.v0))) := by
   let us' := (us - c.u0)/(c.u1-c.u0)
   let vs' := (vs - c.v0)/(c.v1-c.v0)
@@ -474,12 +473,26 @@ theorem patch_subdivision_no_missed_nearest_of_root_data (o d : Vec3)
   have hmapv : c.v0 + (c.v1 - c.v0) * vs' = vs := by
     dsimp [vs']; field_simp [ne_of_gt (sub_pos.mpr hvw)]; ring
   have hroot := cell_root_of_global_root o d ts global c hc hus' hvs' hmapu hmapv hrootglobal
+  -- Newton runs on the cell's local control net over [0,1]^2, so the seed must
+  -- be the LOCAL center (1/2,1/2), not the global cell center. Its distance to
+  -- the local root is supplied by the cell-size condition via cell_center_in_basin.
+  have hKRpos : 0 < (192*M : ℝ) := by positivity
+  have hdiv : ((192*M) * R) / (192*M) = R := by field_simp [ne_of_gt hKRpos]
+  have hsize_local : ((1:ℝ) - 0) + ((1:ℝ) - 0) ≤ 2 * (((192*M) * R) / (192*M)) := by
+    rw [hdiv]
+    norm_num at hsizeR ⊢
+    exact hsizeR
+  have hcell := cell_center_in_basin (u0 := (0:ℝ)) (u1 := 1) (v0 := (0:ℝ)) (v1 := 1)
+    (us := us') (vs := vs') (B := (192*M)*R) (K := 192*M)
+    (by norm_num) (by norm_num) hKRpos hus' hvs' hsize_local
+  have hseed_local : |(1/2 : ℝ) - us'| + |(1/2 : ℝ) - vs'| ≤ R := by
+    simpa [hdiv] using hcell
   exact patch_newtonIter_tendsto_of_root_data o d c.cp ts M B0 det0 R hcM hM0 hMpos hB0 hdet0pos
     hus' hvs' hroot (by simpa [us', vs'] using hroot_partial.1)
       (by simpa [us', vs'] using hroot_partial.2.1)
       (by simpa [us', vs'] using hroot_partial.2.2.1)
       (by simpa [us', vs'] using hroot_partial.2.2.2) (by simpa [us', vs'] using hdet0)
-    hBbound_root hR0 hKR hvar hcond hsmall (by simpa [us', vs'] using hrect) (by simpa [us', vs'] using hseed)
+    hBbound_root hR0 hKR hvar hcond hsmall (by simpa [us', vs'] using hrect) hseed_local
 
 end
 end LightRT.Geom
