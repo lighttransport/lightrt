@@ -411,13 +411,26 @@ example (o d : Vec3) (cp : Fin 16 → Vec3) {tmin tbest u v t : ℝ}
   surface_contract_sound o d cp hu0 hu1 hv0 hv1 htmin htbest hres
 
 
-/-- Round/flat nearest-hit existence is non-vacuous given a closed hit set. -/
+/-- The swept tube sets are closed, discharging the old closedness hypothesis. -/
+example (p0 p1 : Vec3) (r0 r1 : ℝ) : IsClosed {x : Vec3 | OnRoundLinear p0 p1 r0 r1 x} :=
+  isClosed_roundLinearTube p0 p1 r0 r1
+
+example (p0 p1 b : Vec3) (r0 r1 : ℝ) : IsClosed {x : Vec3 | OnFlatLinear p0 p1 r0 r1 p0 b x} :=
+  isClosed_flatLinearTube p0 p1 b r0 r1
+
+/-- Round/flat nearest-hit existence no longer needs a closedness hypothesis. -/
 example (o d p0 p1 : Vec3) (r0 r1 tmin tbest : ℝ)
-    (hc : IsClosed {t : ℝ | HitsRoundLinear o d p0 p1 r0 r1 tmin tbest t})
     (hh : ∃ t, HitsRoundLinear o d p0 p1 r0 r1 tmin tbest t) :
     ∃ tstar, HitsRoundLinear o d p0 p1 r0 r1 tmin tbest tstar ∧
       ∀ t, HitsRoundLinear o d p0 p1 r0 r1 tmin tbest t → tstar ≤ t :=
-  roundLinear_exists_nearest_hit o d p0 p1 r0 r1 tmin tbest hc hh
+  roundLinear_exists_nearest_hit o d p0 p1 r0 r1 tmin tbest hh
+
+/-- Cubic-Bezier nearest-hit existence no longer needs a closedness hypothesis. -/
+example (S : BezSys) (a b tmin tbest : ℝ) (x₀ v : EuclideanSpace ℝ (Fin 3))
+    (hh : ∃ t, HitsBezCurveRay S a b tmin tbest x₀ v t) :
+    ∃ tstar, HitsBezCurveRay S a b tmin tbest x₀ v tstar ∧
+      ∀ t, HitsBezCurveRay S a b tmin tbest x₀ v t → tstar ≤ t :=
+  bezCurve_exists_nearest_hit S a b tmin tbest x₀ v hh
 
 
 /-- The nearest-visible-trim scan is non-vacuous: a visible hit makes the scan
