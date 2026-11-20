@@ -526,4 +526,15 @@ example (o d : Vec3) (w : Fin 16 → ℝ) (P : Fin 16 → Vec3)
   rcases trimmed_contract_spec o d w P R hits hparam hscan with ⟨_, _, h⟩
   exact h
 
+
+/-- Crossing-number additivity and rotation invariance are non-vacuous. -/
+example (l₁ l₂ : TrimLoop) (x y : ℝ) :
+    crossingNumber (l₁ ++ l₂) x y =
+      crossingNumber l₁ x y + loopBridge l₁ l₂ x y + crossingNumber l₂ x y :=
+  crossingNumber_append l₁ l₂ x y
+
+example (p : ℝ × ℝ) (l : TrimLoop) (x y : ℝ) (hne : l ≠ []) :
+    crossingNumberClosed (p :: l) x y = crossingNumberClosed (l ++ [p]) x y :=
+  crossingNumberClosed_rotate p l x y hne
+
 end LightRT.Sanity
