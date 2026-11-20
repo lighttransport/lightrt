@@ -124,7 +124,9 @@ Explicitly deferred/recorded (see PLAN.md):
   tube sets proved closed as compact images, nearest-hit existence unconditional),
   `Geom/BezCurveReal.lean` (cubic-Bezier soundness/completeness/nearest, bezTubeSet
   closed, unconditional nearest-hit existence), `Geom/SDFReal.lean` (trace
-  soundness/no-overshoot/boundary).
+  soundness/no-overshoot/boundary). RoundLinear.lean additionally has rlcReal /
+  flatReal nearest-hit models, tapered box containment and the flat-ribbon to
+  two-MT-triangle connection.
 - **M15/M16 contracts**: `Geom/IntersectorContract.lean` — curve and surface
   abstract contract APIs.
 
