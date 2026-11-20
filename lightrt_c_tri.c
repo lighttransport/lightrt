@@ -4001,6 +4001,24 @@ static inline void tri_rlc4_isect(const lrt_rlc4 *blk, const tri_ray_ctx *rc,
 
 /* ---- Point primitives: sphere / ray-facing disc / oriented disc ---------- *
  * Direct port of embree's sphere_intersector.h + disc_intersector.h. */
+/* c2lean-verified cores of the disc branches of tri_point_isect_one. */
+static inline float tri_point_oriented_core(const float org[3], const float dir[3],
+                                            float cx, float cy, float cz,
+                                            float nx, float ny, float nz) {
+    float c0x = cx - org[0], c0y = cy - org[1], c0z = cz - org[2];
+    float divisor = dir[0] * nx + dir[1] * ny + dir[2] * nz;
+    return (c0x * nx + c0y * ny + c0z * nz) / divisor;
+}
+
+static inline float tri_point_raydisc_core(const float org[3], const float dir[3],
+                                           float cx, float cy, float cz) {
+    float dx = dir[0], dy = dir[1], dz = dir[2];
+    float dOdO = dx * dx + dy * dy + dz * dz;
+    float c0x = cx - org[0], c0y = cy - org[1], c0z = cz - org[2];
+    float rd2 = 1.0f / dOdO;
+    return (c0x * dx + c0y * dy + c0z * dz) * rd2;
+}
+
 static int tri_point_isect_one(const tri_ray_ctx *rc, float best_t, float cx,
                                float cy, float cz, float r, float nx, float ny,
                                float nz, float ry, float angle, int point_type,
