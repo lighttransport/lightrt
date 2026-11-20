@@ -116,7 +116,8 @@ Explicitly deferred/recorded (see PLAN.md):
 - **NURBS foundation**: `Geom/NURBSKnots.lean` — Cox–de Boor `bsplineBasis`,
   Bezier-knot = Bernstein identity (degree 3), partition of unity, B-spline =
   Bezier curve, `insertKnot` + degree-0 refinement, degree-1 Boehm
-  (`boehm1_preserves`), surface Bezier extraction (`bezKnot_ratEval`).
+  (`boehm1_preserves`), surface Bezier extraction (`bezKnot_ratEval`, now with
+  the denominator also a B-spline sum, removing the circular statement).
 - **Trimmed NURBS**: `Geom/Trim.lean` — even-odd crossing, unit-square Jordan
   parity, `nearestVisibleT` finite scan + reject-and-continue and its main
   spec theorem (returned parameter is a minimal visible hit).

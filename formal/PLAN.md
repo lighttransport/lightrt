@@ -193,8 +193,9 @@ FP of the solve stays a Tier 2 `primhitcheck` boundary throughout.
    `Geom/NURBSKnots.lean` lays the B-spline foundation: Cox–de Boor basis,
    knot insertion (`insertKnot`) with the degree-0 refinement equation and
    degree-1 Boehm curve preservation (`boehm1_preserves`), and the surface
-   Bezier-extraction identity (`bezKnot_ratEval`: rational B-spline evaluation
-   over the Bezier knot vector equals `ratEval` of NURBSReal),
+   Bezier-extraction identity (`bezKnot_ratEval`: both numerator AND denominator
+   are rational B-spline sums over the Bezier knot vector, equal to `ratEval` of
+   NURBSReal -- no Bernstein denominator remains in the statement),
    the cubic Bezier knot vector giving exactly the Bernstein basis, partition
    of unity, and B-spline-curve = Bezier-curve on `[0,1)` (the right endpoint
    is excluded by the half-open knot convention). Full knot insertion /
