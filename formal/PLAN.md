@@ -91,7 +91,8 @@ axiom allowlist unchanged) and committed with the required trailer:
   refinement, degree-1 Boehm preservation, surface `bezKnot_ratEval`;
   general-degree Boehm insertion remains open.
 - **Trimmed-NURBS search**: DONE (finite-candidate form) -- even-odd crossing
-  parity, `nearestVisibleT`, reject-and-continue.
+  parity, `nearestVisibleT` (with `nearestVisibleT_spec`: a returned parameter
+  is a visible hit and is minimal among visible hits), reject-and-continue.
 - **Curve/SDF soundness over ℝ**: DONE -- round/flat tube hit soundness,
   cubic-Bezier soundness/completeness/nearest, SDF soundness/no-overshoot/boundary,
   round/flat nearest-hit existence (closedness hypothesis).
@@ -173,9 +174,11 @@ FP of the solve stays a Tier 2 `primhitcheck` boundary throughout.
    culling, continuity, uniform-weight reduction to the Bezier patch), but
    `Geom/Trim.lean` models (u,v) trim loops (outer + holes) with the even–odd
    crossing rule and proves the trim invariant, hole rejection, edge-cross
-   bound and the unit-square crossing parity (Jordan case); the full
-   nearest-untrimmed-hit search and knot insertion are not yet formalized
-   (subdivision-plus-Newton completeness is now covered abstractly above).
+   bound, the unit-square crossing parity (Jordan case), and the finite
+   nearest-visible scan with reject-and-continue soundness
+   (`nearestVisibleT_spec`); the full general crossing-number theory and knot
+   insertion are not yet formalized (subdivision-plus-Newton completeness is
+   now covered abstractly above).
    `Geom/NURBSKnots.lean` lays the B-spline foundation: Cox–de Boor basis,
    knot insertion (`insertKnot`) with the degree-0 refinement equation and
    degree-1 Boehm curve preservation (`boehm1_preserves`), and the surface
