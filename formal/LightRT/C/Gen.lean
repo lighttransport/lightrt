@@ -59,14 +59,26 @@ def tri_sph_quad_core : Func where
   params := [0, 1, 2, 3, 4, 5]
   body := (.seq (.seq (.set 6 (.bin .sub none (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 0)) 4)) (.var 2))) (.seq (.set 7 (.bin .sub none (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 1)) 4)) (.var 3))) (.set 8 (.bin .sub none (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 2)) 4)) (.var 4))))) (.seq (.set 9 (.bin .add none (.bin .add none (.bin .mul none (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 0)) 4)) (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 0)) 4))) (.bin .mul none (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 1)) 4)) (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 1)) 4)))) (.bin .mul none (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 2)) 4)) (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 2)) 4))))) (.seq (.set 10 (.bin .add none (.bin .add none (.bin .mul none (.var 6) (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 0)) 4))) (.bin .mul none (.var 7) (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 1)) 4)))) (.bin .mul none (.var 8) (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 2)) 4))))) (.seq (.set 11 (.bin .sub none (.bin .add none (.bin .add none (.bin .mul none (.var 6) (.var 6)) (.bin .mul none (.var 7) (.var 7))) (.bin .mul none (.var 8) (.var 8))) (.bin .mul none (.var 5) (.var 5)))) (.seq (.set 12 (.bin .sub none (.bin .mul none (.var 10) (.var 10)) (.bin .mul none (.var 9) (.var 11)))) (.seq (.set 13 (.sqrt (.var 12))) (.seq (.set 14 (.bin .div none (.const (.f32 1065353216)) (.var 9))) (.ret (some (.bin .mul none (.bin .sub none (.fneg (.var 10)) (.var 13)) (.var 14)))))))))))
 
-/-- `tri_surface_area` (function id 8). Locals: 0=lo, 1=hi, 2=dx, 3=dy, 4=dz -/
-def fid_tri_surface_area : Nat := 8
+/-- `tri_point_oriented_core` (function id 8). Locals: 0=org, 1=dir, 2=cx, 3=cy, 4=cz, 5=nx, 6=ny, 7=nz, 8=c0x, 9=c0y, 10=c0z, 11=divisor -/
+def fid_tri_point_oriented_core : Nat := 8
+def tri_point_oriented_core : Func where
+  params := [0, 1, 2, 3, 4, 5, 6, 7]
+  body := (.seq (.seq (.set 8 (.bin .sub none (.var 2) (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 0)) 4)))) (.seq (.set 9 (.bin .sub none (.var 3) (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 1)) 4)))) (.set 10 (.bin .sub none (.var 4) (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 2)) 4)))))) (.seq (.set 11 (.bin .add none (.bin .add none (.bin .mul none (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 0)) 4)) (.var 5)) (.bin .mul none (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 1)) 4)) (.var 6))) (.bin .mul none (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 2)) 4)) (.var 7)))) (.ret (some (.bin .div none (.bin .add none (.bin .add none (.bin .mul none (.var 8) (.var 5)) (.bin .mul none (.var 9) (.var 6))) (.bin .mul none (.var 10) (.var 7))) (.var 11))))))
+
+/-- `tri_point_raydisc_core` (function id 9). Locals: 0=org, 1=dir, 2=cx, 3=cy, 4=cz, 5=dx, 6=dy, 7=dz, 8=dOdO, 9=c0x, 10=c0y, 11=c0z, 12=rd2 -/
+def fid_tri_point_raydisc_core : Nat := 9
+def tri_point_raydisc_core : Func where
+  params := [0, 1, 2, 3, 4]
+  body := (.seq (.seq (.set 5 (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 0)) 4))) (.seq (.set 6 (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 1)) 4))) (.set 7 (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 2)) 4))))) (.seq (.set 8 (.bin .add none (.bin .add none (.bin .mul none (.var 5) (.var 5)) (.bin .mul none (.var 6) (.var 6))) (.bin .mul none (.var 7) (.var 7)))) (.seq (.seq (.set 9 (.bin .sub none (.var 2) (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 0)) 4)))) (.seq (.set 10 (.bin .sub none (.var 3) (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 1)) 4)))) (.set 11 (.bin .sub none (.var 4) (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 2)) 4)))))) (.seq (.set 12 (.bin .div none (.const (.f32 1065353216)) (.var 8))) (.ret (some (.bin .mul none (.bin .add none (.bin .add none (.bin .mul none (.var 9) (.var 5)) (.bin .mul none (.var 10) (.var 6))) (.bin .mul none (.var 11) (.var 7))) (.var 12))))))))
+
+/-- `tri_surface_area` (function id 10). Locals: 0=lo, 1=hi, 2=dx, 3=dy, 4=dz -/
+def fid_tri_surface_area : Nat := 10
 def tri_surface_area : Func where
   params := [0, 1]
   body := (.seq (.seq (.set 2 (.bin .sub none (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 0)) 4)) (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 0)) 4)))) (.seq (.set 3 (.bin .sub none (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 1)) 4)) (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 1)) 4)))) (.set 4 (.bin .sub none (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 2)) 4)) (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 2)) 4)))))) (.seq (.ite (.lor (.lor (.bin .lt none (.var 2) (.const (.f32 0))) (.bin .lt none (.var 3) (.const (.f32 0)))) (.bin .lt none (.var 4) (.const (.f32 0)))) (.ret (some (.const (.f32 0)))) .skip) (.ret (some (.bin .mul none (.const (.f32 1073741824)) (.bin .add none (.bin .add none (.bin .mul none (.var 2) (.var 3)) (.bin .mul none (.var 3) (.var 4))) (.bin .mul none (.var 4) (.var 2))))))))
 
-/-- `tri_longest_axis` (function id 9). Locals: 0=lo, 1=hi, 2=dx, 3=dy, 4=dz -/
-def fid_tri_longest_axis : Nat := 9
+/-- `tri_longest_axis` (function id 11). Locals: 0=lo, 1=hi, 2=dx, 3=dy, 4=dz -/
+def fid_tri_longest_axis : Nat := 11
 def tri_longest_axis : Func where
   params := [0, 1]
   body := (.seq (.seq (.set 2 (.bin .sub none (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 0)) 4)) (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 0)) 4)))) (.seq (.set 3 (.bin .sub none (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 1)) 4)) (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 1)) 4)))) (.set 4 (.bin .sub none (.load .f32 (.index (.var 1) (.const (.int ⟨32, true⟩ 2)) 4)) (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 2)) 4)))))) (.seq (.ite (.land (.bin .gt none (.var 2) (.var 3)) (.bin .gt none (.var 2) (.var 4))) (.ret (some (.const (.int ⟨32, true⟩ 0)))) .skip) (.seq (.ite (.bin .gt none (.var 3) (.var 4)) (.ret (some (.const (.int ⟨32, true⟩ 1)))) .skip) (.ret (some (.const (.int ⟨32, true⟩ 2)))))))
@@ -84,8 +96,10 @@ def prog : Prog := fun f =>
   | 5 => some tri_woop_one
   | 6 => some tri_sphere_dist_f
   | 7 => some tri_sph_quad_core
-  | 8 => some tri_surface_area
-  | 9 => some tri_longest_axis
+  | 8 => some tri_point_oriented_core
+  | 9 => some tri_point_raydisc_core
+  | 10 => some tri_surface_area
+  | 11 => some tri_longest_axis
   | _ => none
 
 end LightRT.C.Gen

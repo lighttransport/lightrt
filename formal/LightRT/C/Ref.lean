@@ -114,6 +114,28 @@ def sphQuadCore (org dir : Fin 3 → F) (cx cy cz r : F) : F :=
   let inv_a := divBits one a
   mulBits (subBits (neg b) sq) inv_a
 
+/-- `tri_point_oriented_core`: plane-hit parameter of the oriented-disc branch
+    of `tri_point_isect_one`, `t = (c0 . n) / (d . n)`. -/
+def pointOrientedCore (org dir : Fin 3 → F) (cx cy cz nx ny nz : F) : F :=
+  let c0x := subBits cx (org 0)
+  let c0y := subBits cy (org 1)
+  let c0z := subBits cz (org 2)
+  let divisor := addBits (addBits (mulBits (dir 0) nx) (mulBits (dir 1) ny)) (mulBits (dir 2) nz)
+  divBits (addBits (addBits (mulBits c0x nx) (mulBits c0y ny)) (mulBits c0z nz)) divisor
+
+/-- `tri_point_raydisc_core`: nearest-point parameter of the ray-facing-disc
+    branch of `tri_point_isect_one`, `projC0 = (c0 . d) / |d|^2`. -/
+def pointRayDiscCore (org dir : Fin 3 → F) (cx cy cz : F) : F :=
+  let dx := dir 0
+  let dy := dir 1
+  let dz := dir 2
+  let dOdO := addBits (addBits (mulBits dx dx) (mulBits dy dy)) (mulBits dz dz)
+  let c0x := subBits cx (org 0)
+  let c0y := subBits cy (org 1)
+  let c0z := subBits cz (org 2)
+  let rd2 := divBits one dOdO
+  mulBits (addBits (addBits (mulBits c0x dx) (mulBits c0y dy)) (mulBits c0z dz)) rd2
+
 /-! `tri_mt_one`, split into its intermediate values (same evaluation order as the C). -/
 def mtE1 (v0 v1 : Fin 3 → F) (k : Fin 3) : F := subBits (v1 k) (v0 k)
 def mtE2 (v0 v2 : Fin 3 → F) (k : Fin 3) : F := subBits (v2 k) (v0 k)

@@ -48,6 +48,8 @@ FUNCTIONS = [
     "tri_woop_one",
     "tri_sphere_dist_f",
     "tri_sph_quad_core",
+    "tri_point_oriented_core",
+    "tri_point_raydisc_core",
     "tri_surface_area",
     "tri_longest_axis",
 ]
