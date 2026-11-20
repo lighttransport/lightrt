@@ -550,13 +550,36 @@ example (U : ℕ → ℝ) (k : ℕ) (u x : ℝ) (D : KnotData U k u) (p i : ℕ)
   bsplineBasis_refine U k u x D p i
 
 example (U : ℕ → ℝ) (k : ℕ) (u : ℝ) (D : KnotData U k u)
-    (p n : ℕ) (hpk : p ≤ k) (hn : k ≤ n) (P : ℕ → Vec3) :
-    bsplineCurve (insertKnot U k u) (boehmControl U k u p P) p (n+1) u =
-      bsplineCurve U P p n u :=
-  boehm_preserves U k u D p n hpk hn P
+    (p n : ℕ) (hpk : p ≤ k) (hn : k ≤ n) (P : ℕ → Vec3) (u0 : ℝ) :
+    bsplineCurve (insertKnot U k u) (boehmControl U k u p P) p (n+1) u0 =
+      bsplineCurve U P p n u0 :=
+  boehm_preserves U k u D p n hpk hn P u0
 
 
 /-- Box SDF is 1-Lipschitz. -/
 example (h : Fin 3 → ℝ) : AbsLipschitz (sdfBox h) := sdfBox_AbsLipschitz h
+
+
+/-- Iterated Boehm insertion preserves the curve. -/
+example (U : ℕ → ℝ) (p n : ℕ) (P : ℕ → Vec3) (x : ℝ)
+    (ins : List (ℕ × ℝ)) (hval : ValidInserts U p n ins) :
+    ∃ (U' : ℕ → ℝ) (P' : ℕ → Vec3) (n' : ℕ),
+      U' = insertKnotList U ins ∧
+      bsplineCurve U' P' p n' x = bsplineCurve U P p n x :=
+  boehm_iterate U p n P x ins hval
+
+
+/-- Tensor-product surface insertion and ratEval connection. -/
+example (U V : ℕ → ℝ) (k : ℕ) (uk : ℝ) (D : KnotData U k uk)
+    (pu pv nu nv : ℕ) (hpu : pu ≤ k) (hkn : k ≤ nu) (P : ℕ → ℕ → Vec3) (x y : ℝ) :
+    tensorBspline (insertKnot U k uk) V
+      (fun i j => boehmControl U k uk pu (fun ii => P ii j) i)
+      pu pv (nu+1) nv x y = tensorBspline U V P pu pv nu nv x y :=
+  tensorBspline_insert_u U V k uk D pu pv nu nv hpu hkn P x y
+
+example (w : Fin 16 → ℝ) (P : Fin 16 → Vec3) (u v : ℝ)
+    (hu0 : 0 ≤ u) (hu1 : u < 1) (hv0 : 0 ≤ v) (hv1 : v < 1) :
+    rationalTensorBezier w P u v = ratEval w P u v :=
+  rationalTensorBezier_eq_ratEval w P u v hu0 hu1 hv0 hv1
 
 end LightRT.Sanity

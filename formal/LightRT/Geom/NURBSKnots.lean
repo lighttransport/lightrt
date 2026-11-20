@@ -479,16 +479,12 @@ def boehmControl (U : ℕ → ℝ) (k : ℕ) (u : ℝ) (p : ℕ) (P : ℕ → Ve
 
 /-- **General Boehm knot insertion preserves the curve.** -/
 theorem boehm_preserves (U : ℕ → ℝ) (k : ℕ) (u : ℝ) (D : KnotData U k u)
-    (p n : ℕ) (hpk : p ≤ k) (hn : k ≤ n) (P : ℕ → Vec3) :
-    bsplineCurve (insertKnot U k u) (boehmControl U k u p P) p (n+1) u =
-      bsplineCurve U P p n u := by
+    (p n : ℕ) (hpk : p ≤ k) (hn : k ≤ n) (P : ℕ → Vec3) (x : ℝ) :
+    bsplineCurve (insertKnot U k u) (boehmControl U k u p P) p (n+1) x =
+      bsplineCurve U P p n x := by
   unfold bsplineCurve boehmControl
-  simp_rw [bsplineBasis_refine U k u u D p]
-  -- RHS is now sum of ((1-α_i)N'_i + α_{i+1}N'_{i+1}) • P_i
-  -- rewrite smul_add and sum_add_distrib
+  simp_rw [bsplineBasis_refine U k u x D p]
   simp_rw [add_smul, Finset.sum_add_distrib]
-  -- first sum: Σ (1-α_i) • N'_i • P_i ; second: Σ α_{i+1} • N'_{i+1} • P_i
-  -- LHS is Σ_{j=0}^{n+1} N'_j • ((1-α_j)•P_j + α_j•P_{j-1})
   rw [Finset.sum_range_succ]
   simp only [smul_add, Finset.sum_add_distrib]
   have h0 : insertAlpha U k u 0 p = 0 := by
@@ -498,15 +494,14 @@ theorem boehm_preserves (U : ℕ → ℝ) (k : ℕ) (u : ℝ) (D : KnotData U k 
   have hlast : insertAlpha U k u (n+1) p = 1 := by
     unfold insertAlpha
     have hklt : ¬ n + 1 ≤ k := by omega
-    have hpk' : ¬ (p ≤ k ∧ n + 1 ≤ k - p) := by
-      intro h; omega
+    have hpk' : ¬ (p ≤ k ∧ n + 1 ≤ k - p) := by intro h; omega
     have hknp : k ≤ n + p := by omega
     simp [hpk', hklt, hknp]
   have hshift :
-      (∑ x ∈ Finset.range (n+1), bsplineBasis (insertKnot U k u) x p u •
-          insertAlpha U k u x p • P (x-1)) =
-        ∑ x ∈ Finset.range n, bsplineBasis (insertKnot U k u) (x+1) p u •
-          insertAlpha U k u (x+1) p • P x := by
+      (∑ i ∈ Finset.range (n+1), bsplineBasis (insertKnot U k u) i p x •
+          insertAlpha U k u i p • P (i-1)) =
+        ∑ i ∈ Finset.range n, bsplineBasis (insertKnot U k u) (i+1) p x •
+          insertAlpha U k u (i+1) p • P i := by
     rw [Finset.sum_range_succ']
     simp [h0]
   rw [hshift]
@@ -515,6 +510,96 @@ theorem boehm_preserves (U : ℕ → ℝ) (k : ℕ) (u : ℝ) (D : KnotData U k 
   simp [hlast, smul_smul, mul_comm]
   module
 
+/-- Insert a list of (span, knot) pairs into a knot vector. -/
+def insertKnotList (U : ℕ → ℝ) : List (ℕ × ℝ) → (ℕ → ℝ)
+  | [] => U
+  | (k,u) :: rest => insertKnotList (insertKnot U k u) rest
+
+/-- Validity of a list of insertions: each step has valid nondegeneracy data,
+    p ≤ k ≤ n, and the control-point count grows by one. -/
+inductive ValidInserts : (ℕ → ℝ) → ℕ → ℕ → List (ℕ × ℝ) → Prop where
+  | nil (U : ℕ → ℝ) (p n : ℕ) : ValidInserts U p n []
+  | cons (U : ℕ → ℝ) (p n k : ℕ) (u : ℝ) (rest : List (ℕ × ℝ)) :
+      p ≤ k → k ≤ n → KnotData U k u →
+      ValidInserts (insertKnot U k u) p (n+1) rest →
+      ValidInserts U p n ((k,u) :: rest)
+
+/-- **Iterated Boehm insertion preserves the curve.** A finite sequence of
+    valid knot insertions yields a refined knot vector and control net whose
+    B-spline curve equals the original -- the Bezier-extraction foundation. -/
+theorem boehm_iterate (U : ℕ → ℝ) (p n : ℕ) (P : ℕ → Vec3) (x : ℝ)
+    (ins : List (ℕ × ℝ)) (hval : ValidInserts U p n ins) :
+    ∃ (U' : ℕ → ℝ) (P' : ℕ → Vec3) (n' : ℕ),
+      U' = insertKnotList U ins ∧
+      bsplineCurve U' P' p n' x = bsplineCurve U P p n x := by
+  induction ins generalizing U n P with
+  | nil => exact ⟨U, P, n, rfl, rfl⟩
+  | cons hd tl ih =>
+      rcases hd with ⟨k, u⟩
+      cases hval with
+      | cons U0 p0 n0 kk uu rest hpk hn hD hrest =>
+          let Q := boehmControl U k u p P
+          have hstep := boehm_preserves U k u hD p n hpk hn P
+          obtain ⟨U', P', n', hU', hcurve⟩ := ih (insertKnot U k u) (n+1) Q hrest
+          refine ⟨U', P', n', ?_, ?_⟩
+          · simp [insertKnotList, hU']
+          · rw [hcurve]
+            simpa [Q] using hstep x
+
+/-- Tensor-product polynomial B-spline surface. -/
+def tensorBspline (U V : ℕ → ℝ) (P : ℕ → ℕ → Vec3)
+    (pu pv nu nv : ℕ) (x y : ℝ) : Vec3 :=
+  ∑ i ∈ Finset.range (nu+1), ∑ j ∈ Finset.range (nv+1),
+    (bsplineBasis U i pu x * bsplineBasis V j pv y) • P i j
+
+/-- Knot insertion in the u direction preserves a tensor-product surface. -/
+theorem tensorBspline_insert_u (U V : ℕ → ℝ) (k : ℕ) (uk : ℝ) (D : KnotData U k uk)
+    (pu pv nu nv : ℕ) (hpu : pu ≤ k) (hkn : k ≤ nu) (P : ℕ → ℕ → Vec3) (x y : ℝ) :
+    tensorBspline (insertKnot U k uk) V
+      (fun i j => boehmControl U k uk pu (fun ii => P ii j) i)
+      pu pv (nu+1) nv x y = tensorBspline U V P pu pv nu nv x y := by
+  unfold tensorBspline
+  conv_lhs => rw [Finset.sum_comm]
+  conv_rhs => rw [Finset.sum_comm]
+  apply Finset.sum_congr rfl
+  intro j hj
+  have hslice := boehm_preserves U k uk D pu nu hpu hkn (fun ii => P ii j) x
+  simp only [bsplineCurve, boehmControl] at hslice
+  have hs := congrArg (fun z : Vec3 => (bsplineBasis V j pv y) • z) hslice
+  simp only [Finset.smul_sum] at hs
+  simpa [boehmControl, smul_add, smul_smul, mul_comm, mul_left_comm, mul_assoc] using hs
+
+
+/-- Knot insertion in the v direction preserves a tensor-product surface. -/
+theorem tensorBspline_insert_v (U V : ℕ → ℝ) (k : ℕ) (vk : ℝ) (D : KnotData V k vk)
+    (pu pv nu nv : ℕ) (hpv : pv ≤ k) (hkn : k ≤ nv) (P : ℕ → ℕ → Vec3) (x y : ℝ) :
+    tensorBspline U (insertKnot V k vk)
+      (fun i j => boehmControl V k vk pv (fun jj => P i jj) j)
+      pu pv nu (nv+1) x y = tensorBspline U V P pu pv nu nv x y := by
+  unfold tensorBspline
+  apply Finset.sum_congr rfl
+  intro i hi
+  have hslice := boehm_preserves V k vk D pv nv hpv hkn (fun jj => P i jj) y
+  simp only [bsplineCurve, boehmControl] at hslice
+  have hs := congrArg (fun z : Vec3 => (bsplineBasis U i pu x) • z) hslice
+  simp only [Finset.smul_sum] at hs
+  simpa [boehmControl, smul_add, smul_smul, mul_comm, mul_left_comm, mul_assoc] using hs
+
+/-- Rational tensor-product surface with a flattened 4x4 Bezier control net. -/
+def rationalTensorBezier (w : Fin 16 → ℝ) (P : Fin 16 → Vec3) (u v : ℝ) : Vec3 :=
+  fun coord =>
+    (∑ k : Fin 16,
+      (bsplineBasis (bezKnot 3) (k.val % 4) 3 u *
+       bsplineBasis (bezKnot 3) (k.val / 4) 3 v * w k) • P k coord) /
+    (∑ k : Fin 16,
+      bsplineBasis (bezKnot 3) (k.val % 4) 3 u *
+      bsplineBasis (bezKnot 3) (k.val / 4) 3 v * w k)
+
+/-- The rational tensor-product Bezier surface equals `ratEval`. -/
+theorem rationalTensorBezier_eq_ratEval (w : Fin 16 → ℝ) (P : Fin 16 → Vec3) (u v : ℝ)
+    (hu0 : 0 ≤ u) (hu1 : u < 1) (hv0 : 0 ≤ v) (hv1 : v < 1) :
+    rationalTensorBezier w P u v = ratEval w P u v := by
+  exact bezKnot_ratEval w P u v hu0 hu1 hv0 hv1
 
 end
 end LightRT.Geom
