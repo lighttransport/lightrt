@@ -144,7 +144,10 @@ FP of the solve stays a Tier 2 `primhitcheck` boundary throughout.
    `Geom/RoundLinear.lean` also gives the round-linear / flat intersector models
    `rlcReal` / `flatReal` (nearest swept-tube hit) with sound/complete/nearest,
    tapered-radius box containment, and the flat-ribbon/two-MT-triangle connection
-   (`inQuad_flat_of_onFlatLinear`).
+   (`inQuad_flat_of_onFlatLinear`). `Geom/SDFReal.lean` proves the sphere SDF
+   1-Lipschitz (point and ray parameter) and records the curve-capsule model via
+   `CapsuleReal`. `Geom/IntersectorContract.lean` adds bilinear sound/complete,
+   rational-patch sound/nearest and trimmed-scan contracts.
    `Geom/BezFirstContact.lean` composes the chain into a first-contact contract
    (`HitsBezTubeRay`, sampled acceptance sound, exact/sampled no-overshoot,
    boundary existence). `Geom/SphereTraceConvergence.lean` adds the convergence
