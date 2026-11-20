@@ -292,5 +292,68 @@ theorem rectangle_crossing_inside (x0 x1 y0 y1 x y : ℝ)
   simp [crossingNumber, edgeCross, edgeSpansY, edgeCrossX,
         hy0, hy1, hx0, hx1, hy0not, hy1not]
 
+def loopBridge (l₁ l₂ : TrimLoop) (x y : ℝ) : ℕ :=
+  match l₁.getLast?, l₂.head? with
+  | some a, some b => edgeCross a b x y
+  | _, _ => 0
+
+theorem crossingNumber_append (l₁ l₂ : TrimLoop) (x y : ℝ) :
+    crossingNumber (l₁ ++ l₂) x y =
+      crossingNumber l₁ x y + loopBridge l₁ l₂ x y + crossingNumber l₂ x y := by
+  induction l₁ with
+  | nil => simp [crossingNumber, loopBridge]
+  | cons p l₁ ih =>
+    cases l₁ with
+    | nil =>
+      cases l₂ with
+      | nil => simp [crossingNumber, loopBridge]
+      | cons b tl => simp [crossingNumber, loopBridge]
+    | cons q l₁ =>
+      have ih' := ih
+      simp only [List.cons_append] at ih' ⊢
+      simp only [crossingNumber]
+      rw [ih']
+      have hbridge : loopBridge (p :: q :: l₁) l₂ x y = loopBridge (q :: l₁) l₂ x y := by
+        simp [loopBridge]
+      rw [hbridge]
+      omega
+
+def crossingNumberClosed (loop : TrimLoop) (x y : ℝ) : ℕ :=
+  match loop with
+  | [] => 0
+  | p :: rest => crossingNumber (loop ++ [p]) x y
+
+theorem crossingNumberClosed_rotate (p : ℝ × ℝ) (l : TrimLoop) (x y : ℝ)
+    (hne : l ≠ []) :
+    crossingNumberClosed (p :: l) x y = crossingNumberClosed (l ++ [p]) x y := by
+  cases l with
+  | nil => contradiction
+  | cons q rest =>
+    unfold crossingNumberClosed
+    simp
+    -- goal: crossingNumber ((p::q::rest)++[p]) = crossingNumber (((q::rest)++[p])++[q])
+    -- express LHS using append theorem on [p] ++ ((q::rest)++[p])
+    have hL : crossingNumber ((p :: q :: rest) ++ [p]) x y =
+        edgeCross p q x y + crossingNumber ((q :: rest) ++ [p]) x y := by
+      rw [show (p :: q :: rest) ++ [p] = [p] ++ ((q :: rest) ++ [p]) by simp]
+      rw [crossingNumber_append]
+      simp [loopBridge, crossingNumber]
+    -- express RHS using append theorem on ((q::rest)++[p]) ++ [q]
+    have hR : crossingNumber (((q :: rest) ++ [p]) ++ [q]) x y =
+        crossingNumber ((q :: rest) ++ [p]) x y + edgeCross p q x y := by
+      rw [crossingNumber_append]
+      have hlast : (q :: (rest ++ [p])).getLast? = some p := by
+        rw [show q :: (rest ++ [p]) = (q :: rest) ++ [p] by simp]
+        rw [List.getLast?_append_of_ne_nil (q :: rest) (by simp : [p] ≠ [])]
+        simp
+      simp [loopBridge, hlast, crossingNumber]
+    calc
+      crossingNumber (p :: q :: (rest ++ [p])) x y =
+          edgeCross p q x y + crossingNumber (q :: (rest ++ [p])) x y := by simpa using hL
+      _ = crossingNumber (q :: (rest ++ [p, q])) x y := by
+        have hr := hR
+        simp [List.cons_append] at hr
+        omega
+
 end
 end LightRT.Geom
