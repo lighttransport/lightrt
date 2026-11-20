@@ -84,7 +84,10 @@ a decision change; Tier 3 is closed or maintenance.
 **Status (2026-11-20).** The five remaining Tier 1 items advanced to the
 following state, each validated by `make formal` (0 sorry, all gates green,
 axiom allowlist unchanged) and committed with the required trailer:
-- **Patch Newton basin from control points**: DONE (δ stays data, as M14) --
+- **Patch Newton basin from control points**: DONE (δ stays data, as M14); the
+  no-missed-nearest theorem now seeds Newton at the LOCAL cell center (1/2,1/2)
+  and derives its distance to the local root from the cell size via
+  `cell_center_in_basin` --
   `patch_basin_ball_of_data`, `patch_newtonIter_tendsto_of_root_data`,
   `patch_subdivision_no_missed_nearest_of_root_data`.
 - **NURBS knot insertion / Bezier extraction**: FOUNDATION DONE -- degree-0

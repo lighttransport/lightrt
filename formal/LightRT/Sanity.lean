@@ -443,4 +443,11 @@ example (R : TrimRegion) (u v t : ℝ) (hvis : trimVisible R u v) :
     simp [nearestVisibleT, hvis]
   exact ⟨hscan, nearestVisibleT_spec R [(u, v, t)] hscan⟩
 
+
+/-- The local-center seed hypotheses are jointly satisfiable for a sufficiently
+    small control net: R >= 1 supplies the seed distance and K*R <= 1 holds. -/
+example : ∃ M R : ℝ, 0 < M ∧ 1 ≤ R ∧ 192 * M * R ≤ 1 := by
+  refine ⟨1/1000, 1, by norm_num, le_rfl, ?_⟩
+  norm_num
+
 end LightRT.Sanity

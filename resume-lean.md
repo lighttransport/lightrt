@@ -107,7 +107,9 @@ Explicitly deferred/recorded (see PLAN.md):
   `patch_basin_ball_of_data`, `patch_newtonIter_tendsto_of_basin_ball`,
   `patch_newtonIter_tendsto_of_root_data`,
   `patch_subdivision_no_missed_nearest_of_root_data`, `cell_center_in_basin`.
-  δ (determinant lower bound) and the cell seed distance stay data.
+  the seed is now the LOCAL center (1/2,1/2) and its distance to the local root
+  is derived from the cell-size condition via cell_center_in_basin; only δ
+  (determinant lower bound) stays data.
 - **Patch subdivision**: `Geom/BezPatchSubdivision.lean` — `transposeCP`,
   `bicubicEval_transpose`, `splitBicubicV`, `PatchCell` / `Represents` with u/v
   split preservation, `cell_not_culled_of_hit`, `cell_contact_eq`.
@@ -131,10 +133,10 @@ Explicitly deferred/recorded (see PLAN.md):
 The authoritative roadmap is `formal/PLAN.md` §5 (three tiers). Concrete
 remaining sub-items from the 2026-11-20 push:
 
-- **Tier 1, patch surfaces**: unconditional basin verification from control
-  points (the full M14-style coefficient chase for the patch Newton basin —
-  currently the seed distance and δ are data); general-degree exactness of the
-  no-missed contract. δ stays data for arbitrary control points by decision.
+- **Tier 1, patch surfaces**: the seed-distance hypothesis is now supplied from
+  the cell size (local center (1/2,1/2)); δ stays data for arbitrary control
+  points by decision. A local-curvature bound that shrinks with cell size would
+  remove the residual `1 <= R` side condition.
 - **Tier 1, NURBS**: general-degree Boehm insertion / Cox–de Boor refinement
   equation (only degree 0 and degree 1 are proved; degree 3 Bezier extraction
   via `bezKnot_ratEval` is done); full tensor-product general knot insertion.
