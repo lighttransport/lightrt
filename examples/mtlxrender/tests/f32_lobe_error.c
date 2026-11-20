@@ -1,7 +1,7 @@
 // Empirical size of the binary32 lobe-evaluation error behind conservative mode's 1e-3
 // reserve (doc/validation/certified-albedo.md): the native rough transmission lobe
 // (bsdf_eval_lobes, binary32) against a binary64 recomputation of the same formula on
-// identical binary32 inputs. Requires max relative error <= 5e-4 (half the reserve).
+// identical binary32 inputs. Requires max relative error <= 5e-4 (a third of the 1.5e-3 reserve).
 // Evidence, not a proof.
 #include <math.h>
 #include <stdio.h>
