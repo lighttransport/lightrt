@@ -94,8 +94,12 @@ axiom allowlist unchanged) and committed with the required trailer:
   parity, `nearestVisibleT` (with `nearestVisibleT_spec`: a returned parameter
   is a visible hit and is minimal among visible hits), reject-and-continue.
 - **Curve/SDF soundness over ℝ**: DONE -- round/flat tube hit soundness,
-  cubic-Bezier soundness/completeness/nearest, SDF soundness/no-overshoot/boundary,
-  round/flat nearest-hit existence (closedness hypothesis).
+  cubic-Bezier soundness/completeness/nearest, SDF soundness/no-overshoot/boundary;
+  the swept tube sets (round-linear, flat ribbon, cubic-Bezier) are proved closed
+  as compact images of closed bounded parameter sets, so all nearest-hit
+  existence theorems are now unconditional (no false `t < tbest` closedness
+  hypothesis). Bezpatch/ratpatch nearest-hit existence already derived closedness
+  from compact boxes.
 - **M15/M16 abstract contracts**: DONE -- `IntersectorContract.lean` curve and
   surface contract APIs.
 FP of the solve stays a Tier 2 `primhitcheck` boundary throughout.
