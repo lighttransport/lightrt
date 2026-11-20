@@ -216,5 +216,81 @@ theorem nearestVisibleT_skip_invisible (R : TrimRegion) (u v t : ℝ)
   | none => simp [nearestVisibleT, hvis, hm]
   | some m => simp [nearestVisibleT, hvis, hm]
 
+/-- The interpolation parameter of an edge's crossing at height `y`. -/
+def edgeCrossLambda (p q : ℝ × ℝ) (y : ℝ) : ℝ :=
+  if q.2 = p.2 then 0 else (y - p.2) / (q.2 - p.2)
+
+lemma edgeCrossLambda_bounds (p q : ℝ × ℝ) (y : ℝ) (h : edgeSpansY p q y) :
+    0 ≤ edgeCrossLambda p q y ∧ edgeCrossLambda p q y ≤ 1 := by
+  unfold edgeCrossLambda
+  rcases h with h | h
+  · have hne : q.2 ≠ p.2 := by linarith
+    simp [hne]
+    have hpos : 0 < q.2 - p.2 := by linarith
+    constructor
+    · exact div_nonneg (sub_nonneg.mpr h.1) (le_of_lt hpos)
+    · exact (div_le_one hpos).mpr (by linarith [h.2])
+  · have hne : q.2 ≠ p.2 := by linarith
+    simp [hne]
+    have hneg : q.2 - p.2 < 0 := by linarith
+    constructor
+    · exact div_nonneg_of_nonpos (by linarith [h.2]) (by linarith)
+    · rw [div_le_iff_of_neg hneg]
+      linarith [h.1]
+
+/-- A crossing x-coordinate lies between the edge's endpoint x-coordinates. -/
+theorem edgeCrossX_between (p q : ℝ × ℝ) (y : ℝ) (h : edgeSpansY p q y) :
+    min p.1 q.1 ≤ edgeCrossX p q y ∧ edgeCrossX p q y ≤ max p.1 q.1 := by
+  have hne : q.2 ≠ p.2 := by rcases h with h | h <;> linarith
+  have hlam := edgeCrossLambda_bounds p q y h
+  unfold edgeCrossX
+  simp [edgeCrossLambda, hne] at hlam ⊢
+  by_cases hx : p.1 ≤ q.1
+  · constructor
+    · left; exact mul_nonneg hlam.1 (sub_nonneg.mpr hx)
+    · right
+      have hmul := mul_le_mul_of_nonneg_right hlam.2 (sub_nonneg.mpr hx)
+      nlinarith
+  · have hx' : q.1 ≤ p.1 := le_of_not_ge hx
+    constructor
+    · right
+      have hmul := mul_le_mul_of_nonpos_right hlam.2 (sub_nonpos.mpr hx')
+      nlinarith
+    · left; exact mul_nonpos_of_nonneg_of_nonpos hlam.1 (sub_nonpos.mpr hx')
+
+/-- A point strictly to the right of every vertex has zero crossings. -/
+theorem crossingNumber_far_right (loop : TrimLoop) (x y : ℝ)
+    (hfar : ∀ p ∈ loop, p.1 < x) : crossingNumber loop x y = 0 := by
+  induction loop with
+  | nil => simp [crossingNumber]
+  | cons p l ih =>
+    cases l with
+    | nil => simp [crossingNumber]
+    | cons q rest =>
+      simp only [crossingNumber]
+      have hp : p.1 < x := hfar p (by simp)
+      have hq : q.1 < x := hfar q (by simp)
+      have hl_far : ∀ r ∈ q :: rest, r.1 < x := by
+        intro r hr; exact hfar r (by simp [hr])
+      have ih' := ih hl_far
+      rw [ih', add_zero]
+      unfold edgeCross
+      by_cases hspan : edgeSpansY p q y
+      · have hb := edgeCrossX_between p q y hspan
+        have hcross_lt : edgeCrossX p q y < x :=
+          lt_of_le_of_lt hb.2 (max_lt hp hq)
+        simp [hspan, not_lt_of_ge (le_of_lt hcross_lt)]
+      · simp [hspan]
+
+/-- General axis-aligned rectangle: a point strictly inside the horizontal
+    span and in the half-open vertical span has odd crossing number. -/
+theorem rectangle_crossing_inside (x0 x1 y0 y1 x y : ℝ)
+    (hx0 : x0 < x) (hx1 : x < x1) (hy0 : y0 ≤ y) (hy1 : y < y1) :
+    crossingNumber [(x0,y0), (x1,y0), (x1,y1), (x0,y1)] x y % 2 = 1 := by
+  have hy0not : ¬ y < y0 := not_lt_of_ge hy0
+  have hy1not : ¬ y1 ≤ y := not_le_of_gt hy1
+  simp [crossingNumber, edgeCross, edgeSpansY, edgeCrossX,
+        hy0, hy1, hx0, hx1, hy0not, hy1not]
+
 end
 end LightRT.Geom

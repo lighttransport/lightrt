@@ -470,4 +470,19 @@ example (p0 p1 b x : Vec3) (r0 r1 : ℝ) (hr0 : 0 ≤ r0) (hr1 : 0 ≤ r1)
     OnFlatLinear p0 p1 r0 r1 p0 b x :=
   inQuad_flat_of_onFlatLinear p0 p1 b r0 r1 hr0 hr1 hx
 
+
+/-- Crossing-number properties are non-vacuous. -/
+example (p q : ℝ × ℝ) (y : ℝ) (h : edgeSpansY p q y) :
+    min p.1 q.1 ≤ edgeCrossX p q y ∧ edgeCrossX p q y ≤ max p.1 q.1 :=
+  edgeCrossX_between p q y h
+
+example (loop : TrimLoop) (x y : ℝ) (hfar : ∀ p ∈ loop, p.1 < x) :
+    crossingNumber loop x y = 0 :=
+  crossingNumber_far_right loop x y hfar
+
+example (x0 x1 y0 y1 x y : ℝ) (hx0 : x0 < x) (hx1 : x < x1)
+    (hy0 : y0 ≤ y) (hy1 : y < y1) :
+    crossingNumber [(x0,y0), (x1,y0), (x1,y1), (x0,y1)] x y % 2 = 1 :=
+  rectangle_crossing_inside x0 x1 y0 y1 x y hx0 hx1 hy0 hy1
+
 end LightRT.Sanity

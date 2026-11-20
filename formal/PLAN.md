@@ -96,6 +96,10 @@ axiom allowlist unchanged) and committed with the required trailer:
 - **Trimmed-NURBS search**: DONE (finite-candidate form) -- even-odd crossing
   parity, `nearestVisibleT` (with `nearestVisibleT_spec`: a returned parameter
   is a visible hit and is minimal among visible hits), reject-and-continue.
+  Crossing-number properties: `edgeCrossX_between`, `crossingNumber_far_right`,
+  general axis-aligned rectangle parity. Loop-concatenation bridge additivity
+  and cyclic rotation invariance remain open (the latter needs a closed-loop
+  crossingNumber definition).
 - **Curve/SDF soundness over ℝ**: DONE -- round/flat tube hit soundness,
   cubic-Bezier soundness/completeness/nearest, SDF soundness/no-overshoot/boundary;
   the swept tube sets (round-linear, flat ribbon, cubic-Bezier) are proved closed
