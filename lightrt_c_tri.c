@@ -4832,6 +4832,21 @@ static inline int tri_sph_isect_lane(const float *f, int bw, int lane,
     return 1;
 }
 
+/* c2lean-verified quadratic core of tri_sph_isect_lane: the near ray/sphere
+ * root (-b - sqrt(disc))/a, with the same fp32 evaluation order as the full
+ * intersector. The guards and far-root fallback stay in the caller. */
+static inline float tri_sph_quad_core(const float org[3], const float dir[3],
+                                      float cx, float cy, float cz, float r) {
+    float ocx = org[0] - cx, ocy = org[1] - cy, ocz = org[2] - cz;
+    float a = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+    float b = ocx * dir[0] + ocy * dir[1] + ocz * dir[2];
+    float c = ocx * ocx + ocy * ocy + ocz * ocz - r * r;
+    float disc = b * b - a * c;
+    float sq = sqrtf(disc);
+    float inv_a = 1.0f / a;
+    return (-b - sq) * inv_a;
+}
+
 /* Ray vs one sphere lane, any-hit only: returns 1 if hit in [tmin, tmax]. */
 static inline int tri_sph_occluded_lane(const float *f, int bw, int lane,
                                         const tri_ray_ctx *rc, float tmax) {
