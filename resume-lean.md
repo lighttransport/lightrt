@@ -150,11 +150,11 @@ remaining sub-items from the 2026-11-20 push:
 - **Tier 1, NURBS**: general-degree Boehm insertion / Cox–de Boor refinement
   equation (only degree 0 and degree 1 are proved; degree 3 Bezier extraction
   via `bezKnot_ratEval` is done); full tensor-product general knot insertion.
-- **Tier 1, trimmed NURBS**: general crossing-number parity: far-right zero,
-  edgeCrossX betweenness and the general rectangle are now proved; loop bridge
-  additivity and cyclic rotation invariance remain (the latter needs a
-  closed-loop crossingNumber definition). Swept-tube closedness is proved;
-  trim loops beyond the finite candidate list remain.
+- **Tier 1, trimmed NURBS**: crossing-number parity (far-right zero, edgeCrossX
+  betweenness, general rectangle), bridge additivity (crossingNumber_append)
+  and cyclic rotation invariance of the closed-loop crossing number are proved.
+  Swept-tube closedness is proved; trim loops beyond the finite candidate list
+  remain.
 - **Tier 1, curves/SDF**: completeness for round-linear / flat curves (only
   soundness + nearest-hit existence are proved; tube-set closedness is now
   established for round/flat/Bezier curves); real rlc/flat intersector models.
