@@ -582,4 +582,14 @@ example (w : Fin 16 → ℝ) (P : Fin 16 → Vec3) (u v : ℝ)
     rationalTensorBezier w P u v = ratEval w P u v :=
   rationalTensorBezier_eq_ratEval w P u v hu0 hu1 hv0 hv1
 
+/-- The tangency boundary is closed by a proved limitation: the concrete
+    binary32 fact `fl(2⁻¹⁵⁰) = 0` makes the slab parameter's error equal `|t|`,
+    so no uniform `θ < 1` relative bound exists. -/
+example : Binary32.rneR ((2 : ℝ)^(-150 : ℤ)) = 0 := LightRT.Robust.rneR_half_quantum
+example : ¬ ∃ θ : ℝ, 0 ≤ θ ∧ θ < 1 ∧
+    ∀ (r : Ray) (x : ℝ) (i : Fin 3), r.d i ≠ 0 →
+      |LightRT.Robust.fpT Binary32.model r x i - (x - r.o i) / r.d i| ≤
+        θ * |(x - r.o i) / r.d i| :=
+  LightRT.Robust.fpT_no_uniform_relative
+
 end LightRT.Sanity
