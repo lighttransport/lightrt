@@ -100,6 +100,20 @@ def sphereDistF (o d c : Fin 3 → F) (r : F) : F :=
   let disc := subBits (mulBits r r) perp2
   if ltBits disc zero then neg one else subBits proj (sqrt disc)
 
+/-- `tri_sph_quad_core`: the quadratic core of `tri_sph_isect_lane` -- the near
+    ray/sphere root `(-b - sqrt(disc))/a`, in the C's fp32 evaluation order. -/
+def sphQuadCore (org dir : Fin 3 → F) (cx cy cz r : F) : F :=
+  let ocx := subBits (org 0) cx
+  let ocy := subBits (org 1) cy
+  let ocz := subBits (org 2) cz
+  let a := addBits (addBits (mulBits (dir 0) (dir 0)) (mulBits (dir 1) (dir 1))) (mulBits (dir 2) (dir 2))
+  let b := addBits (addBits (mulBits ocx (dir 0)) (mulBits ocy (dir 1))) (mulBits ocz (dir 2))
+  let c := subBits (addBits (addBits (mulBits ocx ocx) (mulBits ocy ocy)) (mulBits ocz ocz)) (mulBits r r)
+  let disc := subBits (mulBits b b) (mulBits a c)
+  let sq := sqrt disc
+  let inv_a := divBits one a
+  mulBits (subBits (neg b) sq) inv_a
+
 /-! `tri_mt_one`, split into its intermediate values (same evaluation order as the C). -/
 def mtE1 (v0 v1 : Fin 3 → F) (k : Fin 3) : F := subBits (v1 k) (v0 k)
 def mtE2 (v0 v2 : Fin 3 → F) (k : Fin 3) : F := subBits (v2 k) (v0 k)

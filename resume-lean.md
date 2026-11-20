@@ -101,7 +101,8 @@ Explicitly deferred/recorded (see PLAN.md):
 - **c2lean / sqrt**: `lrt_sqrtf.h` (ISA sqrt on SSE2/AVX2/NEON), `sqrtf` → MiniC
   `Expr.sqrt`, `FP.Binary32.sqrtBits` (integer RNE model, `#guard`-checked),
   `EvE.sqrt'`, `cdiff` `sph` vectors; `C/Proofs/SphereDistRefines.lean`
-  (`tri_sphere_dist_f_refines`), `SmallKernelsRefines.lean`
+  (`tri_sphere_dist_f_refines`), `SphQuadCoreRefines.lean`
+  (`tri_sph_quad_core_refines`), `SmallKernelsRefines.lean`
   (`tri_surface_area`, `tri_longest_axis`).
 - **Patch basin from control points**: `Geom/BezPatchConvergence.lean` —
   `patch_basin_ball_of_data`, `patch_newtonIter_tendsto_of_basin_ball`,
