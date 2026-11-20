@@ -116,7 +116,8 @@ Explicitly deferred/recorded (see PLAN.md):
   Bezier curve, `insertKnot` + degree-0 refinement, degree-1 Boehm
   (`boehm1_preserves`), surface Bezier extraction (`bezKnot_ratEval`).
 - **Trimmed NURBS**: `Geom/Trim.lean` — even-odd crossing, unit-square Jordan
-  parity, `nearestVisibleT` finite scan + reject-and-continue.
+  parity, `nearestVisibleT` finite scan + reject-and-continue and its main
+  spec theorem (returned parameter is a minimal visible hit).
 - **Curves / SDF**: `Geom/RoundLinear.lean` (round/flat tube hit soundness +
   nearest-hit existence with closedness hypothesis), `Geom/BezCurveReal.lean`
   (cubic-Bezier soundness/completeness/nearest), `Geom/SDFReal.lean` (trace
@@ -139,7 +140,7 @@ remaining sub-items from the 2026-11-20 push:
 - **Tier 1, trimmed NURBS**: general crossing-number parity (only the unit
   square is proved); closedness of the swept tube so the nearest-visible-hit
   existence hypothesis is discharged; trim loops beyond the finite candidate
-  list.
+  list. The finite scan itself is complete (nearestVisibleT_spec).
 - **Tier 1, curves/SDF**: completeness for round-linear / flat curves (only
   soundness + nearest-hit existence with a closedness hypothesis are proved);
   tube-set closedness proof.
