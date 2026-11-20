@@ -95,8 +95,11 @@ axiom allowlist unchanged) and committed with the required trailer:
   general-degree Cox–de Boor refinement equation by induction; `boehmControl`
   and `boehm_preserves` derive general Boehm knot insertion preserving the
   curve. Degree-0/1/2 Boehm and surface `bezKnot_ratEval` also in place.
-  Repeated-insertion Bezier extraction and the tensor-product surface version
-  remain open.
+  Repeated insertion is captured by `ValidInserts` / `insertKnotList` /
+  `boehm_iterate` (curve preservation under any finite sequence of valid
+  insertions). Tensor-product surfaces `tensorBspline` with u/v knot insertion
+  preservation (`tensorBspline_insert_u/_v`) and `rationalTensorBezier_eq_ratEval`
+  connect to ratEval.
 - **Trimmed-NURBS search**: DONE (finite-candidate form) -- even-odd crossing
   parity, `nearestVisibleT` (with `nearestVisibleT_spec`: a returned parameter
   is a visible hit and is minimal among visible hits), reject-and-continue.
