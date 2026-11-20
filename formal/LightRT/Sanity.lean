@@ -419,4 +419,15 @@ example (o d p0 p1 : Vec3) (r0 r1 tmin tbest : ℝ)
       ∀ t, HitsRoundLinear o d p0 p1 r0 r1 tmin tbest t → tstar ≤ t :=
   roundLinear_exists_nearest_hit o d p0 p1 r0 r1 tmin tbest hc hh
 
+
+/-- The nearest-visible-trim scan is non-vacuous: a visible hit makes the scan
+    return that hit's parameter, which is minimal among visible hits. -/
+example (R : TrimRegion) (u v t : ℝ) (hvis : trimVisible R u v) :
+    nearestVisibleT R [(u, v, t)] = some t ∧
+    (∃ u' v', (u', v', t) ∈ [(u, v, t)] ∧ trimVisible R u' v') ∧
+    (∀ t', (∃ u' v', (u', v', t') ∈ [(u, v, t)] ∧ trimVisible R u' v') → t ≤ t') := by
+  have hscan : nearestVisibleT R [(u, v, t)] = some t := by
+    simp [nearestVisibleT, hvis]
+  exact ⟨hscan, nearestVisibleT_spec R [(u, v, t)] hscan⟩
+
 end LightRT.Sanity
