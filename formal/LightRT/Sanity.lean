@@ -555,4 +555,8 @@ example (U : ℕ → ℝ) (k : ℕ) (u : ℝ) (D : KnotData U k u)
       bsplineCurve U P p n u :=
   boehm_preserves U k u D p n hpk hn P
 
+
+/-- Box SDF is 1-Lipschitz. -/
+example (h : Fin 3 → ℝ) : AbsLipschitz (sdfBox h) := sdfBox_AbsLipschitz h
+
 end LightRT.Sanity
