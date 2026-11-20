@@ -132,7 +132,8 @@ Explicitly deferred/recorded (see PLAN.md):
   flatReal nearest-hit models, tapered box containment and the flat-ribbon to
   two-MT-triangle connection.
 - **M15/M16 contracts**: `Geom/IntersectorContract.lean` — curve and surface
-  abstract contract APIs.
+  abstract contract APIs. `Geom/AdaptiveSearch.lean` — cell-solve + keep-min
+  search with soundness and nearest-hit-exactness.
 
 ## Remaining items
 
