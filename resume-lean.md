@@ -118,9 +118,10 @@ Explicitly deferred/recorded (see PLAN.md):
 - **Trimmed NURBS**: `Geom/Trim.lean` — even-odd crossing, unit-square Jordan
   parity, `nearestVisibleT` finite scan + reject-and-continue and its main
   spec theorem (returned parameter is a minimal visible hit).
-- **Curves / SDF**: `Geom/RoundLinear.lean` (round/flat tube hit soundness +
-  nearest-hit existence with closedness hypothesis), `Geom/BezCurveReal.lean`
-  (cubic-Bezier soundness/completeness/nearest), `Geom/SDFReal.lean` (trace
+- **Curves / SDF**: `Geom/RoundLinear.lean` (round/flat tube hit soundness;
+  tube sets proved closed as compact images, nearest-hit existence unconditional),
+  `Geom/BezCurveReal.lean` (cubic-Bezier soundness/completeness/nearest, bezTubeSet
+  closed, unconditional nearest-hit existence), `Geom/SDFReal.lean` (trace
   soundness/no-overshoot/boundary).
 - **M15/M16 contracts**: `Geom/IntersectorContract.lean` — curve and surface
   abstract contract APIs.
@@ -142,8 +143,8 @@ remaining sub-items from the 2026-11-20 push:
   existence hypothesis is discharged; trim loops beyond the finite candidate
   list. The finite scan itself is complete (nearestVisibleT_spec).
 - **Tier 1, curves/SDF**: completeness for round-linear / flat curves (only
-  soundness + nearest-hit existence with a closedness hypothesis are proved);
-  tube-set closedness proof.
+  soundness + nearest-hit existence are proved; tube-set closedness is now
+  established for round/flat/Bezier curves); real rlc/flat intersector models.
 - **Tier 1, c2lean**: translate further scalar kernels and prove `*_refines`.
 - **Tier 2 (boundaries, do not attempt without new tooling/decision)**: SIMD ISA
   semantics (`wtcheck` gate), GPU formalization, fp64 `tlas_instance_margin`
