@@ -485,4 +485,16 @@ example (x0 x1 y0 y1 x y : ℝ) (hx0 : x0 < x) (hx1 : x < x1)
     crossingNumber [(x0,y0), (x1,y0), (x1,y1), (x0,y1)] x y % 2 = 1 :=
   rectangle_crossing_inside x0 x1 y0 y1 x y hx0 hx1 hy0 hy1
 
+
+/-- The adaptive-search min fold is non-vacuous. -/
+example (c : PatchCell) (t : ℝ) : adaptiveSearch [c] (fun _ => some t) = some t := by
+  unfold adaptiveSearch
+  change (List.minimum [t] : WithTop ℝ) = some t
+  exact List.minimum_singleton t
+
+example (c : PatchCell) (t t' : ℝ) (hle : t ≤ t') :
+    adaptiveSearch [c] (fun _ => some t) = some t → t ≤ t' := by
+  intro h
+  exact hle
+
 end LightRT.Sanity
