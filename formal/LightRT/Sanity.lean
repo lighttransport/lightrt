@@ -450,4 +450,22 @@ example : ∃ M R : ℝ, 0 < M ∧ 1 ≤ R ∧ 192 * M * R ≤ 1 := by
   refine ⟨1/1000, 1, by norm_num, le_rfl, ?_⟩
   norm_num
 
+
+/-- Round-linear / flat real models are non-vacuous. -/
+example (o d p0 p1 : Vec3) (r0 r1 tmin tbest t : ℝ)
+    (h : rlcReal o d p0 p1 r0 r1 tmin tbest = some t) :
+    HitsRoundLinear o d p0 p1 r0 r1 tmin tbest t :=
+  rlcReal_sound o d p0 p1 r0 r1 tmin tbest t h
+
+example (o d p0 p1 b : Vec3) (r0 r1 tmin tbest t : ℝ)
+    (h : flatReal o d p0 p1 b r0 r1 tmin tbest = some t) :
+    HitsFlatLinear o d p0 p1 r0 r1 b tmin tbest t :=
+  flatReal_sound o d p0 p1 b r0 r1 tmin tbest t h
+
+/-- A point in the flat-ribbon two-triangle quad is on the ribbon. -/
+example (p0 p1 b x : Vec3) (r0 r1 : ℝ) (hr0 : 0 ≤ r0) (hr1 : 0 ≤ r1)
+    (hx : InQuad (p0 - r0 • b) (p0 + r0 • b) (p1 + r1 • b) (p1 - r1 • b) x) :
+    OnFlatLinear p0 p1 r0 r1 p0 b x :=
+  inQuad_flat_of_onFlatLinear p0 p1 b r0 r1 hr0 hr1 hx
+
 end LightRT.Sanity

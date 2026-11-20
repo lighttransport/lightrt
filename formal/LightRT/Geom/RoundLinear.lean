@@ -7,6 +7,7 @@
 import Mathlib
 import LightRT.Geom.Hull
 import LightRT.Geom.Basic
+import LightRT.Geom.PrimReal
 
 namespace LightRT.Geom
 open LightRT.Geom.Hull
@@ -203,6 +204,181 @@ theorem flatLinear_exists_nearest_hit (o d p0 p1 b : Vec3) (r0 r1 tmin tbest : �
   refine ⟨tstar, ⟨htstarH.1, htstar_best, htstarH.2.2⟩, ?_⟩
   intro t ht
   exact hmin ⟨ht.1, le_of_lt ht.2.1, ht.2.2⟩
+
+/-- Tapered-radius box containment: a point on the round-linear swept tube
+    (radii nonnegative) lies in the box spanned by the two end balls. -/
+theorem onRoundLinear_in_box (p0 p1 : Vec3) (r0 r1 : ℝ)
+    (hr0 : 0 ≤ r0) (hr1 : 0 ≤ r1) (lo hi : Vec3)
+    (hlo0 : ∀ i, lo i ≤ p0 i - r0) (hlo1 : ∀ i, lo i ≤ p1 i - r1)
+    (hhi0 : ∀ i, p0 i + r0 ≤ hi i) (hhi1 : ∀ i, p1 i + r1 ≤ hi i)
+    {x : Vec3} (hx : OnRoundLinear p0 p1 r0 r1 x) : Box.Mem ⟨lo, hi⟩ x := by
+  rcases hx with ⟨s, hs, hdist⟩
+  intro i
+  have hcoord : |x i - roundLinearCenter p0 p1 s i| ≤ roundLinearRadius r0 r1 s := by
+    have hle1 : ‖(x - roundLinearCenter p0 p1 s) i‖ ≤ ‖x - roundLinearCenter p0 p1 s‖ :=
+      norm_le_pi_norm (x - roundLinearCenter p0 p1 s) i
+    have hle2 : ‖x - roundLinearCenter p0 p1 s‖ = dist x (roundLinearCenter p0 p1 s) := by
+      rw [dist_eq_norm]
+    rw [Real.norm_eq_abs, ← dist_eq_norm] at hle1
+    exact hle1.trans hdist
+  constructor
+  · have hwlow : -roundLinearRadius r0 r1 s ≤ x i - roundLinearCenter p0 p1 s i :=
+      (abs_le.mp hcoord).1
+    have h0 := hlo0 i
+    have h1 := hlo1 i
+    simp [roundLinearCenter, roundLinearRadius] at hwlow
+    nlinarith [hs.1, hs.2, h0, h1, hwlow]
+  · have hwhigh : x i - roundLinearCenter p0 p1 s i ≤ roundLinearRadius r0 r1 s :=
+      (abs_le.mp hcoord).2
+    have h0 := hhi0 i
+    have h1 := hhi1 i
+    simp [roundLinearCenter, roundLinearRadius] at hwhigh
+    nlinarith [hs.1, hs.2, h0, h1, hwhigh]
+
+/-- The round-linear intersector model: return the nearest hit parameter, or
+    none when there is no hit. (Classical choice of the compactness minimizer;
+    the swept tube is precisely Embree's round-linear curve = tapered cone plus
+    end spheres.) -/
+noncomputable def rlcReal (o d p0 p1 : Vec3) (r0 r1 tmin tbest : ℝ) : Option ℝ := by
+  classical
+  by_cases h : ∃ t, HitsRoundLinear o d p0 p1 r0 r1 tmin tbest t
+  · exact some (Classical.choose (roundLinear_exists_nearest_hit o d p0 p1 r0 r1 tmin tbest h))
+  · exact none
+
+theorem rlcReal_sound (o d p0 p1 : Vec3) (r0 r1 tmin tbest t : ℝ)
+    (h : rlcReal o d p0 p1 r0 r1 tmin tbest = some t) :
+    HitsRoundLinear o d p0 p1 r0 r1 tmin tbest t := by
+  classical
+  by_cases hh : ∃ t, HitsRoundLinear o d p0 p1 r0 r1 tmin tbest t
+  · have hs := roundLinear_exists_nearest_hit o d p0 p1 r0 r1 tmin tbest hh
+    have hval : rlcReal o d p0 p1 r0 r1 tmin tbest = some (Classical.choose hs) := by
+      simp [rlcReal, hh]
+    have ht_eq : Classical.choose hs = t := by simpa [hval] using h
+    rw [← ht_eq]
+    exact (Classical.choose_spec hs).1
+  · have hnone : rlcReal o d p0 p1 r0 r1 tmin tbest = none := by simp [rlcReal, hh]
+    rw [hnone] at h
+    contradiction
+
+theorem rlcReal_complete (o d p0 p1 : Vec3) (r0 r1 tmin tbest : ℝ)
+    (hhit : ∃ t, HitsRoundLinear o d p0 p1 r0 r1 tmin tbest t) :
+    ∃ t, rlcReal o d p0 p1 r0 r1 tmin tbest = some t := by
+  classical
+  refine ⟨Classical.choose (roundLinear_exists_nearest_hit o d p0 p1 r0 r1 tmin tbest hhit), ?_⟩
+  simp [rlcReal, hhit]
+
+theorem rlcReal_nearest (o d p0 p1 : Vec3) (r0 r1 tmin tbest t t' : ℝ)
+    (h : rlcReal o d p0 p1 r0 r1 tmin tbest = some t)
+    (ht' : HitsRoundLinear o d p0 p1 r0 r1 tmin tbest t') : t ≤ t' := by
+  classical
+  by_cases hh : ∃ t, HitsRoundLinear o d p0 p1 r0 r1 tmin tbest t
+  · have hs := roundLinear_exists_nearest_hit o d p0 p1 r0 r1 tmin tbest hh
+    have hval : rlcReal o d p0 p1 r0 r1 tmin tbest = some (Classical.choose hs) := by
+      simp [rlcReal, hh]
+    have ht_eq : Classical.choose hs = t := by simpa [hval] using h
+    rw [← ht_eq]
+    exact (Classical.choose_spec hs).2 t' ht'
+  · have hnone : rlcReal o d p0 p1 r0 r1 tmin tbest = none := by simp [rlcReal, hh]
+    rw [hnone] at h
+    contradiction
+
+/-- The flat-ribbon intersector model: nearest hit over the ray-facing ribbon. -/
+noncomputable def flatReal (o d p0 p1 b : Vec3) (r0 r1 tmin tbest : ℝ) : Option ℝ := by
+  classical
+  by_cases h : ∃ t, HitsFlatLinear o d p0 p1 r0 r1 b tmin tbest t
+  · exact some (Classical.choose (flatLinear_exists_nearest_hit o d p0 p1 b r0 r1 tmin tbest h))
+  · exact none
+
+theorem flatReal_sound (o d p0 p1 b : Vec3) (r0 r1 tmin tbest t : ℝ)
+    (h : flatReal o d p0 p1 b r0 r1 tmin tbest = some t) :
+    HitsFlatLinear o d p0 p1 r0 r1 b tmin tbest t := by
+  classical
+  by_cases hh : ∃ t, HitsFlatLinear o d p0 p1 r0 r1 b tmin tbest t
+  · have hs := flatLinear_exists_nearest_hit o d p0 p1 b r0 r1 tmin tbest hh
+    have hval : flatReal o d p0 p1 b r0 r1 tmin tbest = some (Classical.choose hs) := by
+      simp [flatReal, hh]
+    have ht_eq : Classical.choose hs = t := by simpa [hval] using h
+    rw [← ht_eq]
+    exact (Classical.choose_spec hs).1
+  · have hnone : flatReal o d p0 p1 b r0 r1 tmin tbest = none := by simp [flatReal, hh]
+    rw [hnone] at h
+    contradiction
+
+theorem flatReal_complete (o d p0 p1 b : Vec3) (r0 r1 tmin tbest : ℝ)
+    (hhit : ∃ t, HitsFlatLinear o d p0 p1 r0 r1 b tmin tbest t) :
+    ∃ t, flatReal o d p0 p1 b r0 r1 tmin tbest = some t := by
+  classical
+  refine ⟨Classical.choose (flatLinear_exists_nearest_hit o d p0 p1 b r0 r1 tmin tbest hhit), ?_⟩
+  simp [flatReal, hhit]
+
+theorem flatReal_nearest (o d p0 p1 b : Vec3) (r0 r1 tmin tbest t t' : ℝ)
+    (h : flatReal o d p0 p1 b r0 r1 tmin tbest = some t)
+    (ht' : HitsFlatLinear o d p0 p1 r0 r1 b tmin tbest t') : t ≤ t' := by
+  classical
+  by_cases hh : ∃ t, HitsFlatLinear o d p0 p1 r0 r1 b tmin tbest t
+  · have hs := flatLinear_exists_nearest_hit o d p0 p1 b r0 r1 tmin tbest hh
+    have hval : flatReal o d p0 p1 b r0 r1 tmin tbest = some (Classical.choose hs) := by
+      simp [flatReal, hh]
+    have ht_eq : Classical.choose hs = t := by simpa [hval] using h
+    rw [← ht_eq]
+    exact (Classical.choose_spec hs).2 t' ht'
+  · have hnone : flatReal o d p0 p1 b r0 r1 tmin tbest = none := by simp [flatReal, hh]
+    rw [hnone] at h
+    contradiction
+
+/-- The four corners of the ray-facing flat ribbon (a trapezoid). -/
+def flatQuad (p0 p1 b : Vec3) (r0 r1 : ℝ) : Fin 4 → Vec3 :=
+  ![p0 - r0 • b, p0 + r0 • b, p1 + r1 • b, p1 - r1 • b]
+
+/-- A point in the two-triangle quad of the flat-ribbon corners is on the
+    ribbon. This connects the C's flat-curve two-MT-triangle intersector to the
+    swept-ribbon model: `quadReal` over these corners is a correct flat hit. -/
+theorem inQuad_flat_of_onFlatLinear (p0 p1 b : Vec3) (r0 r1 : ℝ)
+    (hr0 : 0 ≤ r0) (hr1 : 0 ≤ r1) {x : Vec3}
+    (hx : InQuad (p0 - r0 • b) (p0 + r0 • b) (p1 + r1 • b) (p1 - r1 • b) x) :
+    OnFlatLinear p0 p1 r0 r1 p0 b x := by
+  let v0 : Vec3 := p0 - r0 • b
+  let v1 : Vec3 := p0 + r0 • b
+  let v2 : Vec3 := p1 + r1 • b
+  let v3 : Vec3 := p1 - r1 • b
+  rcases hx with hx | hx
+  · rcases hx with ⟨u, v, hu0, hv0, huv, hpt⟩
+    refine ⟨v, ⟨hv0, ?_⟩, (2*u - 1 + v) * r0 + v * r1, ?_, ?_⟩
+    · -- v ≤ 1
+      linarith
+    · -- |w| ≤ rad(v)
+      rw [abs_le]
+      constructor
+      · have : 0 ≤ 2*u*r0 + 2*v*r1 := by positivity
+        unfold roundLinearRadius
+        linarith
+      · have : (u + v - 1) * r0 ≤ 0 := mul_nonpos_of_nonpos_of_nonneg (by linarith) hr0
+        unfold roundLinearRadius
+        linarith
+    · -- point identity
+      ext i
+      have hpti := congrArg (fun f : Vec3 => f i) hpt
+      simp only [Pi.add_apply, Pi.sub_apply, Pi.smul_apply, smul_eq_mul] at hpti ⊢
+      unfold roundLinearCenter
+      simp only [Pi.add_apply, Pi.smul_apply, smul_eq_mul]
+      linear_combination hpti
+  · rcases hx with ⟨u, v, hu0, hv0, huv, hpt⟩
+    refine ⟨u + v, ⟨by positivity, by linarith⟩, (u + v - 1) * r0 + (u - v) * r1, ?_, ?_⟩
+    · rw [abs_le]
+      constructor
+      · have : 0 ≤ 2*u*r1 := by positivity
+        unfold roundLinearRadius
+        linarith
+      · have h1 : (u + v - 1) * r0 ≤ 0 := mul_nonpos_of_nonpos_of_nonneg (by linarith) hr0
+        have h2 : (-v) * r1 ≤ 0 := mul_nonpos_of_nonpos_of_nonneg (by linarith) hr1
+        unfold roundLinearRadius
+        linarith
+    · ext i
+      have hpti := congrArg (fun f : Vec3 => f i) hpt
+      simp only [Pi.add_apply, Pi.sub_apply, Pi.smul_apply, smul_eq_mul] at hpti ⊢
+      unfold roundLinearCenter
+      simp only [Pi.add_apply, Pi.smul_apply, smul_eq_mul]
+      linear_combination hpti
 
 end
 end LightRT.Geom
