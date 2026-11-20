@@ -7,6 +7,8 @@
 import Mathlib
 import LightRT.Geom.SphereTraceConvergence
 import LightRT.Geom.SphereTrace3
+import LightRT.Geom.Basic
+import LightRT.Geom.CapsuleReal
 
 namespace LightRT.Geom
 noncomputable section
@@ -47,6 +49,34 @@ theorem sdf_boundary_exists {X : Type*} [NormedAddCommGroup X] [NormedSpace ℝ 
   have himg := intermediate_value_Icc' (le_of_lt ht) hcont hy
   rcases himg with ⟨s, hs, hsg⟩
   exact ⟨s, hs, by simpa [g] using hsg⟩
+
+/-- The sphere SDF `p ↦ dist p c - r` is 1-Lipschitz. -/
+theorem sdfSphere_AbsLipschitz (c : Vec3) (r : ℝ) :
+    AbsLipschitz (fun p : Vec3 => dist p c - r) := by
+  intro x y
+  have h := absLipschitz_infDist ({c} : Set Vec3) x y
+  simpa [Metric.infDist_singleton] using h
+
+/-- The sphere SDF along a ray with `‖v‖ ≤ 1` is 1-Lipschitz in the parameter. -/
+theorem sdfSphere_line_lipschitz (c : Vec3) (r : ℝ) {x₀ v : Vec3} (hv : ‖v‖ ≤ 1) (t u : ℝ) :
+    |(dist (x₀ + t • v) c - r) - (dist (x₀ + u • v) c - r)| ≤ |t - u| := by
+  simpa [Metric.infDist_singleton] using
+    (infDist_line_lipschitz ({c} : Set Vec3) hv t u)
+
+/-- The curve-capsule intersector over ℝ is exactly the capsule model:
+    a constant-radius hair segment is a capsule. Its sound/complete/nearest
+    facts are `capsuleReal_sound` / `capsuleReal_complete` and the nearest-hit
+    existence from compactness of the capsule section. -/
+theorem crvReal_sound {o dir p0 p1 : Vec3} {r tmin tbest t : ℝ}
+    (h : capsuleReal o dir p0 p1 r tmin tbest = some t) :
+    HitsCapsuleAt o dir p0 p1 r tmin tbest t :=
+  capsuleReal_sound h
+
+theorem crvReal_complete {o dir p0 p1 : Vec3} {r tmin tbest t : ℝ}
+    (hp0p1 : p0 ≠ p1) (hdir : perpTo dir (p1 - p0) ≠ 0)
+    (hhit : HitsCapsuleAt o dir p0 p1 r tmin tbest t) :
+    ∃ t', capsuleReal o dir p0 p1 r tmin tbest = some t' ∧ t' ≤ t :=
+  capsuleReal_complete hp0p1 hdir hhit
 
 end
 end LightRT.Geom

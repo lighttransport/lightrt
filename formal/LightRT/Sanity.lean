@@ -506,4 +506,24 @@ example (P : Fin 3 → Vec3) (t u : ℝ) (ht0 : 0 < t) (ht1 : t < 1)
     bsplineCurve (bezKnot 2) (fun i => if h : i < 3 then P ⟨i,h⟩ else 0) 2 2 u :=
   boehm2_preserves P t ht0 ht1 u hu0 hu1
 
+
+/-- Remaining intersector contracts are non-vacuous. -/
+example (c : Vec3) (r : ℝ) : AbsLipschitz (fun p : Vec3 => dist p c - r) :=
+  sdfSphere_AbsLipschitz c r
+
+example (o dir p0 p1 : Vec3) (r tmin tbest t : ℝ)
+    (h : capsuleReal o dir p0 p1 r tmin tbest = some t) :
+    HitsCapsuleAt o dir p0 p1 r tmin tbest t :=
+  crvReal_sound h
+
+example (o d : Vec3) (w : Fin 16 → ℝ) (P : Fin 16 → Vec3)
+    (R : TrimRegion) {tmin tbest : ℝ}
+    (hits : List (ℝ × ℝ × ℝ))
+    (hparam : ∀ u v t, (u, v, t) ∈ hits → tmin ≤ t ∧ t < tbest ∧
+      o + t • d = ratEval w P u v)
+    {t : ℝ} (hscan : nearestVisibleT R hits = some t) :
+    ∃ u v, o + t • d = ratEval w P u v := by
+  rcases trimmed_contract_spec o d w P R hits hparam hscan with ⟨_, _, h⟩
+  exact h
+
 end LightRT.Sanity
