@@ -497,4 +497,13 @@ example (c : PatchCell) (t t' : ℝ) (hle : t ≤ t') :
   intro h
   exact hle
 
+
+/-- Degree-2 Boehm insertion preserves the quadratic Bezier curve. -/
+example (P : Fin 3 → Vec3) (t u : ℝ) (ht0 : 0 < t) (ht1 : t < 1)
+    (hu0 : 0 ≤ u) (hu1 : u < 1) :
+    bsplineCurve (insertKnot (bezKnot 2) 2 t)
+      (fun i => if h : i < 4 then boehm2 P t ⟨i,h⟩ else 0) 2 3 u =
+    bsplineCurve (bezKnot 2) (fun i => if h : i < 3 then P ⟨i,h⟩ else 0) 2 2 u :=
+  boehm2_preserves P t ht0 ht1 u hu0 hu1
+
 end LightRT.Sanity
