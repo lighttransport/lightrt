@@ -150,8 +150,9 @@ remaining sub-items from the 2026-11-20 push:
   remove the residual `1 <= R` side condition.
 - **Tier 1, NURBS**: general-degree Cox–de Boor refinement equation and
   Boehm curve preservation are now proved (`bsplineBasis_refine`,
-  `boehm_preserves`). Repeated-insertion Bezier extraction and the full
-  tensor-product surface version remain open.
+  `boehm_preserves`), along with iterated insertion (`boehm_iterate`) and
+  tensor-product surfaces (`tensorBspline_insert_u/_v`,
+  `rationalTensorBezier_eq_ratEval` connecting to ratEval).
 - **Tier 1, trimmed NURBS**: crossing-number parity (far-right zero, edgeCrossX
   betweenness, general rectangle), bridge additivity (crossingNumber_append)
   and cyclic rotation invariance of the closed-loop crossing number are proved.
@@ -183,7 +184,7 @@ remaining sub-items from the 2026-11-20 push:
 > Bezier extraction), trim loops + finite nearest-visible scan, curve/SDF soundness
 > APIs, and M15/M16 contracts. The concrete remaining sub-items are listed above
 > under "Remaining items" — start with the most tractable (e.g. round/flat tube
-> closedness, general-degree Boehm refinement, general crossing parity). Everything
+> closedness). Everything
 > else is a recorded boundary (ISA, tangency, fp64 margins, GPU) or empirical gate
 > (`wtcheck`, `primhitcheck`).
 >
