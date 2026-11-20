@@ -537,4 +537,8 @@ example (p : ℝ × ℝ) (l : TrimLoop) (x y : ℝ) (hne : l ≠ []) :
     crossingNumberClosed (p :: l) x y = crossingNumberClosed (l ++ [p]) x y :=
   crossingNumberClosed_rotate p l x y hne
 
+
+/-- Torus SDF is 1-Lipschitz. -/
+example (R r : ℝ) : AbsLipschitz (sdfTorus R r) := sdfTorus_AbsLipschitz R r
+
 end LightRT.Sanity

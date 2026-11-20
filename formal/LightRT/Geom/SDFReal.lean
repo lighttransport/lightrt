@@ -78,5 +78,46 @@ theorem crvReal_complete {o dir p0 p1 : Vec3} {r tmin tbest t : ℝ}
     ∃ t', capsuleReal o dir p0 p1 r tmin tbest = some t' ∧ t' ≤ t :=
   capsuleReal_complete hp0p1 hdir hhit
 
+def projXZ (p : EuclideanSpace ℝ (Fin 3)) : EuclideanSpace ℝ (Fin 2) := !₂[p 0, p 2]
+
+/-- Torus distance (axis y), matching tri_sdf_eval. -/
+def sdfTorus (R r : ℝ) (p : EuclideanSpace ℝ (Fin 3)) : ℝ :=
+  ‖(!₂[‖projXZ p‖ - R, p 1] : EuclideanSpace ℝ (Fin 2))‖ - r
+
+theorem sdfTorus_AbsLipschitz (R r : ℝ) : AbsLipschitz (sdfTorus R r) := by
+  intro p q
+  unfold sdfTorus
+  simp only [sub_sub_sub_cancel_right]
+  -- |‖v p‖ - ‖v q‖| ≤ dist p q
+  calc
+    |‖(!₂[‖projXZ p‖ - R, p 1] : EuclideanSpace ℝ (Fin 2))‖ -
+      ‖(!₂[‖projXZ q‖ - R, q 1] : EuclideanSpace ℝ (Fin 2))‖| ≤
+        ‖(!₂[‖projXZ p‖ - R, p 1] : EuclideanSpace ℝ (Fin 2)) -
+          (!₂[‖projXZ q‖ - R, q 1] : EuclideanSpace ℝ (Fin 2))‖ := by
+            exact abs_norm_sub_norm_le _ _
+    _ ≤ dist p q := by
+      rw [dist_eq_norm]
+      have hsq_le : ‖(!₂[‖projXZ p‖ - R, p 1] : EuclideanSpace ℝ (Fin 2)) -
+          (!₂[‖projXZ q‖ - R, q 1] : EuclideanSpace ℝ (Fin 2))‖ ^ 2 ≤ ‖p - q‖ ^ 2 := by
+        rw [PiLp.norm_sq_eq_of_L2, PiLp.norm_sq_eq_of_L2]
+        simp [Fin.sum_univ_two, Fin.sum_univ_three, projXZ]
+        -- need (‖projXZ p‖ - ‖projXZ q‖)^2 + (p1-q1)^2 ≤ sum of 3 squared diffs
+        have hpq : |‖projXZ p‖ - ‖projXZ q‖| ≤ ‖projXZ p - projXZ q‖ :=
+          abs_norm_sub_norm_le _ _
+        have hsq : ‖projXZ p - projXZ q‖ ^ 2 =
+            ‖(projXZ p - projXZ q) 0‖^2 + ‖(projXZ p - projXZ q) 1‖^2 := by
+          rw [PiLp.norm_sq_eq_of_L2]
+          simp [Fin.sum_univ_two]
+        have hpq2 : (‖projXZ p‖ - ‖projXZ q‖)^2 ≤
+            ‖(projXZ p - projXZ q) 0‖^2 + ‖(projXZ p - projXZ q) 1‖^2 := by
+          have hpq_sq : |‖projXZ p‖ - ‖projXZ q‖| ^ 2 ≤ ‖projXZ p - projXZ q‖ ^ 2 := by
+            exact sq_le_sq.mpr (by simpa [abs_of_nonneg (norm_nonneg (projXZ p - projXZ q))] using hpq)
+          rw [sq_abs] at hpq_sq
+          nlinarith [hpq_sq]
+        simp [projXZ] at hpq2
+        nlinarith [hpq2, sq_nonneg (p 0 - q 0), sq_nonneg (p 1 - q 1), sq_nonneg (p 2 - q 2)]
+      have h := sq_le_sq.mp hsq_le
+      simpa using h
+
 end
 end LightRT.Geom
