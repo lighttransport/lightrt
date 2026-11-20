@@ -148,9 +148,10 @@ remaining sub-items from the 2026-11-20 push:
   the cell size (local center (1/2,1/2)); δ stays data for arbitrary control
   points by decision. A local-curvature bound that shrinks with cell size would
   remove the residual `1 <= R` side condition.
-- **Tier 1, NURBS**: general-degree Boehm insertion / Cox–de Boor refinement
-  equation (only degree 0 and degree 1 are proved; degree 3 Bezier extraction
-  via `bezKnot_ratEval` is done); full tensor-product general knot insertion.
+- **Tier 1, NURBS**: general-degree Cox–de Boor refinement equation and
+  Boehm curve preservation are now proved (`bsplineBasis_refine`,
+  `boehm_preserves`). Repeated-insertion Bezier extraction and the full
+  tensor-product surface version remain open.
 - **Tier 1, trimmed NURBS**: crossing-number parity (far-right zero, edgeCrossX
   betweenness, general rectangle), bridge additivity (crossingNumber_append)
   and cyclic rotation invariance of the closed-loop crossing number are proved.

@@ -541,4 +541,18 @@ example (p : ℝ × ℝ) (l : TrimLoop) (x y : ℝ) (hne : l ≠ []) :
 /-- Torus SDF is 1-Lipschitz. -/
 example (R r : ℝ) : AbsLipschitz (sdfTorus R r) := sdfTorus_AbsLipschitz R r
 
+
+/-- General Cox–de Boor refinement and Boehm insertion are non-vacuous. -/
+example (U : ℕ → ℝ) (k : ℕ) (u x : ℝ) (D : KnotData U k u) (p i : ℕ) :
+    bsplineBasis U i p x =
+      (1 - insertAlpha U k u i p) * bsplineBasis (insertKnot U k u) i p x +
+      insertAlpha U k u (i+1) p * bsplineBasis (insertKnot U k u) (i+1) p x :=
+  bsplineBasis_refine U k u x D p i
+
+example (U : ℕ → ℝ) (k : ℕ) (u : ℝ) (D : KnotData U k u)
+    (p n : ℕ) (hpk : p ≤ k) (hn : k ≤ n) (P : ℕ → Vec3) :
+    bsplineCurve (insertKnot U k u) (boehmControl U k u p P) p (n+1) u =
+      bsplineCurve U P p n u :=
+  boehm_preserves U k u D p n hpk hn P
+
 end LightRT.Sanity

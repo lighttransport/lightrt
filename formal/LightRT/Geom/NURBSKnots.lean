@@ -275,5 +275,246 @@ theorem boehm2_preserves (P : Fin 3 → Vec3) (t : ℝ) (ht0 : 0 < t) (ht1 : t <
     field_simp [ne_of_gt ht0]
     ring
 
+def insertAlpha (U : ℕ → ℝ) (k : ℕ) (u : ℝ) (i p : ℕ) : ℝ :=
+  if p ≤ k ∧ i ≤ k - p then 0
+  else if i ≤ k then (U (i + p) - u) / (U (i + p) - U i)
+  else 1
+
+structure KnotData (U : ℕ → ℝ) (k : ℕ) (u : ℝ) where
+  hbelow : ∀ j, j ≤ k → U j < u
+  habove : ∀ j, k + 1 ≤ j → u < U j
+  hden : ∀ i p, 0 < p → U (i + p) ≠ U i
+
+lemma coeff1 (U : ℕ → ℝ) (k : ℕ) (u x : ℝ) (D : KnotData U k u) (p i : ℕ) :
+    ((x - U i) / (U (i + p + 1) - U i)) * (1 - insertAlpha U k u i p) =
+      (1 - insertAlpha U k u i (p+1)) *
+        ((x - insertKnot U k u i) / (insertKnot U k u (i + p + 1) - insertKnot U k u i)) := by
+  have hdpos : ∀ (j q : ℕ), 0 < q → U (j + q) - U j ≠ 0 := by
+    intro j q hq h; apply D.hden j q hq; linarith
+  have hupos : ∀ j, u - U j ≠ 0 := by
+    intro j h
+    by_cases hj : j ≤ k
+    · have := D.hbelow j hj; linarith
+    · have hj' : k + 1 ≤ j := by omega
+      have := D.habove j hj'; linarith
+  unfold insertAlpha
+  simp (disch := omega) [insertKnot]
+  split_ifs <;> try omega
+  all_goals
+    have h1 : U (i + p + 1) - U i ≠ 0 := by
+      have hh := hdpos i (p+1) (by omega)
+      have heq : i + (p+1) = i+p+1 := by omega
+      simpa [heq] using hh
+    have hu' : -U i + u ≠ 0 := by intro h; apply hupos i; linarith
+    have hu_neg : ∀ j, -U j + u ≠ 0 := by intro j h; apply hupos j; linarith
+    have hUu : ∀ j, U j - u ≠ 0 := by intro j h; apply hupos j; linarith
+    have hUn : ∀ j q, 0 < q → -U j + U (j+q) ≠ 0 := by
+      intro j q hq h; apply hdpos j q hq; linarith
+    have ha : U (2+i+p) - U (1+i) ≠ 0 := by
+      have heq : (1+i) + (p+1) = 2+i+p := by omega
+      rw [← heq]
+      exact hdpos (1+i) (p+1) (by omega)
+    have hc : -U (1+i) + U (2+i+p) ≠ 0 := by intro h; apply ha; linarith
+    field_simp [h1, hu', ha, hc, hdpos, hupos, hu_neg, hUu, hUn, Nat.add_assoc] <;> ring_nf <;> try
+      (have hp_pos : 0 < p := by omega
+       have h0 : U (i+p) - U i ≠ 0 := hdpos i p hp_pos
+       have h0' : -U i + U (i+p) ≠ 0 := by intro h; apply h0; linarith
+       have hd : U (1+i+p) - U (1+i) ≠ 0 := by
+         have heq : (1+i) + p = 1+i+p := by omega
+         rw [← heq]
+         exact hdpos (1+i) p hp_pos
+       have hd' : -U (1+i) + U (1+i+p) ≠ 0 := by intro h; apply hd; linarith
+       have hu1 : U (1+i+p) - u ≠ 0 := by
+         by_cases hh : 1+i+p ≤ k
+         · have := D.hbelow (1+i+p) hh; linarith
+         · have hh' : k+1 ≤ 1+i+p := by omega
+           have := D.habove (1+i+p) hh'; linarith
+       field_simp [h0, h0', hd, hd', hu1, ha, hc] <;> ring)
+    all_goals field_simp [ha, hc] <;> ring
+
+
+/-- Coefficient identity (2). -/
+lemma coeff2 (U : ℕ → ℝ) (k : ℕ) (u x : ℝ) (D : KnotData U k u) (p i : ℕ) :
+    ((x - U i) / (U (i+p+1) - U i)) * insertAlpha U k u (i+1) p +
+      ((U (i+p+2) - x) / (U (i+p+2) - U (i+1))) * (1 - insertAlpha U k u (i+1) p) =
+    (1 - insertAlpha U k u i (p+1)) *
+      ((insertKnot U k u (i+p+2) - x) / (insertKnot U k u (i+p+2) - insertKnot U k u (i+1))) +
+      insertAlpha U k u (i+1) (p+1) *
+      ((x - insertKnot U k u (i+1)) / (insertKnot U k u (i+p+2) - insertKnot U k u (i+1))) := by
+  have hdpos : ∀ (j q : ℕ), 0 < q → U (j + q) - U j ≠ 0 := by
+    intro j q hq h; apply D.hden j q hq; linarith
+  have hupos : ∀ j, u - U j ≠ 0 := by
+    intro j h
+    by_cases hj : j ≤ k
+    · have := D.hbelow j hj; linarith
+    · have hj' : k + 1 ≤ j := by omega
+      have := D.habove j hj'; linarith
+  unfold insertAlpha
+  simp (disch := omega) [insertKnot]
+  split_ifs <;> try omega
+  all_goals
+    have h1 : U (i + p + 1) - U i ≠ 0 := by
+      have hh := hdpos i (p+1) (by omega)
+      have heq : i + (p+1) = i+p+1 := by omega
+      simpa [heq] using hh
+    have hu' : -U i + u ≠ 0 := by intro h; apply hupos i; linarith
+    have hu_neg : ∀ j, -U j + u ≠ 0 := by intro j h; apply hupos j; linarith
+    have hUu : ∀ j, U j - u ≠ 0 := by intro j h; apply hupos j; linarith
+    have hUn : ∀ j q, 0 < q → -U j + U (j+q) ≠ 0 := by
+      intro j q hq h; apply hdpos j q hq; linarith
+    have ha : U (2+i+p) - U (1+i) ≠ 0 := by
+      have heq : (1+i) + (p+1) = 2+i+p := by omega
+      rw [← heq]
+      exact hdpos (1+i) (p+1) (by omega)
+    have hc : -U (1+i) + U (2+i+p) ≠ 0 := by intro h; apply ha; linarith
+    field_simp [h1, hu', ha, hc, hdpos, hupos, hu_neg, hUu, hUn, Nat.add_assoc] <;> ring_nf <;> try
+      (have hp_pos : 0 < p := by omega
+       have h0 : U (i+p) - U i ≠ 0 := hdpos i p hp_pos
+       have h0' : -U i + U (i+p) ≠ 0 := by intro h; apply h0; linarith
+       have hd : U (1+i+p) - U (1+i) ≠ 0 := by
+         have heq : (1+i) + p = 1+i+p := by omega
+         rw [← heq]
+         exact hdpos (1+i) p hp_pos
+       have hd' : -U (1+i) + U (1+i+p) ≠ 0 := by intro h; apply hd; linarith
+       have hu1 : U (1+i+p) - u ≠ 0 := by
+         by_cases hh : 1+i+p ≤ k
+         · have := D.hbelow (1+i+p) hh; linarith
+         · have hh' : k+1 ≤ 1+i+p := by omega
+           have := D.habove (1+i+p) hh'; linarith
+       field_simp [h0, h0', hd, hd', hu1, ha, hc] <;> ring)
+    all_goals field_simp [ha, hc] <;> ring
+
+
+/-- Coefficient identity (3). -/
+lemma coeff3 (U : ℕ → ℝ) (k : ℕ) (u x : ℝ) (D : KnotData U k u) (p i : ℕ) :
+    ((U (i+p+2) - x) / (U (i+p+2) - U (i+1))) * insertAlpha U k u (i+2) p =
+      insertAlpha U k u (i+1) (p+1) *
+      ((insertKnot U k u (i+p+3) - x) / (insertKnot U k u (i+p+3) - insertKnot U k u (i+2))) := by
+  have hdpos : ∀ (j q : ℕ), 0 < q → U (j + q) - U j ≠ 0 := by
+    intro j q hq h; apply D.hden j q hq; linarith
+  have hupos : ∀ j, u - U j ≠ 0 := by
+    intro j h
+    by_cases hj : j ≤ k
+    · have := D.hbelow j hj; linarith
+    · have hj' : k + 1 ≤ j := by omega
+      have := D.habove j hj'; linarith
+  unfold insertAlpha
+  simp (disch := omega) [insertKnot]
+  split_ifs <;> try omega
+  all_goals
+    have h1 : U (i + p + 1) - U i ≠ 0 := by
+      have hh := hdpos i (p+1) (by omega)
+      have heq : i + (p+1) = i+p+1 := by omega
+      simpa [heq] using hh
+    have hu' : -U i + u ≠ 0 := by intro h; apply hupos i; linarith
+    have hu_neg : ∀ j, -U j + u ≠ 0 := by intro j h; apply hupos j; linarith
+    have hUu : ∀ j, U j - u ≠ 0 := by intro j h; apply hupos j; linarith
+    have hUn : ∀ j q, 0 < q → -U j + U (j+q) ≠ 0 := by
+      intro j q hq h; apply hdpos j q hq; linarith
+    have ha : U (2+i+p) - U (1+i) ≠ 0 := by
+      have heq : (1+i) + (p+1) = 2+i+p := by omega
+      rw [← heq]
+      exact hdpos (1+i) (p+1) (by omega)
+    have hc : -U (1+i) + U (2+i+p) ≠ 0 := by intro h; apply ha; linarith
+    field_simp [h1, hu', ha, hc, hdpos, hupos, hu_neg, hUu, hUn, Nat.add_assoc] <;> ring_nf <;> try
+      (have hp_pos : 0 < p := by omega
+       have h0 : U (i+p) - U i ≠ 0 := hdpos i p hp_pos
+       have h0' : -U i + U (i+p) ≠ 0 := by intro h; apply h0; linarith
+       have hd : U (1+i+p) - U (1+i) ≠ 0 := by
+         have heq : (1+i) + p = 1+i+p := by omega
+         rw [← heq]
+         exact hdpos (1+i) p hp_pos
+       have hd' : -U (1+i) + U (1+i+p) ≠ 0 := by intro h; apply hd; linarith
+       have hu1 : U (1+i+p) - u ≠ 0 := by
+         by_cases hh : 1+i+p ≤ k
+         · have := D.hbelow (1+i+p) hh; linarith
+         · have hh' : k+1 ≤ 1+i+p := by omega
+           have := D.habove (1+i+p) hh'; linarith
+       field_simp [h0, h0', hd, hd', hu1, ha, hc] <;> ring)
+    all_goals field_simp [ha, hc] <;> ring
+
+/-- **General Cox–de Boor refinement.** Inserting a knot `u` strictly inside
+    span `k` refines every degree-p basis function:
+    N_i^p = (1-α_i^p) N'^p_i + α_{i+1}^p N'^p_{i+1}. -/
+theorem bsplineBasis_refine (U : ℕ → ℝ) (k : ℕ) (u x : ℝ)
+    (D : KnotData U k u) (p : ℕ) :
+    ∀ i, bsplineBasis U i p x =
+      (1 - insertAlpha U k u i p) * bsplineBasis (insertKnot U k u) i p x +
+      insertAlpha U k u (i+1) p * bsplineBasis (insertKnot U k u) (i+1) p x := by
+  induction p with
+  | zero =>
+      intro i
+      have hr := bsplineBasis_zero_refinement U k u x (le_of_lt (D.hbelow k le_rfl)) (D.habove (k+1) le_rfl)
+      unfold insertAlpha
+      by_cases hik : i ≤ k
+      · by_cases hlt : i < k
+        · have hi1 : i + 1 ≤ k := by omega
+          simp [hik, hi1]
+          exact (hr.1 i hlt).symm
+        · have hik_eq : i = k := by omega
+          subst i
+          have hk1 : ¬ k + 1 ≤ k := by omega
+          simp [hk1]
+          exact hr.2.1
+      · have hi1 : ¬ i + 1 ≤ k := by omega
+        simp [hik, hi1]
+        exact hr.2.2 i (by omega : k < i)
+  | succ p ih =>
+      intro i
+      simp only [bsplineBasis]
+      rw [ih i, ih (i+1)]
+      have h1 := coeff1 U k u x D p i
+      have h2 := coeff2 U k u x D p i
+      have h3 := coeff3 U k u x D p i
+      simp only [Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] at h1 h2 h3 ⊢
+      -- let the three new-basis terms be atoms and use the coefficient identities
+      linear_combination h1 * bsplineBasis (insertKnot U k u) i p x +
+        h2 * bsplineBasis (insertKnot U k u) (i+1) p x +
+        h3 * bsplineBasis (insertKnot U k u) (i+2) p x
+
+
+/-- Boehm control points for inserting knot `u` at span `k`, degree `p`. -/
+def boehmControl (U : ℕ → ℝ) (k : ℕ) (u : ℝ) (p : ℕ) (P : ℕ → Vec3) (j : ℕ) : Vec3 :=
+  (1 - insertAlpha U k u j p) • P j + insertAlpha U k u j p • P (j - 1)
+
+/-- **General Boehm knot insertion preserves the curve.** -/
+theorem boehm_preserves (U : ℕ → ℝ) (k : ℕ) (u : ℝ) (D : KnotData U k u)
+    (p n : ℕ) (hpk : p ≤ k) (hn : k ≤ n) (P : ℕ → Vec3) :
+    bsplineCurve (insertKnot U k u) (boehmControl U k u p P) p (n+1) u =
+      bsplineCurve U P p n u := by
+  unfold bsplineCurve boehmControl
+  simp_rw [bsplineBasis_refine U k u u D p]
+  -- RHS is now sum of ((1-α_i)N'_i + α_{i+1}N'_{i+1}) • P_i
+  -- rewrite smul_add and sum_add_distrib
+  simp_rw [add_smul, Finset.sum_add_distrib]
+  -- first sum: Σ (1-α_i) • N'_i • P_i ; second: Σ α_{i+1} • N'_{i+1} • P_i
+  -- LHS is Σ_{j=0}^{n+1} N'_j • ((1-α_j)•P_j + α_j•P_{j-1})
+  rw [Finset.sum_range_succ]
+  simp only [smul_add, Finset.sum_add_distrib]
+  have h0 : insertAlpha U k u 0 p = 0 := by
+    unfold insertAlpha
+    have hkp : 0 ≤ k - p := by omega
+    simp [hpk, hkp]
+  have hlast : insertAlpha U k u (n+1) p = 1 := by
+    unfold insertAlpha
+    have hklt : ¬ n + 1 ≤ k := by omega
+    have hpk' : ¬ (p ≤ k ∧ n + 1 ≤ k - p) := by
+      intro h; omega
+    have hknp : k ≤ n + p := by omega
+    simp [hpk', hklt, hknp]
+  have hshift :
+      (∑ x ∈ Finset.range (n+1), bsplineBasis (insertKnot U k u) x p u •
+          insertAlpha U k u x p • P (x-1)) =
+        ∑ x ∈ Finset.range n, bsplineBasis (insertKnot U k u) (x+1) p u •
+          insertAlpha U k u (x+1) p • P x := by
+    rw [Finset.sum_range_succ']
+    simp [h0]
+  rw [hshift]
+  simp [h0, hlast]
+  simp only [Finset.sum_range_succ]
+  simp [hlast, smul_smul, mul_comm]
+  module
+
+
 end
 end LightRT.Geom
