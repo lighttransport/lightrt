@@ -360,7 +360,9 @@ example (w : Fin 16 → ℝ) (P : Fin 16 → Vec3) (u v : ℝ)
     (fun i => (∑ k : Fin 16,
         (bsplineBasis (bezKnot 3) (k.val % 4) 3 u *
          bsplineBasis (bezKnot 3) (k.val / 4) 3 v * w k) • P k i) /
-      (∑ k : Fin 16, LightRT.Geom.Hull.bern33 u v k * w k)) = ratEval w P u v := by
+      (∑ k : Fin 16,
+        bsplineBasis (bezKnot 3) (k.val % 4) 3 u *
+        bsplineBasis (bezKnot 3) (k.val / 4) 3 v * w k)) = ratEval w P u v := by
   exact bezKnot_ratEval w P u v hu0 hu1 hv0 hv1
 
 
