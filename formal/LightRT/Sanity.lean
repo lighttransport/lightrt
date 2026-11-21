@@ -592,4 +592,22 @@ example : ¬ ∃ θ : ℝ, 0 ≤ θ ∧ θ < 1 ∧
         θ * |(x - r.o i) / r.d i| :=
   LightRT.Robust.fpT_no_uniform_relative
 
+/-- Region queries: the conservative box test is non-trivial and monotone. -/
+example : LightRT.Geom.boxMayOverlap
+    (LightRT.Geom.Region.aabb (fun _ => (-1 : ℝ)) (fun _ => 1))
+    (⟨fun _ => (0 : ℝ), fun _ => (1 : ℝ)⟩ : Box) := by
+  intro i; constructor <;> norm_num
+
+example : ¬ LightRT.Geom.boxMayOverlap
+    (LightRT.Geom.Region.aabb (fun _ => (2 : ℝ)) (fun _ => 3))
+    (⟨fun _ => (0 : ℝ), fun _ => 1⟩ : Box) := by
+  intro h
+  have := (h 0).2
+  norm_num at this
+
+example (a b : Box) (hsub : a.Subset b)
+    (h : LightRT.Geom.boxMayOverlap (LightRT.Geom.Region.sphere (fun _ => (0 : ℝ)) 1) a) :
+    LightRT.Geom.boxMayOverlap (LightRT.Geom.Region.sphere (fun _ => (0 : ℝ)) 1) b :=
+  LightRT.Geom.boxMayOverlap_mono hsub h
+
 end LightRT.Sanity
