@@ -4985,6 +4985,31 @@ static inline int tri_traverse_node_core(const tri_ray_ctx *rc,
     return nhit;
 }
 
+/* c2lean core for the ascending-insertion half of a node step. Given the
+ * per-child slab results (ok/tnear) and child refs, emits the passing children
+ * in ascending tnear order into caller buffers. Factored separately so its
+ * refinement is independent of the slab kernel (composed in Phase 2). */
+static inline int tri_traverse_insert_core(const int *ok, const float *tn,
+                                           const uint32_t *child, int n,
+                                           uint32_t *out_ref, float *out_tnear) {
+    int nhit = 0;
+    for (int i = 0; i < n; i++) {
+        if (ok[i]) {
+            float t = tn[i];
+            int j = nhit;
+            nhit = nhit + 1;
+            while (j > 0 && out_tnear[j - 1] > t) {
+                out_tnear[j] = out_tnear[j - 1];
+                out_ref[j] = out_ref[j - 1];
+                j--;
+            }
+            out_tnear[j] = t;
+            out_ref[j] = child[i];
+        }
+    }
+    return nhit;
+}
+
 /* Scalar Moller-Trumbore on an explicit triangle (v0,v1,v2). Returns 1 and
  * writes t,u,v if the ray hits within [tmin, tbest). Shared by the quad/tetra
  * leaf intersectors. */
