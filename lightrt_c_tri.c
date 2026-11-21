@@ -4949,6 +4949,42 @@ static inline int tri_slab_scalar(const float *lo_x, const float *lo_y,
     return tnear <= tfar;
 }
 
+/* c2lean core for one NODE step of `tri_intersect_scalar` (Tier 1: BVH
+ * traversal refinement). Takes an already-decoded node's lo/hi arrays and
+ * children, tests each child with the verified `tri_slab_scalar`, and emits
+ * the hits in ascending tnear order into caller-provided buffers. Kept
+ * config-independent: the cull bound is passed in (`tbest`), and the push key
+ * is the raw slab tnear (the default, non-EXACT_NEAREST `TRI_PUSH_TN`; the EXN
+ * key is composed separately via `tri_exn_key` / `ExnKeyRefines.lean`).
+ * The caller writes the resulting hits onto the stack far-to-near. */
+static inline int tri_traverse_node_core(const tri_ray_ctx *rc,
+                                         const float *lo_x, const float *lo_y,
+                                         const float *lo_z, const float *hi_x,
+                                         const float *hi_y, const float *hi_z,
+                                         const uint32_t *child, int nchildren,
+                                         float tbest,
+                                         uint32_t *out_ref, float *out_tnear) {
+    int nhit = 0;
+    for (int i = 0; i < nchildren; i++) {
+        int ok;
+        ok = tri_slab_scalar(lo_x, lo_y, lo_z, hi_x, hi_y, hi_z, i, rc, tbest,
+                             &out_tnear[nhit]);
+        if (ok) {
+            float tn = out_tnear[nhit];
+            int j = nhit;
+            nhit = nhit + 1;
+            while (j > 0 && out_tnear[j - 1] > tn) {
+                out_tnear[j] = out_tnear[j - 1];
+                out_ref[j] = out_ref[j - 1];
+                j--;
+            }
+            out_tnear[j] = tn;
+            out_ref[j] = child[i];
+        }
+    }
+    return nhit;
+}
+
 /* Scalar Moller-Trumbore on an explicit triangle (v0,v1,v2). Returns 1 and
  * writes t,u,v if the ray hits within [tmin, tbest). Shared by the quad/tetra
  * leaf intersectors. */
