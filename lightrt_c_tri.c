@@ -25,9 +25,15 @@
 #endif
 
 #include "lightrt_c_tri.h"
+#include "lrt_sqrtf.h"
 
 #include <float.h>
 #include <math.h>
+/* Route every scalar sqrtf through the ISA's correctly-rounded sqrt
+ * instruction (see lrt_sqrtf.h).  Bit-identical to libm sqrtf on all
+ * supported targets; the formal c2lean translator maps lrt_sqrtf to the
+ * MiniC `sqrt` operation. */
+#define sqrtf lrt_sqrtf
 #include <stdio.h> /* serialization (fopen/fread/fwrite) */
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -939,6 +945,24 @@ static void tri_aligned_free(void *p) {
 
 static inline float tri_minf(float a, float b) { return a < b ? a : b; }
 static inline float tri_maxf(float a, float b) { return a > b ? a : b; }
+
+/* Scalar ray/sphere nearest-hit distance. This is the exact fp32 core of the
+ * sphere point primitive (tri_point_isect_one, sphere branch) factored into a
+ * translatable helper: it exercises the correctly-rounded sqrt path that the
+ * c2lean bridge models as `FP.Binary32.sqrtBits`. Returns -1 on a miss.
+ *
+ * Kept here as the smallest kernel that makes c2lean's sqrtf support
+ * end-to-end testable (Tier 1.2); the main intersectors call sqrtf directly. */
+static inline float tri_sphere_dist_f(const float *o, const float *d,
+                                      const float *c, float r) {
+    float ex = c[0] - o[0], ey = c[1] - o[1], ez = c[2] - o[2];
+    float proj = ex * d[0] + ey * d[1] + ez * d[2];
+    float l2 = ex * ex + ey * ey + ez * ez;
+    float perp2 = l2 - proj * proj;
+    float disc = r * r - perp2;
+    if (disc < 0.0f) return -1.0f;
+    return proj - sqrtf(disc);
+}
 /* LRT_TRI_EXACT_NEAREST: closest-hit node tests never depend on the current
  * best hit (box test against tmax, children pushed with tnear = tmin), so the
  * tnear-vs-hit-t comparison that can cull a nearer hit at the ulp level never
@@ -3977,6 +4001,24 @@ static inline void tri_rlc4_isect(const lrt_rlc4 *blk, const tri_ray_ctx *rc,
 
 /* ---- Point primitives: sphere / ray-facing disc / oriented disc ---------- *
  * Direct port of embree's sphere_intersector.h + disc_intersector.h. */
+/* c2lean-verified cores of the disc branches of tri_point_isect_one. */
+static inline float tri_point_oriented_core(const float org[3], const float dir[3],
+                                            float cx, float cy, float cz,
+                                            float nx, float ny, float nz) {
+    float c0x = cx - org[0], c0y = cy - org[1], c0z = cz - org[2];
+    float divisor = dir[0] * nx + dir[1] * ny + dir[2] * nz;
+    return (c0x * nx + c0y * ny + c0z * nz) / divisor;
+}
+
+static inline float tri_point_raydisc_core(const float org[3], const float dir[3],
+                                           float cx, float cy, float cz) {
+    float dx = dir[0], dy = dir[1], dz = dir[2];
+    float dOdO = dx * dx + dy * dy + dz * dz;
+    float c0x = cx - org[0], c0y = cy - org[1], c0z = cz - org[2];
+    float rd2 = 1.0f / dOdO;
+    return (c0x * dx + c0y * dy + c0z * dz) * rd2;
+}
+
 static int tri_point_isect_one(const tri_ray_ctx *rc, float best_t, float cx,
                                float cy, float cz, float r, float nx, float ny,
                                float nz, float ry, float angle, int point_type,
@@ -4806,6 +4848,21 @@ static inline int tri_sph_isect_lane(const float *f, int bw, int lane,
     *u = atan2f(nz, nx) * TRI_INV_2PI + 0.5f;
     *v = acosf(cl) * TRI_INV_PI;
     return 1;
+}
+
+/* c2lean-verified quadratic core of tri_sph_isect_lane: the near ray/sphere
+ * root (-b - sqrt(disc))/a, with the same fp32 evaluation order as the full
+ * intersector. The guards and far-root fallback stay in the caller. */
+static inline float tri_sph_quad_core(const float org[3], const float dir[3],
+                                      float cx, float cy, float cz, float r) {
+    float ocx = org[0] - cx, ocy = org[1] - cy, ocz = org[2] - cz;
+    float a = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+    float b = ocx * dir[0] + ocy * dir[1] + ocz * dir[2];
+    float c = ocx * ocx + ocy * ocy + ocz * ocz - r * r;
+    float disc = b * b - a * c;
+    float sq = sqrtf(disc);
+    float inv_a = 1.0f / a;
+    return (-b - sq) * inv_a;
 }
 
 /* Ray vs one sphere lane, any-hit only: returns 1 if hit in [tmin, tmax]. */

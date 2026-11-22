@@ -166,6 +166,32 @@ def divBits (a b : UInt32) : UInt32 := propagate a b fun _ => encode ((decode a)
 def ltBits (a b : UInt32) : Bool := (decode a).cmp true (decode b)
 def leBits (a b : UInt32) : Bool := (decode a).cmp false (decode b)
 
+/-- Correctly rounded binary32 square root (IEEE-754 RNE), bit-level. -/
+def sqrtBits (a : UInt32) : UInt32 :=
+  if isNaNBits a then a ||| 0x400000
+  else
+    let s := (a >>> 31) == 1
+    let e := ((a >>> 23) &&& 0xff).toNat
+    let frac := (a &&& 0x7fffff).toNat
+    if e = 255 then
+      if s then 0xffc00000 else 0x7f800000
+    else
+      let M : Nat := if e = 0 then frac else 2^23 + frac
+      let E : Int := if e = 0 then -149 else (e : Int) - 150
+      if M = 0 then (if s then 0x80000000 else 0)
+      else if s then 0xffc00000
+      else
+        let L : Int := (Nat.log 2 M : Int) + E
+        let j : Int := (if L % 2 = 0 then L else L - 1) / 2
+        let k : Nat := (E + 46 - 2 * j).toNat
+        let T : Nat := M * 2 ^ k
+        let r : Nat := Nat.sqrt T
+        let m0 : Nat := if T ≥ r*r + r + 1 then r+1 else r
+        let m : Nat := if m0 = 2^24 then 2^23 else m0
+        let j' : Int := if m0 = 2^24 then j + 1 else j
+        let ex : Nat := (j' + 127).toNat
+        (UInt32.shiftLeft ex.toUInt32 23) ||| (m - 2^23).toUInt32
+
 /-! ### Sanity tests (kernel-checked by `decide`-free `rfl` on small values is too
 slow; they run at build time via `#guard`). -/
 #guard addBits 0x3f800000 0x3f800000 == 0x40000000          -- 1 + 1 = 2
@@ -179,6 +205,21 @@ slow; they run at build time via `#guard`). -/
 #guard ltBits 0x7fc00000 0x3f800000 == false                -- NaN < 1 is false
 #guard mulBits 0x7fc00000 0x3f800000 == 0x7fc00000          -- NaN payload/sign propagates
 #guard subBits 0x7f800000 0x7f800000 == 0xffc00000          -- ∞ - ∞ = default NaN
+#guard sqrtBits 0x3f800000 == 0x3f800000                    -- sqrt(1) = 1
+#guard sqrtBits 0x40000000 == 0x3fb504f3                    -- sqrt(2) nearest-even
+#guard sqrtBits 0x40490fdb == 0x3fe2dfc5                    -- sqrt(pi)
+#guard sqrtBits 0x00000001 == 0x1a3504f3                    -- sqrt(min subnormal)
+#guard sqrtBits 0x007fffff == 0x1fffffff                    -- sqrt(max subnormal)
+#guard sqrtBits 0x00800000 == 0x20000000                    -- sqrt(min normal)
+#guard sqrtBits 0x7f7fffff == 0x5f7fffff                    -- sqrt(max finite)
+#guard sqrtBits 0x3f000000 == 0x3f3504f3                    -- sqrt(0.5)
+#guard sqrtBits 0x00000000 == 0x00000000                    -- sqrt(+0) = +0
+#guard sqrtBits 0x80000000 == 0x80000000                    -- sqrt(-0) = -0
+#guard sqrtBits 0x7f800000 == 0x7f800000                    -- sqrt(+∞) = +∞
+#guard sqrtBits 0xff800000 == 0xffc00000                    -- sqrt(-∞) = default NaN
+#guard sqrtBits 0xbf800000 == 0xffc00000                    -- sqrt(-1) = default NaN
+#guard sqrtBits 0x7fc00000 == 0x7fc00000                    -- QNaN passes through
+#guard sqrtBits 0x7f800001 == 0x7fc00001                    -- SNaN quieted
 
 /-! ### The abstract model instance -/
 

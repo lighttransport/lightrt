@@ -17,14 +17,15 @@
     from the caller's best is a real lane hit with the reported `(t, u, v)`
     and lane id; `blockBest_all_skip` covers an all-padding block.
 
-  **Assumption (the remaining gap).** The model *defines* the vector ops as
-  the corresponding `FP.Binary32` lane operations (round-to-nearest-even, no
-  FMA contraction, no reassociation). Showing that the ISA's packed
+  **Model boundary (deliberate, recorded in PLAN.md M22).** The model
+  *defines* the vector ops as the corresponding
+  `FP.Binary32` lane operations (round-to-nearest-even, no FMA contraction, no
+  reassociation). Showing that the ISA's packed
   `mulps/addps/subps/divps/cmpps` compute exactly this (and that the C's
-  intrinsics compile to them) is what remains for a machine-checked SIMD
-  refinement; `wtcheck`'s leaf fuzz checks it exhaustively for this kernel
-  (400k blocks / 2.7M lanes bit-identical to `tri_woop_one`, including SVE
-  8/16).
+  intrinsics compile to them) is **not** attempted; it is recorded as the model
+  boundary. It is not an axiom; `wtcheck`'s leaf fuzz checks it exhaustively
+  for this kernel (400k blocks / 2.7M lanes bit-identical to `tri_woop_one`,
+  including SVE 8/16).
 -/
 import LightRT.C.Ref
 

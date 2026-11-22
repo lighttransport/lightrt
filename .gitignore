@@ -11,6 +11,7 @@ __pycache__/
 # Compiled executables
 lightrt_example
 lightrt_benchmark
+lrt_sqrtf_test
 obj_bvh_bench
 test_spatial_query
 viewer/viewer
@@ -88,3 +89,9 @@ dep/
 /examples/mtlxrender/volume_lobes
 /white_furnace
 /examples/mtlxrender/white_furnace
+
+# Local C/make test binaries (rebuilt by `make formal` / test targets)
+lightrt_bench_occ
+lightrt_c_*test*
+lightrt_spatial_query_test
+wasm/dist/

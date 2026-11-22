@@ -1,304 +1,269 @@
-# LightRT formal verification plan (Lean 4 + Mathlib)
+# LightRT formal verification — PLAN (document of record)
 
-Status as of 2026-11-10. Everything below builds with `make formal`. The codebase has **0 `sorry`s** (`tools/count_sorry.sh`; `FORMAL_SORRY_MAX = 0`). Every stated theorem is closed, including `tri_ray_setup_refines` (loop + struct stores), the Higham γₙ product lemmas, Möller–Trumbore soundness/completeness/Cramer over ℝ, the Woop vertex fan, and the BVH build/traversal theorems. **337 theorems are closed** with axioms limited to {`propext`, `Classical.choice`, `Quot.sound`}. That count includes 52 MiniC logic lemmas ported from tinygltf; 117 are new to this project, including the full M1 Ize slab bound (`slab_no_false_miss`, `slab_t_err`, `slab_t_err_fma`, `ize_constant_sufficient`/`_gamma3_insufficient`). The binary32 instance `Binary32.model` is now sorry-free (`rneR_rel`, `rneR_mono`, `rneR_neg`, `rneR_idem`, `rne_cast`, `mul_num_refines`), so `slab_no_false_miss` holds for real binary32 RNE. No closed theorem uses `native_decide`.
+Status: 2026-11-17. Branch `formal-lean` (local commits ahead of `origin/formal-lean`, not pushed), tree clean.
+`make formal`: PASS end-to-end. `count_sorry --max 0`: 0 sorry.
+Axioms: only `propext`, `Quot.sound`, `Classical.choice`. No `native_decide`.
 
-## 1. Repo layout
+This file is the **document of record**, not a changelog. The milestone history
+(M0–M22) remains in git history (`git log --oneline formal-lean`); do not
+re-add narrative history here. Update this file when a theorem, a gate, or a
+decision changes. `resume-lean.md` points here; it is not a second source of
+truth.
 
-```
-formal/
-  lean-toolchain        leanprover/lean4:v4.35.0   (= latest stable Mathlib tag v4.35.0)
-  lakefile.lean         require mathlib @ v4.35.0; lib LightRT (+submodules); exe cdiff
-  LightRT/Geom/         Stage 1  Basic (Ray, Box, HitsBox, InTriangle), SlabReal, MTReal
-  LightRT/FP/           Stage 2  Model (RoundingModel), Gamma (γₙ), Binary32 (executable RNE)
-  LightRT/Robust/       Stage 3/4  Slab (no-false-miss, Ize), Woop (watertightness)
-  LightRT/BVH/Tree.lean Stage 5  containment invariant, traversal = brute force
-  LightRT/C/            Stage 6  MiniC Semantics/Logic/Hoare (ported from tinygltf),
-                                 Gen (GENERATED from lightrt_c_tri.c), Ref (bit-level oracle),
-                                 Proofs/Refines, Proofs/SlabMiss
-  LightRT/Sanity.lean   non-vacuity examples (§4)
-  CDiff.lean            MiniC + Ref runner for differential testing
-  tools/                c2lean.py, cdiff.py, cdiff_c.c, count_sorry.sh, check_axioms.py
-```
+## 1. Scope and coverage map
 
-Naming conventions:
-- Namespaces follow the directories (`LightRT.Geom`, `LightRT.FP`, …).
-- Theorems are named `<algo>_<property>` (for example `slab_no_false_miss` or `woop_edge_antisymm`).
-- Each translated C function `foo` has a `foo_refines`.
+**Verified (Lean theorems, C-equivalent via `c2lean` + `cdiff`):**
 
-## 2. Floating-point dependency decision
+| C kernel / concept | Lean counterpart (representative theorems) |
+|---|---|
+| ray setup, robust slab | `C/Proofs/RaySetupRefines.lean`, `C/Proofs/SlabRobustRefines.lean`, `Robust/Slab.fpT_abs_err_total` (range-free), `Robust/SlabTotal.slab_no_false_miss_total_of_floor` (conditional) |
+| Möller–Trumbore gap / scalar triangle | `C/Proofs/MTGap.lean` (`mt_not_watertight`), `Geom/MTReal.lean` (soundness/completeness over ℝ), `Robust/MTT.lean` (`mt_t_fl_err_total_model`) |
+| Woop watertight leaf (scalar) | `C/Proofs/WoopRefines.lean`, `WoopWatertight.lean` (`woop_no_gap_bits`, `woop_det_ne_zero`), `Robust/Woop.lean` |
+| `EXACT_NEAREST` pruning key | `BVH/ExactPruneTotal.lean` (`key_le_total`, `woop_key_le_t_total_model`, both edge-sign classes) |
+| BVH build / traversal / K-nearest / refit | `BVH/Tree.lean`, `BVH/Flat.lean`, `BVH/KBest.lean`, `BVH/Check.lean`, `BVH/TwoLevel.lean` |
+| SIMD watertight leaf (lane model) | `C/Proofs/SimdLanes.lean` (`vWoopK_lane`, `blockBest_woop`), `C/Proofs/SimdLeafISA.lean` (`simd_leaf_eq_scalar_of_isa`, conditional) |
+| Bézier curve, tube, signed distance | `Geom/BezTube.lean` (`infDist_bezTubeSet`, `samDist_le_bezPhiMin_add`, `stTrace3_bezTube_le_root`) |
+| Newton foot-point / contact system | `Geom/Newton2D.lean`, `Geom/BezNewton.lean` (`ofCubic_newton_quadratic`), `Geom/SafeguardedNewton.lean` (`bracket_root`), `Geom/BezNewtonGuards.lean` (domain-of-attraction theorem) |
 
-Each library was cloned and read on 2026-11-10. The `sorry` counts are real tokens; every matching word inside a comment was ignored.
+**Empirical gates only (no Lean theorem):** CUDA/HIP/Vulkan/d3d kernels
+(trusted ports of the C; **out of scope for formalization for now**); the
+floating-point solve of the Bézier Newton minimizer (`primhitcheck`); the
+intrinsic→model ISA step (`wtcheck` leaf fuzz). These are documented boundaries,
+not axioms.
 
-| | FloatSpec | Flean | FloatLib | **custom (chosen)** |
-|---|---|---|---|---|
-| Last commit | 2026-09-13 | 2026-04-07 | 2026-11-07 | — |
-| Toolchain | v4.34.0-rc2 | v4.27.0-rc1 | v4.35.0 ✓ | v4.35.0 |
-| License | Apache-2.0 | Apache-2.0 | MIT | MIT (LightRT) |
-| `sorry` / `axiom` | 0 / 0 | 0 / 0 | 0 / 0 | 15 (ours, tracked) |
-| Size | 80 files | 9 files | 1451 files, `native_decide` in 6 | 3 files |
-| Executable bit-exact binary32 for cdiff | unclear | partial | yes | yes |
+## 2. Invariants — what is actually proved
 
-**Decision: a minimal custom model.** `FP/Model.lean` defines an abstract `RoundingModel`: one fresh δ per operation, monotone, odd, idempotent, with an explicit `InRange` predicate. `FP/Binary32.lean` is a computable RNE with subnormals, ±0, ±∞ and x86 NaN propagation. One generic `rne` definition serves both ℚ (executed) and ℝ (`model`).
+- **FP**: executable binary32 RNE with subnormals/NaN; range-free absolute error
+  `|fl x − x| ≤ u|x| + η` (`η = 2⁻¹⁵⁰`); Woop `t` bounds in both sign classes;
+  1e-37 TLAS dilation floor; conditional non-tangent slab completeness.
+- **Geometry**: MT soundness/completeness over ℝ and the concrete gap witness;
+  Woop watertightness for every bit pattern; hull containment for curve/patch/
+  point primitives; 1D/3D sphere-trace no-overshoot; Bézier tube `infDist` identity,
+  sampled/exact distance sandwich, interior nearest-point classification.
+- **BVH**: build/refit containment, traversal = brute force (ordered and
+  k-nearest), two-level world-hit bound, `EXACT_NEAREST` conservativity where proved.
+- **Newton/Bez**: local quadratic contraction of the 2D contact system;
+  safeguarded bracket convergence to a critical point of `φ`; algebraic bridge
+  (`F = 0` at a critical contact); guarded-step model and two conditional
+  convergence theorems (`newtonIter_tendsto_of_basin`,
+  `newtonIter_tendsto_of_basin_ball`).
 
-**Range-free binary32 error (resume-lean item 3, first step).** `FP/TotalErr.lean` proves `|rneR x − x| ≤ u |x| + 2⁻¹⁵⁰` for **every** `x` (subnormals, zero, and values beyond the finite range), from the per-rounding `q/2` bound and the quantum clamp at `2⁻¹⁴⁹`; `model_abs_err_total` exposes it for the model. `Robust/Total.lean` re-derives the whole Woop `t` chain with `u|x| + η` per rounding, without any `InRange` hypothesis: `num_err_total` (`≤ 4u(b0+b1+b2) + 8η`), `den_bounds_total` (`(1−u)²(Σe) − 4η ≤ D ≤ (1+u)²(Σe) + 4η`), `quot_bounds_total` (`|fl(N/D) − E/A| ≤ 40uM + 100η(1+M)/a0 + 4η` given `0 < a0 ≤ Σe` and `4η ≤ a0/2`), and `woop_t_err_total` / `woop_t_err_total_model` (the `_model` version discharges the per-operation hypotheses with `model_abs_err_total`). The price is the `η/a0` term, which degrades exactly when the projected area is tiny. A tighter quotient/vs assembly (`quot_bounds_total_tight`, `woop_t_err_total_tight`) reduces the constants to `29.1uM + 49η(1+M)/a0 + η`.
+## 3. Gates (manual only — no CI workflow by decision)
 
-**Item 3, C-call-site instantiation.** `BVH/ExactPruneTotal.lean` proves the `InRange`-free replacement for the `EXACT_NEAREST` pruning theorem:
-- `key_le_total`: the float node key is `≤ m − 30uM + 3η` (the total rounding model only adds `3η` to `key_le`);
-- `woop_key_le_t_total_model`: for an accepted triangle whose *computed* dominant-axis depths lie in `[m, M]`, `fl(m − fl(2⁻¹⁹M)) ≤ t` (positive edge-sign class), provided the extra slack fits: `49η(1+M)/a0 + 4η ≤ 0.9uM`. For a real scene (`M` not subnormal) that is a projected area `a0 ≳ 50·2⁻¹²⁶(1+M)/M`, the same `1e-37`-scale regime as the dilation floor.
+`make formal` = `lake build` (9000+ jobs, cached) → `c2lean --check` →
+`count_sorry.sh --max 0` → `check_axioms.py` (allowlist above) → `cdiff` →
+`bvhcheck.py` → `tlascheck(_exn)` → `wtcheck` (default + `EXACT_NEAREST`) →
+`mtcheck 500000` → `primboxcheck` → `primhitcheck`. All must PASS to commit.
+`formal/tools/` is gitignored; add new tools with `git add -f`.
+GPU/CUDA/HIP/VK validation is required only after C changes (correctness only
+on the miner nodes); no C changes in the formalization-only milestones.
 
-**Item 3, the `1e-37` floor.** `FP/TotalErr.fl_add_margin_ge` / `fl_sub_margin_le` prove that `tlas_dil_origins`' margin `mk = (m + 2⁻²³|o| + 1e-37)(1 + 2⁻²⁰)` is conservative: `o + m ≤ fl(o + fl mk)` and `fl(o − fl mk) ≤ o − m`. The `2⁻²³|o|` term covers the add with `o`, `1 + 2⁻²⁰` the double→float conversion plus that add, and `1e-37` the subnormal absolute error (`η = 2⁻¹⁵⁰`); the C's `mk < 1e38` guard covers overflow with the conservative infinite-origin box. Remaining for item 3: the negative edge-sign class of `woop_key_le_t_total_model` and the slab/MT ranges.
+## 4. Boundaries and decisions (do not attempt without new tooling)
 
-Reasons:
-1. MiniC needs an executable, bit-exact semantics that agrees with compiled C. None of the theorems need Flocq-scale generality.
-2. No toolchain lag: FloatSpec and Flean pin older Lean versions.
-3. FloatLib is compatible (MIT, v4.35.0), but adds about 1.4k modules and uses `native_decide` internally. It remains the fallback for lemmas such as `rneR_rel` if proving them ourselves stalls (risk R1).
+- **Item 4 / SIMD ISA**: `PackedOps` makes the intrinsic→model hypothesis
+  machine-checked, and `simd_leaf_eq_scalar_of_isa` is conditional on it. No
+  vendor SSE4.1/AVX2/SVE semantics model exists; `wtcheck` is the empirical gate.
+- **Item 3 / slab no-false-miss**: unprovable at tangency (no error-dominating
+  K); the conditional non-tangent form is proved. `tlas_instance_margin` fp64
+  stays out of scope (`tlascheck` covers it).
+- **GPU kernels**: out of scope for formalization for now; trusted ports of C,
+  validated by the C suites and `cdiff`-family checks.
+- **M14 remainder**: the Newton basin hypotheses are discharged conditionally
+  (see §5); `det0` (a lower bound on `|det J|`) is data, not an axiom, since it
+  cannot be proved for arbitrary control points. Floating point of the
+  minimizer remains `primhitcheck`-gated.
 
-## 3. Stages: main statements
+## 5. Roadmap
 
-All statements below compile. A † marks a theorem that is already proved.
+The open roadmap is organized into three tiers. Tier 1 is actionable formalization
+work; Tier 2 records boundaries that must not be attempted without new tooling or
+a decision change; Tier 3 is closed or maintenance.
 
-**Stage 1 (ℝ³):**
-- `slabReal_iff (hd : ∀ i, r.d i ≠ 0) : slabReal r b ↔ HitsBox r b`
-- `hitsBox_parallel`†
-- `mtReal_sound` (needs `0 < ε`: with `ε = 0` a zero determinant is not rejected and the division by zero yields a bogus hit, so the original `0 ≤ ε` statement was false), `mtReal_complete`, `mt_cramer`
-- Helpers: `slab_axis_iff`, `mt_cramer`
+### Tier 1 — Open formalization work
 
-**Stage 2:**
-- `gamma_nonneg`†, `gamma_mono`
-- `prod_one_add_le` (Higham Lemma 3.1, with independent `δ : Fin n → ℝ`) and its inverse-factor variant
-- `gamma_compose`, `abs_err`
-- `sub_antisymm`†
-- The binary32 obligations `rneR_rel`, `rneR_mono`, `rneR_neg`, `rneR_idem`, plus the bridges `rne_cast` and `mul_num_refines`
-- Eleven `#guard` tests: ties-to-even, subnormal tie, 1/±0, overflow, NaN.
+**Status (2026-11-20).** The five remaining Tier 1 items advanced to the
+following state, each validated by `make formal` (0 sorry, all gates green,
+axiom allowlist unchanged) and committed with the required trailer:
+- **Patch Newton basin from control points**: DONE (δ stays data, as M14); the
+  no-missed-nearest theorem now seeds Newton at the LOCAL cell center (1/2,1/2)
+  and derives its distance to the local root from the cell size via
+  `cell_center_in_basin` --
+  `patch_basin_ball_of_data`, `patch_newtonIter_tendsto_of_root_data`,
+  `patch_subdivision_no_missed_nearest_of_root_data`.
+- **NURBS knot insertion / Bezier extraction**: GENERAL REFINEMENT DONE --
+  `insertAlpha`, `KnotData`, `coeff1/2/3` and `bsplineBasis_refine` prove the
+  general-degree Cox–de Boor refinement equation by induction; `boehmControl`
+  and `boehm_preserves` derive general Boehm knot insertion preserving the
+  curve. Degree-0/1/2 Boehm and surface `bezKnot_ratEval` also in place.
+  Repeated insertion is captured by `ValidInserts` / `insertKnotList` /
+  `boehm_iterate` (curve preservation under any finite sequence of valid
+  insertions). Tensor-product surfaces `tensorBspline` with u/v knot insertion
+  preservation (`tensorBspline_insert_u/_v`) and `rationalTensorBezier_eq_ratEval`
+  connect to ratEval.
+- **Trimmed-NURBS search**: DONE (finite-candidate form) -- even-odd crossing
+  parity, `nearestVisibleT` (with `nearestVisibleT_spec`: a returned parameter
+  is a visible hit and is minimal among visible hits), reject-and-continue.
+  Crossing-number properties: `edgeCrossX_between`, `crossingNumber_far_right`,
+  general axis-aligned rectangle parity, `crossingNumber_append` (bridge
+  additivity) and `crossingNumberClosed_rotate` (cyclic rotation invariance of
+  the closed-loop crossing number).
+- **Curve/SDF soundness over ℝ**: DONE -- round/flat tube hit soundness,
+  cubic-Bezier soundness/completeness/nearest, SDF soundness/no-overshoot/boundary;
+  the swept tube sets (round-linear, flat ribbon, cubic-Bezier) are proved closed
+  as compact images of closed bounded parameter sets, so all nearest-hit
+  existence theorems are now unconditional (no false `t < tbest` closedness
+  hypothesis). Bezpatch/ratpatch nearest-hit existence already derived closedness
+  from compact boxes.
+- **M15/M16 abstract contracts**: DONE -- `IntersectorContract.lean` curve and
+  surface contract APIs.
+FP of the solve stays a Tier 2 `primhitcheck` boundary throughout.
 
-**Stage 3 (slab):**
-- `slab_t_err`: scalar order, |t̃ − t| ≤ γ₃|t|.
-- `slab_t_err_fma`: the FMA order used by the SIMD kernels has an *absolute* error, ≤ γ₃(|x−o|+|o|)/|d|.
-- `slab_no_false_miss (hK : InflationOK u K) (hrange : SlabInRange …) : HitsBox r b → fpSlab R r b K`. The implication runs from a geometric hit to an algorithm hit.
-- **Derived finding.** I derived this condition myself; Ize's constant is still UNVERIFIED against the paper. When `tfar·K` is itself rounded, the requirement is `1+γ₃ ≤ (1−γ₃)(1−u)K`. The real number K = 1+2γ₃ does *not* meet it (`ize_constant_gamma3_insufficient`), while 1+2γ₄ does (`ize_constant_sufficient`). Empirically, either constant rounded *up* to binary32 (1+8u or 1+10u) removed all 2,908 observed misses.
-- **The real C misses hits.** `tri_slab_scalar_false_miss`† is kernel-checked with `decide +kernel` on the c2lean translation. In exact ℚ the ray meets the box, yet `tri_slab_scalar` returns 0. A seeded search found 2,908 such false misses among 73,412 exact-hit grazing rays (4%).
+1. **Primitive intersector soundness over ℝ.** The C kernel exposes ~20 non-triangle
+   scalar intersectors (sphere, quad/tetra, point, round-linear/flat curves, cubic
+   Bézier, SDF, bilinear/Bézier/NURBS/trimmed-NURBS surfaces). `Geom/Hull.lean`
+   proves their box containment, but none has a soundness/completeness/nearest
+   theorem over ℝ, and none is `c2lean`-translated. `Geom/PrimReal.lean` now
+   proves soundness+completeness+nearest over ℝ for ray–sphere (analytic nearest
+   root) and quad/tetra (nearest of two/four MT triangle hits, composing
+   `Geom/MTReal.lean`), with a `Sanity.lean` non-vacuity example. Next: expand
+   family by family (points, round-linear/flat/cubic-Bézier curves, SDF, and the
+   parametric surfaces). `Geom/PointReal.lean` now covers point discs (ray-facing
+   and oriented; point spheres reuse `sphereReal`). Next: curves (round-linear,
+   flat via `quadReal`, cubic Bézier), SDF, surfaces. Acceptance: for each family, a
+   soundness+completeness+nearest theorem over ℝ and non-vacuity examples; a
+   `*_refines` theorem once the scalar C function is translated.
+   Coverage so far: triangle/MT (`MTReal`), sphere + quad/tetra (`PrimReal`),
+   point sphere (via `sphereReal`), ray-facing/oriented point discs
+   (`PointReal`), flat curve (ray-facing ribbon = quad via `quadReal`), SDF
+   sphere/box (via `sphereReal` / `SlabReal` respectively). `CylinderReal`
+   adds finite ray-cylinder side soundness/completeness; `CapsuleReal`
+   composes it with two end spheres (nearest of three components, with
+   soundness/completeness) and `Geom/EllipseReal.lean` covers ellipse points
+   (plane intersection + elliptical-bound test, soundness/completeness).
+   `Geom/RoundLinear.lean` defines swept-ball round-linear and ray-facing flat
+   ribbon tube sets with hit soundness (completeness/nearest pending).
+   `Geom/BezCurveReal.lean` gives the cubic-Bezier curve hit API: sampled
+   acceptance soundness, completeness (boundary existence) and nearest-hit
+   existence (closedness hypothesis), composing BezTube/BezFirstContact.
+   `Geom/SDFReal.lean` adds the SDF intersector API: trace soundness,
+   no-overshoot and boundary existence, composing the sphere-trace chain.
+   `Geom/RoundLinear.lean` also gives the round-linear / flat intersector models
+   `rlcReal` / `flatReal` (nearest swept-tube hit) with sound/complete/nearest,
+   tapered-radius box containment, and the flat-ribbon/two-MT-triangle connection
+   (`inQuad_flat_of_onFlatLinear`). `Geom/SDFReal.lean` proves the sphere SDF
+   1-Lipschitz (point and ray parameter) and records the curve-capsule model via
+   `CapsuleReal`. `Geom/IntersectorContract.lean` adds bilinear sound/complete,
+   rational-patch sound/nearest and trimmed-scan contracts.
+   `Geom/BezFirstContact.lean` composes the chain into a first-contact contract
+   (`HitsBezTubeRay`, sampled acceptance sound, exact/sampled no-overshoot,
+   boundary existence). `Geom/SphereTraceConvergence.lean` adds the convergence
+   half (`stTrace_tendsto_contact`: an SDF-like 1-Lipschitz trace converges to
+   a contact `L` with `f L = 0`). `Geom/BilinearSurface.lean` begins the
+   parametric-surface family: the `tri_bilin_one` coplanarity quadratic +
+   Cramer solve, with soundness (a reported hit is a genuine surface point
+   in the unit square) and the dual-basis reconstruction identity.
+   `bilinReal_complete` closes the other half: a geometric hit (point on the
+   surface with `(u,v)` in the unit square, nondegenerate ruling) implies
+   `bilinReal` reports a genuine hit. `Geom/BezPatchReal.lean` starts the
+   bicubic Bezier patch: tensor Bernstein evaluation, control-hull containment,
+   continuity and u-partial derivative, ray/patch hit soundness, and culling
+   soundness (a ray missing the control hull cannot hit the patch) and culling
+   completeness (`bezpatch_cull_complete`: a true hit is never culled; together
+   the two make the subdivision AABB cull exact). `bez3Vec` and
+   `bez3Vec_decasteljau_left` give the vector-valued de Casteljau split of each
+   patch control row, and bicubicEval_eq_rows / bicubic_split_left give the
+   full tensor de Casteljau split (Fin 16 reindexed as Fin 4 x Fin 4 via
+   finProdFinEquiv, avoiding the slow global simp), and
+   bezpatch_exists_nearest_hit (a hit implies a minimal hit parameter exists,
+   via compactness of the closed hit-parameter set with a cheap finite-sum
+   continuity proof). Newton2D instantiation, the patch basin supplied from
+   control points, and the abstract subdivision-plus-Newton / adaptive-search
+   contracts are in place; NURBS/trimmed-NURBS surface models are below.
+   The Newton-to-
+   hit bridge is in place: `newton2Step_at_root` (Newton is a fixed point at a
+   root), `bezPatchContact` (the patch contact residual), and
+   `newton_patch_hit_of_contact_zero` / `newton_patch_contact_ge_nearest` tie
+   a converged Newton contact to a genuine hit no smaller than the nearest.
+   `bezpatch_newton_quadratic` instantiates Newton2D contraction at the patch
+   contact system (`patchF`/`patchG`). The control-point bound chase is now
+   complete: Bernstein derivative bounds (`abs_bern3'_le ≤ 3`,
+   `abs_bern3''_le ≤ 12`), componentwise partial/second-partial bounds
+   (du/dv ≤48M, uv ≤144M, duu/dvv ≤192M), pd1/pd2 formulas and their
+   second-order HasDerivAt lemmas for both patchF and patchG, full `patchF_C2Seg`
+   / `patchG_C2Seg` assembly (K = 192·M), and
+   `bezpatch_newton_quadratic_of_controls`, which supplies B = 48·M and K from
+   the control net. The determinant lower bound δ remains necessarily data (as
+   M14's `det0`): no lower bound on |det J| is provable for arbitrary control
+   points. `Geom/AdaptiveSearch.lean` supplies the abstract adaptive-search
+   contract; `Geom/NURBSReal.lean` models the rational bicubic
+   patch produced by NURBS Bezier extraction (positive-weight denominator,
+   convex-combination identity, control-hull containment, hit soundness /
+   culling, continuity, uniform-weight reduction to the Bezier patch), but
+   `Geom/Trim.lean` models (u,v) trim loops (outer + holes) with the even–odd
+   crossing rule and proves the trim invariant, hole rejection, edge-cross
+   bound, the unit-square crossing parity (Jordan case), and the finite
+   nearest-visible scan with reject-and-continue soundness
+   (`nearestVisibleT_spec`), bridge additivity (`crossingNumber_append`) and
+   cyclic rotation invariance (`crossingNumberClosed_rotate`); general knot
+   insertion is in `NURBSKnots.lean` below.
+   `Geom/NURBSKnots.lean` lays the B-spline foundation: Cox–de Boor basis,
+   knot insertion (`insertKnot`) with the degree-0 refinement equation and
+   degree-1 Boehm curve preservation (`boehm1_preserves`), and the surface
+   Bezier-extraction identity (`bezKnot_ratEval`: both numerator AND denominator
+   are rational B-spline sums over the Bezier knot vector, equal to `ratEval` of
+   NURBSReal -- no Bernstein denominator remains in the statement),
+   the cubic Bezier knot vector giving exactly the Bernstein basis, partition
+   of unity, and B-spline-curve = Bezier-curve on `[0,1)` (the right endpoint
+   is excluded by the half-open knot convention). The general-degree
+   Cox--de Boor refinement (`bsplineBasis_refine`), general Boehm insertion
+   (`boehm_preserves`), iterated insertion / Bezier-extraction foundation
+   (`boehm_iterate`) and tensor-product insertion + ratEval connection
+   (`tensorBspline_insert_u/_v`, `rationalTensorBezier_eq_ratEval`) are now
+   proved here.
+2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates the
+   scalar triangle core (`tri_minf/maxf`, `tri_slab_scalar`, `tri_mt_one`,
+   `tri_ray_setup`, `tri_woop_one`, `tri_exn_key`) plus `tri_sphere_dist_f`
+   (the ray/sphere distance helper that exercises `sqrtf`), `tri_surface_area`
+   and `tri_longest_axis` (box helpers). Their `*_refines` theorems are in
+   `C/Proofs/{SphereDist,SmallKernels}Refines.lean`. `sqrtf` support is
+   now in place: the C kernel uses `lrt_sqrtf` (`lrt_sqrtf.h`, the ISA's
+   correctly-rounded SQRTSS on x86 SSE2/AVX/AVX2 and `vsqrt.f32` on ARM64 NEON,
+   no libm call; `make test_lrt_sqrtf` checks bit-exactness vs libm over 200k+
+   patterns); c2lean maps `sqrtf`/`lrt_sqrtf` to MiniC `Expr.sqrt`; the semantics
+   executes `FP.Binary32.sqrtBits` (integer algorithm, `#guard`-checked);
+   `EvE.sqrt'` is the refinement lemma; `cdiff.py` includes `sph` vectors that
+   compare the real C sqrt with the MiniC model end-to-end (0 mismatches).
+   Translate additional *scalar* kernels (e.g. `tri_woop_one_hp`, the primitive
+   scalar intersectors from item 1) and prove their `*_refines` theorems.
+   Acceptance: each new translated function has a passing `c2lean --check` and a
+   refinement theorem. `tri_sphere_dist_f_refines` is proved in
+   `C/Proofs/SphereDistRefines.lean` (ExS symbolic execution with an explicit
+   post-`set` witness state, plus a `callFunc` wrapper); the model, translation
+   and differential test are all covered.
+3. **Bézier/patch intersector contract (M15/M16).** The cubic-Bézier and surface
+   intersectors use adaptive subdivision + bounded Newton. Formalize the abstract
+   contract (sampled acceptance sound; no missed nearest) analogous to the M14
+   chain (`Geom/BezTube.lean`, `Geom/BezNewton*.lean`, `Geom/BezData.lean`,
+   `Geom/BezKBounds.lean`). High effort; scope each surface kind before starting.
+   Acceptance: an abstract soundness theorem per intersector strategy; FP of the
+   solve itself remains the Tier 2 empirical boundary.
 
-**Stage 4 (Woop):**
-- Reference implementation over any `RoundingModel`.
-- `woop_edge_antisymm`† (**M1**) and `woop_shared_edge_W`†: adjacent triangles compute exactly opposite W.
-- `woop_no_gap`†: no ray passes between two triangles sharing an edge.
-- `edgeFn_sign_weak`, and `woop_vertex_fan` (under an exact-sector hypothesis).
-- Not modelled: the paper's double-precision tie fallback. Its absence can only duplicate a hit, never lose one.
+### Tier 2 — Documented boundaries (do not attempt without new tooling/a decision)
 
-**Stage 5 (BVH):**
-- `build_contains`† holds for every split strategy.
-- `build_prims_perm`.
-- `refit_contains`: the bottom-up refit (`tri_refit_propagate`) re-establishes containment for any new primitive bounds, `refit_prims` keeps the primitive lists, and `refit_traverse_eq_brute` re-derives traversal = brute force after a refit. This is the algorithm-level counterpart of `tri_leaf_prim_aabb(vf = 1)` (exact vertex min/max) plus the parent union; the C function's translation is not part of c2lean.
-- `KBest` (`BVH/KBest.lean`): the multi-hit (`lrt_tri_intersect_n`) model. `ins`/`kbest` are the sorted insertion buffer and its fold (`kbest_sorted`, `kbest_length_le`, `kbest_mem`); `runN` mirrors the C loop (best-first stack, prune by the k-th buffer value, leaf fold) and `runN_sound` proves every reported hit is a real hit. `KInv`/`kbest_omitted` give the k-best-by-value specification: the k-th buffer value is nonincreasing under insertion (`prune_take_ins_le`), and every element omitted from `kbest k l` is at least the k-th kept value (`kbest_omitted`). The buffer step `stepN` mirrors the C leaf test (`t < prune_t`); `stepN_KInv`/`foldN_KInv` carry `KInv` through a leaf fold, and `runN_prune_le` proves the prune never increases along the traversal. `KInv_add_ge` extends the invariant with hits above the prune (the dropped-child case) and `mem_hitList` characterises the folded hits. `runN_KInv` threads `KInv` through the stack (skipped entries, leaf folds, and the node's `order`/`filter` permutation bookkeeping, with `filterMap_facts`/`den_wf` and the C1/C2 conditions), and `runN_complete` concludes: every hit of the root's primitives strictly below the returned k-th value is in the result (no false misses). With `runN_sound` this is the multi-hit completeness/soundness pair; the C's `max_hits == 0` early return is outside the model (k > 0).
-- `traverse_eq_brute (hcons : Conservative …)` and `traverseOrdered_eq_brute`, which models the LightRT loop with t_best culling.
-- Stage 3 discharges `Conservative`: the box test receives a box that encloses a hit primitive's bound, so `HitsBox` holds.
+- **SIMD ISA semantics**: `PackedOps` makes the intrinsic→model hypothesis machine-checked, and `simd_leaf_eq_scalar_of_isa` is conditional on it. No vendor SSE4.1/AVX2/SVE semantics model exists; `wtcheck` is the empirical gate.
+- **GPU formalization**: CUDA/HIP/Vulkan kernels are trusted ports of C, validated by the C suites and `cdiff`-family checks; out of scope for formalization for now.
+- **`tlas_instance_margin` fp64 ρ/σ bound**: unproved, covered by `tlascheck` empirically.
+- **Slab completeness at tangency**: unprovable (no error-dominating K); the conditional non-tangent form (`slab_no_false_miss_total_of_floor`) is proved.
+- **Bézier Newton minimizer floating point**: remains `primhitcheck`-gated.
 
-**Stage 6 (C):** `tri_ray_setup_refines`, `tri_slab_scalar_refines` and `tri_mt_one_refines` cover every input, including NaN, ∞ and subnormals, and include frame conditions. `slab_ref_eq_fpSlab` connects these bit-level results to Stage 3.
+### Tier 3 — Closed / maintenance
 
-Helper lemmas still needed:
-- evaluation lemmas for `binF32`, `loadF32` and `storeF32`, in the style of tinygltf's `varLoad`
-- (done) decode/encode round-trip `decode_encode_num`, `propagate` identity on finite inputs, `fmin`/`fmax` = `min`/`max` (`C/Proofs/SlabFP.lean`)
+- **M14 (Newton/basin verification)**: complete under the conditional-convergence acceptance criterion. Local quadratic contraction, safeguarded bracket, algebraic bridge, guarded basin convergence, `exists_radius_of_data`, control-point supply of `B0` (`ofCubicB0`) and `K` (`ofCubicK`/`ofCubic_PddBounds`/`ofCubicK_pos`), and `ofCubic_newton_tendsto_of_control_points`. `Sanity.lean` covers non-vacuity. `det0` stays data (no provable lower bound for arbitrary control points).
+- **Sanity and doc consistency**: `Sanity.lean` examples and this document-of-record are maintained as part of each milestone, not tracked as separate roadmap items.
 
-Full verification of the SIMD and GPU kernels is out of scope. They are byte-for-byte ports already tested against the scalar oracle (`tests/test_lightrt_c_tri.c`).
+## 6. Conventions
 
-## 4. Specification review checklist (human)
-
-1. **Direction of the implication.** Conservativeness must read `HitsBox → algorithm hit`. Reject `algorithm hit → HitsBox` (that would be soundness, a different claim) and any `↔` stated for FP code.
-2. **Ground truth independent of the algorithm.** Postconditions should mention `HitsBox` / `InTriangle`, never `fpSlab` on both sides. A spec built from the algorithm's own output is trivially true.
-3. **Hypotheses are satisfiable.** Each main theorem should have an `example` in `Sanity.lean` that inhabits its premises. `RoundingModel.exact` shows the class is consistent. Look for range hypotheses that silently exclude the interesting cases; for example, `InRange` must not exclude 0.
-4. **The conclusion is not trivial.** There should be a negative example: a miss, a rejected `Accept`, or a violated `Contains`.
-5. **Unintended hypotheses.** Check against the C. `0 ≤ tmin` is required, so state it explicitly. `d i ≠ 0` changes semantics, because C clamps `invd` to ±1e18. The NaN inputs needed for `refines` must cover every bit pattern.
-6. **Constants come from the code or the paper.** `1e18f`, `1e37f` and `1e-12f` are taken from `lightrt_c_tri.c`. Ize's constant is UNVERIFIED (§3).
-7. **Per-operation δ.** No statement may use a single shared `δ` across operations.
-8. **Generated code is fresh.** `c2lean.py --check` must pass, and `Gen.lean` must never be edited by hand.
-
-## 5. Agent workflow
-
-- **Human-owned:** every statement in §3, edits to `Model.lean`, `Semantics.lean` and `c2lean.py` (all part of the trusted base), and the checklist. The agent never edits a theorem statement. If one looks false, it escalates with a counterexample from `cdiff.py` or `#eval`.
-- **Delegated to the agent through lean-lsp-mcp:** closing `sorry`s, one theorem per task, with ≤30-line lemmas.
-  - The agent first writes a `have`-skeleton with sub-`sorry`s and checks the goal states.
-  - It then closes the leaves.
-  - Preferred tactics: `simp`, `linarith`, `nlinarith`, `positivity`, `gcongr`, and `decide +kernel` for concrete bits.
-- **Splitting:**
-  - Refinement proofs go statement by statement through `Logic.lean` (`EvE`/`ExS`), with one lemma per C basic block.
-  - FP bounds go one operation at a time through `RoundingModel.rel`, then `prod_one_add_le`.
-- **Retry and escalation:** 3 attempts per lemma, each with a different strategy. After that the agent posts the goal state, the attempted tactics and a minimal `example` to the human. If the agent believes the statement is false, it searches for a counterexample with cdiff before escalating.
-- **CI gates (`make formal`):**
-  - `lake build`
-  - `c2lean --check`
-  - the `sorry` budget (`FORMAL_SORRY_MAX`, monotonically decreasing)
-  - `check_axioms.py`: allowlist enforced, no `native_decide`/`bv_decide` under `Robust/` and `C/Proofs/`
-  - `cdiff --n 1000`, three-way: compiled C under ASan/UBSan, MiniC, and Ref
-  - Build budget: ≤15 min cold with the Mathlib cache. The current incremental build takes about 1 min, and the `decide +kernel` witness takes about 9 s.
-
-## 6. Risk register
-
-| # | Risk | Mitigation / fallback |
-|---|---|---|
-| R1 | `rneR_rel`/`mono` take long to prove over `Int.log` | Cite FloatLib's lemmas, or prove only the normal range |
-| R2 | MiniC binary32 ≠ hardware | Three-way cdiff (60k vectors, 0 mismatches). NaN sign/payload follows x86 SSE (IEEE leaves it unspecified) and is visible through `copysignf`. ARM may differ, so cdiff must run there before any ARM claim. |
-| R3 | `-ffp-contract` | The verified object is the code compiled with `-ffp-contract=off`. GCC's default `fast` contracts to FMA, so production builds need the flag, or `slab_t_err_fma` must be the bound that applies. |
-| R4 | `decide +kernel` blowups | Keep concrete witnesses small; never use `native_decide` |
-| R5 | The Ize constant is misremembered | Read the JCGT 2013 paper and its FMA note, then update §3. The derived condition is the safe one. |
-| R6 | Woop is not in LightRT C | Port `tri_woop_one` to C behind a flag, extend `c2lean` `FUNCTIONS`, and reuse Stage 4 |
-| R7 | Translator bugs (trusted base) | Reject unsupported syntax (`die`), audit diffs of `c2lean.py`, and rely on cdiff against the compiled binary |
-
-## 7. Milestones
-
-- **M0 (done):** Project, pinned toolchain, Stage 1–6 statements, c2lean port, three-way cdiff, CI gates.
-  - c2lean was ported with f32 support, `copysignf`, scalar replacement of constant-indexed local arrays, and fixes for loop-variable ordering and enums.
-- **M1:** Woop edge antisymmetry (✅ done: `woop_edge_antisymm`, `woop_no_gap`), plus Ize's slab bound (✅ done: `slab_t_err`, `slab_t_err_fma`, `slab_no_false_miss` under `6u<1`, `InflationOK`; spec fix: `slab_axis_iff`/`slabReal_iff` needed `lo ≤ hi`).
-- **M2:** binary32 model obligations (`rneR_*`) and `slab_ref_eq_fpSlab`.
-- **M3:** ✅ `tri_slab_scalar_refines`, `tri_mt_one_refines` (all inputs, eventual-fuel form), `tri_slab_scalar_false_miss_exists` (over ℝ, `Binary32.model`), add/sub/mul/div value bridges, and the opt-in C patch `LRT_TRI_SLAB_INFLATE` (`tfar *= 0x3f800005`). `slab_ref_eq_fpSlab` ✅ (via `decode_encode_num`). `tri_ray_setup_refines` ✅ (3-iteration loop unrolled; arbitrary initial `*rc` contents).
-- **M4:** ✅ Woop vertex fan and `tri_mt_one_refines`. `mt_not_watertight` ✅ (`C/Proofs/MTGap.lean`): a ray through the shared edge of two adjacent triangles hits one of them in exact arithmetic but binary32 `tri_mt_one` rejects both (kernel-checked). C port of Woop ✅: `tri_woop_one` in `lightrt_c_tri.c`, used by the CPU quad/tetra leaves under `-DLRT_TRI_WATERTIGHT` (default off; GPU `hp_mt` unchanged). Proved: `tri_woop_one_refines` (C = `Ref.woop`, all inputs, 8-way axis selection + one symbolic run of the fp body), `woop_no_gap_bits` (bit-level watertightness for EVERY input, NaN/∞/underflow/overflow included: the shared edge function has exactly opposite sign in the two triangles, so the sign test of at least one passes), `woop_no_gap_det` / `woop_det_ne_zero` (`WoopDet.lean`: after the sign test, `det ≠ 0` for every input once some edge value is strictly signed, because a same-sign binary32 sum never rounds to zero; so the only remaining per-triangle rejection is the `t` range), and `woop_closes_mt_gap` (Woop accepts the triangle on `mt_not_watertight`'s witness). cdiff covers `woop` vectors; the quad seam test in `tests/test_lightrt_c_quadtetra.c` leaks 5/3000 diagonal rays with MT and 0 with the flag.
-- **M5:** ✅ BVH `build_prims_perm`, `traverse_eq_brute` / `traverseOrdered_eq_brute` (generic in the box test; instantiate with the Stage 3 inflated slab).
-- **M6 (flat BVH of the C kernel):** ✅ `BVH/Flat.lean` models `tri_intersect_scalar`'s data and loop: an array of wide nodes with `(box, ref)` children, leaf refs as block ranges, a `(ref, tnear)` stack, `tnear ≥ best` culling, and pushing the box hits in any order. The semantics `den`/`visits` are total, by recursion on increasing child indices. Proved:
-  - `den_inside`: global containment follows from the local check `WF` (child indices increase, each child box contains its children's boxes and its leaf primitives).
-  - `run_spec` / `run_root`: with fuel `visits root + 1`, the loop terminates and returns exactly the brute-force nearest `t`, given conservativity C1 (an enclosed hit `t < best` passes the box test) and C2 (`tnear ≤ t`).
-  - `run_approx`: if `tnear ≤ g t` for a slack `g ≥ id`, the result `r` satisfies `brute ≤ r` and `r ≤ g t` for every hit, so it is at most `g` farther than the nearest hit.
-  - `checkWF` / `checkWF_sound`: an executable checker for `WF`. `BVH/Check.lean` instantiates it with exact-rational containment of the *stored* triangle `v0 + u·e1 + v·e2` (`insideQ`); `checked_run_root` is the result.
-- **M6 validation (`make formal` → `tools/bvhcheck.py`):** `tools/bvhdump.c` dumps real C-built BVH4/BVH8 trees (LBVH and SAH; random soup and a jittered heightfield, with rays aimed at grid vertices and edges, including axis-parallel rays). The `checkbvh` executable runs `checkWF` and a Lean mirror of the loop that uses the verified `Ref.raySetup`/`Ref.slab`. It compares the mirror with the C scalar traversal (t and prim_id) and with brute force. Findings:
-  1. **The mirror equals the C scalar traversal bit for bit** on every ray tested.
-  2. **Default leaf boxes do not contain the tested triangle.** `e1 = fl(v1−v0)` is stored rounded, so `v0+e1` can exceed the box by up to ~10 ulp, and `checkWF` fails on every tree. Refit's `tri_leaf_prim_aabb` has the same issue. Fix `LRT_TRI_LEAF_BOX_EXACT` (default on since this milestone; opt out `-DLRT_TRI_NO_LEAF_BOX_EXACT`): TwoSum-bracketed corners in `tri_leaf_prim_aabb`, plus a bottom-up `tri_refit_propagate` after the build (not SBVH/HQ, whose clipped boxes need a different invariant). With it, `checkWF` passes on every tree.
-  3. **C2 fails at the ulp level.** On shared-edge rays the rounded box `tnear` can exceed the rounded triangle `t`, so the BVH returns a hit 1–4 ulp farther (another prim) than brute force. This is exactly `run_approx` with `g t = t + few ulp`.
-  4. **Parallel-ray false miss** (`C/Proofs/SlabParallel.lean`, `slab_parallel_false_miss`, decide +kernel): with `d_k = ±0` and the origin exactly on a box face, the clamp `1/±0 → ±1e18` gives `0·1e18 = 0` as the far bound, so the box is rejected although the ray lies in it. Vertical rays along the scene's boundary edge miss the scene. This is outside the `|d| ≥ 1e-18` hypothesis of the Stage 3 theorems. A fix must touch every slab implementation (scalar/SSE/AVX2/NEON/SVE/GPU), so it is left open.
-  The SIMD-dispatched traversal (`lrt_tri_intersect1`, not bit-identical to scalar) differs by ≤ 10 ulp on most rays, with rare different-prim hits.
-- **M7 (open items closed; opt-in compile flags, of which `SLAB_ROBUST` and `LEAF_BOX_EXACT` became the default in M8):**
-  - **Parallel-ray false miss → `LRT_TRI_SLAB_ROBUST` (default on; opt out `-DLRT_TRI_NO_SLAB_ROBUST`).** The slab reciprocal is `+∞` (not the `1e18` clamp) for `d = ±0`, the entry bound is `min(th, tl)`, and the SIMD node tests use the sub-mul form instead of the FMA form. A ray lying on a slab plane then gives `0·∞ = NaN`, which the operand order of the min/max chain drops (`+∞` for both signs of zero means only two NaN placements can occur, and both are dropped). Lean: `Ref.slabRobust`, plus `slabRobust_parallel_hit` / `_lo` (decide +kernel) on the witness that `slab_parallel_false_miss` rejects. Validation: 0 hit/miss differences against brute force on the heightfield trees, where the default kernel had 3–4 per 400 rays. Coverage of the other backends (ARM, quantized nodes, GPU) is listed under "Robust slab on every backend" below.
-  - **SIMD/scalar parity → `-DLRT_TRI_BITEXACT`.** The AVX2 leaf (`TRI_X8`/`TRI_DOT8`) uses scalar `tri_isect_lane` order without FMA. The det-epsilon test uses scalar association `(EPS·s)·s` and the scalar predicate `!(−rel < det < rel)`. With `LRT_TRI_SLAB_ROBUST` (sub-mul slabs), `lrt_tri_intersect1` (SSE BVH4 / AVX2 BVH8) equals `tri_intersect_scalar` in (t, prim) on every validation ray, asserted by `bvhcheck.py`.
-  - **Watertight main triangle leaf → `-DLRT_TRI_WATERTIGHT_TRI`.** The scene keeps the exact input vertices (`wverts`, refreshed by refit). The scalar leaf `tri_isect_lane_s` runs `tri_woop_one`, which is proved to refine `Ref.woop` and to be watertight on shared edges (`woop_no_gap_bits`, `woop_no_gap_det`). Triangle queries route to the scalar kernels. `tests/test_lightrt_c_tri_seam.c` (`make c_tri_seam_test`) shoots 400k rays at shared heightfield edges: default MT leaks 10–13%, the watertight leaf leaks 0. Serialized/mmapped scenes carry no `wverts` and fall back to MT.
-  - **SBVH (HQ) correctness → `Flat.run_cover` / `run_cover_root`.** Containment is replaced by per-ray coverage: every hit primitive has a reference whose whole box path contains the hit point (`goodN`/`goodRef`), and C1/C2 are stated for hit points. The loop then terminates with `brute ≤ r ≤ tmax` and `r ≤ g t` for every hit (`g = id`: exactly the nearest). This needs only the index part of well-formedness (`WFidx`; `WF.idx`). The validator checks the Lean mirror against C scalar on SBVH trees too.
-  - **Exactly nearest → `-DLRT_TRI_EXACT_NEAREST` + `Flat.run_exact`.** With pruning that depends on the current best, C2 with `g = id` cannot hold in general, because the MT/Woop `t` error is unbounded for grazing triangles. In exact-nearest mode the closest-hit node test uses `tmax` instead of the current best and pushes children with `tnear = tmin`, so C2 holds trivially. `run_exact` then proves the loop returns EXACTLY the brute-force nearest hit, given containment and a conservative box test. Implemented for scalar, SSE BVH4 (and the NEON shim) and AVX2/SVE BVH8. Validation (`bvhcheck.py` "exactn", and aarch64 under qemu with 512-bit SVE): t equals brute force, and SIMD equals scalar, on every ray. Without the flag, `run_approx`/`run_cover` still bound the slack (≤ 4 ulp measured). The cost is losing early-out pruning.
-  - **Robust slab on every backend.**
-    - *ARM:* the NEON shim maps `_mm_min/max_ps` to exact x86 semantics (`vbslq(vcltq)`) under `SLAB_ROBUST`/`BITEXACT`. The SVE BVH8/BVH16 slabs use `sinv` and select-based min/max, and the SVE leaves use separate mul+add under `BITEXACT`. Under qemu, NEON BVH4 and SVE BVH8 match scalar in (t, prim) with 0 hit/miss differences against brute force.
-    - *Quantized nodes (BVH8Q / QF8 / Q4):* boxes are decoded to floats and run through the robust float slab (`tri_slab8_robust_q`). The qnode kernels' leaf takes the watertight path under `WATERTIGHT_TRI`. `tests/test_lightrt_c_tri_parallel.c` (`make c_tri_parallel_test`) fires 20k vertical rays exactly on box faces: the default build misses 649 / 18 / 18 / 18 (BVH4 / BVH8Q / QF8 / Q4), the robust build 0 on every format.
-    - *GPU:* the hiprtc kernel (`hip/trace_bvh_hip.h`, `-DLRT_TRI_SLAB_ROBUST` passed to hiprtc), the CUDA port, the stale `.hip` source and the Vulkan `trace_bvh.comp` (specialization constant 2, SPIR-V regenerated). GPU `fminf`/GLSL `min` IGNORE the on-plane NaN and keep the infinite bound, so explicit selects are used. On an RX 9070 XT the same vertical-ray set gives HIP 547 → 16 misses and Vulkan 547 → 8 with the robust slab alone.
-    - *GPU watertight leaf:* the hiprtc kernel and `trace_bvh.comp` include a line-for-line port of `tri_woop_one` (`woop_one`; the GLSL edge functions are `precise`, i.e. not contracted, so the antisymmetry the proof uses still holds). The host uploads the exact vertices from the LRTS aux region: HIP passes a kernel argument, Vulkan uses binding 4 plus `pc.nwverts`. Only `LRT_TRI_WATERTIGHT_TRI` scenes carry that data, so default behaviour is unchanged. With all three flags, both HIP and Vulkan have **0 misses**. HIP is also bit-identical to the CPU in (t, prim) on every ray. Vulkan is not, because RADV's arithmetic outside the precise edge functions may fuse, as in the default build. `make vk_test` still passes, 0 mismatches. The precompiled resident HIP backend (`lightrt_c_hip.hip`: `hp_woop_lane` in `k_trace`/`k_occluded`, `d_wverts` uploaded from the aux region and refreshed by `refit_core`) also reaches 0 misses on the parallel-ray set, bit-identical to the CPU. The CUDA twin (`lightrt_c_cuda.cu`) has the same code. Verified on hardware (2026-11-11, `make cuda_full_test`): RTX 3070 (sm_86) and RTX 5060 Ti (sm_120) give identical results: triangles 0 mismatches; every primitive kind and the shading normals 100% vs the CPU oracle (Bézier curves 99.93%, as on HIP); parallel-ray test with the watertight leaf 0 GPU misses and GPU == CPU bit for bit on BVH4 and BVH8.
-  - **HIP build fixed.** Commit `44e178e` had replaced `lightrt_c_hip.h` with a 6-function header for the new hiprtc path. That broke the resident HIP backend (`lightrt_c_hip.hip`), `tests/test_lightrt_c_hip.c`, `benchmark_hip/` and the CUDA port, all of which use the device-resident API. The new path's `lightrt_c_hip.c` was also unbuildable: no `hipew.h`, and no build target.
-    - Restored the resident-API header. It is a superset of the hiprtc path's API, plus `LRT_HIP_CAP_POINTS`. `make hip_test` passes on gfx1201 again.
-    - Added `lightrt_hipew.{h,c}`, a minimal dlopen loader in the style of `lightrt_vkew` for the 21 HIP/hiprtc entry points the hiprtc path uses (no ROCm SDK at build time). It searches the versioned ROCm roots (`/opt/rocm/core-*/lib`, newest numeric version first) as well as `/opt/rocm/lib` and `LRT_HIP_LIB`/`LRT_HIPRTC_LIB`, so the hiprtc path works with Ubuntu's `rocm` metapackage layout; `make hip_rtc_test` is green again on gfx1201.
-    - Added `make hip_rtc_test` (`tests/test_lightrt_c_hip_rtc.c`). It skips without a runtime.
-    - The hiprtc kernel is now compiled with `-ffp-contract=off`: hiprtc contracts by default, which broke parity with the CPU and the exact antisymmetry of the Woop edge functions. With all flags it is bit-identical to the CPU with 0 misses.
-- **M8 (robust defaults):** `LRT_TRI_SLAB_ROBUST` and `LRT_TRI_LEAF_BOX_EXACT` are on by default (`lightrt_c_tri.h`; opt out with `-DLRT_TRI_NO_SLAB_ROBUST` / `-DLRT_TRI_NO_LEAF_BOX_EXACT`). Every backend includes that header, so the CPU SIMD paths, hiprtc, the resident HIP and CUDA kernels and Vulkan follow the same default.
-  - *Two translated configurations.* `c2lean.py` now emits `C/Gen.lean` (legacy kernel, both opt-outs; the Stage 6 refinement theorems and the `tri_slab_scalar_false_miss` witness are about this code, which is still built with the opt-outs) and `C/GenRobust.lean` (the default build). `--check` checks both.
-  - *Default-build refinement.* `tri_slab_scalar_robust_refines` (`C/Proofs/SlabRobustRefines.lean`): for every input, the compiled default `tri_slab_scalar` returns exactly `Ref.slabRobust` on the 68-byte context `tri_ray_setup` builds (`sinv = +∞` for `d = ±0`, else `invd`). With `slabRobust_parallel_hit` this closes the parallel-ray false miss at the C level for the shipped kernel.
-  - *cdiff.* New `slabr` vectors run the default-build C against `GenRobust` and `Ref.slabRobust`; half put the ray parallel to and exactly on a face plane. The legacy `slab`/`mt`/`woop` vectors run against a legacy C build. 20k vectors: 0 mismatches.
-  - *Cost* (1 thread, mandelbulb 128k tris, 4 interleaved pinned runs, best of each): trace within noise (−3%..+2% on BVH4/BVH8/LBVH8, primary/incoherent/shadow), build +7% (SAH BVH4) to +29% (LBVH8), all from `LEAF_BOX_EXACT` (TwoSum bracketing + the refit pass). No memory change. The unloaded-machine caveat applies: the host had load average 15–24 while measuring.
-  - Still opt-in: `BITEXACT`, `WATERTIGHT_TRI` (extra vertex copy, scalar leaf), `EXACT_NEAREST` (no early-out pruning).
-- **M9 (any-hit, SBVH coverage check, two-level):**
-  - *Any-hit* (`BVH/AnyHit.lean`): `Flat.runAny` models `tri_occluded_scalar` (box test against fixed `tmax`, stop at the first leaf hit, any push order). `runAny_root`: with `WF` and a conservative box test it returns exactly whether any reachable primitive hits. `runAny_cover_root`: the SBVH form, needing only `WFidx` and per-node coverage (`skip`). Not modelled: C returns 0 on stack overflow (`sp + nchildren > TRI_STACK_SIZE`).
-  - *Validation* (`bvhcheck.py`): the validator runs the proven `Flat.runAny` itself, with the bit-level C box test, and compares it with `tri_occluded_scalar`, the dispatched `lrt_tri_occluded1` and brute force. It also checks the coverage hypothesis bit-exactly: every hitting primitive must have a reference whose whole box path passes the test. SBVH trees now also run under the default flags. Result: Lean == C scalar on every ray of every variant; default flags (robust/exactn/SBVH-robust): 0 differences from SIMD or brute force and 0 uncovered hits; legacy flags: 32 (BVH) / 29 (SBVH) uncovered hits, the parallel-ray false miss.
-  - *Two-level* (`BVH/TwoLevel.lean`): `runT` models `lrt_tlas_intersect1` (leaf = per-instance BLAS query with `tmax = best`). `runT_eq_run`: if each BLAS query from `best` is the fold of its primitives (`blas_fold`, from `run_root`), the TLAS loop equals `run` over (instance, primitive) pairs; `tlas_root` then gives brute force over every reachable pair. `hit_iff`: over ℝ the affine world→object map preserves the ray parameter exactly (`HitsTriangleAt` in object space ⇔ in world space on the obj2world image). `xform_point_err` / `xform_vec_err`: rounding of `tlas_xform_point` / `tlas_xform_vec` in any `RoundingModel`, as `u·Σ|products| + u·Σ|partial sums|`. (The pair conservativity conditions and the world-space `t` error, open here, are closed in M16.)
-  - *Validation* (`tools/tlascheck.c`, in `make formal`): random BLAS (BVH4/BVH8, LBVH/SAH) and 60 instances with random rotation, non-uniform scale and translation, plus masks. TLAS `t` == brute-force minimum over instances, bit for bit (with and without `EXACT_NEAREST`); any-hit == brute force; 0 hit/miss differences against an fp64 world-space Möller–Trumbore over the transformed triangles; max relative `t` error 1.4e-5–2.5e-5.
-- **M10 (curve / patch / point boxes; hit-accuracy reference):**
-  - *Hull theorems* (`Geom/Hull.lean`): `hull_of_balls` (a convex combination of points, each within `r k` of `P k`, lies in every box containing all `P k ± r k`) and its instances `bezier_tube_in_box`, `linear_tube_in_box` (round-linear and flat curves: hull of the end balls), `bilinear_in_box`, `bicubic_in_box`, `rational_in_box` (positive weights, box of the projected CPs `x/w`), `ball_in_box`; Bernstein nonnegativity / partition of unity (`bern3_*`, `bern33_*`); `decasteljau_left/right` (the pre-subdivided sub-arc CPs describe exactly that sub-arc).
-  - *Exact C check* (`tools/primboxcheck.c`, in `make formal`): every BVH4 child box contains the control-point hull of the STORED leaf data (exact in double; `x/w ≥ lo` tested as `x ≥ lo·w`), and every inner box contains its children. **Found:** every `c ± r` box (round-linear, flat, Bézier curves, sphere/disc points; also ellipse and SDF primitives, same code shape) missed the stored primitive by up to 0.5 ulp on 2–10% of the checks, and NURBS `x·fl(1/w)` boxes by up to 10 ulp. **Fix** (under `LRT_TRI_LEAF_BOX_EXACT`, default): `tri_box_sub/add` (TwoSum bracket) and `tri_box_div_lo/hi` (exact rounding-direction test) at every such site, including the curve refit box and the NURBS intersector's own subdivision cull (also in the HIP/CUDA ports, `hp_div_lo/hi` via `fmaf`). After: 0 failures.
-  - *Hit accuracy* (`tools/primhitcheck.c`, in `make formal`): C hits against a double-precision reference: the residual on the exact stored geometry (union-of-balls distance for tubes/points, `|S(u,v) − (o + t d)|` for patches) and an independent nearest-hit reference (sphere tracing on the exact union-of-balls distance; MT on a 128×128 double tessellation of each patch). **Found:** the patch Newton loops (bicubic, rational, and the fp64 refinement `tri_patch_newton_hp`) and the Bézier-curve Newton tested convergence on the residual BEFORE the final update but returned the point AFTER it, so an ill-conditioned last step produced false hits (one bicubic hit 0.17 from any surface; Bézier-curve hits up to ~a radius off). **Fix:** the convergence test is on the returned point; patches take one more step and keep it only if its residual is smaller (accuracy unchanged, ~1e-6). Mirrored in HIP/CUDA; GPU-vs-CPU agreement unchanged (patches 100%, Bézier 99.93%).
-  - *Measured* (8 seeds × 3000 rays per kind): round-linear, sphere points, bilinear, bicubic, NURBS: 0 hit/miss and 0 `t` disagreements with the reference beyond the tessellation tolerance, residual ≤ 2.4e-5 (curves) / ≤ 4e-6 (patches). Cubic Bézier curves: residual p99.9 ≈ 3e-4 (the Newton tolerance `1e-5·(1+|R|)` and the normal-plane-circle surface model vs the union of balls), ≤ 0.1% of hits above 1e-3 (the documented cone fallback for ill-conditioned Newton), and 0–3 per 3000 rays where the adaptive sweep returns a farther hit than the nearest. These are thresholds in the tool, not zero; improving the sweep's pruning is open.
-  - *Cost* (1 thread, `dea7d73^` vs this, interleaved pinned runs, best of 3–6; 28k-segment hair, 20k Bézier curves, 50k sphere points, 4k bicubic patches, 39×39-span NURBS, 400k rays): trace within ±0.5% for every kind except NURBS −2.8%; hit counts identical except one bicubic hit (the Newton fix). Build: round-linear +1.7 ms (+37%), flat +2.2 ms (+11%), Bézier +6.9 ms (+20%), points +2 ms (+5%), bicubic 0, NURBS +1.1 ms (+81%, exact `x/w` box per extracted patch). The first version cost NURBS −80% trace: the exact per-point `x/w` rounding ran inside the intersector's subdivision cull. That hot path now uses the original arithmetic plus an 8u widening of the finished bounds (conservative for the ≤ 2 roundings of `x·fl(1/w)`); `nextafterf` was replaced by an inline bit step and the TwoSum `volatile` dropped.
-- **M11 (refit / serialization, more kinds, stack overflow):**
-  - *Box check coverage* (`tools/primboxcheck.c`): every scene is also checked after `lrt_tri_scene_save_to_memory` → `load_from_memory` and `save` → `open_mmap`, and the curve and patch scenes after refit (`lrt_curve_refit`, `lrt_tri_surface_refit` with moved control data). New kinds: ellipses, built-in SDF primitives (sphere/box/torus, including the ray-interval clip radius `brad`), planar quads, tetrahedra, and quantized triangles in all four formats, lossy and conservative (no serialization: they refuse to save).
-  - *Found* (against the previous kernel): SDF boxes and clip radii missed the shape by up to 2 ulp (99 failures/seed: the torus extent `|R| + |r|` and `br = sqrt(…)` rounded inward). Quantized-triangle leaf boxes missed the tested triangle by up to 8 ulp, including in CONSERVATIVE mode: the box was built from the decoded vertices, but the intersector tests `v0 + u·fl(v1−v0) + v·fl(v2−v0)`. *Fix* (under `LEAF_BOX_EXACT`): torus extent via `tri_box_add`, `br` widened by 4u, quantized-triangle box corners via `tri_sum_bracket` like plain triangles. After: 0 failures on 3 seeds for every kind and every reload / mmap / refit variant.
-  - *Stack overflow* (`BVH/AnyHit.lean`): `runAnyB` models `tri_occluded_scalar`'s `if (sp + nchildren > TRI_STACK_SIZE) return 0`. `need i = (#children − 1) + max(1, max over children of need)` (order-independent). `runAnyB_eq`: under the invariant "each entry's need plus the entries below it fits" (`Good`, preserved by every push via `need_child` / `good_append`) the check never fires; `runAnyB_root`: if `needRef root ≤ cap`, the bounded C loop equals brute force. The closest-hit check uses the number of children that pass the box test, at most `#children`, so the same bound covers it (not separately formalized). The validator computes `need` on every C-built tree and asserts it ≤ 1024 (max 17 measured) and runs `runAnyB` itself against the C any-hit.
-- **M12 (pathological geometry, degenerate triangles, NaN and boundary semantics):**
-  - *Pathological scenes* in `bvhcheck.py` (`--only-patho` to run alone): every vertex at one point (all triangles degenerate) and 500 distinct triangles overlapping in one plane, BVH4/BVH8. The builder's median fallback and depth cap keep the stack requirement small (`need` ≤ 18).
-  - *Found:* the SIMD any-hit leaves (SSE BVH4 and the NEON shim, AVX2 BVH8, SVE BVH8/BVH16) accepted `t <= tmax` (closed), the scalar leaf and every closest-hit / GPU path `t < tmax` (half-open), so a blocker exactly at the light distance was occluded only on SIMD. Now half-open everywhere; robust/bitexact any-hit SIMD == scalar on every ray. (The closest-hit "hit/miss vs brute" on the coplanar scene are rays whose exact hit is at `t = tmax`, i.e. a miss under `[tmin, tmax)`; brute force's rounded `t` is one ulp below.)
-  - *Degenerate triangles* (`Robust/Degenerate.lean`, any `RoundingModel`): MT computes `det = 0` exactly when `e1 = 0` or `e2 = 0` and its threshold `rel ≥ 1e-12 > 0` rejects it (`mt_rejects_degenerate`); Woop gets `det = 0` exactly when any two vertices coincide (`woop_det_ab/ac/bc`, from `mul_comm'` + `sub_antisymm` + `fl_idem`). They are kept by the builder because the spatial queries (closest point, kNN, region) do see them; for ray queries they never contribute. *Decision (resume-lean item 17):* keep them. Dropping them would silently change the point/kNN/region answers, and the ray path is already provably unaffected; the extra nodes are bounded by the median fallback and depth cap.
-  - *Found* (cdiff `degenerate` vectors, bit level): the scalar MT accepted NaN results as hits. A 0·∞ (infinite vertex or ray component, or overflow) gives `det = NaN`, and `uu < 0 || uu > 1`, `tt < tmin || tt >= tbest`, `-eps < det < eps` are all false for NaN, so `t = u = v = NaN` was returned (and poisoned `best_t`). The SIMD masks already rejected NaN. *Fix:* every scalar acceptance test is now NaN-rejecting (`!(uu >= 0 && uu <= 1)`, `!(vv >= 0 && uu + vv <= 1)`, `!(tt >= tmin && tt < tbest)`, `!(det <= -eps || det >= eps)`), identical for numbers, in the CPU kernel and the HIP, CUDA, hiprtc and Vulkan kernels (SPIR-V regenerated). `Ref.mtRej1–4` updated; `tri_mt_one_refines` re-proved (`EvE.lnot'` moved to `Eval.lean`). On 4000 random MT/Woop vectors with special values: 410 of 450 old MT "hits" were NaN/∞ results and are gone, no finite hit lost or gained; Woop unchanged. 4000/4000 degenerate vectors miss in C, MiniC and Ref. CUDA (RTX 3070, RTX 5060 Ti), HIP, hiprtc and Vulkan suites unchanged.
-- **M13 (instance boxes):**
-  - *Lean* (`BVH/TwoLevel.lean`): `aff_in_corner_box`: the affine image of every point of a box lies in any per-axis interval that contains the images of its 8 corners (each coordinate is affine; its minimum over the box is attained at the corner that picks, per input axis, the bound minimizing `L a j · p j`). With `hit_iff` this gives: an exact object-space hit inside the BLAS root box is a world-space hit inside the instance box built from the transformed corners.
-  - *Found* (`tools/tlascheck.c`, new exact check, double): `tlas_transform_aabb` takes min/max of `fl(m0 c0 + m1 c1 + m2 c2 + m3)`; with cancellation that misses the exact corner by many ulps of the result. ~2% of the checks failed, by up to 47 ulp. *Fix* (under `LEAF_BOX_EXACT`): each transformed corner is widened by `4u · (Σ|products| + Σ|partial sums|)` (+tiny), i.e. 4× the bound proved in `xform_point_err`. After: 0 failures on 5 seeds; TLAS results unchanged (TLAS == brute bit for bit, 0 hit/miss vs fp64 world).
-  - *Open:* the BLAS query runs on the rounded object-space ray `fl(W o) + t·fl(W d)`, not the exact one; the world point of a reported hit is within `|L_O|·(|e_o| + t |e_d|)` of the exact transformed box (grows with `t`), so containment of the world hit itself is not proved; measured: 0 hit/miss vs the fp64 world-space reference.
-- **M14 (cubic Bézier curve intersector):** the three weaknesses `primhitcheck` measured had separate causes, all fixed (CPU kernel and the HIP/CUDA device port, regenerated from the C):
-  - *Wrong surface model:* Newton solved a normal-plane circle sweep (foot `R·T = 0`, `|R⊥| = r`); a round curve is the union of balls, whose envelope is `F = R·C′ + r r′ = 0`, `G = |R| − r = 0`. Now that, plus the second-order condition `∂F/∂u < 0` (a minimum of the distance along u; a maximum lies inside the tube on the concave side of a bend). Residual 3e-4 → ~3e-6.
-  - *Approximate fallback hits:* when Newton failed the cone seed (on the inflated bounding cone) was reported as the hit. Never now.
-  - *Missed nearest:* nothing checked that Newton's root was this leaf's entry. Now the fast path is accepted only if converged, front-facing (`R·dir ≤ 0`) and inside the leaf's u-range; otherwise `tri_bez_leaf_trace` sphere-traces the exact leaf-tube distance (u restricted to the leaf, so end balls — where `F ≠ 0` and Newton cannot converge — are included) from the entry of a capsule that encloses the leaf tube, so the first contact is found, then polishes with Newton. Every leaf thus returns its own nearest contact below the current best, so the minimum over leaves is the nearest hit. A converged front contact elsewhere on the curve is kept as a candidate (it is a real surface point) and lowers `best` for the remaining search. Bugs found on the way, each by a specific failing ray: the sub-interval capsule used the distance to the chord LINE where the cull measures against the SEGMENT; a warm-started foot point slid to an interior local minimum and overestimated the distance near end balls (now the interval ends are also tried, and overshoot bisects back to the last point a full search verified outside).
-  - *Reference fix:* `primhitcheck`'s tube distance refined only around its best sample and could pick the wrong basin (it reported a spurious miss / residual on a correct C hit); it now refines around every sampled local minimum. Bézier curves are checked with the strict criterion (no farther hit, residual ≤ 2e-4); "C nearer with a tiny residual" is no longer a failure (it is the patch tessellation missing a silhouette sliver).
-  - *First-contact core (resume-lean item 7):* `Geom/SphereTrace.lean` proves the 1D sphere-trace no-overshoot lemma for a 1-Lipschitz distance `f`: if `f root ≤ 0` and `y ≤ root`, then `y + f y ≤ root` (`stStep_le_root`), so every iterate stays left of a surface point (`stTrace_le_root`), and the trace is monotone where `f ≥ 0` (`stStep_ge`/`stTrace_mono`). The full model (the actual Bézier signed distance and the Newton refinement) remains.
-  - *Result* (24 seeds × 2000 rays): 0 hit/miss, 0 farther-than-nearest, worst residual 3.8e-6. HIP GPU vs CPU agreement 99.930% → 99.975%. *Cost* (1 thread, 20k curves, 400k rays): closest 0.221 → 0.182 Mray/s, occluded 0.258 → 0.211 (−18%), after replacing the leaf distance's 28-step golden-section refinement by a bracketed Newton on φ′(u) (~5 evaluations); profile: the remaining leaf work is mostly sphere traces that end in a miss. Any-hit (`lrt_tri_occluded1`) now passes `anyhit` down to the leaf solve, which accepts the first converged, residual-verified Newton contact in range (front or back, any u) and the sweeps stop at the first hit: occluded 0.258 → 0.304 Mray/s (+18% over the pre-rewrite sweep). `primhitcheck` checks any-hit against the exact reference for every tube/point kind (`occ-bad`). *Decision (resume-lean item 16):* accept the closest-hit cost. The exact solve removed false hits (one bicubic hit 0.17 off any surface); the remaining time is conservative sphere traces that end in a miss. The next candidate is a cheaper miss-side bound (a tighter interval or an early AABB reject inside the trace), not a return to the golden-section refinement.
-  - *Patch follow-up (M15 below).*
-- **M15 (bicubic / NURBS patch intersector):**
-  - *Reference first:* both "farther than the reference" rays of M14 were tessellation artifacts. Near a silhouette a 128×128 tessellation triangle pokes past the surface (no exact root exists), and at a grazing angle its `t` is off by more than the tolerance. `primhitcheck` now adjudicates every patch disagreement (farther hit, or a miss where the tessellation hits) with an exact double multi-start Newton over every patch the ray's box admits; only a confirmed nearer exact root counts as a C failure.
-  - *Found* (24 seeds, and an old-vs-new diff on a 4000-patch scene judged by a tessellation + exact-polish oracle): (1) a real miss. The per-cell Newton (seeded at the cell centre, undamped) jumped from a corner cell to (0.71, −0.41) at a grazing root and converged outside the domain. (2) Several old false hits and farther hits.
-  - *Fix* (CPU `tri_bezpatch_newton` / `tri_rbezpatch_newton` and drivers; HIP/CUDA `hp_patch_newton2<RAT>` / `hp_patch_fold<RAT>`): Newton is cell-bounded (steps ≤ one cell, iterate clamped to the cell ± half a cell, roots accepted only there) and returns 0 = failed, 1 = hit, 2 = converged to an in-domain root outside [tmin, best). A depth-4 cell whose box is hit is refined (to depth 7) when Newton fails. A root of the analytically extended surface just outside [0,1]² is NOT settled: a different in-domain root can sit next to it, which was a regression of the first version. After a hit, the cell is also refined when the surface folds against the ray inside it (n·dir changes sign at its corners/centre: a silhouette, the only way to have a nearer second root in a small cell), which was the second regression, a farther root picked in a folded cell.
-  - *Result:* 24 seeds × 3 patch kinds: 0 confirmed C misses/farther hits (5 tessellation artifacts adjudicated away), worst residual 3.7e-5. On the 18 disputed rays of the 4000-patch scene the oracle rates old {ok 4, farther 2, miss 1, nearer 11} and new {ok 6, nearer 12} ("nearer" = C found a root nearer than the tessellation-seeded polish). HIP GPU vs CPU still 100% on all patch kinds. *Cost* (1 thread, 300k rays): bicubic 0.034 → 0.031 Mray/s (−9%), NURBS 0.071 → 0.059 (−17%); then *more than recovered*: the profile showed ~55% of patch time in re-deriving every cell's control net from the root net (`tri_bezpatch_subpatch` / `tri_rbezpatch_subpatch`: per-row/column `subcurve` = two de Casteljau splits each). The CPU drivers now carry each cell's net on the stack and split it once at the midpoint (`tri_patch_split4`), with a 16u widening of the cull box for the accumulated split rounding (Newton still uses the original net and global (u,v)). Bicubic 0.031 → 0.117 Mray/s (3.5× the original), NURBS 0.059 → 0.088 (+24% over the original); results unchanged (24-seed strict check clean, oracle unchanged, GPU vs CPU 100%). The GPU kernels keep the per-cell re-derivation (carrying 48–64 floats per stack entry would cost KB of per-thread stack).
-- **M16 (defaults, closest-hit stack bound, TLAS pair conservativity, world `t` error):**
-  - *Defaults:* `LRT_TRI_BITEXACT` is on by default (opt out: `-DLRT_TRI_NO_BITEXACT`). Cost, 1 thread, 131k-triangle bumpy sphere, 400k rays: −1% to −3% (within noise). `WATERTIGHT_TRI` and `EXACT_NEAREST` stay opt-in for now. Measured on the same scene, `WATERTIGHT_TRI` traces 1.5–2.4× slower (the leaf is scalar Woop), `EXACT_NEAREST` 2.2× slower on BVH8 primary rays, and all three together 4–5× slower on closest-hit. They become defaults once a SIMD watertight leaf and a pruning `EXACT_NEAREST` exist.
-  - *Closest-hit stack* (`BVH/AnyHit.lean`): `runB` models `tri_intersect_scalar`'s `if (sp + nhit > TRI_STACK_SIZE) return 0`. `runB_eq`: under the same `need` invariant as any-hit, the check never fires and `runB = run`. `runB_root`: if `needRef root ≤ TRI_STACK_SIZE`, the bounded C loop returns `run_root`'s brute-force answer. `bvhcheck.py` already checks `need` on real trees (max 18 ≤ 1024).
-  - *TLAS pair conservativity* (`BVH/TwoLevel.lean`): the BLAS traces the rounded object ray `õ + s d̃`. `world_near_obj` maps that ray's point back with the stored `obj2world` `A`, not the exact inverse of the float `world2obj` `W`. Its distance to the world ray point `o + s d` is at most `ρ|o + s d|₁ + σ + Σ_j |A_kj| (e_o + |s| e_d)_j`. Here `ρ, σ` bound the residual of `A ∘ W − id` (`hres_of_entries`, from the entries of `L_A L_W − I` and `L_A c_W + c_A`). `xform_point_err_simple` / `xform_vec_err_simple` give `e ≤ 5u Σ|products|`. Together the margin is `α(|o|₁ + |s||d|₁) + β` per instance. `world_in_dilated_box`: if the BLAS point lies in the BLAS box, the world point lies in the instance box dilated by that margin (with `aff_in_corner_box`). `s_bound`: before the first hit `best = tmax`, so the per-ray margin is capped by `|s| ≤ (|o_k| + R + a)/(|d_k| − b)` on the dominant axis, R being the root box half-extent. The pair conditions C1/C2 of `tlas_root` thus reduce to the conservative slab test on the dilated box, with the BLAS's own slack.
-  - *C* (under `LEAF_BOX_EXACT`, default): `tlas_instance_margin` computes α, β per instance in double with explicit rounding terms. β widens the instance box outward, and the TLAS keeps `max α` and the root half-extent. `lrt_tlas_intersect1` / `lrt_tlas_occluded1` test each node against the dilated box. To keep the cost low, the dilation shifts the ray origin rather than the faces: `oL = fl(o + m_f) ≥ o + m` and `oH ≤ o − m`. Then `(lo − oL)·sinv` is the usual robust slab arithmetic against the plane `lo − (oL − o)`. The shifted origins are recomputed only when `best` changes. Cost (2000 instances of small BLASes, 300k incoherent rays, 1 thread): closest −4%, occluded −4%. Hits are identical. A first version that dilated each face in double with `nextafterf` was 2.7× slower.
-  - *Validation* (`tools/tlascheck.c`, in `make formal`): for every brute-force (instance, BLAS) hit it checks `|o + s d − A(õ + s d̃)| ≤ α(|o|₁ + |s||d|₁) + β` in long double, and also `|s| ≤ s_bound`. 4 seeds, ~1700 pair hits each: 0 over the bound, worst use of the bound 0.22, 0 over `s_bound`. TLAS == brute force and any-hit == brute force, unchanged; 0 hit/miss against the fp64 world reference.
-  - *World `t` error* (`plane_t_perturb`, `plane_t_perturb_abs`): the mapped-back BLAS ray `A õ + s L_A d̃` meets the world triangle `A T` at the BLAS's own parameter (`hit_iff`). On the triangle's plane `n·x = h` it differs from the exact world ray by `t₂ − t₁ = (n·(o − o') + t₁ n·(d − d'))/(n·d')`. That gives `|Δt| ≤ Σ_j |n_j| (|δo_j| + |t₁||δd_j|) / |n·d'|`, with `δo, δd` from `world_near_obj`. The reported `t` adds the BLAS kernel's own `t` error. Grazing rays (`n·d' → 0`) are unbounded, as for any ray/plane solve. Measured max relative `t` error against fp64 world: 2.5e-5.
-  - *World hit point, conditioned on incidence* (`TwoLevel.tlas_hit_point_in_box_incidence`, 0 sorry): `plane_t_incidence` bounds `|s − t*|` by `planePerturb(n,o,d,o',d',t*)/c` when `0 < c ≤ |n⬝ᵥd'|`; `hit_point_in_dilated_box` turns a parameter error `δ` into `δ|dⱼ|` per axis; the composed theorem places the reported point `o + t·d` in the instance box (already dilated by the `world_in_dilated_box` transform margin `m`) dilated by `mⱼ + (planePerturb/c + ε)|dⱼ|`, with `ε` the BLAS's own `t` error (`ExactPrune.woop_t_err`). Grazing rays (`|n⬝ᵥd'| → 0`) are outside the bound, as any ray/plane solve must be. The closest-hit result was already covered: C1/C2 use the BLAS's exact parameter, as in the single-level `run_cover`.
-
-  - *GPU patch drivers, negative result:* porting the CPU's stack-carried cell nets (`tri_patch_split4`) to `hp_bezpatch_one` / `hp_rbez_one` kept agreement at 100% but was about 2× slower on an RX 9070 XT (`bench_hip --normals`, 20k bicubic patches): primary 6.4 → 3.8 Mray/s, incoherent 0.7 → 0.3. 32 stack entries × 192–256 B per thread spill to local memory, which costs more than recomputing each cell's net from the root in registers. The GPU keeps `hp_subpatch`. *Decision (resume-lean item 15):* keep `hp_subpatch`; a shared-memory cell net per warp is the only plausible retry, and it is not worth the complexity without a measured win.
-- **M17 (SIMD watertight leaf):**
-  - *Per-lane model (resume-lean item 4, first step):* `C/Proofs/SimdLanes.lean` models the SIMD watertight leaf lane-wise. `vmul`/`vadd`/`vsub`/`vdiv`/`vlt` are the packed binary32 operations; `vWoopK` mirrors `Ref.woopK` expression for expression (same order, no FMA, no reassociation), so `vWoopK_lane` proves lane `i` is exactly the scalar reference on lane `i`'s vertices (definitional). On top of that, `bstep`/`blockBest` mirror the C driver's fold (`NO_HIT` slots skipped, strict `t < best`), with `blockBest_sound` (a changed block result is a real lane hit with the reported `t,u,v` and id), `blockBest_all_skip` (all-padding block leaves the caller's best), and `blockBest_woop` (the reported prim id belongs to a lane whose scalar `woop` returns the reported `(t,u,v)`). The model *assumes* the ISA's packed ops are the binary32 lane ops of `FP.Binary32`; mapping the intrinsics to that (and the C to the intrinsics) remains the trust gap, covered exhaustively for this kernel by `wtcheck`'s leaf fuzz (400k blocks / 2.7M lanes, bit-identical incl. SVE 8/16).
-  - *Leaf:* `tri_woop4_block` (SSE, BVH4) and `tri_woop8_block` (AVX2, BVH8) are generated from one template. They perform `tri_woop_one`'s operations in its order, with no FMA and the same association. Comparisons keep the scalar NaN behaviour: ordered `<`, `>`, `>=`, and an unordered `!=` for the `det == 0` reject. The closest lane is the minimum `t`, lowest lane on ties, which is what the scalar lane loop with a strict `t < best` update returns. So every lane equals `tri_woop_one` bit for bit, and `tri_woop_one_refines` / `woop_no_gap_bits` carry over unchanged. Exact vertices sit in a self-contained SoA side block `wblk` (`10·W` words per leaf block: v0, v1, v2, then the prim ids). It is derived from `wverts` by `tri_build_wblk` after build, load and refit, and prefetched in place of the edge block.
-  - *Dispatch:* `lrt_tri_intersect1` / `occluded1` now run the SIMD kernels when the leaf exists (`TRI_WBLK_SIMD`: BVH4 on SSE, BVH4/BVH8 on AVX2, not quantized nodes). The interleaved `intersect1N` pipeline is used only for BVH4 closest-hit; elsewhere it measured slower than per-ray with this leaf. *Found:* the Ray4/Ray8 packet kernels (`lrt_tri_intersect4/8`, `occluded4/8`, and the coherent `intersect1N` that calls them) ran Möller–Trumbore even in watertight builds. They now fall back per ray when the scene carries exact vertices. BVH8Q builds keep the scalar watertight kernels; the NEON shim dispatches the SIMD Woop leaf for BVH4 (validated under `qemu-aarch64`: `wtcheck` leaf 400k blocks / 1.37M lanes bit-identical, traversal/batch/save-load/refit 0 differences, `c_tri_seam_test_wt` 0 leaks).
-  - *SVE watertight leaves (resume-lean item 10):* `tri_woop_sve_setup`/`tri_woop_sve_core` implement the fp32 Woop test with SVE intrinsics on the exact-vertex `wblk` (separate mul/sub, no FMA, scalar axis/shear), one kernel for width 8 (BVH8) and 16 (BVH16), plus the half-open any-hit variant. `TRI_WBLK_SIMD` now includes SVE layouts 8/16, and the four SVE traversals (`intersect`/`occluded` × BVH8/BVH16) dispatch the Woop leaf when `s->wblk` is set; the edge-format MT SVE leaves are unchanged. Validation under `qemu-aarch64 -cpu max` (`-march=armv8.2-a+sve`): new `leaf_fuzz_sve(8/16)` 400k blocks / 2.74M lanes bit-identical to `tri_woop_one` (including any-hit), layout-8 traversal/batch/save-load/refit 0 differences, `c_tri_seam_test_wt` 0 leaks and the C tri test passes. The 16-wide wblk kernel is leaf-validated; the scalar traversal reference does not support layout 16, so the traversal-level bit check is BVH8 only (pre-existing scalar limitation). NEON (no SVE) and x86 builds are unchanged and pass; the SVE code is `#if LRT_TRI_HAS_SVE` only.
-  - *Validation* (`tools/wtcheck.c`, in `make formal`):
-    - Leaf fuzz: 1.2M blocks, a third with special values (±0, ±inf, NaN, subnormal, 1e30) and a third with rays through vertices/edges and lanes sharing edges. Every lane and the chosen hit equal the scalar test: 0 differences.
-    - Traversal: BVH4/BVH8 × LBVH/SAH × soup / shared-edge heightfield / coplanar, 54k rays. Dispatched `intersect1` / `occluded1` == `tri_intersect_scalar` / `tri_occluded_scalar` bit for bit (t, u, v, prim).
-    - Also checked: `intersect1N` / `occluded1N` (both hints), `intersect4`, and the scene after save → load and after refit: 0 differences.
-    - SSE-only build: same, 0 differences.
-    - `c_tri_seam_test_wt`: 0 leaks. The full C suite passes when built watertight.
-  - *Cost* (1 thread, 131k-tri bumpy sphere, 400k rays), against the default MT build. Before this change the watertight build was 1.5–2.4× slower everywhere.
-
-    | | BVH4 | BVH8 |
-    |---|---|---|
-    | Primary | +24% | −3% |
-    | Incoherent | −9% | +3% |
-    | Shadow | −8% | −2% |
-
-    Memory is now the obstacle to making it the default: exact vertices `wverts` (36 B/tri) plus `wblk` (40 B per lane slot) add 145–155% to nodes + leaves on this mesh. The MT edge blocks are still kept, for the GPU upload, shading reconstruction and serialization. Dropping one copy (leaf blocks storing exact vertices, or `wverts` reconstructed from `wblk`) is the next step before a default switch.
-- **M18 (one exact-vertex copy):** watertight scenes kept the exact vertices twice: prim-ordered `wverts` (36 B/tri) and the SoA `wblk`. `wverts` is gone and `wblk` is the only copy.
-  - `tri_build_wblk(s, src, n)` fills it from the caller's vertices at build (a temporary prim-ordered array, freed right after), from the LRTS aux vertices at load, and from the new vertices at refit.
-  - The scalar lane test `tri_isect_lane_s` reads the lane's vertices from `wblk` by block index. That covers BVH8Q and the quantized-node kernels, and NEON/SVE/scalar targets now build `wblk` too.
-  - The serializer regenerates the prim-ordered aux array from `wblk` (`tri_wblk_to_prims`). The file format is unchanged, so the HIP/CUDA/Vulkan watertight kernels still receive `d_wverts` from the blob.
-  - *Independent check:* `wtcheck` previously compared SIMD against a scalar oracle that now reads the same `wblk`. So it also checks that every reported hit equals `tri_woop_one` on the caller's input vertices of that prim, bit for bit, after build, load and refit: 0 differences. All `wtcheck` sections pass, also under ASan/UBSan. `c_tri_seam_test_wt` has 0 leaks, the full C suite passes built watertight, and `c_tri_parallel_test_rb` passes.
-  - *Memory:* the overhead over nodes + leaves on the 131k-tri mesh drops from +145–155% to +78–84%. *Speed* is unchanged from M17 relative to the default build: BVH4 +23 / −8 / −5%, BVH8 −3 / +3 / −3% (primary / incoherent / shadow). The rest of the overhead is `wblk` sitting beside the MT edge blocks. The SIMD traversal no longer reads those blocks, but they remain the source for the GPU upload, `lrt_tri_get_verts` and serialization. Dropping them would mean a watertight-specific leaf format through the GPU and LRTS paths.
-- **M19 (watertight scenes without edge blocks):** for BVH4/BVH8 watertight scenes the leaf blocks themselves store the exact `v0 v1 v2`, replacing `v0 e1 e2`. The size is the same (`10·W` words), so `wblk` aliases `s->blocks` (`tri_vfmt`). Watertight scenes now take the same memory as default ones: on the 131k-tri mesh BVH4 is 7.0 MB in both, BVH8 6.7 MB.
-  - *Edge readers:* the build stores `e1 = fl(v1 − v0)`, so readers that still want edges recompute them bit-identically. That is the fp64 path `tri_block_isect_hp` for non-vertex-format blocks; on the vertex format it now runs a double Woop leaf (`tri_woop_one_hp`) on the exact vertices, replacing the double Möller–Trumbore. The fp64 slab also mirrors the robust `+∞` reciprocal and inflation, so its node tests match the fp32 ones. `lrt_tri_get_verts` returns the exact vertices. *Found:* it used to return `v0 + e1` in watertight scenes too, which differs from the input on 544 of the checked prims. `tri_leaf_verts` / `tri_leaf_prim_aabb` (node boxes under `LEAF_BOX_EXACT`, region queries, refit) take the exact vertices, so node boxes now contain the triangles the watertight test actually tests, rather than the MT triangle `v0 + e`. The SSE/AVX2/SVE MT edge leaves are never dispatched for these scenes. `wtcheck` compares every entry point against the scalar oracle and against `tri_woop_one` on the input vertices, which would show a misroute.
-  - *Format:* LRTS header flag bit 2 (value 4) marks vertex-format leaves. A build without `WATERTIGHT_TRI` rejects such a file instead of misreading it. Vertex-format files load directly, including when mmapped, read-only. Legacy watertight files (edge blocks + aux vertices) are converted on load, or keep a separate `wblk` when mmapped. BVH16 also keeps a separate `wblk`. The aux vertex array is still written, so the HIP/CUDA/Vulkan watertight kernels are unchanged.
-  - *Validation* (`wtcheck`, in `make formal`): all sections from M17/M18, plus readers. `get_verts` equals the input exactly. `intersect_n` agrees with `intersect1` on hit/miss on every ray. Its first `t` differs on 2468 of 36000 rays, by at most 11 ulp, all on the shared-edge and coplanar scenes. That is the node-pruning slack of the two searches (`Flat.run_approx`): each prunes by a rounded `tnear` against its own running bound, so either can miss the true nearest by a few ulp, or pick another prim at a tie. It is the same count with the previous library. The ≤4-ulp figure from M7 was measured on ordinary scenes; in-plane rays on overlapping coplanar triangles reach 11. The fp64 path uses a watertight Woop leaf in double on vertex-format blocks (MT otherwise). It still differs from the fp32 hit/miss on ~4% of the vertex- and edge-aimed rays (1456 of 36000, down from 1562). The cause is the test construction, not the leaf: `ray.dir = p − org` is rounded in fp32, so the exact real fp64 ray can pass one fp32 ulp to the side of the vertex and genuinely miss, while the fp32 arithmetic lands inside. A caller supplying double rays (`lrt_ray_hp` is double) gets the watertight double leaf. Reported, not failed; the fp64 leaf is scalar on SVE (the 8-wide double MT loop is bypassed for vertex-format blocks). SSE-only and ASan/UBSan runs pass, `c_tri_seam_test_wt` has 0 leaks, and the full C suite built watertight passes.
-  - *Speed* vs the default build (1 thread, 131k tris, load ~4 while measuring): BVH4 about +20% primary, −8 to −10% incoherent, −10% shadow; BVH8 0% primary, +1–2% incoherent, about −10% shadow.
-- **M20 (shadow retune; `WATERTIGHT_TRI` on by default):**
-  - *Retune:* measured best of 9 on a quiet machine (load < 0.5). Under load the earlier "−10% shadow" was mostly noise: the real loss was BVH4 −4%, BVH8 −1%. Two changes, neither altering any result:
-    - The Woop leaf returns before the `t` divide when no lane passes the edge-sign / det test (≈ +3% everywhere).
-    - The per-ray Woop setup (three divides) is lazy: done at the first leaf visit. Rays that reach no leaf skip it. This applies to the single-ray kernels and all four pipelines.
-    - The BVH4 shadow interleaved pipeline was re-measured with the Woop leaf and stays slower than per-ray (7.7 vs 7.9 Mray/s), so watertight any-hit batches remain per ray.
-  - *Result* (1 thread, 131k tris, 400k rays), watertight vs the MT build:
-
-    | | BVH4 | BVH8 |
-    |---|---|---|
-    | Primary | +20% | 0% |
-    | Incoherent | −2% | +9% |
-    | Shadow | +3% | +14% |
-
-    Memory is the same (M19).
-  - *Default:* `LRT_TRI_WATERTIGHT_TRI` is now set in `lightrt_c_tri.h`; opt out with `-DLRT_TRI_NO_WATERTIGHT_TRI`. The Lean mirror in `bvhcheck.py` models the Möller–Trumbore leaf, so its variants, `cdiff`'s legacy build, c2lean's `Gen`, and the "report" builds of the seam and parallel-ray tests opt out explicitly. The default watertight leaf is validated by `wtcheck.c` (bit-identical to `tri_woop_one`, which `tri_woop_one_refines` / `woop_no_gap_bits` cover) and by `c_tri_seam_test_wt` (0 leaks). Full C suite, quad/tetra, surfaces, HIP (RX 9070 XT), Vulkan and CUDA (RTX 3070, RTX 5060 Ti) pass with the new default.
-  - *Any-hit pipeline heuristic, benchmarked and fixed* (`make bench_occ`, `benchmark_c/bench_occ.c`): on the 131k-triangle scene the batched `occluded1N` interleaved pipeline is slower than per-ray `occluded1` (7.7 vs 8.5 Mray/s), as noted in M17. A larger, cache-cold sweep (1M incoherent shadow rays, BVH8, 0 differences in hit bits; best of 9, alternated) shows the crossover: per-ray wins below ~245k triangles (−11 to −14%) and the interleaved pipeline wins above ~500k (+7 to +16%). The BVH8 AUTO hint now uses per-ray below 300k triangles and the interleaved pipeline above; explicit `LRT_TRI_BATCH_INCOHERENT` always interleaves and `_COHERENT` always runs per-ray. Re-measured AUTO: 180-grid (65k tris) +0.4% vs per-ray (was −11 to −14%), 700-grid (980k tris) +14.8% vs per-ray. Watertight scenes always take the per-ray path (`wblk`), so this affects only non-watertight builds.
-- **M21 (exact nearest with pruning; slab false misses at vertices):**
-  - *Key* (`BVH/ExactPrune.lean`, 0 sorry): the Woop leaf's `t = fl(N/D)` is a weighted mean of the vertex depths `z_i = fl(sz · fl(v_i[kz] − o[kz]))` along the dominant axis, with all edge values of one sign. `woop_t_lower` / `woop_t_lower_neg` prove `t ≥ m − 16u M` for `m ≤ z_i`, `|z_i| ≤ M`, `|m| ≤ M`. `depth_bounds` gives such `m, M` from the box's two `kz` faces, because rounding is monotone. `key_le` shows the float key `fl(m − fl(2⁻¹⁹ M))` is below that bound. Together (`woop_key_le_t`), pushing `max(key, tmin)` satisfies `Flat.run_root`'s C2 for every accepted triangle whose exact vertices lie in the node box. The box test against the fixed `tmax` is C1, as in `run_exact`. So the traversal returns exactly the brute-force nearest `t` while still pruning by `best`.
-  - *Tighter key attempt (resume-lean item 12), negative:* adding the child box's slab entry to the key (`max(old, tnear − 2⁻²⁰|tnear| − 2⁻¹⁹M)`, suggested by the `slab_no_false_miss` relative bound and the Woop `t` error) gave no measurable gain: on 131k triangles / 400k incoherent rays the `EXACT_NEAREST` rate stayed at 0.5–0.6 vs 0.7 Mray/s for the default build (was 0.5). The slab entry is the box entry, which for incoherent rays is not much tighter than the dominant-axis box extent at leaf scale; a useful tighter key would need a leaf-level bound, not a node-slab bound. Reverted (the exact-nearest pruning gap remains the known −24%/−12% cost).
-  - *C refinement of the key* (`C/Proofs/ExnKeyRefines.lean`, 0 sorry): `c2lean.py` gained a `GenExn` configuration (`-DLRT_TRI_EXACT_NEAREST`) that translates `tri_exn_key` (and maps `fabsf` to `copysignf(x, +1)`). `tri_exn_key_refines` proves the compiled scalar function returns exactly `exnKey` — the bit-level `fl(m − fl(2⁻¹⁹ M))` with `m = fmin(z_lo, z_hi)`, `M = fmax(|z_lo|, |z_hi|)` (and `tmin` when `on == 0`) — closing the C-to-Lean gap for the key computation itself.
-  - *Two-sided `t` error* (`ExactPrune.woop_t_err`, `woop_t_err_neg`, 0 sorry): the same numerator/denominator analysis gives `|t − (Σ eᵢzᵢ)/(Σ eᵢ)| ≤ 16u M` for both edge-sign classes; since the exact ratio is a convex combination of the depths, `woop_t_upper` (`t ≤ Z + 16u M` when all `zᵢ ≤ Z`, both signs) follows. `quot_err` holds the generic quotient algebra. This complements `woop_t_lower` (`t ≥ m − 16u M`) and is the C-level `t` error needed by the TLAS world-hit bound.
-  - *C* (`-DLRT_TRI_EXACT_NEAREST`, watertight scenes with `wbox_exact`, i.e. node boxes that are the exact min/max of the exact vertices): `tri_exn_key` in the scalar, SSE BVH4 and AVX2 BVH8 closest-hit kernels. `wbox_exact` is set at build (not SBVH, not quantized nodes) and refit, and saved as LRTS flag 8. Other scenes (MT leaves, SBVH, quantized nodes) keep the unpruned rule. *Found:* `intersect1N`'s interleaved pipelines and the Ray4/Ray8 packets ignored `EXACT_NEAREST` and pruned by `best`; under the flag they now run the per-ray kernels.
-  - *Found while validating — slab false misses on vertex-aimed rays:* comparing every ray against brute force (`tri_woop_one` over all input triangles) showed 26–27 rays aimed at shared vertices of the heightfield missing entirely, in the default build since watertight became the default (and in the scalar kernel). The node slab test rejects a box the ray touches exactly at an edge or corner. This is the false miss proved to exist in `Robust/SlabMissReal.lean`; random rays almost never hit it, so `bvhcheck` never flagged it.
-  - *Fix:* `LRT_TRI_SLAB_INFLATE` (far value `× (1 + 10u)`, `Robust/Slab.lean` `ize_constant_sufficient`) is now on by default with `SLAB_ROBUST` (opt out: `-DLRT_TRI_NO_SLAB_INFLATE`). It is mirrored in every CPU node slab (scalar, SSE, AVX2 incl. BVH8Q / fp8 / q4 nodes, SVE, the Ray4 packet, the TLAS) and in the HIP, CUDA and hiprtc kernels and the Vulkan shader (specialization constant 2 is now a bit mask: bit 1 = inflate; SPIR-V regenerated). `Ref.slabRobust` now includes the inflation, and `tri_slab_scalar_robust_refines` and `slabRobust_parallel_hit` re-check against it.
-  - *Result* (`wtcheck`, both builds in `make formal`):
-    - Default: 0 misses against brute force (was 26), with `t` within 13 ulp (pruning slack); misses now fail the check.
-    - `EXACT_NEAREST`: `t` equal to brute force bit for bit on all 36000 rays.
-    - All earlier sections still pass. The full C suite also passes built with `EXACT_NEAREST`. Cost of the inflation: 1–3%.
-  - *Cost of the pruning key* (1 thread, 131k tris, best of 9; load 3–4):
-
-    | | Default | New `EXACT_NEAREST` | Old `EXACT_NEAREST` |
-    |---|---|---|---|
-    | BVH4 primary | 6.47 | 4.91 (−24%) | 2.95 (−55%) |
-    | BVH8 primary | 6.89 | 6.05 (−12%) | 3.42 (−52%) |
-    | BVH4 incoherent | 5.15 | 3.19 | 5.16 |
-    | BVH8 incoherent | 5.58 | 4.66 (−17%) | 3.75 |
-
-    The old BVH4 incoherent figure came from the non-exact pipeline. The key uses only the dominant-axis extent of the box, so diagonal rays prune less. `EXACT_NEAREST` stays opt-in.
-
+- Namespaces mirror directories; `<algo>_<property>` theorem names; each
+  translated C function `foo` has `foo_refines`.
+- No sorry, no new axioms, no `native_decide`, no CI Actions (manual gates).
+- Every commit: `make formal` green, `Co-Authored-By:` trailer, no force-push.

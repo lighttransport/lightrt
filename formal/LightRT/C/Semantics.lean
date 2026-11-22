@@ -12,7 +12,8 @@ import LightRT.FP.Binary32
   * integer types of width 8/16/32/64, signed and unsigned; `double`
     (as IEEE bit patterns, comparisons only); `float` (IEEE binary32 bit
     patterns with full RNE arithmetic `+ - * /`, negation, comparisons and
-    `copysignf`, executed by `LightRT.FP.Binary32`; no FMA contraction — the
+    `copysignf`, `sqrtf` (correctly-rounded binary32 sqrt via `sqrtBits`),
+    executed by `LightRT.FP.Binary32`; no FMA contraction — the
     C side is compiled with `-ffp-contract=off`); pointers to objects;
     structs/arrays through computed byte offsets (from clang's record layout)
   * locals whose address is never taken (they live in a register file)
@@ -211,6 +212,9 @@ inductive Expr where
   | fneg (a : Expr)
   /-- C `copysignf(a, b)`: magnitude of `a`, sign of `b` (exact, bit-level). -/
   | copysign (a b : Expr)
+  /-- C `sqrtf(a)`: correctly-rounded IEEE binary32 square root, exact at the
+      bit level (`LightRT.FP.Binary32.sqrtBits`). -/
+  | sqrt (a : Expr)
   /-- Integer conversion to `t`. -/
   | cast (t : IntTy) (a : Expr)
   /-- `a && b`, `a || b` (short-circuit), `c ? a : b`. -/
@@ -537,6 +541,11 @@ def evalExpr (p : Prog) : Nat → State → Expr → Res Val
       match va, vb with
       | .f32 x, .f32 y => pure (.f32 (x % 0x80000000 + (y / 0x80000000) * 0x80000000))
       | _, _ => .ub
+    | .sqrt a => do
+      let va ← evalExpr p fuel s a
+      match va with
+      | .f32 x => pure (.f32 (FP.Binary32.sqrtBits x.toUInt32).toNat)
+      | _ => .ub
     | .cast t a => do
       let va ← evalExpr p fuel s a
       evalCast t va
