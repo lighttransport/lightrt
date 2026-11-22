@@ -28,7 +28,8 @@ macro_rules
   | `(tactic| ev) => `(tactic| first
       | (apply EvE.var; rfl)
       | (apply EvE.f32mul <;> ev) | (apply EvE.f32sub <;> ev) | (apply EvE.f32add <;> ev)
-      | (apply EvE.f32div <;> ev) | (apply EvE.f32le <;> ev) | (apply EvE.f32lt <;> ev)
+      | (apply EvE.f32div <;> ev) | (apply EvE.sqrt' <;> ev)
+      | (apply EvE.f32le <;> ev) | (apply EvE.f32lt <;> ev)
       | (apply EvE.f32gt <;> ev) | (apply EvE.f32ge <;> ev)
       | (apply EvE.land' <;> ev) | (apply EvE.lor' <;> ev) | (apply EvE.fneg' <;> ev)
       | (apply EvE.lnot' <;> ev)

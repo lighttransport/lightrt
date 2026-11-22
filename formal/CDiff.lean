@@ -135,6 +135,20 @@ def refWoop (w : List Nat) : String :=
   | some (t, u, v) => s!"1 {h t} {h u} {h v}"
   | none => "0"
 
+/-- `sph`: MiniC execution of tri_sphere_dist_f (exercises the sqrt path). -/
+def runSphereDist (w : List Nat) : String :=
+  let vecs := (List.range 3).map (fun k => blockOf ((w.drop (3 * k)).take 3))
+  let m0 := mkMem (vecs ++ [blockOf [w.getD 9 0]])
+  let args : List Val := [.ptr 0 0, .ptr 1 0, .ptr 2 0, .f32 (w.getD 9 0)]
+  match callFunc Gen.prog fuel Gen.fid_tri_sphere_dist_f args m0 with
+  | .ok (some (.f32 r), _) => hex8 r
+  | .ok _ => "ERR noval"
+  | .ub => "UB"
+  | .timeout => "TIMEOUT"
+
+def refSphereDist (w : List Nat) : String :=
+  hex8 (Ref.sphereDistF (v3 w 0) (v3 w 3) (v3 w 6) (w.getD 9 0).toUInt32).toNat
+
 /-- MiniC result; if the Lean reference disagrees, flag it so cdiff fails. -/
 def runLine (line : String) : String :=
   let check (mc ref : String) := if mc == ref then mc else mc ++ " REFDIFF " ++ ref
@@ -143,6 +157,7 @@ def runLine (line : String) : String :=
   | "slabr" :: rest => let w := rest.map hexNat; check (runSlabR w) (refSlabR w)
   | "mt" :: rest => let w := rest.map hexNat; check (runMt w) (refMt w)
   | "woop" :: rest => let w := rest.map hexNat; check (runWoop w) (refWoop w)
+  | "sph" :: rest => let w := rest.map hexNat; check (runSphereDist w) (refSphereDist w)
   | "slabk" :: rest =>
     let w := rest.map hexNat
     let rc := Ref.raySetup (v3 w 0) (v3 w 4) (w.getD 3 0).toUInt32

@@ -66,6 +66,13 @@ theorem EvE.f32add {a b} {x y : UInt32} (ha : EvE p s a (.f32 x.toNat)) (hb : Ev
     EvE p s (.bin .add none a b) (.f32 (addBits x y).toNat) := EvE.f32bin ha hb (by simp [binF32])
 theorem EvE.f32div {a b} {x y : UInt32} (ha : EvE p s a (.f32 x.toNat)) (hb : EvE p s b (.f32 y.toNat)) :
     EvE p s (.bin .div none a b) (.f32 (divBits x y).toNat) := EvE.f32bin ha hb (by simp [binF32])
+theorem EvE.sqrt' {a} {x : UInt32} (ha : EvE p s a (.f32 x.toNat)) :
+    EvE p s (.sqrt a) (.f32 (Ref.sqrt x).toNat) := by
+  obtain ⟨K, hK⟩ := ha
+  refine ⟨K + 1, fun n hn => ?_⟩
+  obtain ⟨m, rfl⟩ : ∃ m, n = m + 1 := ⟨n - 1, by omega⟩
+  simp only [evalExpr, hK m (by omega), Res.bind_eq, Res.bind_ok, Ref.sqrt, toUInt32_toNat]
+  rfl
 theorem EvE.f32lt {a b} {x y : UInt32} (ha : EvE p s a (.f32 x.toNat)) (hb : EvE p s b (.f32 y.toNat)) :
     EvE p s (.bin .lt none a b) (boolVal (ltBits x y)) := EvE.f32bin ha hb (by simp [binF32])
 theorem EvE.f32le {a b} {x y : UInt32} (ha : EvE p s a (.f32 x.toNat)) (hb : EvE p s b (.f32 y.toNat)) :

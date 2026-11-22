@@ -21,6 +21,8 @@ def detEps : F := 0x2b8cbccc    -- 1e-12f
 
 def neg (a : F) : F := a ^^^ 0x80000000
 def copysign (a b : F) : F := (a &&& 0x7fffffff) ||| (b &&& 0x80000000)
+/-- `lrt_sqrtf` / `sqrtf`: correctly-rounded IEEE binary32 square root. -/
+def sqrt (a : F) : F := sqrtBits a
 def eqF (a b : F) : Bool := leBits a b && leBits b a
 /-- `tri_minf(a, b) = a < b ? a : b` (NaN-asymmetric, as in C). -/
 def fmin (a b : F) : F := if ltBits a b then a else b
@@ -85,6 +87,54 @@ def slabInflated (rc : RayCtx) (lo hi : Fin 3 → F) (tbest K : F) : Bool :=
   let tnear := fmax (fmax (tn 0) (tn 1)) (fmax (tn 2) rc.tmin)
   let tfar := mulBits (fmin (fmin (tf 0) (tf 1)) (fmin (tf 2) tbest)) K
   leBits tnear tfar
+
+/-- `tri_sphere_dist_f`: nearest ray/sphere hit distance (scalar fp32 core).
+    Returns -1 when the discriminant is negative. -/
+def sphereDistF (o d c : Fin 3 → F) (r : F) : F :=
+  let ex := subBits (c 0) (o 0)
+  let ey := subBits (c 1) (o 1)
+  let ez := subBits (c 2) (o 2)
+  let proj := addBits (addBits (mulBits ex (d 0)) (mulBits ey (d 1))) (mulBits ez (d 2))
+  let l2 := addBits (addBits (mulBits ex ex) (mulBits ey ey)) (mulBits ez ez)
+  let perp2 := subBits l2 (mulBits proj proj)
+  let disc := subBits (mulBits r r) perp2
+  if ltBits disc zero then neg one else subBits proj (sqrt disc)
+
+/-- `tri_sph_quad_core`: the quadratic core of `tri_sph_isect_lane` -- the near
+    ray/sphere root `(-b - sqrt(disc))/a`, in the C's fp32 evaluation order. -/
+def sphQuadCore (org dir : Fin 3 → F) (cx cy cz r : F) : F :=
+  let ocx := subBits (org 0) cx
+  let ocy := subBits (org 1) cy
+  let ocz := subBits (org 2) cz
+  let a := addBits (addBits (mulBits (dir 0) (dir 0)) (mulBits (dir 1) (dir 1))) (mulBits (dir 2) (dir 2))
+  let b := addBits (addBits (mulBits ocx (dir 0)) (mulBits ocy (dir 1))) (mulBits ocz (dir 2))
+  let c := subBits (addBits (addBits (mulBits ocx ocx) (mulBits ocy ocy)) (mulBits ocz ocz)) (mulBits r r)
+  let disc := subBits (mulBits b b) (mulBits a c)
+  let sq := sqrt disc
+  let inv_a := divBits one a
+  mulBits (subBits (neg b) sq) inv_a
+
+/-- `tri_point_oriented_core`: plane-hit parameter of the oriented-disc branch
+    of `tri_point_isect_one`, `t = (c0 . n) / (d . n)`. -/
+def pointOrientedCore (org dir : Fin 3 → F) (cx cy cz nx ny nz : F) : F :=
+  let c0x := subBits cx (org 0)
+  let c0y := subBits cy (org 1)
+  let c0z := subBits cz (org 2)
+  let divisor := addBits (addBits (mulBits (dir 0) nx) (mulBits (dir 1) ny)) (mulBits (dir 2) nz)
+  divBits (addBits (addBits (mulBits c0x nx) (mulBits c0y ny)) (mulBits c0z nz)) divisor
+
+/-- `tri_point_raydisc_core`: nearest-point parameter of the ray-facing-disc
+    branch of `tri_point_isect_one`, `projC0 = (c0 . d) / |d|^2`. -/
+def pointRayDiscCore (org dir : Fin 3 → F) (cx cy cz : F) : F :=
+  let dx := dir 0
+  let dy := dir 1
+  let dz := dir 2
+  let dOdO := addBits (addBits (mulBits dx dx) (mulBits dy dy)) (mulBits dz dz)
+  let c0x := subBits cx (org 0)
+  let c0y := subBits cy (org 1)
+  let c0z := subBits cz (org 2)
+  let rd2 := divBits one dOdO
+  mulBits (addBits (addBits (mulBits c0x dx) (mulBits c0y dy)) (mulBits c0z dz)) rd2
 
 /-! `tri_mt_one`, split into its intermediate values (same evaluation order as the C). -/
 def mtE1 (v0 v1 : Fin 3 → F) (k : Fin 3) : F := subBits (v1 k) (v0 k)

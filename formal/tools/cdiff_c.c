@@ -56,6 +56,13 @@ int main(void) {
             int r = tri_woop_one(&v[0], &v[3], &v[6], &v[9], &v[12], f(w[15]), f(w[16]), &t, &u, &vv);
             if (r == 1) printf("1 %08x %08x %08x\n", b(t), b(u), b(vv));
             else printf("%d\n", r);
+        } else if (strcmp(kind, "sph") == 0) {
+            /* sqrt path: scalar ray/sphere distance (tri_sphere_dist_f). */
+            unsigned w[10];
+            for (int k = 0; k < 10; k++) if (scanf("%x", &w[k]) != 1) return 1;
+            float in[10];
+            for (int k = 0; k < 10; k++) in[k] = f(w[k]);
+            printf("%08x\n", b(tri_sphere_dist_f(in, in + 3, in + 6, in[9])));
         } else {
             printf("BADLINE\n");
         }
