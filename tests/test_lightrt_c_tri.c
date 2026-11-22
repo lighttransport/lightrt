@@ -2016,7 +2016,7 @@ static int filter_t_gt3(void *u, uint32_t p, float t, float uu, float vv) {
     return t >= 3.0f;
 }
 static int filter_u_le_half(void *u, uint32_t p, float t, float uu, float vv) {
-    (void)u; (void)p; (void)t;
+    (void)u; (void)p; (void)t; (void)vv;
     return uu <= 0.5f;
 }
 static int filter_requires_user(void *u, uint32_t p, float t, float uu, float vv) {
@@ -2574,7 +2574,6 @@ static void test_bezcurve_scene(void) {
 
 static void test_tri_edge_cases(void) {
     lrt_hit h;
-    lrt_result err = LRT_RESULT_OK;
 
     /* (1) Near-degenerate triangle: very small extent in x/y, non-zero in z.
      * The Moller-Trumbore det is near-zero; the scale-dependent threshold must
@@ -4356,7 +4355,7 @@ static void test_batch_edge_cases(void) {
 
             for (int i = 0; i < 4; i++) {
                 lrt_hit hs;
-                int sh = lrt_tri_intersect1(m, &rays[i], &hs);
+                lrt_tri_intersect1(m, &rays[i], &hs);
                 int so = lrt_tri_occluded1(m, &rays[i]);
                 CHECK(h[i].prim_id == hs.prim_id,
                       "batch mixed lane %d prim_id mismatch (%u != %u)", i,
@@ -4828,7 +4827,6 @@ static void test_multihit_edge_cases(void) {
 static void test_closest_point_edge_cases(void) {
     /* Closest point / kNN edge cases. */
     lrt_point_hit ph;
-    lrt_knn_result knn[5];
 
     /* Query point at triangle centroid: that triangle should be nearest with
      * dist_sq approx 0. */
@@ -4981,7 +4979,6 @@ static void test_region_query_edge_cases(void) {
 
 static void test_build_options(void) {
     /* Build options edge cases. */
-    lrt_result err = LRT_RESULT_OK;
 
     /* max_leaf_size=0: should use default (not crash). */
     {
@@ -5301,7 +5298,6 @@ static void test_tlas_edge_cases(void) {
 
 static void test_parallel_build(void) {
     lrt_result err = LRT_RESULT_OK;
-    lrt_hit h;
 
     /* section 21.1 - 100 triangles, 4 threads: should use serial path (below 4096
      * threshold) and build successfully. */
@@ -6029,8 +6025,6 @@ refit_dn_done:
 /* --- section 6: SDF edge-case tests ----------------------------------------------- */
 
 static void test_sdf_edge_cases(void) {
-    lrt_result err = LRT_RESULT_OK;
-
     /* section 6.1: SDF sphere trace with NaN field value */
     {
         lrt_sdf_params p;
@@ -6061,7 +6055,6 @@ static void test_sdf_edge_cases(void) {
 
     /* section 6.3: SDF sphere trace with non-Lipschitz field (dist*2) */
     {
-        sdf_sphere_ctx c = {{0, 0, 0}, 1.0f};
         lrt_sdf_params p;
         memset(&p, 0, sizeof(p));
         p.max_steps = 128;
@@ -6243,8 +6236,6 @@ static void test_sdf_edge_cases(void) {
 /* --- section 3: TLAS edge-case tests (continued) ---------------------------------- */
 
 static void test_tlas_edge_cases2(void) {
-    lrt_result err = LRT_RESULT_OK;
-
     /* section 3.5: TLAS with near-singular transform */
     {
         float tri[9] = {-1, -1, 5, 1, -1, 5, 0, 1, 5};
