@@ -351,7 +351,7 @@ theorem bezPhi_min_critical (S : BezSys) (x : EuclideanSpace ℝ (Fin 3))
       · exact Or.inl h
       · have hb : u = b := by
           by_contra hb'
-          exact absurd ⟨lt_of_le_of_ne h1 (Ne.symm h), lt_of_le_of_ne h2 hb'⟩ hio' 
+          exact absurd ⟨lt_of_le_of_ne h1 (Ne.symm h), lt_of_le_of_ne h2 hb'⟩ hio'
         exact Or.inr (Or.inl hb)
 
 /-! ### The sampled distance rule (the C's `tri_bez_leaf_dist` fold) -/
