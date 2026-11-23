@@ -161,14 +161,13 @@ remaining sub-items from the 2026-11-20 push:
 - **Tier 1, curves/SDF**: completeness for round-linear / flat curves (only
   soundness + nearest-hit existence are proved; tube-set closedness is now
   established for round/flat/Bezier curves); real rlc/flat intersector models.
-- **Tier 1, c2lean**: the SDF shape cores (`tri_sdf_sphere_core`,
-  `tri_sdf_box_core`, `tri_sdf_torus_core`) and the bilinear-patch quadratic
-  core (`tri_bilin_quad_core`) and the round-linear CSG cores
-  (`tri_rlc_plane_y_core`, `tri_rlc_cone_test_core`) are now translated and
-  refined (`C/Proofs/{SdfCore,BilinQuad,RlcCore}Refines.lean`), with
-  `sdfs`/`sdfb`/`sdft`/`bilin`/`rlcy`/`rlcc` cdiff vectors at 0 mismatches.
-  Still open: further primitive scalar
-  intersectors; `tri_woop_one_hp` is fp64 and stays a Tier 2 model boundary.
+- **Tier 1, c2lean — DONE**: the SDF shape cores, the bilinear-patch quadratic
+  core, the round-linear CSG cores and the real `tri_isect_det_parallel` kernel
+  are translated and refined (`C/Proofs/{SdfCore,BilinQuad,RlcCore,DetParallel}Refines.lean`),
+  with `sdfs`/`sdfb`/`sdft`/`bilin`/`rlcy`/`rlcc`/`detp` cdiff vectors at 0
+  mismatches. `tri_woop_one_hp` is fp64 and stays a Tier 2 model boundary;
+  full loop/subdivision intersectors remain covered by abstract contracts and
+  the `primhitcheck`/`wtcheck` gates.
 - **Tier 2 (boundaries, do not attempt without new tooling/decision)**: SIMD ISA
   semantics (`wtcheck` gate), GPU formalization, fp64 `tlas_instance_margin`
   (`tlascheck` gate), slab completeness at tangency (unprovable), Bézier-minimizer

@@ -3610,9 +3610,13 @@ static inline int tri_isect_det_parallel(float e1x, float e1y, float e1z,
     float e1_len = sqrtf(e1x * e1x + e1y * e1y + e1z * e1z);
     float e2_len = sqrtf(e2x * e2x + e2y * e2y + e2z * e2z);
     float scale = e1_len + e2_len;
-    float rel_thresh = TRI_ISECT_DET_EPS_SCALE * scale * scale;
-    if (rel_thresh < TRI_ISECT_DET_EPS_MIN) rel_thresh = TRI_ISECT_DET_EPS_MIN;
-    if (rel_thresh > TRI_ISECT_DET_EPS_MAX) rel_thresh = TRI_ISECT_DET_EPS_MAX;
+    /* The two clamps are tri_maxf(MIN, .) then tri_minf(MAX, .); expressed as
+     * calls they stay bit-identical (including NaN asymmetry) and branch-free,
+     * so c2lean translates this whole kernel and Ref.isectDetParallel refines
+     * it with the existing callMin/callMax evaluation lemmas. */
+    float rel_thresh = tri_maxf(TRI_ISECT_DET_EPS_MIN,
+                                tri_minf(TRI_ISECT_DET_EPS_MAX,
+                                         TRI_ISECT_DET_EPS_SCALE * scale * scale));
     return !(det <= -rel_thresh || det >= rel_thresh); /* NaN det: parallel */
 }
 

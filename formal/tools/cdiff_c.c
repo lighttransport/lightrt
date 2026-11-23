@@ -97,6 +97,11 @@ int main(void) {
             float in[11];
             for (int k = 0; k < 11; k++) in[k] = f(w[k]);
             printf("%d\n", tri_rlc_cone_test_core(in, in[3], in + 4, in[7], in + 8));
+        } else if (strcmp(kind, "detp") == 0) {
+            unsigned w[7];
+            for (int k = 0; k < 7; k++) if (scanf("%x", &w[k]) != 1) return 1;
+            printf("%d\n", tri_isect_det_parallel(f(w[0]), f(w[1]), f(w[2]),
+                                                  f(w[3]), f(w[4]), f(w[5]), f(w[6])));
         } else {
             printf("BADLINE\n");
         }
