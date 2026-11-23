@@ -175,7 +175,7 @@ target_compile_definitions(cert_energy PRIVATE _POSIX_C_SOURCE=200809L)
 target_link_libraries(cert_energy PRIVATE m)
 add_test(NAME cert_energy COMMAND cert_energy)
 
-add_executable(film_energy tests/film_energy.c bsdf.c)
+add_executable(film_energy tests/film_energy.c bsdf.c passive_film.c)
 target_include_directories(film_energy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(film_energy PRIVATE _POSIX_C_SOURCE=200809L)
 target_link_libraries(film_energy PRIVATE m)
