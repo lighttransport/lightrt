@@ -191,6 +191,13 @@ verify: mtlxrender
 
 .PHONY: clean test test-white-furnace test-bsdf-response test-texture check verify
 
+# EXT-001 prototype (standalone; not in `test` yet)
+certified_bsdf_test: tests/certified_bsdf_test.c certified_bsdf.c certified_bsdf.h cert_surrogate_table.h tests/generated/certified-weight-vectors.inc
+	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/certified_bsdf_test.c certified_bsdf.c $(LDFLAGS)
+
+test-certified-bsdf: certified_bsdf_test
+	./certified_bsdf_test
+
 conductor_response: tests/conductor_response.c bsdf.c bsdf.h mtlx_eval.h vecmath.h
 	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/conductor_response.c bsdf.c $(LDFLAGS)
 
