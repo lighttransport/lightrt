@@ -582,4 +582,32 @@ example (w : Fin 16 → ℝ) (P : Fin 16 → Vec3) (u v : ℝ)
     rationalTensorBezier w P u v = ratEval w P u v :=
   rationalTensorBezier_eq_ratEval w P u v hu0 hu1 hv0 hv1
 
+/-- The tangency boundary is closed by a proved limitation: the concrete
+    binary32 fact `fl(2⁻¹⁵⁰) = 0` makes the slab parameter's error equal `|t|`,
+    so no uniform `θ < 1` relative bound exists. -/
+example : Binary32.rneR ((2 : ℝ)^(-150 : ℤ)) = 0 := LightRT.Robust.rneR_half_quantum
+example : ¬ ∃ θ : ℝ, 0 ≤ θ ∧ θ < 1 ∧
+    ∀ (r : Ray) (x : ℝ) (i : Fin 3), r.d i ≠ 0 →
+      |LightRT.Robust.fpT Binary32.model r x i - (x - r.o i) / r.d i| ≤
+        θ * |(x - r.o i) / r.d i| :=
+  LightRT.Robust.fpT_no_uniform_relative
+
+/-- Region queries: the conservative box test is non-trivial and monotone. -/
+example : LightRT.Geom.boxMayOverlap
+    (LightRT.Geom.Region.aabb (fun _ => (-1 : ℝ)) (fun _ => 1))
+    (⟨fun _ => (0 : ℝ), fun _ => (1 : ℝ)⟩ : Box) := by
+  intro i; constructor <;> norm_num
+
+example : ¬ LightRT.Geom.boxMayOverlap
+    (LightRT.Geom.Region.aabb (fun _ => (2 : ℝ)) (fun _ => 3))
+    (⟨fun _ => (0 : ℝ), fun _ => 1⟩ : Box) := by
+  intro h
+  have := (h 0).2
+  norm_num at this
+
+example (a b : Box) (hsub : a.Subset b)
+    (h : LightRT.Geom.boxMayOverlap (LightRT.Geom.Region.sphere (fun _ => (0 : ℝ)) 1) a) :
+    LightRT.Geom.boxMayOverlap (LightRT.Geom.Region.sphere (fun _ => (0 : ℝ)) 1) b :=
+  LightRT.Geom.boxMayOverlap_mono hsub h
+
 end LightRT.Sanity
