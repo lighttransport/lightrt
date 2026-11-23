@@ -43,6 +43,8 @@ FUNCTIONS = [
     "tri_minf",
     "tri_maxf",
     "tri_slab_scalar",
+    "tri_traverse_node_core",
+    "tri_traverse_insert_core",
     "tri_mt_one",
     "tri_ray_setup",
     "tri_woop_one",

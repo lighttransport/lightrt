@@ -5,6 +5,7 @@ import LightRT.Geom.Basic
 import LightRT.Geom.SlabReal
 import LightRT.Geom.MTReal
 import LightRT.Geom.PrimReal
+import LightRT.Geom.Region
 import LightRT.Geom.PointReal
 import LightRT.Geom.CylinderReal
 import LightRT.Geom.CapsuleReal
@@ -34,9 +35,11 @@ import LightRT.Geom.SafeguardedNewton
 import LightRT.Geom.SphereTrace3
 import LightRT.Robust.Slab
 import LightRT.Robust.SlabTotal
+import LightRT.Robust.SlabLimit
 import LightRT.Robust.SlabMissReal
 import LightRT.Robust.Woop
 import LightRT.BVH.Tree
+import LightRT.BVH.Region
 import LightRT.BVH.Flat
 import LightRT.BVH.Check
 import LightRT.BVH.AnyHit

@@ -35,7 +35,8 @@ not axioms.
 
 - **FP**: executable binary32 RNE with subnormals/NaN; range-free absolute error
   `|fl x − x| ≤ u|x| + η` (`η = 2⁻¹⁵⁰`); Woop `t` bounds in both sign classes;
-  1e-37 TLAS dilation floor; conditional non-tangent slab completeness.
+  1e-37 TLAS dilation floor; conditional non-tangent slab completeness, with
+  tangency closed as a proved impossibility (`Robust/SlabLimit.lean`).
 - **Geometry**: MT soundness/completeness over ℝ and the concrete gap witness;
   Woop watertightness for every bit pattern; hull containment for curve/patch/
   point primitives; 1D/3D sphere-trace no-overshoot; Bézier tube `infDist` identity,
@@ -63,9 +64,14 @@ on the miner nodes); no C changes in the formalization-only milestones.
 - **Item 4 / SIMD ISA**: `PackedOps` makes the intrinsic→model hypothesis
   machine-checked, and `simd_leaf_eq_scalar_of_isa` is conditional on it. No
   vendor SSE4.1/AVX2/SVE semantics model exists; `wtcheck` is the empirical gate.
-- **Item 3 / slab no-false-miss**: unprovable at tangency (no error-dominating
-  K); the conditional non-tangent form is proved. `tlas_instance_margin` fp64
-  stays out of scope (`tlascheck` covers it).
+- **Item 3 / slab no-false-miss**: closed as a proved limitation in
+  `Robust/SlabLimit.lean`: `fpT_no_uniform_relative` shows no uniform `θ < 1`
+  bounds the range-free slab-parameter error (the binary32 fact `fl(2⁻¹⁵⁰) = 0`
+  makes the error equal `|t|`), and `slab_no_uniform_inflation` /
+  `slab_hit_box_no_endpoint_theta` rule out a single error-dominating `K`
+  without the non-degeneracy floor. The conditional non-tangent form
+  (`slab_no_false_miss_total_of_floor`) remains the strongest provable version.
+  `tlas_instance_margin` fp64 stays out of scope (`tlascheck` covers it).
 - **GPU kernels**: out of scope for formalization for now; trusted ports of C,
   validated by the C suites and `cdiff`-family checks.
 - **M14 remainder**: the Newton basin hypotheses are discharged conditionally
@@ -272,7 +278,7 @@ FP of the solve stays a Tier 2 `primhitcheck` boundary throughout.
 - **SIMD ISA semantics**: `PackedOps` makes the intrinsic→model hypothesis machine-checked, and `simd_leaf_eq_scalar_of_isa` is conditional on it. No vendor SSE4.1/AVX2/SVE semantics model exists; `wtcheck` is the empirical gate.
 - **GPU formalization**: CUDA/HIP/Vulkan kernels are trusted ports of C, validated by the C suites and `cdiff`-family checks; out of scope for formalization for now.
 - **`tlas_instance_margin` fp64 ρ/σ bound**: unproved, covered by `tlascheck` empirically.
-- **Slab completeness at tangency**: unprovable (no error-dominating K); the conditional non-tangent form (`slab_no_false_miss_total_of_floor`) is proved.
+- **Slab completeness at tangency**: closed as a proved limitation in `Robust/SlabLimit.lean` — `fpT_no_uniform_relative` (no uniform relative bound `θ < 1`, via `fl(2⁻¹⁵⁰)=0`), `slab_no_uniform_inflation`, and `slab_hit_box_no_endpoint_theta` show the floor is necessary for this proof route; the conditional non-tangent form (`slab_no_false_miss_total_of_floor`) is the strongest provable version.
 - **Bézier Newton minimizer floating point**: remains `primhitcheck`-gated.
 
 ### Tier 3 — Closed / maintenance
