@@ -21,6 +21,8 @@ truth.
 | Woop watertight leaf (scalar) | `C/Proofs/WoopRefines.lean`, `WoopWatertight.lean` (`woop_no_gap_bits`, `woop_det_ne_zero`), `Robust/Woop.lean` |
 | `EXACT_NEAREST` pruning key | `BVH/ExactPruneTotal.lean` (`key_le_total`, `woop_key_le_t_total_model`, both edge-sign classes) |
 | BVH build / traversal / K-nearest / refit | `BVH/Tree.lean`, `BVH/Flat.lean`, `BVH/KBest.lean`, `BVH/Check.lean`, `BVH/TwoLevel.lean` |
+| BVH spatial queries (AABB/sphere/frustum) | `Geom/Region.lean` (`boxMayOverlap` + monotonicity), `BVH/Region.lean` (`runRegion_spec`, soundness/completeness) |
+| closest point / kNN | `Geom/PointTriReal.lean` (sInf triangle distance + box lower bound), `BVH/KNearest.lean` (`runKNN_sound`/`_complete`, via `KBest.runN`) |
 | SIMD watertight leaf (lane model) | `C/Proofs/SimdLanes.lean` (`vWoopK_lane`, `blockBest_woop`), `C/Proofs/SimdLeafISA.lean` (`simd_leaf_eq_scalar_of_isa`, conditional) |
 | Bézier curve, tube, signed distance | `Geom/BezTube.lean` (`infDist_bezTubeSet`, `samDist_le_bezPhiMin_add`, `stTrace3_bezTube_le_root`) |
 | Newton foot-point / contact system | `Geom/Newton2D.lean`, `Geom/BezNewton.lean` (`ofCubic_newton_quadratic`), `Geom/SafeguardedNewton.lean` (`bracket_root`), `Geom/BezNewtonGuards.lean` (domain-of-attraction theorem) |
@@ -42,7 +44,9 @@ not axioms.
   point primitives; 1D/3D sphere-trace no-overshoot; Bézier tube `infDist` identity,
   sampled/exact distance sandwich, interior nearest-point classification.
 - **BVH**: build/refit containment, traversal = brute force (ordered and
-  k-nearest), two-level world-hit bound, `EXACT_NEAREST` conservativity where proved.
+  k-nearest), two-level world-hit bound, `EXACT_NEAREST` conservativity where proved;
+  region queries = filtered brute force (sound + complete); kNN via `KBest.runN`
+  with the exact point-triangle distance (sound + complete).
 - **Newton/Bez**: local quadratic contraction of the 2D contact system;
   safeguarded bracket convergence to a critical point of `φ`; algebraic bridge
   (`F = 0` at a critical contact); guarded-step model and two conditional

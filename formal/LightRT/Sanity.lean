@@ -610,4 +610,14 @@ example (a b : Box) (hsub : a.Subset b)
     LightRT.Geom.boxMayOverlap (LightRT.Geom.Region.sphere (fun _ => (0 : ℝ)) 1) b :=
   LightRT.Geom.boxMayOverlap_mono hsub h
 
+/-- kNN: the exact point-triangle distance is nonnegative and is bounded below
+    by the enclosing box's point distance (conservative pruning). -/
+example (p v0 v1 v2 : Vec3) : 0 ≤ LightRT.Geom.pointTriDistSq p v0 v1 v2 :=
+  LightRT.Geom.pointTriDistSq_nonneg p v0 v1 v2
+
+example (p v0 v1 v2 : Vec3) (b : Box)
+    (htri : ∀ q, InTriangle v0 v1 v2 q → b.Mem q) :
+    LightRT.Geom.boxPointDistSq b p ≤ LightRT.Geom.pointTriDistSq p v0 v1 v2 :=
+  LightRT.Geom.boxPointDistSq_le_pointTriDistSq p v0 v1 v2 b htri
+
 end LightRT.Sanity

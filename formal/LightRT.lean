@@ -7,6 +7,7 @@ import LightRT.Geom.MTReal
 import LightRT.Geom.PrimReal
 import LightRT.Geom.Region
 import LightRT.Geom.PointReal
+import LightRT.Geom.PointTriReal
 import LightRT.Geom.CylinderReal
 import LightRT.Geom.CapsuleReal
 import LightRT.Geom.EllipseReal
@@ -40,6 +41,7 @@ import LightRT.Robust.SlabMissReal
 import LightRT.Robust.Woop
 import LightRT.BVH.Tree
 import LightRT.BVH.Region
+import LightRT.BVH.KNearest
 import LightRT.BVH.Flat
 import LightRT.BVH.Check
 import LightRT.BVH.AnyHit
