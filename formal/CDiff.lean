@@ -216,6 +216,18 @@ def refRlcC (w : List Nat) : String :=
   if Ref.rlcConeTest (v3 w 0) (w.getD 3 0).toUInt32 (v3 w 4) (w.getD 7 0).toUInt32 (v3 w 8)
   then "1" else "0"
 
+/-- `detp`: relative-determinant cull (7 scalar fp32 args). -/
+def runDetParallel (w : List Nat) : String :=
+  let args : List Val := (List.range 7).map (fun k => .f32 (w.getD k 0))
+  match callFunc Gen.prog fuel Gen.fid_tri_isect_det_parallel args (mkMem []) with
+  | .ok (some (.int _ r), _) => toString r
+  | .ok _ => "ERR noval"
+  | .ub => "UB"
+  | .timeout => "TIMEOUT"
+
+def refDetParallel (w : List Nat) : String :=
+  if Ref.isectDetParallel (v3 w 0) (v3 w 3) (w.getD 6 0).toUInt32 then "1" else "0"
+
 /-- MiniC result; if the Lean reference disagrees, flag it so cdiff fails. -/
 def runLine (line : String) : String :=
   let check (mc ref : String) := if mc == ref then mc else mc ++ " REFDIFF " ++ ref
@@ -243,6 +255,9 @@ def runLine (line : String) : String :=
   | "rlcc" :: rest =>
     let w := rest.map hexNat
     check (runRlcC w) (refRlcC w)
+  | "detp" :: rest =>
+    let w := rest.map hexNat
+    check (runDetParallel w) (refDetParallel w)
   | "slabk" :: rest =>
     let w := rest.map hexNat
     let rc := Ref.raySetup (v3 w 0) (v3 w 4) (w.getD 3 0).toUInt32

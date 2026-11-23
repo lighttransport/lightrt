@@ -119,6 +119,17 @@ def vec_rlc(r):
     return rlcy, rlcc
 
 
+def vec_det_parallel(r):
+    """Relative-determinant cull: two edge vectors and a determinant, chosen to
+    straddle the 1e-12/1e-6 clamp thresholds."""
+    e1 = [rnd(r) for _ in range(3)]
+    e2 = [rnd(r) for _ in range(3)]
+    scale = max(abs(v) for v in e1 + e2) or 1.0
+    det = r.choice([0.0, scale * scale * 1e-8, scale * scale * 1e-12,
+                    scale * scale * 1e-6, rnd(r, 0.3)])
+    return "detp " + " ".join(f"{bits(fl(v)):08x}" for v in e1 + e2 + [det])
+
+
 def vec_degenerate(r):
     """MT with v1 = v0 or v2 = v0 (zero edge), Woop with any two vertices equal:
     both must MISS (Robust/Degenerate.lean). Copies are numerically equal; a
@@ -340,7 +351,22 @@ def main():
                 if rbad <= 5:
                     print("RLC MISMATCH\n  in:   ", line, "\n  C:    ", cc, "\n  MiniC:", ll)
         print(f"{len(rlc_lines)} round-linear-core vectors, {rbad} mismatches")
-        return 1 if (bad or sbad or sdbad or bbad or rbad) else 0
+        # Relative-determinant cull kernel (real function, branch-free clamp).
+        detp_lines = [vec_det_parallel(r) for _ in range(max(64, args.n // 4))]
+        dinp = "\n".join(detp_lines) + "\n"
+        c_detp = run([cexe], dinp)
+        l_detp = run(lexe, dinp)
+        if len(c_detp) != len(detp_lines) or len(l_detp) != len(detp_lines):
+            print(f"detp output length mismatch: C={len(c_detp)} MiniC={len(l_detp)}")
+            return 1
+        dbad = 0
+        for line, cc, ll in zip(detp_lines, c_detp, l_detp):
+            if norm(cc) != norm(ll):
+                dbad += 1
+                if dbad <= 5:
+                    print("DETP MISMATCH\n  in:   ", line, "\n  C:    ", cc, "\n  MiniC:", ll)
+        print(f"{len(detp_lines)} det-cull vectors, {dbad} mismatches")
+        return 1 if (bad or sbad or sdbad or bbad or rbad or dbad) else 0
 
 
 if __name__ == "__main__":

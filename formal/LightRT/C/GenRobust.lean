@@ -122,6 +122,12 @@ def tri_rlc_cone_test_core : Func where
   params := [0, 1, 2, 3, 4]
   body := (.seq (.seq (.set 5 (.bin .sub none (.load .f32 (.index (.var 2) (.const (.int ⟨32, true⟩ 0)) 4)) (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 0)) 4)))) (.seq (.set 6 (.bin .sub none (.load .f32 (.index (.var 2) (.const (.int ⟨32, true⟩ 1)) 4)) (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 1)) 4)))) (.set 7 (.bin .sub none (.load .f32 (.index (.var 2) (.const (.int ⟨32, true⟩ 2)) 4)) (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 2)) 4)))))) (.seq (.set 8 (.bin .add none (.bin .add none (.bin .mul none (.var 5) (.var 5)) (.bin .mul none (.var 6) (.var 6))) (.bin .mul none (.var 7) (.var 7)))) (.seq (.set 9 (.bin .sub none (.var 3) (.var 1))) (.seq (.set 10 (.bin .mul none (.var 1) (.var 9))) (.seq (.set 11 (.bin .sub none (.var 8) (.bin .mul none (.var 9) (.var 9)))) (.seq (.seq (.set 12 (.bin .sub none (.load .f32 (.index (.var 4) (.const (.int ⟨32, true⟩ 0)) 4)) (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 0)) 4)))) (.seq (.set 13 (.bin .sub none (.load .f32 (.index (.var 4) (.const (.int ⟨32, true⟩ 1)) 4)) (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 1)) 4)))) (.set 14 (.bin .sub none (.load .f32 (.index (.var 4) (.const (.int ⟨32, true⟩ 2)) 4)) (.load .f32 (.index (.var 0) (.const (.int ⟨32, true⟩ 2)) 4)))))) (.seq (.set 15 (.bin .add none (.bin .add none (.bin .mul none (.var 12) (.var 5)) (.bin .mul none (.var 13) (.var 6))) (.bin .mul none (.var 14) (.var 7)))) (.seq (.set 16 (.bin .add none (.bin .add none (.bin .mul none (.var 12) (.var 12)) (.bin .mul none (.var 13) (.var 13))) (.bin .mul none (.var 14) (.var 14)))) (.ret (some (.bin .lt none (.bin .sub none (.bin .mul none (.var 16) (.var 11)) (.bin .mul none (.var 15) (.var 15))) (.bin .add none (.bin .mul none (.bin .mul none (.var 8) (.var 1)) (.var 1)) (.bin .mul none (.bin .mul none (.const (.f32 1073741824)) (.var 10)) (.var 15))))))))))))))
 
+/-- `tri_isect_det_parallel` (function id 18). Locals: 0=e1x, 1=e1y, 2=e1z, 3=e2x, 4=e2y, 5=e2z, 6=det, 7=e1_len, 8=e2_len, 9=scale, 10=rel_thresh -/
+def fid_tri_isect_det_parallel : Nat := 18
+def tri_isect_det_parallel : Func where
+  params := [0, 1, 2, 3, 4, 5, 6]
+  body := (.seq (.set 7 (.sqrt (.bin .add none (.bin .add none (.bin .mul none (.var 0) (.var 0)) (.bin .mul none (.var 1) (.var 1))) (.bin .mul none (.var 2) (.var 2))))) (.seq (.set 8 (.sqrt (.bin .add none (.bin .add none (.bin .mul none (.var 3) (.var 3)) (.bin .mul none (.var 4) (.var 4))) (.bin .mul none (.var 5) (.var 5))))) (.seq (.set 9 (.bin .add none (.var 7) (.var 8))) (.seq (.set 10 (.call 1 [(.const (.f32 730643660)), (.call 0 [(.const (.f32 897988541)), (.bin .mul none (.bin .mul none (.const (.f32 841731191)) (.var 9)) (.var 9))])])) (.ret (some (.un .lnot ⟨32, true⟩ (.lor (.bin .le none (.var 6) (.fneg (.var 10))) (.bin .ge none (.var 6) (.var 10))))))))))
+
 /-- String literals referenced by the translated functions. -/
 def literals : List UInt8 := []
 
@@ -145,6 +151,7 @@ def prog : Prog := fun f =>
   | 15 => some tri_bilin_quad_core
   | 16 => some tri_rlc_plane_y_core
   | 17 => some tri_rlc_cone_test_core
+  | 18 => some tri_isect_det_parallel
   | _ => none
 
 end LightRT.C.GenRobust

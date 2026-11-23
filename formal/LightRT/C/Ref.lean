@@ -158,6 +158,15 @@ def bilinQuadCore (o d q00 q10 q11 q01 : Fin 3 → F) : F × F × F :=
     (addBits (addBits (mulBits (e10 0) ax) (mulBits (e10 1) ay)) (mulBits (e10 2) az))
   (a, b, c)
 
+/-- `tri_isect_det_parallel`: relative-determinant cull (the branch-free
+    tri_maxf/tri_minf clamp is bit-identical to the C's two clamp `if`s). -/
+def isectDetParallel (e1 e2 : Fin 3 → F) (det : F) : Bool :=
+  let e1_len := sqrt (addBits (addBits (mulBits (e1 0) (e1 0)) (mulBits (e1 1) (e1 1))) (mulBits (e1 2) (e1 2)))
+  let e2_len := sqrt (addBits (addBits (mulBits (e2 0) (e2 0)) (mulBits (e2 1) (e2 1))) (mulBits (e2 2) (e2 2)))
+  let scale := addBits e1_len e2_len
+  let rel := fmax 0x2b8cbccc (fmin 0x358637bd (mulBits (mulBits 0x322bcc77 scale) scale))
+  !(leBits det (neg rel) || leBits rel det)
+
 /-- `tri_rlc_plane_y_core`: axial coordinate of `p` on the cone `(cp0->cp1)`. -/
 def rlcPlaneY (cp0 cp1 p : Fin 3 → F) : F :=
   let dPx := subBits (cp1 0) (cp0 0)

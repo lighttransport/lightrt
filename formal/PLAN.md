@@ -220,7 +220,7 @@ FP of the solve stays a Tier 2 `primhitcheck` boundary throughout.
    (`boehm_iterate`) and tensor-product insertion + ratEval connection
    (`tensorBspline_insert_u/_v`, `rationalTensorBezier_eq_ratEval`) are now
    proved here.
-2. **`c2lean` coverage expansion.** `C/Gen*.lean` currently translates the
+2. **`c2lean` coverage expansion — DONE (2026-11-23).** `C/Gen*.lean` translates the
    scalar triangle core (`tri_minf/maxf`, `tri_slab_scalar`, `tri_mt_one`,
    `tri_ray_setup`, `tri_woop_one`, `tri_exn_key`) plus `tri_sphere_dist_f`
    (the ray/sphere distance helper that exercises `sqrtf`), `tri_surface_area`
@@ -240,12 +240,20 @@ FP of the solve stays a Tier 2 `primhitcheck` boundary throughout.
    `tri_bilin_one`). `C/Ref.lean` adds `sdfSphereCore`/`sdfBoxCore`/`sdfTorusCore`
    and `bilinQuadCore`, plus `rlcPlaneY`/`rlcConeTest` (the branch-free cores of
    the round-linear CSG cone tests); `C/Proofs/SdfCoreRefines.lean`,
-   `C/Proofs/BilinQuadRefines.lean` and `C/Proofs/RlcCoreRefines.lean` prove
-   bit-for-bit `*_refines` (including the three output stores of the bilinear
-   core). `cdiff.py` generates `sdfs`/`sdfb`/`sdft`/`bilin`/`rlcy`/`rlcc`
+   `C/Proofs/BilinQuadRefines.lean`, `C/Proofs/RlcCoreRefines.lean` and
+   `C/Proofs/DetParallelRefines.lean` prove bit-for-bit `*_refines` (including
+   the three output stores of the bilinear core). The real kernel
+   `tri_isect_det_parallel` was made branch-free with the already-translated
+   `tri_maxf`/`tri_minf` (bit-identical clamp, including NaN asymmetry).
+   `cdiff.py` generates `sdfs`/`sdfb`/`sdft`/`bilin`/`rlcy`/`rlcc`/`detp`
    vectors, checked C <-> MiniC <-> bit-level Lean: 0 mismatches.
-   Remaining: `tri_woop_one_hp` (fp64 is outside the MiniC model - Tier 2
-   boundary), and further primitive scalar intersectors from item 1.
+   **Status: DONE.** The translated set covers the scalar triangle core plus
+   representative fp32 cores of every primitive family (sphere, point, SDF,
+   bilinear surface, round-linear curve, det cull), each with a refinement
+   theorem and cdiff vectors; `make formal` is green (0 sorries). `tri_woop_one_hp`
+   stays a Tier 2 boundary (fp64 is outside the MiniC model); the un-translated
+   full intersectors (loops, adaptive subdivision) remain covered by the
+   abstract contracts of item 1/3 and the `primhitcheck`/`wtcheck` gates.
    Acceptance: each new translated function has a passing `c2lean --check` and a
    refinement theorem. `tri_sphere_dist_f_refines` is proved in
    `C/Proofs/SphereDistRefines.lean` (ExS symbolic execution with an explicit

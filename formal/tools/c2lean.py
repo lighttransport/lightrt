@@ -58,6 +58,7 @@ FUNCTIONS = [
     "tri_bilin_quad_core",
     "tri_rlc_plane_y_core",
     "tri_rlc_cone_test_core",
+    "tri_isect_det_parallel",
 ]
 
 # Extra functions that exist only in a particular configuration's preprocessor
