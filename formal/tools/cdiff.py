@@ -93,6 +93,32 @@ def vec_sph(r):
     return "sph " + " ".join(f"{bits(fl(v)):08x}" for v in vals)
 
 
+def vec_sdf_core(r):
+    """Vectors for the three built-in SDF shape cores: p (3), plus radius,
+    half-extents, or (major, minor). Mixed specials exercise sqrt/abs/min/max."""
+    p = [rnd(r) for _ in range(3)]
+    sdfs = "sdfs " + " ".join(f"{bits(fl(v)):08x}" for v in p + [abs(rnd(r, 0.2))])
+    sdfb = "sdfb " + " ".join(f"{bits(fl(v)):08x}" for v in p + [abs(rnd(r, 0.2)) for _ in range(3)])
+    sdft = "sdft " + " ".join(f"{bits(fl(v)):08x}" for v in p + [abs(rnd(r, 0.2)) for _ in range(2)])
+    return sdfs, sdfb, sdft
+
+
+def vec_bilin(r):
+    """Bilinear-patch quadratic core: ray o,d plus four patch corners q00,q10,q11,q01."""
+    vals = [rnd(r) for _ in range(18)]
+    return "bilin " + " ".join(f"{bits(fl(v)):08x}" for v in vals)
+
+
+def vec_rlc(r):
+    """Round-linear CSG cores: cp0, cp1, p (3x3 floats) plus two radii."""
+    vals = [rnd(r) for _ in range(9)]
+    rlcy = "rlcy " + " ".join(f"{bits(fl(v)):08x}" for v in vals)
+    vals2 = vals + [abs(rnd(r, 0.2)), abs(rnd(r, 0.2))]
+    vals2[3], vals2[7] = vals2[9], vals2[10]
+    rlcc = "rlcc " + " ".join(f"{bits(fl(v)):08x}" for v in vals2[:11])
+    return rlcy, rlcc
+
+
 def vec_degenerate(r):
     """MT with v1 = v0 or v2 = v0 (zero edge), Woop with any two vertices equal:
     both must MISS (Robust/Degenerate.lean). Copies are numerically equal; a
@@ -266,7 +292,55 @@ def main():
                 if sbad <= 5:
                     print("SPH MISMATCH\n  in:   ", line, "\n  C:    ", c, "\n  MiniC:", l)
         print(f"{len(sph_lines)} sqrt vectors, {sbad} mismatches")
-        return 1 if (bad or sbad) else 0
+        # Built-in SDF shape cores: real C vs MiniC semantics (and the bit-level
+        # Lean reference, checked inside CDiff.runLine).
+        sdf_triples = [vec_sdf_core(r) for _ in range(max(64, args.n // 4))]
+        sdf_lines = [line for tri in sdf_triples for line in tri]
+        sdinp = "\n".join(sdf_lines) + "\n"
+        c_sdf = run([cexe], sdinp)
+        l_sdf = run(lexe, sdinp)
+        if len(c_sdf) != len(sdf_lines) or len(l_sdf) != len(sdf_lines):
+            print(f"sdf output length mismatch: C={len(c_sdf)} MiniC={len(l_sdf)}")
+            return 1
+        sdbad = 0
+        for line, c, l in zip(sdf_lines, c_sdf, l_sdf):
+            if norm(c) != norm(l):
+                sdbad += 1
+                if sdbad <= 5:
+                    print("SDF MISMATCH\n  in:   ", line, "\n  C:    ", c, "\n  MiniC:", l)
+        print(f"{len(sdf_lines)} SDF-core vectors, {sdbad} mismatches")
+        # Bilinear-patch quadratic core: C vs MiniC vs bit-level Lean reference.
+        bilin_lines = [vec_bilin(r) for _ in range(max(64, args.n // 4))]
+        binp = "\n".join(bilin_lines) + "\n"
+        c_bilin = run([cexe], binp)
+        l_bilin = run(lexe, binp)
+        if len(c_bilin) != len(bilin_lines) or len(l_bilin) != len(bilin_lines):
+            print(f"bilin output length mismatch: C={len(c_bilin)} MiniC={len(l_bilin)}")
+            return 1
+        bbad = 0
+        for line, cc, ll in zip(bilin_lines, c_bilin, l_bilin):
+            if norm(cc) != norm(ll):
+                bbad += 1
+                if bbad <= 5:
+                    print("BILIN MISMATCH\n  in:   ", line, "\n  C:    ", cc, "\n  MiniC:", ll)
+        print(f"{len(bilin_lines)} bilinear-core vectors, {bbad} mismatches")
+        # Round-linear CSG cores: C vs MiniC vs bit-level Lean reference.
+        rlc_triples = [vec_rlc(r) for _ in range(max(64, args.n // 4))]
+        rlc_lines = [line for tri in rlc_triples for line in tri]
+        rinp = "\n".join(rlc_lines) + "\n"
+        c_rlc = run([cexe], rinp)
+        l_rlc = run(lexe, rinp)
+        if len(c_rlc) != len(rlc_lines) or len(l_rlc) != len(rlc_lines):
+            print(f"rlc output length mismatch: C={len(c_rlc)} MiniC={len(l_rlc)}")
+            return 1
+        rbad = 0
+        for line, cc, ll in zip(rlc_lines, c_rlc, l_rlc):
+            if norm(cc) != norm(ll):
+                rbad += 1
+                if rbad <= 5:
+                    print("RLC MISMATCH\n  in:   ", line, "\n  C:    ", cc, "\n  MiniC:", ll)
+        print(f"{len(rlc_lines)} round-linear-core vectors, {rbad} mismatches")
+        return 1 if (bad or sbad or sdbad or bbad or rbad) else 0
 
 
 if __name__ == "__main__":

@@ -114,6 +114,78 @@ def sphQuadCore (org dir : Fin 3 → F) (cx cy cz r : F) : F :=
   let inv_a := divBits one a
   mulBits (subBits (neg b) sq) inv_a
 
+/-- `tri_sdf_sphere_core`: `|p| - r`, in the C's fp32 evaluation order. -/
+def sdfSphereCore (px py pz r : F) : F :=
+  subBits (sqrt (addBits (addBits (mulBits px px) (mulBits py py)) (mulBits pz pz))) r
+
+/-- `tri_sdf_box_core`: box signed distance. `fabsf` is `copysign(x, +1)`;
+    the ternaries are C's NaN-asymmetric `>` / `<` (via `ltBits`). -/
+def sdfBoxCore (px py pz ex ey ez : F) : F :=
+  let qx := subBits (copysign px one) ex
+  let qy := subBits (copysign py one) ey
+  let qz := subBits (copysign pz one) ez
+  let mx := fmax qx zero
+  let my := fmax qy zero
+  let mz := fmax qz zero
+  let outside := sqrt (addBits (addBits (mulBits mx mx) (mulBits my my)) (mulBits mz mz))
+  let qmax := fmax qx (fmax qy qz)
+  let inside := fmin qmax zero
+  addBits outside inside
+
+/-- `tri_sdf_torus_core`: torus signed distance (axis y, `p0`=major, `p1`=minor). -/
+def sdfTorusCore (px py pz major minor : F) : F :=
+  let lxz := subBits (sqrt (addBits (mulBits px px) (mulBits pz pz))) major
+  subBits (sqrt (addBits (mulBits lxz lxz) (mulBits py py))) minor
+
+/-- `tri_bilin_quad_core`: coefficients `(a, b, c)` of the bilinear-patch
+    coplanarity quadratic `a + b*u + c*u^2`, in the C's fp32 evaluation order. -/
+def bilinQuadCore (o d q00 q10 q11 q01 : Fin 3 → F) : F × F × F :=
+  let e10 := fun k => subBits (q10 k) (q00 k)
+  let e00 := fun k => subBits (q01 k) (q00 k)
+  let e11 := fun k => subBits (q11 k) (q10 k)
+  let dd := fun k => subBits (e11 k) (e00 k)
+  let q0 := fun k => subBits (q00 k) (o k)
+  let ax := subBits (mulBits (d 1) (e00 2)) (mulBits (d 2) (e00 1))
+  let ay := subBits (mulBits (d 2) (e00 0)) (mulBits (d 0) (e00 2))
+  let az := subBits (mulBits (d 0) (e00 1)) (mulBits (d 1) (e00 0))
+  let bx := subBits (mulBits (d 1) (dd 2)) (mulBits (d 2) (dd 1))
+  let bcy := subBits (mulBits (d 2) (dd 0)) (mulBits (d 0) (dd 2))
+  let bz := subBits (mulBits (d 0) (dd 1)) (mulBits (d 1) (dd 0))
+  let a := addBits (addBits (mulBits (q0 0) ax) (mulBits (q0 1) ay)) (mulBits (q0 2) az)
+  let c := addBits (addBits (mulBits (e10 0) bx) (mulBits (e10 1) bcy)) (mulBits (e10 2) bz)
+  let b := addBits
+    (addBits (addBits (mulBits (q0 0) bx) (mulBits (q0 1) bcy)) (mulBits (q0 2) bz))
+    (addBits (addBits (mulBits (e10 0) ax) (mulBits (e10 1) ay)) (mulBits (e10 2) az))
+  (a, b, c)
+
+/-- `tri_rlc_plane_y_core`: axial coordinate of `p` on the cone `(cp0->cp1)`. -/
+def rlcPlaneY (cp0 cp1 p : Fin 3 → F) : F :=
+  let dPx := subBits (cp1 0) (cp0 0)
+  let dPy := subBits (cp1 1) (cp0 1)
+  let dPz := subBits (cp1 2) (cp0 2)
+  let p0px := subBits (p 0) (cp0 0)
+  let p0py := subBits (p 1) (cp0 1)
+  let p0pz := subBits (p 2) (cp0 2)
+  addBits (addBits (mulBits p0px dPx) (mulBits p0py dPy)) (mulBits p0pz dPz)
+
+/-- `tri_rlc_cone_test_core`: the branch-free cone-side test. -/
+def rlcConeTest (cp0 : Fin 3 → F) (cr0 : F) (cp1 : Fin 3 → F) (cr1 : F)
+    (p : Fin 3 → F) : Bool :=
+  let dPx := subBits (cp1 0) (cp0 0)
+  let dPy := subBits (cp1 1) (cp0 1)
+  let dPz := subBits (cp1 2) (cp0 2)
+  let dPdP := addBits (addBits (mulBits dPx dPx) (mulBits dPy dPy)) (mulBits dPz dPz)
+  let dr := subBits cr1 cr0
+  let r0dr := mulBits cr0 dr
+  let g := subBits dPdP (mulBits dr dr)
+  let p0px := subBits (p 0) (cp0 0)
+  let p0py := subBits (p 1) (cp0 1)
+  let p0pz := subBits (p 2) (cp0 2)
+  let y := addBits (addBits (mulBits p0px dPx) (mulBits p0py dPy)) (mulBits p0pz dPz)
+  let p0p2 := addBits (addBits (mulBits p0px p0px) (mulBits p0py p0py)) (mulBits p0pz p0pz)
+  ltBits (subBits (mulBits p0p2 g) (mulBits y y))
+    (addBits (mulBits (mulBits dPdP cr0) cr0) (mulBits (mulBits 0x40000000 r0dr) y))
+
 /-- `tri_point_oriented_core`: plane-hit parameter of the oriented-disc branch
     of `tri_point_isect_one`, `t = (c0 . n) / (d . n)`. -/
 def pointOrientedCore (org dir : Fin 3 → F) (cx cy cz nx ny nz : F) : F :=
