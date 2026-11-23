@@ -78,7 +78,7 @@ theorem adaptiveSearch_nearest (o d : Vec3) (global : Fin 16 → Vec3)
       have hmin' := hres
       have hempty : cells.filterMap S.solve = [] := List.minimum_eq_top.mp hmin'
       have hmem' : t' ∈ cells.filterMap S.solve := by simpa using ⟨c, hc, hsolve⟩
-      simp [hempty] at hmem' 
+      simp [hempty] at hmem'
   | some m =>
       have hm_le_t' := adaptiveSearch_le cells S.solve c t' hc hsolve hres
       have hm_ge : tstar ≤ m := by

@@ -45,9 +45,10 @@ bench_hip
 tools/
 build_glslang/
 
-# IDE files
+# IDE / local tool config
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~

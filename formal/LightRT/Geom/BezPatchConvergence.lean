@@ -406,7 +406,7 @@ theorem patch_newtonIter_tendsto_of_root_data (o d : Vec3) (cp : Fin 16 → Vec3
     hu₀ hv₀ hroot hR0 (by
       have hKpos : 0 < (192*M : ℝ) := by positivity
       have hle : (192*M) * R ≤ 48*M := by nlinarith [hBbound_root, hB0]
-      exact (le_div_iff₀' hKpos).2 hle) hrect hball hcond' hseed hsmall' 
+      exact (le_div_iff₀' hKpos).2 hle) hrect hball hcond' hseed hsmall'
 
 
 /-- Non-vacuity of the root-data hypotheses: the radius conditions are
