@@ -3807,6 +3807,30 @@ static inline void tri_crv4_isect(const lrt_crv4 *blk, const tri_ray_ctx *rc,
 #define TRI_RLC_ULP 1.1920929e-7f
 #define TRI_RLC_MIN_A 1e-18f
 
+/* c2lean-verified branch-free cores of the round-linear CSG cone tests. The
+ * early-outs (infinite neighbor, start/end plane) stay in the callers; the
+ * fp32 arithmetic below is translated and refined bit-for-bit. */
+static inline float tri_rlc_plane_y_core(const float cp0[3], const float cp1[3],
+                                         const float p[3]) {
+    float dPx = cp1[0] - cp0[0], dPy = cp1[1] - cp0[1], dPz = cp1[2] - cp0[2];
+    float p0px = p[0] - cp0[0], p0py = p[1] - cp0[1], p0pz = p[2] - cp0[2];
+    return p0px * dPx + p0py * dPy + p0pz * dPz;
+}
+
+static inline int tri_rlc_cone_test_core(const float cp0[3], float cr0,
+                                         const float cp1[3], float cr1,
+                                         const float p[3]) {
+    float dPx = cp1[0] - cp0[0], dPy = cp1[1] - cp0[1], dPz = cp1[2] - cp0[2];
+    float dPdP = dPx * dPx + dPy * dPy + dPz * dPz;
+    float dr = cr1 - cr0;
+    float r0dr = cr0 * dr;
+    float g = dPdP - dr * dr;
+    float p0px = p[0] - cp0[0], p0py = p[1] - cp0[1], p0pz = p[2] - cp0[2];
+    float y = p0px * dPx + p0py * dPy + p0pz * dPz;
+    float p0p2 = p0px * p0px + p0py * p0py + p0pz * p0pz;
+    return (p0p2 * g - y * y) < (dPdP * cr0 * cr0 + 2.0f * r0dr * y);
+}
+
 /* Is p inside the capped cone (cp0,cr0)->(cp1,cr1)? (ConeGeometry::isInsideCappedCone) */
 static inline int tri_rlc_inside_capped_cone(const float cp0[3], float cr0,
                                              const float cp1[3], float cr1,
@@ -3816,13 +3840,10 @@ static inline int tri_rlc_inside_capped_cone(const float cp0[3], float cr0,
     float dPdP = dPx * dPx + dPy * dPy + dPz * dPz;
     float dr = cr1 - cr0;
     float r0dr = cr0 * dr;
-    float g = dPdP - dr * dr;
-    float p0px = p[0] - cp0[0], p0py = p[1] - cp0[1], p0pz = p[2] - cp0[2];
-    float y = p0px * dPx + p0py * dPy + p0pz * dPz;
+    float y = tri_rlc_plane_y_core(cp0, cp1, p);
     if (!(y > -r0dr + TRI_RLC_ULP)) return 0; /* start plane */
     if (!(y < -cr1 * dr + dPdP)) return 0;     /* end plane */
-    float p0p2 = p0px * p0px + p0py * p0py + p0pz * p0pz;
-    return (p0p2 * g - y * y) < (dPdP * cr0 * cr0 + 2.0f * r0dr * y);
+    return tri_rlc_cone_test_core(cp0, cr0, cp1, cr1, p);
 }
 
 /* Does the neighbor cone's start plane clip away p? (ConeGeometry::isClippedByPlane) */
@@ -3830,10 +3851,8 @@ static inline int tri_rlc_clipped_by_plane(const float cp0[3], float cr0,
                                            const float cp1[3], float cr1,
                                            const float p[3]) {
     if (!(cp1[0] < TRI_INF_F) || !(cp0[0] < TRI_INF_F)) return 0;
-    float dPx = cp1[0] - cp0[0], dPy = cp1[1] - cp0[1], dPz = cp1[2] - cp0[2];
     float r0dr = cr0 * (cr1 - cr0);
-    float p0px = p[0] - cp0[0], p0py = p[1] - cp0[1], p0pz = p[2] - cp0[2];
-    float y = p0px * dPx + p0py * dPy + p0pz * dPz;
+    float y = tri_rlc_plane_y_core(cp0, cp1, p);
     return y > -r0dr;
 }
 
@@ -5111,6 +5130,34 @@ static inline void tri_tetra4_isect(const lrt_quad4 *blk, const tri_ray_ctx *rc,
  * The ray (org+t*dir) meets the ruled line A(u)+v*D(u) where A(u)=q00+u*e10 and
  * D(u)=e00+u*(e11-e00); coplanarity dot(A(u)-org, dir x D(u))=0 is a quadratic
  * in u. For each root in [0,1] solve t,v from the two skew lines. */
+/* c2lean-verified core of tri_bilin_one: the coefficients a, b, c of the
+ * coplanarity quadratic a + b*u + c*u^2, with all cross/dot products expanded.
+ * Straight-line fp32, so the c2lean bridge translates it and Ref.bilinQuadCore
+ * refines it bit-for-bit. */
+static inline void tri_bilin_quad_core(const float *o, const float *d,
+                                       const float *q00, const float *q10,
+                                       const float *q11, const float *q01,
+                                       float *a_out, float *b_out,
+                                       float *c_out) {
+    float e10x = q10[0] - q00[0], e10y = q10[1] - q00[1], e10z = q10[2] - q00[2];
+    float e00x = q01[0] - q00[0], e00y = q01[1] - q00[1], e00z = q01[2] - q00[2];
+    float e11x = q11[0] - q10[0], e11y = q11[1] - q10[1], e11z = q11[2] - q10[2];
+    float ddx = e11x - e00x, ddy = e11y - e00y, ddz = e11z - e00z;
+    float q0x = q00[0] - o[0], q0y = q00[1] - o[1], q0z = q00[2] - o[2];
+    float ax = d[1] * e00z - d[2] * e00y;
+    float ay = d[2] * e00x - d[0] * e00z;
+    float az = d[0] * e00y - d[1] * e00x;
+    float bx = d[1] * ddz - d[2] * ddy;
+    float by = d[2] * ddx - d[0] * ddz;
+    float bz = d[0] * ddy - d[1] * ddx;
+    float a = q0x * ax + q0y * ay + q0z * az;
+    float c = e10x * bx + e10y * by + e10z * bz;
+    float b = (q0x * bx + q0y * by + q0z * bz) + (e10x * ax + e10y * ay + e10z * az);
+    *a_out = a;
+    *b_out = b;
+    *c_out = c;
+}
+
 static inline int tri_bilin_one(const float *o, const float *d,
                                 const float *q00, const float *q10,
                                 const float *q11, const float *q01, float tmin,
@@ -5128,12 +5175,8 @@ static inline int tri_bilin_one(const float *o, const float *d,
         (r)[2] = (a)[0] * (b)[1] - (a)[1] * (b)[0]; \
     } while (0)
 #define DOT(a, b) ((a)[0] * (b)[0] + (a)[1] * (b)[1] + (a)[2] * (b)[2])
-    float dxe00[3], dxdd[3];
-    CROSS(dxe00, d, e00);
-    CROSS(dxdd, d, dd);
-    float a = DOT(Q0, dxe00);
-    float c = DOT(e10, dxdd);
-    float b = DOT(Q0, dxdd) + DOT(e10, dxe00);
+    float a, b, c;
+    tri_bilin_quad_core(o, d, q00, q10, q11, q01, &a, &b, &c);
     /* roots of a + b u + c u^2 = 0 */
     float roots[2];
     int nr = 0;
@@ -5872,21 +5915,37 @@ static inline void tri_rbezpatch4_isect(const lrt_rbezpatch4 *blk,
     }
 }
 
+/* c2lean-verified branch-free cores of tri_sdf_eval (Tier 1 c2lean expansion).
+ * Each is straight-line fp32 with sqrtf/fabsf and the already-translated
+ * tri_minf/tri_maxf, so the c2lean bridge
+ * translates it and Ref.{sdfSphere,sdfBox,sdfTorus} refine it bit-for-bit. */
+static inline float tri_sdf_sphere_core(float px, float py, float pz, float r) {
+    return sqrtf(px * px + py * py + pz * pz) - r;
+}
+
+static inline float tri_sdf_box_core(float px, float py, float pz,
+                                     float ex, float ey, float ez) {
+    float qx = fabsf(px) - ex, qy = fabsf(py) - ey, qz = fabsf(pz) - ez;
+    float mx = tri_maxf(qx, 0.0f), my = tri_maxf(qy, 0.0f),
+          mz = tri_maxf(qz, 0.0f);
+    float outside = sqrtf(mx * mx + my * my + mz * mz);
+    float inside = tri_minf(tri_maxf(qx, tri_maxf(qy, qz)), 0.0f);
+    return outside + inside;
+}
+
+static inline float tri_sdf_torus_core(float px, float py, float pz,
+                                       float major, float minor) {
+    float lxz = sqrtf(px * px + pz * pz) - major;
+    return sqrtf(lxz * lxz + py * py) - minor;
+}
+
 /* Built-in implicit distance field in object space (p = world - center). */
 static inline float tri_sdf_eval(uint32_t type, float px, float py, float pz,
                                  float p0, float p1, float p2) {
-    if (type == TRI_SDF_SPHERE) return sqrtf(px * px + py * py + pz * pz) - p0;
-    if (type == TRI_SDF_BOX) {
-        float qx = fabsf(px) - p0, qy = fabsf(py) - p1, qz = fabsf(pz) - p2;
-        float mx = tri_maxf(qx, 0.0f), my = tri_maxf(qy, 0.0f),
-              mz = tri_maxf(qz, 0.0f);
-        float outside = sqrtf(mx * mx + my * my + mz * mz);
-        float inside = tri_minf(tri_maxf(qx, tri_maxf(qy, qz)), 0.0f);
-        return outside + inside;
-    }
+    if (type == TRI_SDF_SPHERE) return tri_sdf_sphere_core(px, py, pz, p0);
+    if (type == TRI_SDF_BOX) return tri_sdf_box_core(px, py, pz, p0, p1, p2);
     /* torus (axis y): p0 = major R, p1 = minor r */
-    float lxz = sqrtf(px * px + pz * pz) - p0;
-    return sqrtf(lxz * lxz + py * py) - p1;
+    return tri_sdf_torus_core(px, py, pz, p0, p1);
 }
 
 /* Sphere-trace one built-in SDF prim; clips the march to its bounding sphere. */

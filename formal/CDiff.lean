@@ -149,6 +149,73 @@ def runSphereDist (w : List Nat) : String :=
 def refSphereDist (w : List Nat) : String :=
   hex8 (Ref.sphereDistF (v3 w 0) (v3 w 3) (v3 w 6) (w.getD 9 0).toUInt32).toNat
 
+/-- Built-in SDF shape cores (c2lean-translated). -/
+def runSdfCore (fid : Nat) (n : Nat) (w : List Nat) : String :=
+  let args := (List.range n).map (fun k => .f32 (w.getD k 0))
+  match callFunc Gen.prog fuel fid args (mkMem []) with
+  | .ok (some (.f32 r), _) => hex8 r
+  | .ok _ => "ERR noval"
+  | .ub => "UB"
+  | .timeout => "TIMEOUT"
+
+def refSdfCore (f : Ref.F → Ref.F → Ref.F → Ref.F → Ref.F → Ref.F → Ref.F)
+    (w : List Nat) (n : Nat) : String :=
+  hex8 (f (w.getD 0 0).toUInt32 (w.getD 1 0).toUInt32 (w.getD 2 0).toUInt32
+    (w.getD 3 0).toUInt32 (w.getD 4 0).toUInt32 (w.getD 5 0).toUInt32).toNat
+
+def refSdfSphere (w : List Nat) : String :=
+  hex8 (Ref.sdfSphereCore (w.getD 0 0).toUInt32 (w.getD 1 0).toUInt32
+    (w.getD 2 0).toUInt32 (w.getD 3 0).toUInt32).toNat
+
+def refSdfBox (w : List Nat) : String :=
+  refSdfCore (fun px py pz ex ey ez => Ref.sdfBoxCore px py pz ex ey ez) w 6
+
+def refSdfTorus (w : List Nat) : String :=
+  hex8 (Ref.sdfTorusCore (w.getD 0 0).toUInt32 (w.getD 1 0).toUInt32
+    (w.getD 2 0).toUInt32 (w.getD 3 0).toUInt32 (w.getD 4 0).toUInt32).toNat
+
+/-- `bilin`: MiniC execution of tri_bilin_quad_core (a, b, c outputs). -/
+def runBilin (w : List Nat) : String :=
+  let vecs := (List.range 6).map (fun k => blockOf ((w.drop (3 * k)).take 3))
+  let m0 := mkMem (vecs ++ [blockOf [0], blockOf [0], blockOf [0]])
+  let args : List Val := [.ptr 0 0, .ptr 1 0, .ptr 2 0, .ptr 3 0, .ptr 4 0, .ptr 5 0,
+    .ptr 6 0, .ptr 7 0, .ptr 8 0]
+  match callFunc Gen.prog fuel Gen.fid_tri_bilin_quad_core args m0 with
+  | .ok (_, m) => s!"{hex8 (rd32 m 6 0)} {hex8 (rd32 m 7 0)} {hex8 (rd32 m 8 0)}"
+  | .ub => "UB"
+  | .timeout => "TIMEOUT"
+
+def refBilin (w : List Nat) : String :=
+  let r := Ref.bilinQuadCore (v3 w 0) (v3 w 3) (v3 w 6) (v3 w 9) (v3 w 12) (v3 w 15)
+  s!"{h r.1} {h r.2.1} {h r.2.2}"
+
+/-- Round-linear CSG cores. -/
+def runRlcY (w : List Nat) : String :=
+  let vecs := (List.range 3).map (fun k => blockOf ((w.drop (3 * k)).take 3))
+  match callFunc Gen.prog fuel Gen.fid_tri_rlc_plane_y_core
+      [.ptr 0 0, .ptr 1 0, .ptr 2 0] (mkMem vecs) with
+  | .ok (some (.f32 r), _) => hex8 r
+  | .ok _ => "ERR noval"
+  | .ub => "UB"
+  | .timeout => "TIMEOUT"
+
+def refRlcY (w : List Nat) : String :=
+  hex8 (Ref.rlcPlaneY (v3 w 0) (v3 w 3) (v3 w 6)).toNat
+
+def runRlcC (w : List Nat) : String :=
+  let m0 := mkMem [blockOf (w.take 3), blockOf [w.getD 3 0],
+    blockOf ((w.drop 4).take 3), blockOf [w.getD 7 0], blockOf (w.drop 8)]
+  let args : List Val := [.ptr 0 0, .f32 (w.getD 3 0), .ptr 2 0, .f32 (w.getD 7 0), .ptr 4 0]
+  match callFunc Gen.prog fuel Gen.fid_tri_rlc_cone_test_core args m0 with
+  | .ok (some (.int _ r), _) => toString r
+  | .ok _ => "ERR noval"
+  | .ub => "UB"
+  | .timeout => "TIMEOUT"
+
+def refRlcC (w : List Nat) : String :=
+  if Ref.rlcConeTest (v3 w 0) (w.getD 3 0).toUInt32 (v3 w 4) (w.getD 7 0).toUInt32 (v3 w 8)
+  then "1" else "0"
+
 /-- MiniC result; if the Lean reference disagrees, flag it so cdiff fails. -/
 def runLine (line : String) : String :=
   let check (mc ref : String) := if mc == ref then mc else mc ++ " REFDIFF " ++ ref
@@ -158,6 +225,24 @@ def runLine (line : String) : String :=
   | "mt" :: rest => let w := rest.map hexNat; check (runMt w) (refMt w)
   | "woop" :: rest => let w := rest.map hexNat; check (runWoop w) (refWoop w)
   | "sph" :: rest => let w := rest.map hexNat; check (runSphereDist w) (refSphereDist w)
+  | "sdfs" :: rest =>
+    let w := rest.map hexNat
+    check (runSdfCore Gen.fid_tri_sdf_sphere_core 4 w) (refSdfSphere w)
+  | "sdfb" :: rest =>
+    let w := rest.map hexNat
+    check (runSdfCore Gen.fid_tri_sdf_box_core 6 w) (refSdfBox w)
+  | "sdft" :: rest =>
+    let w := rest.map hexNat
+    check (runSdfCore Gen.fid_tri_sdf_torus_core 5 w) (refSdfTorus w)
+  | "bilin" :: rest =>
+    let w := rest.map hexNat
+    check (runBilin w) (refBilin w)
+  | "rlcy" :: rest =>
+    let w := rest.map hexNat
+    check (runRlcY w) (refRlcY w)
+  | "rlcc" :: rest =>
+    let w := rest.map hexNat
+    check (runRlcC w) (refRlcC w)
   | "slabk" :: rest =>
     let w := rest.map hexNat
     let rc := Ref.raySetup (v3 w 0) (v3 w 4) (w.getD 3 0).toUInt32

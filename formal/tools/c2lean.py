@@ -52,6 +52,12 @@ FUNCTIONS = [
     "tri_point_raydisc_core",
     "tri_surface_area",
     "tri_longest_axis",
+    "tri_sdf_sphere_core",
+    "tri_sdf_box_core",
+    "tri_sdf_torus_core",
+    "tri_bilin_quad_core",
+    "tri_rlc_plane_y_core",
+    "tri_rlc_cone_test_core",
 ]
 
 # Extra functions that exist only in a particular configuration's preprocessor

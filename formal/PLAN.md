@@ -233,8 +233,19 @@ FP of the solve stays a Tier 2 `primhitcheck` boundary throughout.
    executes `FP.Binary32.sqrtBits` (integer algorithm, `#guard`-checked);
    `EvE.sqrt'` is the refinement lemma; `cdiff.py` includes `sph` vectors that
    compare the real C sqrt with the MiniC model end-to-end (0 mismatches).
-   Translate additional *scalar* kernels (e.g. `tri_woop_one_hp`, the primitive
-   scalar intersectors from item 1) and prove their `*_refines` theorems.
+   **Primitive intersector cores (Tier 1 c2lean expansion):** the translator now
+   also covers the three built-in SDF shape cores (`tri_sdf_sphere_core`,
+   `tri_sdf_box_core`, `tri_sdf_torus_core`, wired into `tri_sdf_eval`) and the
+   bilinear-patch quadratic core `tri_bilin_quad_core` (wired into
+   `tri_bilin_one`). `C/Ref.lean` adds `sdfSphereCore`/`sdfBoxCore`/`sdfTorusCore`
+   and `bilinQuadCore`, plus `rlcPlaneY`/`rlcConeTest` (the branch-free cores of
+   the round-linear CSG cone tests); `C/Proofs/SdfCoreRefines.lean`,
+   `C/Proofs/BilinQuadRefines.lean` and `C/Proofs/RlcCoreRefines.lean` prove
+   bit-for-bit `*_refines` (including the three output stores of the bilinear
+   core). `cdiff.py` generates `sdfs`/`sdfb`/`sdft`/`bilin`/`rlcy`/`rlcc`
+   vectors, checked C <-> MiniC <-> bit-level Lean: 0 mismatches.
+   Remaining: `tri_woop_one_hp` (fp64 is outside the MiniC model - Tier 2
+   boundary), and further primitive scalar intersectors from item 1.
    Acceptance: each new translated function has a passing `c2lean --check` and a
    refinement theorem. `tri_sphere_dist_f_refines` is proved in
    `C/Proofs/SphereDistRefines.lean` (ExS symbolic execution with an explicit
