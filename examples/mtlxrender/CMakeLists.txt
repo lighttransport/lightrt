@@ -200,6 +200,13 @@ target_compile_definitions(f32_lobe_error PRIVATE _POSIX_C_SOURCE=200809L)
 target_link_libraries(f32_lobe_error PRIVATE m)
 add_test(NAME f32_lobe_error COMMAND f32_lobe_error)
 
+# EXT-001 certified-weight kernel (header-only; standalone prototype vectors).
+add_executable(certified_bsdf_test tests/certified_bsdf_test.c bsdf.c certified_bsdf.c)
+target_include_directories(certified_bsdf_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(certified_bsdf_test PRIVATE _POSIX_C_SOURCE=200809L)
+target_link_libraries(certified_bsdf_test PRIVATE m)
+add_test(NAME certified_bsdf_test COMMAND certified_bsdf_test)
+
 # Special values (NaN, infinities, signed zero, flags) of the verified binary32 ops
 # versus verif/lean/MtlxSpec/Binary32Special.lean.
 add_executable(vf_special tests/vf_special.c verified_float.c)

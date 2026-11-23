@@ -1,4 +1,5 @@
 #include "bsdf.h"
+#include "certified_bsdf.h"
 #include <pthread.h>
 
 #include <math.h>
@@ -62,7 +63,7 @@ static double materialx_conductor_fresnel(double cosine, double n, double k) {
 static int g_energy_mode = 0;
 static MtlxFilmReflectanceFn g_conservative_film_fn = 0;
 static double fitted_ggx_comp(double favg, double ess) {
-    return g_energy_mode == 1 ? 1.0 : 1.0 + favg * (1.0 - ess) / ess;
+    return g_energy_mode >= 1 ? 1.0 : 1.0 + favg * (1.0 - ess) / ess;
 }
 
 static double materialx_ggx_directional_terms(double x, double y, double *a_out, double *b_out) {
@@ -368,7 +369,7 @@ static v3 fresnel_airy(float cosTheta, float ior_substrate, float tf_thickness_n
  * arithmetic the passive model fails closed (full reflection), which cannot create
  * energy. Without a provider, behaviour is exactly the reference Airy path. */
 static v3 film_fresnel(float cosine, float substrate_ior, float thickness, float film_ior) {
-    if (g_energy_mode != 1 || !g_conservative_film_fn)
+    if (g_energy_mode < 1 || !g_conservative_film_fn)
         return fresnel_airy(cosine, substrate_ior, thickness, film_ior);
     const float eta[3] = {substrate_ior, substrate_ior, substrate_ior};
     const float extinction[3] = {0.0f, 0.0f, 0.0f};
@@ -822,7 +823,7 @@ static v3 coat_substrate_attenuation(const Layers *L, float ndotv,
             double favg=L->coat_f0+(1.0-L->coat_f0)/21.0;
             comp=(float)(1.0+favg*(1.0-ess)/ess);
             coat_fr=(float)(L->coat_w*(a*L->coat_f0+b)*comp);
-            if (g_energy_mode == 1) {
+            if (g_energy_mode >= 1) {
                 /* conservative: attenuate the base by at least the coat lobe's sampled
                  * directional albedo (the fit underestimates it near grazing). */
                 float rc = interior_reflection_albedo(clampf(ndotv, 0.0f, 1.0f), L->coat_alpha,
@@ -874,7 +875,7 @@ void bsdf_set_conservative_film_fn(MtlxFilmReflectanceFn fn) { g_conservative_fi
 #define CERT_LOOKUP_EPS 1.0e-5
 
 static int cert_glass_domain(const Layers *L) {
-    return g_energy_mode == 1 && L->openpbr_base && L->base_metalness == 0.0f &&
+    return g_energy_mode >= 1 && L->openpbr_base && L->base_metalness == 0.0f &&
            L->glass_w == 1.0f && L->tf_weight == 0.0f && L->base_specular_weight == 1.0f &&
            L->coat_w == 0.0f && L->sheen_w == 0.0f && L->sheen_lobe_count == 0 &&
            L->specular_lobe_count == 0 && L->conductor_lobe_count == 0;
@@ -978,7 +979,7 @@ static v3 eval_reflection_split(const Layers *L, v3 N, v3 wo, v3 wi, float *pdf,
                 albedo=v3_lerp(albedo,v3_scale(film_comp,(float)(a*f0+b)),L->tf_weight);
                 /* In conservative mode the fitted film compensation must not turn
                  * an attenuation into an energy gain. */
-                if (g_energy_mode == 1)
+                if (g_energy_mode >= 1)
                     albedo=v3_make(clampf(albedo.x,0.0f,1.0f),
                                    clampf(albedo.y,0.0f,1.0f),
                                    clampf(albedo.z,0.0f,1.0f));
@@ -988,7 +989,7 @@ static v3 eval_reflection_split(const Layers *L, v3 N, v3 wo, v3 wi, float *pdf,
              * represent: past the critical angle nearly all energy is reflected,
              * and an unattenuated diffuse lobe underneath created up to 40% energy
              * (white base, transmission 0.5). Use at least the exact view Fresnel. */
-            if (g_energy_mode == 1 && L->base_ior >= 1.0f) {
+            if (g_energy_mode >= 1 && L->base_ior >= 1.0f) {
                 /* conservative: at least the specular lobe's sampled directional albedo */
                 float rs = interior_reflection_albedo(clampf(NdotV, 0.0f, 1.0f), L->alpha,
                                                       1.0f / maxf(L->base_ior, 1.0001f));
@@ -1163,7 +1164,7 @@ static v3 eval_reflection_split(const Layers *L, v3 N, v3 wo, v3 wi, float *pdf,
         float Fc = L->coat_w * fresnel_schlick_s(VdotH, L->coat_f0);
         if (L->openpbr && isfinite(L->coat_ior) && L->coat_ior>0.0f)
             Fc = (float)(L->coat_w * materialx_conductor_fresnel(VdotH,L->coat_ior,0.0));
-        coat = v3_splat(fuzz_throughput * Fc * Dc * Gc * (g_energy_mode == 1 ? 1.0f : coat_comp) /
+        coat = v3_splat(fuzz_throughput * Fc * Dc * Gc * (g_energy_mode >= 1 ? 1.0f : coat_comp) /
                         (4.0f * NdotV * NdotL));
     }
 
@@ -1347,7 +1348,13 @@ static v3 eval_rough_transmission(const OpenPBRParams *p, const Layers *L,
     if (v3_dot(h, N) < 0.0f) h = v3_neg(h);
     float nh = v3_dot(N, h), oh = v3_dot(wo, h), ih = v3_dot(wi, h);
     if (!(nh > 0.0f && oh > 0.0f && ih < 0.0f)) return v3_splat(0.0f);
-    float fresnel = fresnel_dielectric(oh, eta);
+    /* --energy-mode certified (2): the dielectric Fresnel factor comes from the
+     * EXT-001 piecewise surrogate.  On the critical band this evaluates 1-F in
+     * q = sqrt(c-c_crit) instead of cancelling inside sqrt(1-eta^2(1-c^2)); TIR
+     * is the exact clamp F = 1.  Table IORs are 2/3, 5/8, 3/2 and 8/5; other
+     * IORs select the nearest band and are not covered by the certificate. */
+    float fresnel = g_energy_mode >= 2 ? cert_fresnel_reflectance(oh, eta)
+                                       : fresnel_dielectric(oh, eta);
     if (fresnel >= 1.0f) return v3_splat(0.0f);
     float a2 = L->alpha * L->alpha;
     float root = sqrtf(a2 + (1.0f-a2)*nv*nv);

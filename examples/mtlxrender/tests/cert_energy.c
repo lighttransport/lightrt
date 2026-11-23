@@ -78,8 +78,19 @@ int main(void) {
         fail |= !ok;
         worst = fmax(worst, cons);
         gain = fmax(gain, cons - ref);
-        printf("%s rough=%.2f mu=%.2f reference=%.5f conservative=%.5f (quad %.1e)%s\n",
-               side ? "exit " : "enter", rough[r], views[v], ref, cons, qerr, ok ? "" : "  FAIL");
+        /* --energy-mode certified (2): same certified scale, but the glass
+         * Fresnel factor is the EXT-001 piecewise surrogate.  It must stay
+         * passive and close to conservative mode on the certified table IORs. */
+        bsdf_set_energy_mode(2);
+        const double certified = albedo(&p, Ns, views[v], 512);
+        const int ok2 = certified <= 1.0 + qerr + 1e-3 &&
+                        fabs(certified - cons) <= 5.0e-3 + qerr;
+        fail |= !ok2;
+        worst = fmax(worst, certified);
+        printf("%s rough=%.2f mu=%.2f reference=%.5f conservative=%.5f certified=%.5f "
+               "(quad %.1e)%s%s\n",
+               side ? "exit " : "enter", rough[r], views[v], ref, cons, certified, qerr,
+               ok ? "" : "  FAIL", ok2 ? "" : "  CERT FAIL");
       }
     }
   }
