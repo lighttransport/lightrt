@@ -269,6 +269,11 @@ if(BUILD_TESTING)
     target_link_libraries(lightrt_query_ray_test lightrt)
     add_test(NAME lightrt_query_ray_test COMMAND lightrt_query_ray_test)
 
+    # Spatial AABB/sphere query regression test.
+    add_executable(lightrt_spatial_query_test tests/test_spatial_query.cc)
+    target_link_libraries(lightrt_spatial_query_test lightrt)
+    add_test(NAME lightrt_spatial_query_test COMMAND lightrt_spatial_query_test)
+
     # Vulkan GPU interop self-test. Skips (exit 0) when no Vulkan device is
     # present, so GPU-less CI stays green.
     if(LIGHTRT_BUILD_VK)

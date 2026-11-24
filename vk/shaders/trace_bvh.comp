@@ -6,7 +6,8 @@
 // (lightrt_c_tri.c) byte-for-byte over the SAME node/leaf memory image the C
 // builder produces (serialized LRTS node + block regions, uploaded verbatim):
 //   - stack of {ref, tnear} with deferred culling (pop, skip if tnear>=best_t),
-//   - leaf: blocks x lanes Moller-Trumbore (det window +/-1e-12),
+//   - leaf: blocks x lanes Moller-Trumbore for triangles or analytic ellipse
+//           plane tests for serialized point leaves,
 //   - interior: slab test all children, insertion-sort ascending tnear, push
 //     far-to-near so the nearest child is popped first.
 //
@@ -14,7 +15,7 @@
 // GPU sees exactly the bytes of lrt_bvh{4,8}_node / lrt_tri{4,8}, independent of
 // std430 struct-padding rules. A single SPIR-V serves BVH4 and BVH8 via the
 // spec constant W (per-array SoA stride): node stride = 8*W words, block stride
-// = 10*W words, prim_id array at word 9*W.
+// = 10*W words, prim_id array at word 9*W for triangles (7*W for points).
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -22,17 +23,29 @@ layout(local_size_x = 64) in;
 
 layout(constant_id = 0) const uint W = 8u;     // SoA lane width: 4 (BVH4) or 8 (BVH8)
 layout(constant_id = 1) const uint STACK = 96u; // per-invocation traversal stack depth
+// 1 = LRT_TRI_SLAB_ROBUST (host sets it when built with the flag): +inf slab
+// reciprocal for d == 0 and x86 `a < b ? a : b` min/max with the NaN-dropping
+// operand order of tri_slab_scalar (GLSL min/max are undefined on NaN).
+layout(constant_id = 2) const uint ROBUST = 0u;
+float smin(float a, float b) { return ROBUST != 0u ? (a < b ? a : b) : min(a, b); }
+float smax(float a, float b) { return ROBUST != 0u ? (a > b ? a : b) : max(a, b); }
+float stn(float tl, float th) { return ROBUST != 0u ? smin(th, tl) : min(tl, th); }
 
 layout(std430, binding = 0) readonly buffer Nodes  { uint nodes[]; };
 layout(std430, binding = 1) readonly buffer Blocks { uint blocks[]; };
 layout(std430, binding = 2) readonly buffer Rays   { uint rays[]; };  // 8 words / ray
 layout(std430, binding = 3) writeonly buffer Hits  { uint hits[]; };  // 4 words / hit
+// Exact vertices (9 floats / prim) for the watertight leaf; pc.nwverts == 0 => MT.
+layout(std430, binding = 4) readonly buffer WVerts { uint wverts[]; };
 
 layout(push_constant) uniform PC {
     uint root;        // root child-ref
     uint node_count;  // (unused by traversal; kept for diagnostics)
     uint block_count; // (unused)
     uint ray_count;   // dispatch tail bound
+    uint prim_kind;   // 0 = triangle, 6 = serialized point leaf
+    uint point_type;  // 3 = ellipse
+    uint nwverts;     // > 0: watertight Woop leaf on wverts (LRT_TRI_WATERTIGHT_TRI scenes)
 } pc;
 
 const uint LEAF_BIT = 0x80000000u;
@@ -40,6 +53,37 @@ const uint NO_HIT   = 0xFFFFFFFFu;
 const float INVD_MAX = 1e18;       // mirrors TRI_INVD_MAX
 
 float fu(uint i) { return uintBitsToFloat(i); }
+
+// Woop-Benthin-Wald watertight test: line-for-line port of the CPU
+// tri_woop_one (formal: tri_woop_one_refines, woop_no_gap_bits).
+bool woop_one(vec3 o, vec3 d, vec3 v0, vec3 v1, vec3 v2, float tmin, float tbest,
+              out float t, out float u, out float v) {
+    t = 0.0; u = 0.0; v = 0.0;
+    float a0 = abs(d.x), a1 = abs(d.y), a2 = abs(d.z);
+    int kz = 0;
+    if (a1 > a0) kz = 1;
+    if (a2 > a0 && a2 > a1) kz = 2;
+    int kx = kz + 1; if (kx == 3) kx = 0;
+    int ky = kx + 1; if (ky == 3) ky = 0;
+    if (d[kz] < 0.0) { int tmp = kx; kx = ky; ky = tmp; }
+    float sx = d[kx] / d[kz], sy = d[ky] / d[kz], sz = 1.0 / d[kz];
+    float ax = v0[kx] - o[kx], ay = v0[ky] - o[ky], az = v0[kz] - o[kz];
+    float bx = v1[kx] - o[kx], by = v1[ky] - o[ky], bz = v1[kz] - o[kz];
+    float cx = v2[kx] - o[kx], cy = v2[ky] - o[ky], cz = v2[kz] - o[kz];
+    ax = ax - sx * az; ay = ay - sy * az;
+    bx = bx - sx * bz; by = by - sy * bz;
+    cx = cx - sx * cz; cy = cy - sy * cz;
+    precise float ue = cx * by - cy * bx;
+    precise float ve = ax * cy - ay * cx;
+    precise float we = bx * ay - by * ax;
+    if ((ue < 0.0 || ve < 0.0 || we < 0.0) && (ue > 0.0 || ve > 0.0 || we > 0.0)) return false;
+    float det = ue + ve + we;
+    if (det == 0.0) return false;
+    float tt = (ue * (sz * az) + ve * (sz * bz) + we * (sz * cz)) / det;
+    if (!(tt >= tmin && tt < tbest)) return false;
+    t = tt; u = ve / det; v = we / det;
+    return true;
+}
 
 void main() {
     uint gid = gl_GlobalInvocationID.x;
@@ -63,6 +107,10 @@ void main() {
         }
         invd[k] = inv;
     }
+    vec3 sinv = invd;
+    if (ROBUST != 0u)
+        for (int k = 0; k < 3; k++)
+            if (dir[k] == 0.0) sinv[k] = uintBitsToFloat(0x7f800000u);
 
     float best_t = tmax;
     float best_u = 0.0, best_v = 0.0;
@@ -92,7 +140,57 @@ void main() {
                 uint bb = (blk0 + b) * block_stride;
                 for (uint lane = 0u; lane < W; lane++) {
                     uint prim = blocks[bb + prim_off + lane];
+                    if (pc.prim_kind == 6u) {
+                        prim = blocks[bb + 7u * W + lane];
+                        if (prim == NO_HIT) continue;
+                        float cx = fu(blocks[bb + 0u * W + lane]);
+                        float cy = fu(blocks[bb + 1u * W + lane]);
+                        float cz = fu(blocks[bb + 2u * W + lane]);
+                        float rx = fu(blocks[bb + 3u * W + lane]);
+                        float nx = fu(blocks[bb + 4u * W + lane]);
+                        float ny = fu(blocks[bb + 5u * W + lane]);
+                        float nz = fu(blocks[bb + 6u * W + lane]);
+                        float ry = fu(blocks[bb + 8u * W + lane]);
+                        float angle = fu(blocks[bb + 9u * W + lane]);
+                        if (pc.point_type != 3u || rx <= 0.0 || ry <= 0.0) continue;
+                        vec3 n = vec3(nx, ny, nz);
+                        float nl = length(n);
+                        if (nl <= 1e-20) continue;
+                        n /= nl;
+                        vec3 ref = abs(n.y) < 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0);
+                        vec3 uaxis = normalize(cross(ref, n));
+                        vec3 vaxis = cross(n, uaxis);
+                        if (angle != 0.0) {
+                            float ca = cos(angle), sa = sin(angle);
+                            vec3 old = uaxis;
+                            uaxis = old * ca + vaxis * sa;
+                            vaxis = -old * sa + vaxis * ca;
+                        }
+                        float div = dot(dir, n);
+                        if (abs(div) <= 1e-20) continue;
+                        vec3 center = vec3(cx, cy, cz);
+                        float tt = dot(center - org, n) / div;
+                        if (!(tt >= tmin && tt < best_t)) continue;
+                        vec3 hp = org + tt * dir - center;
+                        float pu = dot(hp, uaxis) / rx;
+                        float pv = dot(hp, vaxis) / ry;
+                        if (pu * pu + pv * pv >= 1.0) continue;
+                        best_t = tt; best_u = 0.5 + 0.5 * pu;
+                        best_v = 0.5 + 0.5 * pv; best_prim = prim;
+                        continue;
+                    }
                     if (prim == NO_HIT) continue;
+                    if (prim < pc.nwverts) {
+                        uint wb = 9u * prim;
+                        vec3 w0 = vec3(fu(wverts[wb + 0u]), fu(wverts[wb + 1u]), fu(wverts[wb + 2u]));
+                        vec3 w1 = vec3(fu(wverts[wb + 3u]), fu(wverts[wb + 4u]), fu(wverts[wb + 5u]));
+                        vec3 w2 = vec3(fu(wverts[wb + 6u]), fu(wverts[wb + 7u]), fu(wverts[wb + 8u]));
+                        float tw, uw, vw;
+                        if (woop_one(org, dir, w0, w1, w2, tmin, best_t, tw, uw, vw)) {
+                            best_t = tw; best_u = uw; best_v = vw; best_prim = prim;
+                        }
+                        continue;
+                    }
                     float v0x = fu(blocks[bb + 0u * W + lane]);
                     float v0y = fu(blocks[bb + 1u * W + lane]);
                     float v0z = fu(blocks[bb + 2u * W + lane]);
@@ -107,20 +205,20 @@ void main() {
                     float py = dir.z * e2x - dir.x * e2z;
                     float pz = dir.x * e2y - dir.y * e2x;
                     float det = e1x * px + e1y * py + e1z * pz;
-                    if (det > -1e-12 && det < 1e-12) continue;
+                    if (!(det <= -1e-12 || det >= 1e-12)) continue;
                     float inv_det = 1.0 / det;
                     float tvx = org.x - v0x;
                     float tvy = org.y - v0y;
                     float tvz = org.z - v0z;
                     float uu = (tvx * px + tvy * py + tvz * pz) * inv_det;
-                    if (uu < 0.0 || uu > 1.0) continue;
+                    if (!(uu >= 0.0 && uu <= 1.0)) continue;
                     float qx = tvy * e1z - tvz * e1y;
                     float qy = tvz * e1x - tvx * e1z;
                     float qz = tvx * e1y - tvy * e1x;
                     float vv = (dir.x * qx + dir.y * qy + dir.z * qz) * inv_det;
-                    if (vv < 0.0 || uu + vv > 1.0) continue;
+                    if (!(vv >= 0.0 && uu + vv <= 1.0)) continue;
                     float tt = (e2x * qx + e2y * qy + e2z * qz) * inv_det;
-                    if (tt < tmin || tt >= best_t) continue;
+                    if (!(tt >= tmin && tt < best_t)) continue;
                     best_t = tt; best_u = uu; best_v = vv; best_prim = prim;
                 }
             }
@@ -141,17 +239,18 @@ void main() {
             float hi_x = fu(nodes[nb + 3u * W + i]);
             float hi_y = fu(nodes[nb + 4u * W + i]);
             float hi_z = fu(nodes[nb + 5u * W + i]);
-            float tlx = (lo_x - org.x) * invd.x;
-            float thx = (hi_x - org.x) * invd.x;
-            float tly = (lo_y - org.y) * invd.y;
-            float thy = (hi_y - org.y) * invd.y;
-            float tlz = (lo_z - org.z) * invd.z;
-            float thz = (hi_z - org.z) * invd.z;
-            float tnx = min(tlx, thx), tfx = max(tlx, thx);
-            float tny = min(tly, thy), tfy = max(tly, thy);
-            float tnz = min(tlz, thz), tfz = max(tlz, thz);
-            float tnear = max(max(tnx, tny), max(tnz, tmin));
-            float tfar  = min(min(tfx, tfy), min(tfz, best_t));
+            float tlx = (lo_x - org.x) * sinv.x;
+            float thx = (hi_x - org.x) * sinv.x;
+            float tly = (lo_y - org.y) * sinv.y;
+            float thy = (hi_y - org.y) * sinv.y;
+            float tlz = (lo_z - org.z) * sinv.z;
+            float thz = (hi_z - org.z) * sinv.z;
+            float tnx = stn(tlx, thx), tfx = smax(tlx, thx);
+            float tny = stn(tly, thy), tfy = smax(tly, thy);
+            float tnz = stn(tlz, thz), tfz = smax(tlz, thz);
+            float tnear = smax(smax(tnx, tny), smax(tnz, tmin));
+            float tfar  = smin(smin(tfx, tfy), smin(tfz, best_t));
+            if ((ROBUST & 2u) != 0u) tfar *= uintBitsToFloat(0x3f800005u); // 1 + 10u (Robust/Slab)
             if (tnear <= tfar) {
                 int j = nhit++;
                 while (j > 0 && hit_tn[j - 1] > tnear) {

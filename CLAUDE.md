@@ -701,10 +701,15 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
 - `lrt_bezcurve_scene_build` — **true higher-order round cubic-Bézier curves**
   (not tessellation): a port of Embree's sweep intersector
   (`curve_intersector_sweep.h`, `RTC_GEOMETRY_TYPE_ROUND_BEZIER_CURVE`). Each
-  sub-interval seeds a 2D Newton/Jacobian iteration (`tri_bez_newton`: `f =
-  dot(R,T)` foot, `g = dist−radius` surface) that converges to the exact tube;
-  the seed comes from a round-linear cone, with a cone fallback when Newton is
-  ill-conditioned (grazing). Build-time de Casteljau **pre-subdivision**
+  sub-interval is solved by `tri_bez_leaf_solve` on the exact round curve = union of
+  balls B(C(u), r(u)) (canal surface): a fast 2D Newton on the envelope conditions
+  (`R·C′ + r r′ = 0`, `|R| = r`, minimum along u) from a cone seed, accepted only when
+  converged, front-facing and inside the leaf's u-range; otherwise a sphere trace of the
+  exact leaf-tube distance from the entry of an enclosing capsule (first contact, end
+  balls included), polished by Newton. No approximate cone hit is ever reported.
+  Measured vs a double reference (`tools/primhitcheck.c`, 24 seeds × 2000 rays): 0
+  hit/miss and 0 farther-than-nearest hits, residual ≤ 4e-6 (was up to 9e-3); trace
+  ~18% slower than the old sweep (see PLAN.md M14). Build-time de Casteljau **pre-subdivision**
   (`TRI_BEZ_BUILD_SPLIT=4`) gives tight AABBs so the BVH culls well; the sub-arcs
   are computed on the fly (no materialized temp array — low build memory), and
   the leaf keeps the original segment id (`seg = sub/K`). `TRI_PRIM_BEZCURVE`,
@@ -757,7 +762,9 @@ FAST/DEFAULT/HQ, plus scalar + ASan/UBSan).
     exact closed-form quadratic solve (Reshetov "Cool Patches"). `TRI_PRIM_
     BILINEAR`, reuses the 208-byte `lrt_quad4` leaf.
   - `lrt_bezpatch_scene_build` — **bicubic Bézier surface** (4×4 CPs), adaptive
-    (u,v) quadtree subdivision + Newton on (u,v,t). `TRI_PRIM_BEZPATCH`,
+    (u,v) quadtree subdivision + a cell-bounded damped Newton on (u,v,t); cells whose
+    Newton fails, or that contain a silhouette after a hit, are refined to depth 7
+    (PLAN.md M15). `TRI_PRIM_BEZPATCH`,
     784-byte `lrt_bezpatch4` leaf (4 patches/block SoA).
   - `lrt_nurbs_scene_build` — **NURBS surface** (control net + 2 knot vectors +
     weights, any bidegree ≤8): build-time knot-insertion Bézier extraction
@@ -1138,6 +1145,8 @@ hybrid Path-B build covers fast rebuilds.
 cmake -S . -B build_cuda -DLIGHTRT_BUILD_CUDA=ON -DBUILD_TESTING=ON
 cmake --build build_cuda && ctest --test-dir build_cuda -R lightrt_c_cuda_test
 make cuda_test && ./lightrt_c_cuda_test         # Makefile path (opt-in, needs nvcc)
+make cuda_full_test CUDA_ARCH=sm_86             # + all primitive kinds + parallel-ray/watertight
+                                                # (tests generated from the HIP ones: scripts/gen_cuda_tests.sh)
 ```
 
 ## A64FX (ARM64 + SVE 1.0) backend for the C11 kernel
@@ -1249,6 +1258,29 @@ NEON BVH4 ~1.95x primary; SVE BVH8 ~2.33x primary / ~2.2-2.3x incoherent+shadow;
 all hits verify 100% against the fp64 oracle. CMake also gained an aarch64
 `-march=armv8.2-a+sve` branch (top-level + `benchmark_c`); for fcc under CMake
 pass `-DCMAKE_C_FLAGS=-Nclang`.
+
+## Formal verification (`formal/`)
+
+Lean 4 + Mathlib (v4.35.0) specs and proofs for slab/MT/Woop/BVH, a binary32
+rounding model, and a C→Lean bridge (`formal/tools/c2lean.py`, ported from
+tinygltf) that translates the scalar kernels of `lightrt_c_tri.c`
+(`tri_ray_setup`, `tri_slab_scalar`, `tri_mt_one`, …) into MiniC. The opt-in
+watertight triangle test `tri_woop_one` (Woop–Benthin–Wald; CPU quad/tetra leaves,
+`-DLRT_TRI_WATERTIGHT`) is proved to refine `Ref.woop` and to be watertight on
+shared edges for every input. Run
+`make formal` (build + `c2lean --check` + sorry budget + axiom allowlist +
+3-way cdiff + `tools/bvhcheck.py`, which validates real C-built BVH4/BVH8 trees against the Lean flat-BVH traversal theorem in `LightRT/BVH/Flat.lean`). Robustness flags, all validated by `bvhcheck.py` and described in PLAN.md M7. **`LRT_TRI_LEAF_BOX_EXACT`, `LRT_TRI_SLAB_ROBUST`, `LRT_TRI_SLAB_INFLATE`, `LRT_TRI_BITEXACT` and `LRT_TRI_WATERTIGHT_TRI` are on by default** (set in `lightrt_c_tri.h`; opt out with `-DLRT_TRI_NO_LEAF_BOX_EXACT` / `-DLRT_TRI_NO_SLAB_ROBUST` / `-DLRT_TRI_NO_SLAB_INFLATE` / `-DLRT_TRI_NO_BITEXACT` / `-DLRT_TRI_NO_WATERTIGHT_TRI`). Measured cost (1 thread, mandelbulb 128k): trace within noise (±3%), build +7% SAH / +29% LBVH (leaf-box TwoSum + refit pass), no memory change. The others stay opt-in:
+- `LRT_TRI_LEAF_BOX_EXACT` (default): node boxes contain the stored, rounded leaf triangles exactly; it is needed for the checker's `checkWF` to pass.
+- `LRT_TRI_SLAB_ROBUST` (default): no false miss for a ray lying exactly on a slab plane.
+- `LRT_TRI_SLAB_INFLATE` (default with `SLAB_ROBUST`): the slab far value is scaled by `1 + 10u`, which rules out false misses of rays touching a box at an edge or corner (`Robust/Slab.lean`). Without it, rays aimed at shared vertices could miss the watertight mesh entirely. Mirrored in all CPU slabs and the HIP/CUDA/Vulkan kernels; cost 1–3% (PLAN.md M21).
+- `LRT_TRI_BITEXACT` (default): the SIMD leaf and det test use scalar evaluation order. With `SLAB_ROBUST`, SIMD traversal is bit-identical to scalar. Cost within noise (PLAN.md M16).
+- `LRT_TRI_WATERTIGHT_TRI` (default): watertight Woop main triangle leaf on exact vertices, no gaps on shared edges. SSE BVH4 / AVX2 BVH8 run a SIMD Woop leaf (`tri_woop4/8_block`), bit-identical to the scalar `tri_woop_one` (checked by `formal/tools/wtcheck.c`). The BVH4/BVH8 leaf blocks store the exact vertices instead of MT edges (LRTS flag 4), so memory equals the MT build. Speed vs the MT build: BVH4 +20/−2/+3%, BVH8 0/+9/+14% (primary/incoherent/shadow; PLAN.md M17–M20). `bvhcheck.py`'s Lean mirror models MT and opts out. Run `make c_tri_seam_test`.
+- `-DLRT_TRI_EXACT_NEAREST` (opt-in): the closest hit is exactly the brute-force nearest. On watertight scenes it still prunes by the best hit, using a per-node key proved below every contained triangle's `t` (`BVH/ExactPrune.lean`, `tri_exn_key`): −24% BVH4 / −12% BVH8 primary vs the default (was −55% / −52%). Other scenes push `tmin` (`Flat.run_exact`, no pruning).
+
+`SLAB_ROBUST` covers scalar, SSE/AVX2, the NEON shim, SVE, the quantized node formats and the GPU kernels (hiprtc, CUDA, Vulkan via specialization constant 2). Run `make c_tri_parallel_test`. The HIP (resident `.hip` and hiprtc), Vulkan and CUDA kernels also run the watertight leaf when the scene carries exact vertices (`WATERTIGHT_TRI` builds). The CUDA kernels are verified on hardware (RTX 3070 sm_86, RTX 5060 Ti sm_120) with `make cuda_full_test`: triangles, every primitive kind and normals vs the CPU oracle, and the parallel-ray test (`_wt` build: 0 GPU misses, GPU == CPU bit for bit).
+
+The hiprtc Path-A trace (`lightrt_c_hip.c` + `lightrt_hipew.c`) needs no hipcc. Run `make hip_rtc_test`; it is a separate binary because it defines the same `lrt_hip_*` engine symbols as `lightrt_c_hip.hip`. Any-hit traversal (`BVH/AnyHit.lean`, `runAny_root`/`runAny_cover_root`) and the two-level TLAS/BLAS loop (`BVH/TwoLevel.lean`, `tlas_root`, exact `t` preservation under affine instance transforms, transform rounding bounds, `aff_in_corner_box`: instance boxes from the 8 transformed corners contain the affine image of the BLAS box; the corners are widened by the proved rounding bound under `LEAF_BOX_EXACT`; `world_in_dilated_box`: the TLAS node test dilates by a per-ray margin covering the rounded instance ray transform, so pair hits are never culled, PLAN.md M16) are proved too; `bvhcheck.py` validates any-hit and the SBVH coverage hypothesis, and `tools/tlascheck.c` validates the TLAS against brute force and an fp64 world-space reference. Curve, patch and point boxes: `Geom/Hull.lean` proves each primitive lies in the (radius-dilated) control-point box; `tools/primboxcheck.c` checks exactly that every C box contains it (the `c ± r` and `x/w` bounds are rounded outward under `LEAF_BOX_EXACT`); `tools/primhitcheck.c` measures hit accuracy against a double-precision reference (see PLAN.md M10). c2lean emits two configurations: `C/Gen.lean` (legacy kernel, built with both opt-outs) and `C/GenRobust.lean` (default build; `tri_slab_scalar_robust_refines` proves the default slab equals `Ref.slabRobust`). If you edit a translated C function, regenerate with
+`python3 formal/tools/c2lean.py`. Plan/status: `formal/PLAN.md`.
 
 ## Code Conventions
 

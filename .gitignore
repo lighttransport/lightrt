@@ -11,6 +11,7 @@ __pycache__/
 # Compiled executables
 lightrt_example
 lightrt_benchmark
+lrt_sqrtf_test
 obj_bvh_bench
 test_spatial_query
 viewer/viewer
@@ -44,9 +45,10 @@ bench_hip
 tools/
 build_glslang/
 
-# IDE files
+# IDE / local tool config
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~
@@ -64,3 +66,33 @@ Thumbs.db
 # External dependencies
 deps/
 dep/
+
+# mtlxrender test binaries (built in place by make)
+/bsdf_response
+/examples/mtlxrender/bsdf_response
+/conductor_mixture
+/examples/mtlxrender/conductor_mixture
+/conductor_response
+/examples/mtlxrender/conductor_response
+/diffuse_mixture
+/examples/mtlxrender/diffuse_mixture
+/eon_response
+/examples/mtlxrender/eon_response
+/pixel_filter
+/examples/mtlxrender/pixel_filter
+/rough_diffuse
+/examples/mtlxrender/rough_diffuse
+/sheen_mixture
+/examples/mtlxrender/sheen_mixture
+/texture_sampling
+/examples/mtlxrender/texture_sampling
+/volume_lobes
+/examples/mtlxrender/volume_lobes
+/white_furnace
+/examples/mtlxrender/white_furnace
+
+# Local C/make test binaries (rebuilt by `make formal` / test targets)
+lightrt_bench_occ
+lightrt_c_*test*
+lightrt_spatial_query_test
+wasm/dist/

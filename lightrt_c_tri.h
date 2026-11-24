@@ -17,6 +17,41 @@
 #ifndef LIGHTRT_C_TRI_H
 #define LIGHTRT_C_TRI_H
 
+/* Robustness defaults (see formal/PLAN.md M7). All are on unless opted out:
+ *  LRT_TRI_SLAB_ROBUST    : no false miss for rays lying on a slab plane
+ *                           (opt out: -DLRT_TRI_NO_SLAB_ROBUST)
+ *  LRT_TRI_SLAB_INFLATE   : (with SLAB_ROBUST) the slab far value is scaled by
+ *                           1 + 10u, which rules out false misses of rays
+ *                           touching a box at an edge or corner (Robust/Slab)
+ *                           (opt out: -DLRT_TRI_NO_SLAB_INFLATE)
+ *  LRT_TRI_LEAF_BOX_EXACT : node boxes exactly contain the stored triangles
+ *                           (opt out: -DLRT_TRI_NO_LEAF_BOX_EXACT)
+ *  LRT_TRI_BITEXACT       : SIMD leaf / det test use the scalar evaluation
+ *                           order, so SIMD traversal == scalar bit for bit
+ *                           (opt out: -DLRT_TRI_NO_BITEXACT)
+ *  LRT_TRI_WATERTIGHT_TRI : watertight (Woop) triangle leaf on exact vertices;
+ *                           no gaps on shared edges. Leaf blocks store v0 v1
+ *                           v2 instead of v0 e1 e2, same size (PLAN.md M17-M20)
+ *                           (opt out: -DLRT_TRI_NO_WATERTIGHT_TRI)
+ * Every backend (CPU SIMD, HIP/hiprtc, CUDA, Vulkan) includes this header, so
+ * the GPU kernels follow the same default. */
+#if !defined(LRT_TRI_NO_SLAB_ROBUST) && !defined(LRT_TRI_SLAB_ROBUST)
+#define LRT_TRI_SLAB_ROBUST 1
+#endif
+#if defined(LRT_TRI_SLAB_ROBUST) && !defined(LRT_TRI_NO_SLAB_INFLATE) && \
+    !defined(LRT_TRI_SLAB_INFLATE)
+#define LRT_TRI_SLAB_INFLATE 1
+#endif
+#if !defined(LRT_TRI_NO_LEAF_BOX_EXACT) && !defined(LRT_TRI_LEAF_BOX_EXACT)
+#define LRT_TRI_LEAF_BOX_EXACT 1
+#endif
+#if !defined(LRT_TRI_NO_BITEXACT) && !defined(LRT_TRI_BITEXACT)
+#define LRT_TRI_BITEXACT 1
+#endif
+#if !defined(LRT_TRI_NO_WATERTIGHT_TRI) && !defined(LRT_TRI_WATERTIGHT_TRI)
+#define LRT_TRI_WATERTIGHT_TRI 1
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -328,6 +363,7 @@ lrt_tri_scene *lrt_bezcurve_scene_build(const float *cps, size_t nseg,
  *   LRT_POINT_SPHERE         analytic sphere      (RTC_GEOMETRY_TYPE_SPHERE_POINT)
  *   LRT_POINT_DISC           ray-facing disc      (RTC_GEOMETRY_TYPE_DISC_POINT)
  *   LRT_POINT_ORIENTED_DISC  fixed-normal disc    (ORIENTED_DISC_POINT)
+ *   LRT_POINT_ELLIPSE        fixed-normal oval    (LightRT extension)
  *
  * centers = 3*nprims xyz, radii = nprims. normals = 3*nprims (required only for
  * LRT_POINT_ORIENTED_DISC, else may be NULL). Queried via the lrt_tri_*
@@ -335,7 +371,8 @@ lrt_tri_scene *lrt_bezcurve_scene_build(const float *cps, size_t nseg,
 typedef enum lrt_tri_point_type {
     LRT_POINT_SPHERE = 0,
     LRT_POINT_DISC = 1,
-    LRT_POINT_ORIENTED_DISC = 2
+    LRT_POINT_ORIENTED_DISC = 2,
+    LRT_POINT_ELLIPSE = 3
 } lrt_tri_point_type;
 
 lrt_tri_scene *lrt_points_scene_build(const float *centers, const float *radii,
@@ -343,6 +380,23 @@ lrt_tri_scene *lrt_points_scene_build(const float *centers, const float *radii,
                                       size_t nprims,
                                       const lrt_tri_build_options *opts,
                                       lrt_result *err);
+
+/* Build fixed-normal elliptical discs (ovals). radii_xy has 2*nprims values
+ * (major/minor radii); normals has 3*nprims values. The in-plane major axis is
+ * chosen deterministically from the normal. */
+lrt_tri_scene *lrt_ellipse_scene_build(const float *centers,
+                                       const float *radii_xy,
+                                       const float *normals, size_t nprims,
+                                       const lrt_tri_build_options *opts,
+                                       lrt_result *err);
+
+/* Oriented variant. major_axes contains one in-plane major-axis vector per
+ * primitive (3*nprims floats); it is projected onto the ellipse plane and the
+ * minor axis is derived from the supplied normal. */
+lrt_tri_scene *lrt_ellipse_scene_build_oriented(
+    const float *centers, const float *radii_xy, const float *normals,
+    const float *major_axes, size_t nprims, const lrt_tri_build_options *opts,
+    lrt_result *err);
 
 /* --- Custom (user) geometry -----------------------------------------------
  *
@@ -620,6 +674,14 @@ size_t lrt_tri_curve_tessellate_bound(const lrt_tri_scene *s, uint32_t nsides);
 lrt_result lrt_tri_curve_tessellate(const lrt_tri_scene *s, uint32_t nsides,
                                     float *pos, float *nrm, size_t cap,
                                     size_t *ntris_out);
+/* Range form of the tessellator. Skips the first `first` output triangles and
+ * writes at most `cap` subsequent triangles. `ntris_out` receives the number
+ * actually written. This lets GPU callers page very large curve scenes without
+ * retaining one monolithic tessellated mesh. */
+lrt_result lrt_tri_curve_tessellate_range(const lrt_tri_scene *s,
+                                          uint32_t nsides, size_t first,
+                                          float *pos, float *nrm, size_t cap,
+                                          size_t *ntris_out);
 
 /* Direct access to a scene's resident node/block buffers + metadata, for GPU
  * backends that upload in-memory scenes without the LRTS serialization round

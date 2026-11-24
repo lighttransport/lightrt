@@ -1,11 +1,21 @@
 #include "lightrt.hh"
+#include <algorithm>
+#include <cmath>
 #include <iostream>
+#include <initializer_list>
 #include <vector>
 
 using namespace lightrt;
 
+static bool hasExactly(std::vector<uint32_t> results,
+                       std::initializer_list<uint32_t> expected) {
+  std::sort(results.begin(), results.end());
+  return results == std::vector<uint32_t>(expected);
+}
+
 int main() {
   std::cout << "Testing spatial query methods...\n\n";
+  bool all_pass = true;
 
   // Create a simple scene with triangles in known locations
   std::vector<Triangle> triangles;
@@ -40,7 +50,10 @@ int main() {
 
   // Build BVH
   TriangleBVH bvh;
-  bvh.build(triangles);
+  if (!bvh.build(triangles)) {
+    std::cerr << "Failed to build triangle BVH\n";
+    return 1;
+  }
   std::cout << "Built BVH with " << triangles.size() << " triangles\n\n";
 
   // Test 1: Query AABB at origin - should find triangle 0
@@ -58,6 +71,7 @@ int main() {
     std::cout << "\n";
 
     bool pass = (results.size() == 1 && results[0] == 0);
+    all_pass = all_pass && pass;
     std::cout << "  Result: " << (pass ? "PASS" : "FAIL") << "\n\n";
   }
 
@@ -75,7 +89,8 @@ int main() {
     }
     std::cout << "\n";
 
-    bool pass = (results.size() == 2);
+    bool pass = hasExactly(results, {0, 1});
+    all_pass = all_pass && pass;
     std::cout << "  Result: " << (pass ? "PASS" : "FAIL") << "\n\n";
   }
 
@@ -94,7 +109,8 @@ int main() {
     }
     std::cout << "\n";
 
-    bool pass = (results.size() >= 1);
+    bool pass = hasExactly(results, {0});
+    all_pass = all_pass && pass;
     std::cout << "  Result: " << (pass ? "PASS" : "FAIL") << "\n\n";
   }
 
@@ -113,7 +129,8 @@ int main() {
     }
     std::cout << "\n";
 
-    bool pass = (results.size() == 4);
+    bool pass = hasExactly(results, {0, 1, 2, 3});
+    all_pass = all_pass && pass;
     std::cout << "  Result: " << (pass ? "PASS" : "FAIL") << "\n\n";
   }
 
@@ -128,6 +145,7 @@ int main() {
     std::cout << "  Found " << results.size() << " triangles\n";
 
     bool pass = (results.size() == 0);
+    all_pass = all_pass && pass;
     std::cout << "  Result: " << (pass ? "PASS" : "FAIL") << "\n\n";
   }
 
@@ -147,9 +165,51 @@ int main() {
     std::cout << "\n";
 
     bool pass = (results.size() == 1 && results[0] == 3);
+    all_pass = all_pass && pass;
+    std::cout << "  Result: " << (pass ? "PASS" : "FAIL") << "\n\n";
+  }
+
+  // Test 7: KNN with k=1 should return the nearest primitive and distance.
+  {
+    std::vector<KNNResult> results;
+    bvh.queryKNN(Vec3(0.5f, 0.5f, 1.0f), 1, results);
+
+    std::cout << "Test 7: KNN query with k=1\n";
+    std::cout << "  Expected: triangle 0 at distance squared 1\n";
+    bool pass = results.size() == 1 && results[0].prim_id == 0 &&
+                std::abs(results[0].distance_sq - 1.0f) < 1.0e-6f;
+    all_pass = all_pass && pass;
+    std::cout << "  Result: " << (pass ? "PASS" : "FAIL") << "\n\n";
+  }
+
+  // Test 8: Empty BVHs must clear caller-provided output vectors.
+  {
+    BVH empty_bvh;
+    std::vector<uint32_t> results = {42};
+    empty_bvh.queryAABB(
+        AABB(Vec3(-1.0f, -1.0f, -1.0f), Vec3(1.0f, 1.0f, 1.0f)), results);
+    bool pass = results.empty();
+    all_pass = all_pass && pass;
+    std::cout << "Test 8: Empty BVH clears query results\n";
+    std::cout << "  Result: " << (pass ? "PASS" : "FAIL") << "\n\n";
+  }
+
+  // Test 9: Identity clip-space frustum should retain only the origin tile.
+  {
+    const float identity[16] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f};
+    const Frustum frustum = Frustum::fromMatrix(identity);
+    std::vector<uint32_t> results;
+    bvh.queryFrustum(frustum, results);
+    bool pass = hasExactly(results, {0});
+    all_pass = all_pass && pass;
+    std::cout << "Test 9: Identity frustum query\n";
     std::cout << "  Result: " << (pass ? "PASS" : "FAIL") << "\n\n";
   }
 
   std::cout << "Spatial query tests completed!\n";
-  return 0;
+  return all_pass ? 0 : 1;
 }

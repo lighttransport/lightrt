@@ -146,12 +146,43 @@ info:
 
 obj_bench: $(OBJ_BENCH_TARGET)
 
+# C++ spatial-query regression test (also registered with CTest).
+spatial_query_test: tests/test_spatial_query.cc $(TARGET_LIB)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o lightrt_spatial_query_test tests/test_spatial_query.cc $(TARGET_LIB)
+	@echo "Built lightrt_spatial_query_test (run: ./lightrt_spatial_query_test)"
+
 # ---- C11 fp32 triangle kernel self-test (scalar + SSE4/AVX2 on x86,
 #      NEON/SVE on aarch64). On A64FX: make c_tri_test CC=fcc && ./lightrt_c_tri_test
 C_TRI_TEST_SRC = tests/test_lightrt_c_tri.c lightrt_c_tri.c
 c_tri_test: $(C_TRI_TEST_SRC)
 	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -o lightrt_c_tri_test $^ -lm -lpthread
 	@echo "Built lightrt_c_tri_test (run: ./lightrt_c_tri_test)"
+
+# Bit-exactness of our ISA sqrtf (SSE2/AVX2/NEON) against libm sqrtf.
+test_lrt_sqrtf: tests/test_lrt_sqrtf.c lrt_sqrtf.h
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -o lrt_sqrtf_test tests/test_lrt_sqrtf.c -lm
+	./lrt_sqrtf_test
+
+# Seam (watertightness) test of the main triangle leaf: default build reports the
+# Moller-Trumbore leak count (-DLRT_TRI_NO_WATERTIGHT_TRI); the _wt build (the
+# default watertight leaf) requires 0.
+c_tri_seam_test: tests/test_lightrt_c_tri_seam.c lightrt_c_tri.c
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_NO_WATERTIGHT_TRI -o lightrt_c_tri_seam_test $^ -lm -lpthread
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_WATERTIGHT_TRI -o lightrt_c_tri_seam_test_wt $^ -lm -lpthread
+	./lightrt_c_tri_seam_test && ./lightrt_c_tri_seam_test_wt
+
+# Any-hit interleaved pipeline vs per-ray, large cache-cold BVH8 scene
+# (resume-lean item 14; build without watertight so the pipeline is eligible).
+bench_occ: benchmark_c/bench_occ.c lightrt_c_tri.c
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_NO_WATERTIGHT_TRI -o lightrt_bench_occ benchmark_c/bench_occ.c lightrt_c_tri.c -lm -lpthread
+	@echo "Built lightrt_bench_occ (run: ./lightrt_bench_occ [grid] [rays])"
+
+# Axis-parallel rays exactly on box faces, all node formats; the _rb build
+# (robust slab + exact leaf boxes + watertight leaf) requires 0 misses.
+c_tri_parallel_test: tests/test_lightrt_c_tri_parallel.c lightrt_c_tri.c
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_NO_SLAB_ROBUST -DLRT_TRI_NO_LEAF_BOX_EXACT -DLRT_TRI_NO_BITEXACT -DLRT_TRI_NO_WATERTIGHT_TRI -o lightrt_c_tri_parallel_test $^ -lm -lpthread
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_SLAB_ROBUST -DLRT_TRI_LEAF_BOX_EXACT -DLRT_TRI_WATERTIGHT_TRI -o lightrt_c_tri_parallel_test_rb $^ -lm -lpthread
+	./lightrt_c_tri_parallel_test && ./lightrt_c_tri_parallel_test_rb
 
 # ---- Vulkan GPU interop (opt-in; runtime dlopen of libvulkan, no SDK, no -lvulkan) ----
 # Build + run the GPU-interop self-test:  make vk_test && ./lightrt_c_vk_test
@@ -201,6 +232,17 @@ hip_test: hip_dev_objs
 	$(HIPCC) --offload-arch=$(HIP_ARCH) -O2 /tmp/lrt_hip_test.o $(HIP_DEV_OBJS) $(HIP_C_OBJS) -o lightrt_c_hip_test -lm
 	@echo "Built lightrt_c_hip_test (run: ./lightrt_c_hip_test)"
 
+# hiprtc Path-A trace (lightrt_c_hip.c): plain C, dlopen'd HIP/hiprtc via
+# lightrt_hipew.c (no hipcc/ROCm SDK at build time). Defines the same lrt_hip_*
+# engine symbols as the precompiled lightrt_c_hip.hip backend, so it is built as
+# a separate binary. The _rb variant (robust slab + exact leaf boxes +
+# watertight leaf) requires 0 GPU misses and GPU == CPU bit for bit.
+HIP_RTC_SRC = tests/test_lightrt_c_hip_rtc.c lightrt_c_hip.c lightrt_hipew.c lightrt_c_tri.c lightrt_c.c
+hip_rtc_test: $(HIP_RTC_SRC)
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -o lightrt_c_hip_rtc_test $(HIP_RTC_SRC) -ldl -lm -lpthread
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_SLAB_ROBUST -DLRT_TRI_LEAF_BOX_EXACT -DLRT_TRI_WATERTIGHT_TRI -o lightrt_c_hip_rtc_test_rb $(HIP_RTC_SRC) -ldl -lm -lpthread
+	./lightrt_c_hip_rtc_test && ./lightrt_c_hip_rtc_test_rb
+
 benchmark_hip: hip_dev_objs
 	$(CC) $(CFLAGS) $(INCLUDES) -c lightrt_c.c -o /tmp/lrt_hip_c.o
 	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -c lightrt_c_tri.c -o /tmp/lrt_hip_c_tri.o
@@ -234,9 +276,52 @@ cuda_test:
 	$(NVCC) -arch=$(CUDA_ARCH) /tmp/lrt_cuda_test.o /tmp/lrt_cuda_dev.o /tmp/lrt_cuda_c_tri.o -o lightrt_c_cuda_test -lm
 	@echo "Built lightrt_c_cuda_test (run: ./lightrt_c_cuda_test)"
 
+# Full CUDA correctness suite (needs a CUDA device; skips otherwise):
+#  - lightrt_c_cuda_test           triangles (resident/one-shot/refit)
+#  - lightrt_c_cuda_prims_test     every primitive kind + normals vs the CPU oracle
+#  - lightrt_c_cuda_parallel_test  vertical rays exactly on box faces (report);
+#    _wt: + LRT_TRI_WATERTIGHT_TRI, requires 0 misses and GPU == CPU bit for bit
+# The prims/parallel sources are generated from the HIP tests (scripts/gen_cuda_tests.sh).
+CUDA_FULL_OBJ = /tmp/lrt_cuda_full
+cuda_full_test: cuda_test
+	$(CC) $(CFLAGS) $(INCLUDES) -c tests/test_lightrt_c_cuda_prims.c -o $(CUDA_FULL_OBJ)_prims.o
+	$(NVCC) -arch=$(CUDA_ARCH) $(CUDA_FULL_OBJ)_prims.o /tmp/lrt_cuda_dev.o /tmp/lrt_cuda_c_tri.o -o lightrt_c_cuda_prims_test -lm
+	$(CC) $(CFLAGS) $(INCLUDES) -c tests/test_lightrt_c_cuda_parallel.c -o $(CUDA_FULL_OBJ)_par.o
+	$(NVCC) -arch=$(CUDA_ARCH) $(CUDA_FULL_OBJ)_par.o /tmp/lrt_cuda_dev.o /tmp/lrt_cuda_c_tri.o -o lightrt_c_cuda_parallel_test -lm
+	$(NVCC) $(CUDA_FLAGS) -DLRT_TRI_WATERTIGHT_TRI -c lightrt_c_cuda.cu -o $(CUDA_FULL_OBJ)_dev_wt.o
+	$(CC) $(CFLAGS) $(C_SIMD) $(INCLUDES) -DLRT_TRI_WATERTIGHT_TRI -c lightrt_c_tri.c -o $(CUDA_FULL_OBJ)_tri_wt.o
+	$(CC) $(CFLAGS) $(INCLUDES) -DLRT_TRI_WATERTIGHT_TRI -c tests/test_lightrt_c_cuda_parallel.c -o $(CUDA_FULL_OBJ)_par_wt.o
+	$(NVCC) -arch=$(CUDA_ARCH) $(CUDA_FULL_OBJ)_par_wt.o $(CUDA_FULL_OBJ)_dev_wt.o $(CUDA_FULL_OBJ)_tri_wt.o -o lightrt_c_cuda_parallel_test_wt -lm
+	./lightrt_c_cuda_test && ./lightrt_c_cuda_prims_test && ./lightrt_c_cuda_parallel_test && ./lightrt_c_cuda_parallel_test_wt
+
 info_cuda:
 	@echo "NVCC: $(NVCC)"
 	@echo "CUDA_ARCH: $(CUDA_ARCH)"
 	@echo "CUDA_FLAGS: $(CUDA_FLAGS)"
 
-.PHONY: all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip cuda_test info_cuda
+.PHONY: cuda_full_test hip_rtc_test c_tri_parallel_test c_tri_seam_test test_lrt_sqrtf all clean run benchmark obj_bench info vk_test shaders info_vk hip_dev_objs hip_test benchmark_hip info_hip cuda_test info_cuda formal bench_occ
+
+# Lean 4 formal verification (formal/): build specs+proofs, check the c2lean
+# translation is up to date, the sorry budget, the axiom allowlist, and run
+# 3-way differential testing (compiled C vs MiniC vs Lean reference).
+FORMAL_SORRY_MAX ?= 0
+formal:
+	cd formal && lake build
+	python3 formal/tools/c2lean.py --check
+	sh formal/tools/count_sorry.sh --max $(FORMAL_SORRY_MAX)
+	python3 formal/tools/check_axioms.py > /dev/null
+	python3 formal/tools/cdiff.py --n 1000
+	python3 formal/tools/bvhcheck.py --rays 100 --seeds 2
+	$(CC) -O1 -ffp-contract=off -msse4.1 -mavx2 -mfma -w -I. -o formal/.lake/tlascheck formal/tools/tlascheck.c -lm -lpthread
+	$(CC) -O1 -ffp-contract=off -msse4.1 -mavx2 -mfma -w -I. -DLRT_TRI_EXACT_NEAREST -o formal/.lake/tlascheck_exn formal/tools/tlascheck.c -lm -lpthread
+	for s in 1 2; do formal/.lake/tlascheck $$s 1000 && formal/.lake/tlascheck_exn $$s 1000 || exit 1; done
+	$(CC) -O1 -ffp-contract=off -msse4.1 -mavx2 -mfma -w -I. -DLRT_TRI_WATERTIGHT_TRI -o formal/.lake/wtcheck formal/tools/wtcheck.c -lm -lpthread
+	formal/.lake/wtcheck 2 3000
+	$(CC) -O1 -ffp-contract=off -msse4.1 -mavx2 -mfma -w -I. -DLRT_TRI_WATERTIGHT_TRI -DLRT_TRI_EXACT_NEAREST -o formal/.lake/wtcheck_exn formal/tools/wtcheck.c -lm -lpthread
+	formal/.lake/wtcheck_exn 2 3000
+	$(CC) -O1 -ffp-contract=off -msse4.1 -mavx2 -mfma -w -I. -o formal/.lake/mtcheck formal/tools/mtcheck.c -lm -lpthread
+	formal/.lake/mtcheck 500000
+	$(CC) -O1 -ffp-contract=off -msse4.1 -mavx2 -mfma -w -I. -o formal/.lake/primboxcheck formal/tools/primboxcheck.c -lm -lpthread
+	for s in 1 2 3; do formal/.lake/primboxcheck $$s formal/.lake > formal/.lake/primboxcheck.log || { cat formal/.lake/primboxcheck.log; exit 1; }; done; tail -n 3 formal/.lake/primboxcheck.log
+	$(CC) -O2 -ffp-contract=off -msse4.1 -mavx2 -mfma -w -I. -o formal/.lake/primhitcheck formal/tools/primhitcheck.c -lm -lpthread
+	for s in 1 2; do formal/.lake/primhitcheck $$s 2000 || exit 1; done

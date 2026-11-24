@@ -854,6 +854,16 @@ static void test_gpu_bezier(lrt_hip_engine *e) {
         /* GPU mirrors the scalar adaptive sweep; CPU intersect1 uses the SSE
          * adaptive sweep -> tiny silhouette differences. */
         CHECK(f >= 0.99, "bezier agreement %.3f%% < 99%%", f * 100.0);
+        /* any-hit: both sides stop at the first verified contact */
+        unsigned char *go = (unsigned char *)malloc(nr);
+        lrt_hip_scene_occluded(e, gs, rays, (uint32_t)nr, go, NULL);
+        size_t oagree = 0;
+        for (size_t i = 0; i < nr; i++)
+            oagree += (lrt_tri_occluded1(cpu, &rays[i]) != 0) == (go[i] != 0);
+        double fo = (double)oagree / nr;
+        printf("  bezier       occluded %.3f%%\n", fo * 100.0);
+        CHECK(fo >= 0.999, "bezier occluded agreement %.3f%% < 99.9%%", fo * 100.0);
+        free(go);
         free(rays);
         free(gh);
         lrt_hip_scene_free(e, gs);
@@ -1337,6 +1347,10 @@ int main(void) {
     printf("== GPU refit (animation) vs CPU refit ==\n");
     test_refit(e, "refit/BVH4", soup, ntris, LRT_TRI_LAYOUT_BVH4, 20000);
     test_refit(e, "refit/BVH8", grid, grid_n, LRT_TRI_LAYOUT_BVH8, 20000);
+    /* Tiny scenes: the root is a single leaf (node_count == 0); refit must not
+     * launch a zero-size grid (invalid configuration, poisons the stream). */
+    test_refit(e, "refit/BVH4 1 tri", soup, 1, LRT_TRI_LAYOUT_BVH4, 2000);
+    test_refit(e, "refit/BVH8 3 tris", soup, 3, LRT_TRI_LAYOUT_BVH8, 2000);
 
     test_device_pipeline(e, soup, ntris);
 

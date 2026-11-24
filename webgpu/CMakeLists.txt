@@ -2,7 +2,10 @@ cmake_minimum_required(VERSION 3.16)
 
 project(lightrt_webgpu LANGUAGES CXX)
 
-option(SOFTRT_WEBGPU_ENABLE_CLAIR "Enable Clair WGSL JIT integration" ON)
+# Clair is an optional WGSL compute backend.  The software raster path below
+# does not require it, so keep ordinary WebGPU builds self-contained and make
+# the external dependency an explicit opt-in.
+option(SOFTRT_WEBGPU_ENABLE_CLAIR "Enable Clair WGSL JIT integration" OFF)
 option(SOFTRT_WEBGPU_CLAIR_SAFE_OPT "Force conservative optimization for libclair" ON)
 set(SOFTRT_CLAIR_SOURCE_DIR "/home/syoyo/work/clair/main"
     CACHE PATH "Path to Clair source tree")
@@ -74,27 +77,38 @@ target_link_libraries(webgpu_example PRIVATE softrt_webgpu)
 add_executable(webgpu_headless_triangle_dump webgpu_headless_triangle_dump.cc)
 target_link_libraries(webgpu_headless_triangle_dump PRIVATE softrt_webgpu)
 
-add_executable(webgpu_wgsl_jit_minimal webgpu_wgsl_jit_minimal.cc)
-target_link_libraries(webgpu_wgsl_jit_minimal PRIVATE softrt_webgpu)
-
-add_executable(webgpu_wgsl_jit_storage_minimal webgpu_wgsl_jit_storage_minimal.cc)
-target_link_libraries(webgpu_wgsl_jit_storage_minimal PRIVATE softrt_webgpu)
-
-add_executable(webgpu_wgsl_jit_complex webgpu_wgsl_jit_complex.cc)
-target_link_libraries(webgpu_wgsl_jit_complex PRIVATE softrt_webgpu)
-
-add_executable(webgpu_wgsl_jit_indexed_write webgpu_wgsl_jit_indexed_write.cc)
-target_link_libraries(webgpu_wgsl_jit_indexed_write PRIVATE softrt_webgpu)
-
-add_executable(webgpu_wgsl_jit_heavy_expr webgpu_wgsl_jit_heavy_expr.cc)
-target_link_libraries(webgpu_wgsl_jit_heavy_expr PRIVATE softrt_webgpu)
-
-add_executable(webgpu_wgsl_jit_control_flow webgpu_wgsl_jit_control_flow.cc)
-target_link_libraries(webgpu_wgsl_jit_control_flow PRIVATE softrt_webgpu)
-
 if (SOFTRT_WEBGPU_HAVE_CLAIR)
+  add_executable(webgpu_wgsl_jit_minimal webgpu_wgsl_jit_minimal.cc)
+  target_link_libraries(webgpu_wgsl_jit_minimal PRIVATE softrt_webgpu)
+
+  add_executable(webgpu_wgsl_jit_storage_minimal webgpu_wgsl_jit_storage_minimal.cc)
+  target_link_libraries(webgpu_wgsl_jit_storage_minimal PRIVATE softrt_webgpu)
+
+  add_executable(webgpu_wgsl_jit_complex webgpu_wgsl_jit_complex.cc)
+  target_link_libraries(webgpu_wgsl_jit_complex PRIVATE softrt_webgpu)
+
+  add_executable(webgpu_wgsl_jit_indexed_write webgpu_wgsl_jit_indexed_write.cc)
+  target_link_libraries(webgpu_wgsl_jit_indexed_write PRIVATE softrt_webgpu)
+
+  add_executable(webgpu_wgsl_jit_heavy_expr webgpu_wgsl_jit_heavy_expr.cc)
+  target_link_libraries(webgpu_wgsl_jit_heavy_expr PRIVATE softrt_webgpu)
+
+  add_executable(webgpu_wgsl_jit_control_flow webgpu_wgsl_jit_control_flow.cc)
+  target_link_libraries(webgpu_wgsl_jit_control_flow PRIVATE softrt_webgpu)
+
   add_executable(webgpu_wgsl_compile_file webgpu_wgsl_compile_file.cc)
   target_link_libraries(webgpu_wgsl_compile_file PRIVATE softrt_webgpu)
+endif ()
+
+# This test exercises the self-contained software raster path.  It remains
+# available when Clair is disabled, and writes only inside the build tree.
+if (BUILD_TESTING)
+  add_test(NAME webgpu_non_clair_raster
+           COMMAND $<TARGET_FILE:webgpu_headless_triangle_dump>
+                   --width 64 --height 64
+                   --out-rgba ${CMAKE_CURRENT_BINARY_DIR}/non_clair.rgba
+                   --out-bmp ${CMAKE_CURRENT_BINARY_DIR}/non_clair.bmp)
+  set_tests_properties(webgpu_non_clair_raster PROPERTIES LABELS "WebGPUNonClair")
 endif ()
 
 if (BUILD_TESTING AND SOFTRT_WEBGPU_HAVE_CLAIR)

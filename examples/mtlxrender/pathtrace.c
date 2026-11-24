@@ -114,6 +114,7 @@ static v3 trace_path(const Scene *s, const MtlxDoc *doc, const MaterialBinding *
     VolumeMedium medium = { v3_splat(0.0f), v3_splat(0.0f), 0.0f };
 
     ShadeContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
     ctx.doc = doc; ctx.tex = tex; ctx.memo = memo; ctx.memo_done = memo_done;
 
     for (int depth = 0; depth < max_bounces; depth++) {
@@ -149,12 +150,18 @@ static v3 trace_path(const Scene *s, const MtlxDoc *doc, const MaterialBinding *
         HitInfo hi;
         fill_hit(s, bind, &ray, &hit, &hi);
         v3 wo = v3_neg(dir);
+        ctx.V = wo; /* surface-to-view direction for MaterialX nodes and EDFs */
 
         ctx.uv[0] = hi.uv[0]; ctx.uv[1] = hi.uv[1];
         ctx.P = hi.P;
         ctx.Ns = hi.Ns; ctx.Ng = hi.Ng; ctx.dpdu = hi.dpdu; ctx.dpdv = v3_cross(hi.Ns, hi.dpdu);
         OpenPBRParams params;
-        mtlx_eval_surface(&ctx, hi.surface_node, &params);
+        if (mtlx_eval_surface(&ctx, hi.surface_node, &params) != 0 && hi.surface_node >= 0) {
+            static atomic_flag reported = ATOMIC_FLAG_INIT;
+            if (!atomic_flag_test_and_set(&reported))
+                fprintf(stderr, "MaterialX surface evaluation failed (invalid node or closure lobe limit exceeded)\n");
+            break;
+        }
 
         if (params.emission > 0.0f)
             radiance = v3_add(radiance, v3_mul(throughput, v3_scale(params.emission_color, params.emission)));
@@ -259,8 +266,8 @@ static void *worker(void *arg) {
                 pcg32_seed(&rng, ((uint64_t)j->cfg->seed << 32) ^ ((uint64_t)y * W + x), 0x9e3779b9u);
                 v3 sum = v3_splat(0.0f);
                 for (int sp = 0; sp < j->cfg->spp; sp++) {
-                    float px = (x + pcg32_f(&rng)) / W;
-                    float py = (y + pcg32_f(&rng)) / H;
+                    float px = (x + mtlx_pixel_offset(pcg32_f(&rng), j->cfg->pixel_filter_tent)) / W;
+                    float py = (y + mtlx_pixel_offset(pcg32_f(&rng), j->cfg->pixel_filter_tent)) / H;
                     lrt_ray r = camera_ray(j->cam, px, py);
                     v3 L = trace_path(j->s, j->doc, j->bind, j->tex, j->env, &j->cfg->sun, r,
                                       j->cfg->max_bounces, j->cfg->sss_walk,

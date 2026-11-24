@@ -97,6 +97,7 @@ typedef struct {
 
 static void shade_range(ShadeJob *j, int k0, int k1, MtlxValue *memo, char *memo_done) {
     ShadeContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
     ctx.doc = j->doc; ctx.tex = j->tex; ctx.memo = memo; ctx.memo_done = memo_done;
 
     for (int k = k0; k < k1; k++) {
@@ -132,11 +133,18 @@ static void shade_range(ShadeJob *j, int k0, int k1, MtlxValue *memo, char *memo
         HitInfo hi;
         fill_hit(j->s, j->bind, &p->ray, hit, &hi);
         v3 wo = v3_neg(dir);
+        ctx.V = wo; /* surface-to-view direction for MaterialX nodes and EDFs */
         ctx.uv[0] = hi.uv[0]; ctx.uv[1] = hi.uv[1];
         ctx.P = hi.P; ctx.Ns = hi.Ns; ctx.Ng = hi.Ng;
         ctx.dpdu = hi.dpdu; ctx.dpdv = v3_cross(hi.Ns, hi.dpdu);
         OpenPBRParams params;
-        mtlx_eval_surface(&ctx, hi.surface_node, &params);
+        if (mtlx_eval_surface(&ctx, hi.surface_node, &params) != 0 && hi.surface_node >= 0) {
+            static atomic_flag reported = ATOMIC_FLAG_INIT;
+            if (!atomic_flag_test_and_set(&reported))
+                fprintf(stderr, "MaterialX surface evaluation failed (invalid node or closure lobe limit exceeded)\n");
+            p->alive = 0;
+            continue;
+        }
 
         if (params.emission > 0.0f)
             p->rad = v3_add(p->rad, v3_mul(p->thr, v3_scale(params.emission_color, params.emission)));
@@ -262,8 +270,8 @@ void render_wavefront(const Scene *scene, const MtlxDoc *doc,
             for (int x = 0; x < W; x++) {
                 size_t i = (size_t)y * W + x;
                 Path *p = &path[i];
-                float px = (x + pcg32_f(&p->rng)) / W;
-                float py = (y + pcg32_f(&p->rng)) / H;
+                float px = (x + mtlx_pixel_offset(pcg32_f(&p->rng), cfg->pixel_filter_tent)) / W;
+                float py = (y + mtlx_pixel_offset(pcg32_f(&p->rng), cfg->pixel_filter_tent)) / H;
                 p->ray = camera_ray(cam, px, py);
                 p->thr = v3_splat(1.0f);
                 p->rad = v3_splat(0.0f);

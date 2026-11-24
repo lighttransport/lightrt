@@ -45,6 +45,83 @@ static MtlxValue ev(const char *inner, const char *name, Geo g) {
 
 static Geo geo0(void) { Geo g = { {0.25f, 0.75f}, {1, 2, 3}, {0, 1, 0} }; return g; }
 
+static int test_texcoord_set(void *user, int index, int probe_axis,
+                             float out_uv[2]) {
+    (void)user;
+    if (index != 1) return 0;
+    out_uv[0] = 0.375f; out_uv[1] = 0.625f;
+    if (probe_axis == 1) { out_uv[0] += 0.05f; out_uv[1] += 0.01f; }
+    if (probe_axis == 2) { out_uv[0] -= 0.02f; out_uv[1] += 0.04f; }
+    return 1;
+}
+
+static MtlxValue ev_indexed_geomprop_default(int index, int probe_axis) {
+    char xml[512];
+    snprintf(xml, sizeof(xml), "<materialx version=\"1.39\"><geompropdef name=\"UV0\" geomprop=\"texcoord\" type=\"vector2\" index=\"%d\"/><nodegraph name=\"t\"><image name=\"img\" type=\"color3\"><input name=\"file\" type=\"filename\" value=\"unused.png\"/></image></nodegraph></materialx>", index);
+    MtlxDoc *d = mtlx_load_string(xml);
+    if (!d) return (MtlxValue){0};
+    int id = -1;
+    for (int i = 0; i < d->nnode; ++i) {
+        if (!strcmp(d->nodes[i].category, "texcoord")) { id = i; break; }
+    }
+    if (id < 0) { mtlx_free(d); return (MtlxValue){0}; }
+    ShadeContext ctx; memset(&ctx, 0, sizeof(ctx));
+    ctx.doc = d; ctx.uv[0] = 0.1f; ctx.uv[1] = 0.2f;
+    ctx.texcoord = test_texcoord_set;
+    ctx.texcoord_probe_axis = probe_axis;
+    ctx.memo = calloc((size_t)d->nnode, sizeof(MtlxValue));
+    ctx.memo_done = calloc((size_t)d->nnode, 1);
+    MtlxValue result = mtlx_eval_node_test(&ctx, id);
+    free(ctx.memo); free(ctx.memo_done); mtlx_free(d);
+    return result;
+}
+
+static MtlxValue ev_model_geomprop_default(void) {
+    const char *xml = "<materialx version=\"1.39\"><geompropdef name=\"Pobject\" geomprop=\"position\" type=\"vector3\" space=\"model\"/><nodegraph name=\"t\"><noise3d name=\"n\" type=\"float\"/></nodegraph></materialx>";
+    MtlxDoc *d = mtlx_load_string(xml);
+    if (!d) return (MtlxValue){0};
+    int id = -1;
+    for (int i = 0; i < d->nnode; ++i) {
+        if (!strcmp(d->nodes[i].category, "position")) { id = i; break; }
+    }
+    if (id < 0) { mtlx_free(d); return (MtlxValue){0}; }
+    ShadeContext ctx; memset(&ctx, 0, sizeof(ctx));
+    ctx.doc = d; ctx.has_space_transforms = 1; ctx.P = v3_make(3, 8, 15);
+    for (int i = 0; i < 16; ++i) ctx.model_to_world[i] = ctx.world_to_model[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+    ctx.model_to_world[0] = 2.0f; ctx.model_to_world[5] = 3.0f; ctx.model_to_world[10] = 4.0f;
+    ctx.model_to_world[12] = 1.0f; ctx.model_to_world[13] = 2.0f; ctx.model_to_world[14] = 3.0f;
+    ctx.world_to_model[0] = 0.5f; ctx.world_to_model[5] = 1.0f / 3.0f; ctx.world_to_model[10] = 0.25f;
+    ctx.world_to_model[12] = -0.5f; ctx.world_to_model[13] = -2.0f / 3.0f; ctx.world_to_model[14] = -0.75f;
+    ctx.memo = calloc((size_t)d->nnode, sizeof(MtlxValue));
+    ctx.memo_done = calloc((size_t)d->nnode, 1);
+    MtlxValue result = mtlx_eval_node_test(&ctx, id);
+    free(ctx.memo); free(ctx.memo_done); mtlx_free(d);
+    return result;
+}
+
+
+static MtlxValue ev_space_transform(const char *category, const char *input,
+                                    const char *from, const char *to) {
+    char xml[1024], buf[2048];
+    snprintf(xml, sizeof(xml), "<%s name=\"n\" type=\"vector3\"><input name=\"in\" type=\"vector3\" value=\"%s\"/><input name=\"fromspace\" type=\"string\" value=\"%s\"/><input name=\"tospace\" type=\"string\" value=\"%s\"/></%s>", category, input, from, to, category);
+    snprintf(buf, sizeof(buf), "<materialx version=\"1.39\"><nodegraph name=\"t\">%s</nodegraph></materialx>", xml);
+    MtlxDoc *d = mtlx_load_string(buf);
+    if (!d) return (MtlxValue){0};
+    ShadeContext ctx; memset(&ctx, 0, sizeof(ctx));
+    ctx.doc = d; ctx.has_space_transforms = 1;
+    for (int i = 0; i < 16; ++i) ctx.model_to_world[i] = ctx.world_to_model[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+    ctx.model_to_world[0] = 2.0f; ctx.model_to_world[5] = 3.0f; ctx.model_to_world[10] = 4.0f;
+    ctx.model_to_world[12] = 1.0f; ctx.model_to_world[13] = 2.0f; ctx.model_to_world[14] = 3.0f;
+    ctx.world_to_model[0] = 0.5f; ctx.world_to_model[5] = 1.0f / 3.0f; ctx.world_to_model[10] = 0.25f;
+    ctx.world_to_model[12] = -0.5f; ctx.world_to_model[13] = -2.0f / 3.0f; ctx.world_to_model[14] = -0.75f;
+    int id = mtlx_find_node(d, 0, "n");
+    ctx.memo = calloc((size_t)(d->nnode > 0 ? d->nnode : 1), sizeof(MtlxValue));
+    ctx.memo_done = calloc((size_t)(d->nnode > 0 ? d->nnode : 1), 1);
+    MtlxValue result = id >= 0 ? mtlx_eval_node_test(&ctx, id) : (MtlxValue){0};
+    free(ctx.memo); free(ctx.memo_done); mtlx_free(d);
+    return result;
+}
+
 /* Evaluate a top-level surface shader node into OpenPBR params. */
 static OpenPBRParams eval_surf(const char *shader_xml, const char *name) {
     char buf[8192];
@@ -88,6 +165,16 @@ static void chk3(const char *name, MtlxValue v, float x, float y, float z) {
 int main(void) {
     Geo g = geo0();
     printf("MaterialX node ground-truth tests\n");
+    chk3("transformpoint model-world", ev_space_transform("transformpoint", "1,2,3", "model", "world"), 3.0f, 8.0f, 15.0f);
+    chk3("transformpoint world-model", ev_space_transform("transformpoint", "3,8,15", "world", "model"), 1.0f, 2.0f, 3.0f);
+    chk3("transformvector model-world", ev_space_transform("transformvector", "1,2,3", "model", "world"), 2.0f, 6.0f, 12.0f);
+    chk3("transformnormal model-world", ev_space_transform("transformnormal", "0,3,4", "model", "world"), 0.0f, 0.70710678f, 0.70710678f);
+    chk3("transformnormal same-space", ev_space_transform("transformnormal", "0,3,4", "model", "model"), 0.0f, 0.6f, 0.8f);
+    chk3("defaultgeomprop model-space", ev_model_geomprop_default(), 1.0f, 2.0f, 3.0f);
+    chk3("defaultgeomprop texcoord index", ev_indexed_geomprop_default(1, 0), 0.375f, 0.625f, 0.0f);
+    chk3("indexed texcoord x probe", ev_indexed_geomprop_default(1, 1), 0.425f, 0.635f, 0.0f);
+    chk3("indexed texcoord y probe", ev_indexed_geomprop_default(1, 2), 0.355f, 0.665f, 0.0f);
+    chk3("defaultgeomprop UV0 fallback", ev_indexed_geomprop_default(2, 0), 0.1f, 0.2f, 0.0f);
 
     /* ---- math: binary (definition = the operation) ---- */
     chk1("add",        ev(BIN("add","2","3"), "n", g).v[0], 5.0f);
@@ -194,7 +281,7 @@ int main(void) {
                            "<input name=\"amount\" type=\"float\" value=\"90\"/></rotate2d>", "n", g), 0, 1, 0);
     chk1("ramp4_br", ev("<ramp4 name=\"n\" type=\"float\"><input name=\"valuetl\" type=\"float\" value=\"1\"/>"
                         "<input name=\"valuetr\" type=\"float\" value=\"2\"/><input name=\"valuebl\" type=\"float\" value=\"3\"/>"
-                        "<input name=\"valuebr\" type=\"float\" value=\"4\"/><input name=\"texcoord\" type=\"vector2\" value=\"1,1\"/></ramp4>", "n", g).v[0], 4.0f);
+                        "<input name=\"valuebr\" type=\"float\" value=\"4\"/><input name=\"texcoord\" type=\"vector2\" value=\"1,1\"/></ramp4>", "n", g).v[0], 2.0f);
 
     /* ---- more adjust / channel ---- */
     chk1("saturate_gray", ev("<saturate name=\"n\" type=\"color3\"><input name=\"in\" type=\"color3\" value=\"1,0,0\"/>"
@@ -204,6 +291,37 @@ int main(void) {
     chk3("convert_f_to_c3", ev("<convert name=\"n\" type=\"color3\"><input name=\"in\" type=\"float\" value=\"0.4\"/></convert>", "n", g), 0.4f, 0.4f, 0.4f);
 
     /* ---- surface shader -> OpenPBR parameter mapping ground truth ---- */
+    { OpenPBRParams p = eval_surf(
+        "<open_pbr_surface name=\"s\" type=\"surfaceshader\">"
+        "<input name=\"base_diffuse_roughness\" type=\"float\" value=\"0.7\"/>"
+        "</open_pbr_surface>", "s");
+      chk1("openpbr.diffuse_rough", p.diffuse_roughness, 0.7f);
+      chk1("openpbr.EON", (float)p.diffuse_model, 1.0f); }
+    { OpenPBRParams p = eval_surf(
+        "<standard_surface name=\"s\" type=\"surfaceshader\">"
+        "<input name=\"diffuse_roughness\" type=\"float\" value=\"0.7\"/>"
+        "</standard_surface>", "s");
+      chk1("standard.oren", (float)p.diffuse_model, (float)MTLX_DIFFUSE_OREN_NAYAR); }
+    { OpenPBRParams p = eval_surf(
+        "<burley_diffuse_bsdf name=\"d\" type=\"BSDF\">"
+        "<input name=\"roughness\" type=\"float\" value=\"0.7\"/>"
+        "</burley_diffuse_bsdf><surface name=\"s\" type=\"surfaceshader\">"
+        "<input name=\"bsdf\" type=\"BSDF\" nodename=\"d\"/></surface>", "s");
+      chk1("node.burley", (float)p.diffuse_model, (float)MTLX_DIFFUSE_BURLEY); }
+    { OpenPBRParams p = eval_surf(
+        "<oren_nayar_diffuse_bsdf name=\"d\" type=\"BSDF\">"
+        "<input name=\"roughness\" type=\"float\" value=\"0.7\"/>"
+        "</oren_nayar_diffuse_bsdf><surface name=\"s\" type=\"surfaceshader\">"
+        "<input name=\"bsdf\" type=\"BSDF\" nodename=\"d\"/></surface>", "s");
+      chk1("node.oren", (float)p.diffuse_model, (float)MTLX_DIFFUSE_OREN_NAYAR); }
+    { OpenPBRParams p = eval_surf(
+        "<oren_nayar_diffuse_bsdf name=\"d\" type=\"BSDF\">"
+        "<input name=\"roughness\" type=\"float\" value=\"0.7\"/>"
+        "<input name=\"energy_compensation\" type=\"boolean\" value=\"true\"/>"
+        "</oren_nayar_diffuse_bsdf><surface name=\"s\" type=\"surfaceshader\">"
+        "<input name=\"bsdf\" type=\"BSDF\" nodename=\"d\"/></surface>", "s");
+      chk1("node.EON", (float)p.diffuse_model, 1.0f); }
+
     { OpenPBRParams p = eval_surf(
         "<standard_surface name=\"s\" type=\"surfaceshader\">"
         "<input name=\"base_color\" type=\"color3\" value=\"0.2,0.4,0.6\"/>"
@@ -222,7 +340,14 @@ int main(void) {
         "<UsdPreviewSurface name=\"s\" type=\"surfaceshader\">"
         "<input name=\"diffuseColor\" type=\"color3\" value=\"0.8,0.2,0.1\"/>"
         "<input name=\"metallic\" type=\"float\" value=\"0.0\"/></UsdPreviewSurface>", "s");
-      chk3("usd.diffuse->base", mv_from(p.base_color), 0.8f, 0.2f, 0.1f); }
+      chk3("usd.diffuse->base", mv_from(p.base_color), 0.8f, 0.2f, 0.1f);
+      chk3("usd.metalness.specular-default", mv_from(p.specular_color), 1.0f, 1.0f, 1.0f); }
+    { OpenPBRParams p = eval_surf(
+        "<UsdPreviewSurface name=\"s\" type=\"surfaceshader\">"
+        "<input name=\"useSpecularWorkflow\" type=\"integer\" value=\"1\"/>"
+        "<input name=\"specularColor\" type=\"color3\" value=\"0.2,0.4,0.6\"/>"
+        "</UsdPreviewSurface>", "s");
+      chk3("usd.specular-workflow.color", mv_from(p.specular_color), 0.2f, 0.4f, 0.6f); }
     { OpenPBRParams p = eval_surf(
         "<disney_principled name=\"s\" type=\"surfaceshader\">"
         "<input name=\"baseColor\" type=\"color3\" value=\"0.3,0.6,0.3\"/>"

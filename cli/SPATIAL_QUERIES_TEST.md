@@ -2,7 +2,7 @@
 
 ## Test Coverage for Spatial Queries
 
-The `test_spatial_query.cc` file provides test coverage for spatial queries in the BVH implementation.
+The `tests/test_spatial_query.cc` file provides test coverage for spatial queries in the BVH implementation.
 
 ## Test Scenario: Random Triangles + Random Rays
 

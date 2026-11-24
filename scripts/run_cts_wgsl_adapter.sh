@@ -61,7 +61,8 @@ fi
 if [[ "$CONFIGURE" -eq 1 ]]; then
   cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" \
     -DLIGHTRT_BUILD_WEBGPU=ON \
-    -DBUILD_TESTING=ON
+    -DBUILD_TESTING=ON \
+    -DSOFTRT_WEBGPU_ENABLE_CLAIR=ON
 fi
 
 if [[ "$BUILD" -eq 1 ]]; then

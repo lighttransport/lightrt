@@ -50,8 +50,16 @@ static inline __m128 _mm_add_ps(__m128 a, __m128 b) { return vaddq_f32(a, b); }
 static inline __m128 _mm_sub_ps(__m128 a, __m128 b) { return vsubq_f32(a, b); }
 static inline __m128 _mm_mul_ps(__m128 a, __m128 b) { return vmulq_f32(a, b); }
 static inline __m128 _mm_div_ps(__m128 a, __m128 b) { return vdivq_f32(a, b); }
+#ifdef LRT_SSE2NEON_EXACT_MINMAX
+/* Exact x86 semantics: minps/maxps return the SECOND operand when either is
+ * NaN (a < b ? a : b). Needed where the kernel relies on that NaN dropping
+ * (LRT_TRI_SLAB_ROBUST) or on bit parity with x86 (LRT_TRI_BITEXACT). */
+static inline __m128 _mm_min_ps(__m128 a, __m128 b) { return vbslq_f32(vcltq_f32(a, b), a, b); }
+static inline __m128 _mm_max_ps(__m128 a, __m128 b) { return vbslq_f32(vcgtq_f32(a, b), a, b); }
+#else
 static inline __m128 _mm_min_ps(__m128 a, __m128 b) { return vminq_f32(a, b); }
 static inline __m128 _mm_max_ps(__m128 a, __m128 b) { return vmaxq_f32(a, b); }
+#endif
 static inline __m128 _mm_sqrt_ps(__m128 a) { return vsqrtq_f32(a); }
 static inline __m128 _mm_fmadd_ps(__m128 a, __m128 b, __m128 c) {
     return vfmaq_f32(c, a, b); /* a*b + c */
@@ -94,6 +102,7 @@ static inline __m128 _mm_cmpeq_ps(__m128 a, __m128 b) {
 static inline __m128 _mm_cmpneq_ps(__m128 a, __m128 b) {
     return vreinterpretq_f32_u32(vmvnq_u32(vceqq_f32(a, b)));
 }
+static inline float _mm_cvtss_f32(__m128 a) { return vgetq_lane_f32(a, 0); }
 
 /* ---- blend / movemask ---- */
 static inline __m128 _mm_blendv_ps(__m128 a, __m128 b, __m128 mask) {

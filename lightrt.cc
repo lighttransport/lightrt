@@ -1904,11 +1904,27 @@ uint32_t BVH::traverse(const Ray& ray, float& hit_t) const noexcept {
   
   StackEntry stack[64];
   int stack_ptr = 0;
-  
+  std::vector<uint32_t> spill;
+  spill.reserve(16);
+
+  auto push_node = [&](uint32_t node_idx) {
+    if (stack_ptr < 64) {
+      stack[stack_ptr++].node_idx = node_idx;
+    } else {
+      spill.push_back(node_idx);
+    }
+  };
+
   stack[stack_ptr++].node_idx = 0;
   
-  while (stack_ptr > 0) {
-    uint32_t node_idx = stack[--stack_ptr].node_idx;
+  while (stack_ptr > 0 || !spill.empty()) {
+    uint32_t node_idx;
+    if (stack_ptr > 0) {
+      node_idx = stack[--stack_ptr].node_idx;
+    } else {
+      node_idx = spill.back();
+      spill.pop_back();
+    }
     const BVHNode& node = nodes_[node_idx];
     
     float tmin, tmax;
@@ -1932,10 +1948,8 @@ uint32_t BVH::traverse(const Ray& ray, float& hit_t) const noexcept {
       }
     } else {
       // Add children to stack
-      if (stack_ptr < 62) {
-        stack[stack_ptr++].node_idx = node.left_child;
-        stack[stack_ptr++].node_idx = node.right_child;
-      }
+      push_node(node.left_child);
+      push_node(node.right_child);
     }
   }
   
@@ -1955,11 +1969,27 @@ uint32_t BVH::traverseSIMD(const Ray& ray, float& hit_t) const noexcept {
   // Stack-based traversal with precomputed inv_dir + front-to-back ordering
   uint32_t stack[64];
   int stack_ptr = 0;
+  std::vector<uint32_t> spill;
+  spill.reserve(16);
+
+  auto push_node = [&](uint32_t node_idx) {
+    if (stack_ptr < 64) {
+      stack[stack_ptr++] = node_idx;
+    } else {
+      spill.push_back(node_idx);
+    }
+  };
 
   stack[stack_ptr++] = 0;
 
-  while (stack_ptr > 0) {
-    uint32_t node_idx = stack[--stack_ptr];
+  while (stack_ptr > 0 || !spill.empty()) {
+    uint32_t node_idx;
+    if (stack_ptr > 0) {
+      node_idx = stack[--stack_ptr];
+    } else {
+      node_idx = spill.back();
+      spill.pop_back();
+    }
     const BVHNode& node = nodes_[node_idx];
 
     float tmin;
@@ -1982,12 +2012,10 @@ uint32_t BVH::traverseSIMD(const Ray& ray, float& hit_t) const noexcept {
       }
     } else {
       // Front-to-back ordering
-      if (stack_ptr < 62) {
-        uint32_t children[2] = { node.left_child, node.right_child };
-        uint32_t s = static_cast<uint32_t>(ctx.sign[node.splitAxis()]);
-        stack[stack_ptr++] = children[1 - s]; // far
-        stack[stack_ptr++] = children[s];     // near
-      }
+      uint32_t children[2] = { node.left_child, node.right_child };
+      uint32_t s = static_cast<uint32_t>(ctx.sign[node.splitAxis()]);
+      push_node(children[1 - s]); // far
+      push_node(children[s]);     // near
     }
   }
 
@@ -2000,12 +2028,13 @@ void BVH::queryRay(const Ray& ray, float max_t,
   if (nodes_.empty()) return;
 
   const RayContext ctx(ray);
-  uint32_t stack[128];
-  uint32_t stack_size = 0;
-  stack[stack_size++] = 0;
+  std::vector<uint32_t> stack;
+  stack.reserve(128);
+  stack.push_back(0);
 
-  while (stack_size > 0) {
-    const uint32_t node_idx = stack[--stack_size];
+  while (!stack.empty()) {
+    const uint32_t node_idx = stack.back();
+    stack.pop_back();
     if (node_idx >= nodes_.size()) continue;
     const BVHNode& node = nodes_[node_idx];
 
@@ -2025,10 +2054,8 @@ void BVH::queryRay(const Ray& ray, float max_t,
     } else {
       const uint32_t children[2] = {node.left_child, node.right_child};
       const uint32_t sign = static_cast<uint32_t>(ctx.sign[node.splitAxis()]);
-      if (stack_size + 2 <= 128) {
-        stack[stack_size++] = children[1 - sign];
-        stack[stack_size++] = children[sign];
-      }
+      stack.push_back(children[1 - sign]);
+      stack.push_back(children[sign]);
     }
   }
 }
@@ -2112,22 +2139,24 @@ void BVH::refit(const std::vector<AABB>& new_prim_aabbs) noexcept {
 
 // Spatial query: collect primitives that intersect an AABB
 void BVH::queryAABB(const AABB& query_aabb, std::vector<uint32_t>& results) const noexcept {
+  results.clear();
   if (nodes_.empty()) {
     return;
   }
 
-  results.clear();
-
   // Track visited primitives to avoid duplicates
-  std::vector<bool> visited(prim_aabbs_.size(), false);
+  std::vector<uint8_t> visited(prim_aabbs_.size(), 0);
 
-  // Stack-based traversal
-  uint32_t stack[64];
-  uint32_t stack_ptr = 0;
-  stack[stack_ptr++] = 0;
+  // Stack-based traversal. Reserve the usual depth, but allow the stack to
+  // grow for deliberately deep/pathological BVHs instead of silently
+  // dropping children when a fixed-size stack fills.
+  std::vector<uint32_t> stack;
+  stack.reserve(64);
+  stack.push_back(0);
 
-  while (stack_ptr > 0) {
-    uint32_t node_idx = stack[--stack_ptr];
+  while (!stack.empty()) {
+    uint32_t node_idx = stack.back();
+    stack.pop_back();
     const BVHNode& node = nodes_[node_idx];
 
     // Test AABB intersection
@@ -2140,42 +2169,42 @@ void BVH::queryAABB(const AABB& query_aabb, std::vector<uint32_t>& results) cons
       for (uint32_t i = 0; i < node.prim_count; i++) {
         uint32_t prim_idx = prim_indices_[node.prim_offset + i];
         // Test primitive AABB against query (with deduplication)
-        if (prim_idx < prim_aabbs_.size() && !visited[prim_idx] &&
+        if (prim_idx < prim_aabbs_.size() && visited[prim_idx] == 0 &&
             query_aabb.intersects(prim_aabbs_[prim_idx])) {
-          visited[prim_idx] = true;
+          visited[prim_idx] = 1;
           results.push_back(prim_idx);
         }
       }
     } else {
       // Traverse children
-      if (stack_ptr + 2 <= 64) {
-        stack[stack_ptr++] = node.left_child;
-        stack[stack_ptr++] = node.right_child;
-      }
+      stack.push_back(node.left_child);
+      stack.push_back(node.right_child);
     }
   }
 }
 
 // Spatial query: collect primitives within sphere radius
 void BVH::querySphere(const Vec3& center, float radius, std::vector<uint32_t>& results) const noexcept {
+  results.clear();
   if (nodes_.empty()) {
     return;
   }
 
-  results.clear();
-
   // Track visited primitives to avoid duplicates
-  std::vector<bool> visited(prim_aabbs_.size(), false);
+  std::vector<uint8_t> visited(prim_aabbs_.size(), 0);
 
   float radius_sq = radius * radius;
 
-  // Stack-based traversal
-  uint32_t stack[64];
-  uint32_t stack_ptr = 0;
-  stack[stack_ptr++] = 0;
+  // Stack-based traversal. Reserve the usual depth, but allow the stack to
+  // grow for deliberately deep/pathological BVHs instead of silently
+  // dropping children when a fixed-size stack fills.
+  std::vector<uint32_t> stack;
+  stack.reserve(64);
+  stack.push_back(0);
 
-  while (stack_ptr > 0) {
-    uint32_t node_idx = stack[--stack_ptr];
+  while (!stack.empty()) {
+    uint32_t node_idx = stack.back();
+    stack.pop_back();
     const BVHNode& node = nodes_[node_idx];
 
     // Test sphere-AABB intersection
@@ -2210,38 +2239,38 @@ void BVH::querySphere(const Vec3& center, float radius, std::vector<uint32_t>& r
         Vec3 prim_delta = prim_closest - center;
         float prim_dist_sq = prim_delta.x * prim_delta.x + prim_delta.y * prim_delta.y + prim_delta.z * prim_delta.z;
 
-        if (prim_dist_sq <= radius_sq && !visited[prim_idx]) {
-          visited[prim_idx] = true;
+        if (prim_dist_sq <= radius_sq && visited[prim_idx] == 0) {
+          visited[prim_idx] = 1;
           results.push_back(prim_idx);
         }
       }
     } else {
       // Traverse children
-      if (stack_ptr + 2 <= 64) {
-        stack[stack_ptr++] = node.left_child;
-        stack[stack_ptr++] = node.right_child;
-      }
+      stack.push_back(node.left_child);
+      stack.push_back(node.right_child);
     }
   }
 }
 
 void BVH::queryFrustum(const Frustum& frustum, std::vector<uint32_t>& results) const noexcept {
+  results.clear();
   if (nodes_.empty()) {
     return;
   }
 
-  results.clear();
-
   // Track visited primitives to avoid duplicates
-  std::vector<bool> visited(prim_aabbs_.size(), false);
+  std::vector<uint8_t> visited(prim_aabbs_.size(), 0);
 
-  // Stack-based traversal
-  uint32_t stack[64];
-  uint32_t stack_ptr = 0;
-  stack[stack_ptr++] = 0;
+  // Stack-based traversal. Reserve the usual depth, but allow the stack to
+  // grow for deliberately deep/pathological BVHs instead of silently
+  // dropping children when a fixed-size stack fills.
+  std::vector<uint32_t> stack;
+  stack.reserve(64);
+  stack.push_back(0);
 
-  while (stack_ptr > 0) {
-    uint32_t node_idx = stack[--stack_ptr];
+  while (!stack.empty()) {
+    uint32_t node_idx = stack.back();
+    stack.pop_back();
     const BVHNode& node = nodes_[node_idx];
 
     // Test frustum-AABB intersection
@@ -2254,23 +2283,21 @@ void BVH::queryFrustum(const Frustum& frustum, std::vector<uint32_t>& results) c
       // Add primitives that are visible
       for (uint32_t i = 0; i < node.prim_count; i++) {
         uint32_t prim_idx = prim_indices_[node.prim_offset + i];
-        if (prim_idx >= prim_aabbs_.size() || visited[prim_idx]) {
+        if (prim_idx >= prim_aabbs_.size() || visited[prim_idx] != 0) {
           continue;
         }
 
         // Test primitive AABB against frustum
         int prim_test = frustum.testAABB(prim_aabbs_[prim_idx]);
         if (prim_test != -1) {
-          visited[prim_idx] = true;
+          visited[prim_idx] = 1;
           results.push_back(prim_idx);
         }
       }
     } else {
       // Traverse children
-      if (stack_ptr + 2 <= 64) {
-        stack[stack_ptr++] = node.left_child;
-        stack[stack_ptr++] = node.right_child;
-      }
+      stack.push_back(node.left_child);
+      stack.push_back(node.right_child);
     }
   }
 }
@@ -2283,8 +2310,20 @@ void BVH::queryKNN(const Vec3& point, uint32_t k, std::vector<KNNResult>& result
 
   results.clear();
 
+  // The k=1 case is exactly the nearest-primitive query.  Avoid allocating
+  // the visited bitmap, result heap, and node priority queue used by the
+  // general KNN path for this common query shape.
+  if (k == 1) {
+    float distance_sq = std::numeric_limits<float>::max();
+    const uint32_t prim_idx = queryNearest(point, distance_sq);
+    if (prim_idx != kInvalidIndex) {
+      results.push_back({prim_idx, distance_sq});
+    }
+    return;
+  }
+
   // Track visited primitives to avoid duplicates
-  std::vector<bool> visited(prim_aabbs_.size(), false);
+  std::vector<uint8_t> visited(prim_aabbs_.size(), 0);
 
   // Max-heap to keep track of K nearest (furthest is at top)
   std::vector<KNNResult> heap;
@@ -2315,10 +2354,10 @@ void BVH::queryKNN(const Vec3& point, uint32_t k, std::vector<KNNResult>& result
       // Test primitives
       for (uint32_t i = 0; i < node.prim_count; i++) {
         uint32_t prim_idx = prim_indices_[node.prim_offset + i];
-        if (prim_idx >= prim_aabbs_.size() || visited[prim_idx]) {
+        if (prim_idx >= prim_aabbs_.size() || visited[prim_idx] != 0) {
           continue;
         }
-        visited[prim_idx] = true;
+        visited[prim_idx] = 1;
 
         float dist_sq = prim_aabbs_[prim_idx].distanceSquared(point);
 

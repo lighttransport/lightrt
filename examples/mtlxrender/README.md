@@ -59,6 +59,8 @@ CUDA backend implements the same three ops with no integrator change.
 
 - `--backend cpu` *(default)*: the recursive, tiled, multi-threaded path tracer
   (`pathtrace.c`) — full NEE+MIS, subsurface, etc.
+- `--backend cpu-wavefront`: the wavefront integrator with CPU ray queries,
+  useful for checking the same shading path without a Vulkan device.
 - `--backend vk`: a **wavefront** integrator (`pathtrace_wf.c`) that issues ray
   *batches* (camera / shadow / bounce) and traces them on the GPU via
   `lrt_vk_trace_scene` (LightRT's Vulkan BVH trace). **Shading stays on the CPU
@@ -156,7 +158,11 @@ catches real correctness bugs, not just regressions. Each case feeds inputs
 through the real parse → doc → eval path (`mtlx_load_string` + a one-node graph).
 
 ```bash
-make test        # builds and runs node_truth (67 assertions, all PASS)
+make test        # node_truth, texture sampling, and CPU BSDF white furnace
+make test-texture  # filters, addressing, sRGB decode, cmlib color matrices and gamma paths, mip generation, and LOD selection
+make test-white-furnace  # deterministic material/lobe energy integration
+make test-bsdf-response # Lean-generated pointwise isotropic GGX response vectors
+make test-lean    # Lean-generated node vectors
 make check       # node ground-truth + golden render regression
 # or: ctest       (via CMake)
 ```
@@ -171,6 +177,28 @@ mapping** — `standard_surface` / `gltf_pbr` / `UsdPreviewSurface` /
 `disney_principled` inputs onto the OpenPBR params. Procedural noise is checked
 for spec invariants (determinism, output range). The suite is clean under
 ASan/UBSan.
+
+### CPU BSDF white-furnace integration
+
+`tests/white_furnace.c` integrates the evaluated CPU BSDF over a uniform
+hemisphere with deterministic angular quadrature. It checks total, diffuse, and
+specular energy for diffuse, no-specular, dielectric, metal, subsurface, coat,
+sheen, and colored parameter sets at normal and grazing view angles. A sweep adds
+108 combinations of base color, metalness, specular weight, roughness, and view.
+The test also checks that a colored zero-specular Lambert response integrates
+exactly to its base albedo at normal and grazing views. This caught
+a grazing-angle energy excess in the diffuse-plus-specular response; the BSDF now
+uses the authored specular weight as its grazing reflectance and attenuates
+diffuse/subsurface energy by the view-direction Fresnel response. OpenPBR coat
+darkening uses the graph's per-channel `(1 - Kcoat) / (1 - Ebase * Kcoat)`
+ratio and the authored `coat_darkening` amount. OpenPBR also remaps the base
+specular IOR relative to the coat and roughens the base response using the
+MaterialX graph formulas. For nonmetallic OpenPBR without thin film, the base
+uses MaterialX dielectric Fresnel, directional throughput, and GGX energy
+compensation; the coat uses the matching dielectric response. OpenPBR without
+thin film mixes this dielectric base with the weighted generalized-Schlick metal
+closure, including weighted, tinted, and mixed-metal materials. Thin-film base,
+transmission, and full layered behavior remain approximate.
 
 ### Golden reference renders
 
@@ -209,3 +237,24 @@ recomputes each and reports per-material RMSE (PASS within `TOL`, default 0.02).
 - SSS defaults to a tinted-diffuse diffusion approximation (accurate for the
   chess set's sub-millimeter mean free path); `--sss-walk` enables a bounded
   random walk.
+
+### Strict graph sine/cosine
+
+`--verified-math` opts MaterialX graph sine/cosine calls into the fixed
+Payne–Hanek/Horner binary32 implementation modeled in the conformance Lean
+project. This includes the trigonometric calls used by graph rotations and
+unified noise. Default graph math continues to use libm. Startup reports the
+selected strict graph backend.
+
+The binary32 sine/cosine model has a proved absolute error bound of `2^-20` for
+all finite inputs. This is not a correctness claim for every graph operation or
+for the remaining angle/normalization/rotation pipeline; those finite-operation
+proof connections are still in progress. Inverse trigonometry and BSDF math
+retain their existing implementations. The backend requires nearest/even,
+gradual underflow, and strict single-precision evaluation, and rejects activation
+when these conditions are unavailable. Its sources compile separately with
+`-fno-fast-math -frounding-math -ffp-contract=off`.
+
+The C adapter can be configured with `mtlx_verified_math_enable(1)` before shading
+threads start; `mtlx_verified_math_enable(0)` restores the reference backend.
+Do not change the process-wide selection while shading threads are running.

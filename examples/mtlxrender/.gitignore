@@ -11,3 +11,4 @@ mtlxvk
 !docs/*.png
 !golden/*.png
 deps/
+lean_vectors

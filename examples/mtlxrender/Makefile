@@ -11,7 +11,7 @@ LIGHTRT  = ../..
 DEPS     = deps
 TINYEXR  = $(DEPS)/tinyexr
 
-INCLUDES = -I. -I$(LIGHTRT) -I$(DEPS) -I$(TINYEXR)/include
+INCLUDES = -I. -I$(LIGHTRT) -I$(DEPS) -I$(TINYEXR)/include -I$(LIGHTRT)/viewer/third_party
 
 UNAME_M := $(shell uname -m)
 ifneq (,$(filter x86_64 amd64,$(UNAME_M)))
@@ -29,7 +29,7 @@ BUILD = build$(if $(VK),-vk,)
 APP_SRC = main.c pathtrace.c pathtrace_wf.c raytracer.c raytracer_vk.c \
           bsdf.c env.c framebuffer.c color.c \
           gltf_load.c mesh_build.c obj_load.c mtlx_xml.c mtlx_doc.c mtlx_eval.c \
-          material_bind.c texture.c
+          material_bind.c texture.c verified_float.c verified_math.c verified_eval.c verified_bounds.c verified_ranges.c verified_fixed.c verified_normal.c verified_direction.c verified_single_power.c verified_local_geometry.c verified_vndf.c passive_film.c
 # third-party sources (compiled quietly with -w)
 TP_SRC  = third_party_impl.c \
           $(LIGHTRT)/lightrt_c_tri.c \
@@ -53,6 +53,18 @@ CFLAGS  = $(CSTD) $(OPT) $(SIMD) $(DEFS) $(INCLUDES)
 mtlxrender: $(APP_OBJ) $(TP_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+# Keep the certified operation schedule independent of app fast-math settings.
+$(BUILD)/verified_float.o $(BUILD)/verified_math.o $(BUILD)/verified_eval.o $(BUILD)/verified_bounds.o $(BUILD)/verified_ranges.o $(BUILD)/verified_fixed.o $(BUILD)/verified_normal.o $(BUILD)/verified_direction.o $(BUILD)/verified_single_power.o $(BUILD)/verified_local_geometry.o $(BUILD)/verified_vndf.o $(BUILD)/passive_film.o: CFLAGS += -fno-fast-math -frounding-math -ffp-contract=off
+$(BUILD)/verified_float.o $(BUILD)/verified_math.o $(BUILD)/verified_eval.o: verified_float.h verified_math.h verified_trig_constants.h
+
+$(BUILD)/verified_bounds.o: verified_bounds.h verified_float.h
+$(BUILD)/verified_ranges.o: verified_ranges.h verified_bounds.h verified_float.h
+$(BUILD)/main.o: verified_math.h
+$(BUILD)/passive_film.o: passive_film.h
+
+# The shading parameter layout is shared by the app and node tests.
+$(APP_OBJ) $(BUILD)/node_truth.o: mtlx_eval.h
+
 # Per-node numeric ground-truth tests (reuses the app object files).
 TEST_DEPS = $(BUILD)/node_truth.o $(BUILD)/mtlx_doc.o $(BUILD)/mtlx_xml.o \
             $(BUILD)/mtlx_eval.o $(BUILD)/texture.o $(BUILD)/color.o \
@@ -61,8 +73,79 @@ $(BUILD)/node_truth.o: tests/node_truth.c | $(BUILD)
 	$(CC) $(CFLAGS) $(WARN) -c $< -o $@
 node_truth: $(TEST_DEPS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-test: node_truth
+test: cert_energy film_energy pixel_filter mtlxrender conductor_mixture conductor_response node_truth white_furnace bsdf_response eon_response rough_diffuse diffuse_mixture sheen_mixture texture_sampling volume_lobes
+	./pixel_filter
 	./node_truth
+	./white_furnace
+	./cert_energy
+	./film_energy
+	./bsdf_response
+	./conductor_response
+	./conductor_mixture
+	./eon_response
+	./rough_diffuse
+	./diffuse_mixture
+	./sheen_mixture
+	./texture_sampling texture-sampling.ppm
+	./volume_lobes
+	python3 tests/viewdirection_render.py
+	python3 tests/conductor_anisotropic_render.py
+
+test-viewdirection: mtlxrender
+	python3 tests/viewdirection_render.py
+
+# Lean-generated node evaluation vectors (tests/generated/mtlx-eval.inc, from
+# the materialx-conformance repository). Links only the document loader and
+# the evaluator, with a neutral texture stub, so it needs no deps/.
+LEAN_SRC = tests/lean_vectors.c tests/texture_stub.c mtlx_doc.c mtlx_xml.c mtlx_eval.c color.c
+pixel_filter: tests/pixel_filter.c pathtrace.h
+	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/pixel_filter.c -lm
+
+film_energy: tests/film_energy.c bsdf.c bsdf.h vecmath.h passive_film.c passive_film.h
+	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/film_energy.c bsdf.c passive_film.c $(LDFLAGS)
+
+cert_energy: tests/cert_energy.c bsdf.c bsdf.h cert_albedo_table.h vecmath.h
+	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/cert_energy.c bsdf.c $(LDFLAGS)
+
+white_furnace: tests/white_furnace.c bsdf.c bsdf.h mtlx_eval.h vecmath.h
+	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/white_furnace.c bsdf.c $(LDFLAGS)
+
+test-white-furnace: white_furnace
+	./white_furnace
+
+bsdf_response: tests/bsdf_response.c bsdf.c bsdf.h mtlx_eval.h vecmath.h tests/generated/bsdf-response.inc
+	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/bsdf_response.c bsdf.c $(LDFLAGS)
+
+eon_response: tests/eon_response.c bsdf.c bsdf.h mtlx_eval.h vecmath.h
+	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/eon_response.c bsdf.c $(LDFLAGS)
+
+rough_diffuse: tests/rough_diffuse.c bsdf.c bsdf.h mtlx_eval.h vecmath.h
+	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/rough_diffuse.c bsdf.c $(LDFLAGS)
+
+diffuse_mixture: tests/diffuse_mixture.c tests/texture_stub.c mtlx_doc.c mtlx_xml.c mtlx_eval.c color.c bsdf.c mtlx_eval.h
+	$(CC) $(CSTD) -O2 -D_POSIX_C_SOURCE=200809L -I. -Itests -o $@ tests/diffuse_mixture.c tests/texture_stub.c mtlx_doc.c mtlx_xml.c mtlx_eval.c color.c bsdf.c -lm
+
+sheen_mixture: tests/sheen_mixture.c tests/texture_stub.c mtlx_doc.c mtlx_xml.c mtlx_eval.c color.c bsdf.c mtlx_eval.h
+	$(CC) $(CSTD) -O2 -D_POSIX_C_SOURCE=200809L -I. -Itests -o $@ tests/sheen_mixture.c tests/texture_stub.c mtlx_doc.c mtlx_xml.c mtlx_eval.c color.c bsdf.c -lm
+
+test-bsdf-response: bsdf_response
+	./bsdf_response
+
+TEXTURE_TEST_SRC = tests/texture_sampling.c mtlx_doc.c mtlx_xml.c mtlx_eval.c \
+                   texture.c color.c third_party_impl.c
+texture_sampling: $(TEXTURE_TEST_SRC) texture.h mtlx_doc.h mtlx_eval.h
+	$(CC) $(CSTD) -O2 $(DEFS) $(INCLUDES) -I$(LIGHTRT)/viewer/third_party \
+		-o $@ $(TEXTURE_TEST_SRC) $(LDFLAGS)
+test-texture: texture_sampling
+	./texture_sampling texture-sampling.ppm
+
+lean_vectors: $(LEAN_SRC) tests/generated/mtlx-eval.inc tests/generated/mtlx-eval-approx.inc mtlx_stdlib_defs.inc
+	$(CC) $(CSTD) -O2 -D_POSIX_C_SOURCE=200809L -I. -Itests -o $@ $(LEAN_SRC) -lm
+test-lean: lean_vectors
+	./lean_vectors
+
+volume_lobes: tests/volume_lobes.c tests/texture_stub.c mtlx_doc.c mtlx_xml.c mtlx_eval.c color.c mtlx_eval.h mtlx_doc.h
+	$(CC) $(CSTD) -O2 -D_POSIX_C_SOURCE=200809L -I. -Itests -o $@ tests/volume_lobes.c tests/texture_stub.c mtlx_doc.c mtlx_xml.c mtlx_eval.c color.c -lm
 
 # MaterialX -> GPU shading bridge (bakes per-material OpenPBR params and shades
 # one sphere per material on the GPU via the Vulkan backend). Needs the vk
@@ -96,7 +179,8 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 clean:
-	rm -rf build build-vk mtlxrender node_truth mtlxvk
+	rm -rf build build-vk mtlxrender cert_energy film_energy node_truth pixel_filter white_furnace bsdf_response texture_sampling \
+	       texture-sampling.ppm mtlxvk lean_vectors
 
 # Cross-renderer verification against the ASF MaterialX reference (GLSL + OSL).
 # Needs the one-time setup in verify/README.md (conda env + reference builds).
@@ -105,4 +189,32 @@ VERIFY_MODE ?= all
 verify: mtlxrender
 	bash verify/run_verify.sh $(VERIFY_MODE)
 
-.PHONY: clean test check verify
+.PHONY: clean test test-white-furnace test-bsdf-response test-texture check verify
+
+# EXT-001 prototype (standalone; not in `test` yet)
+certified_bsdf_test: tests/certified_bsdf_test.c certified_bsdf.c certified_bsdf.h cert_surrogate_table.h tests/generated/certified-weight-vectors.inc
+	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/certified_bsdf_test.c certified_bsdf.c $(LDFLAGS)
+
+test-certified-bsdf: certified_bsdf_test
+	./certified_bsdf_test
+
+conductor_response: tests/conductor_response.c bsdf.c bsdf.h mtlx_eval.h vecmath.h
+	$(CC) $(CSTD) -O2 $(INCLUDES) -o $@ tests/conductor_response.c bsdf.c $(LDFLAGS)
+
+conductor_mixture: tests/conductor_mixture.c tests/texture_stub.c mtlx_doc.c mtlx_xml.c mtlx_eval.c color.c bsdf.c
+	$(CC) $(CSTD) -O2 -D_POSIX_C_SOURCE=200809L -I. -Itests -o $@ $^ -lm
+
+test-conductor-anisotropic: mtlxrender
+	python3 tests/conductor_anisotropic_render.py
+
+$(BUILD)/verified_fixed.o: verified_fixed.h
+
+$(BUILD)/verified_normal.o: verified_normal.h verified_normal_program.h verified_normal_float_program.h verified_fixed.h verified_ranges.h verified_bounds.h verified_float.h verified_ndf_power_program.h verified_ndf_density_program.h
+
+$(BUILD)/verified_direction.o: verified_scaled_transmission_program.h verified_surface_program.h verified_transmission_program.h verified_outgoing_program.h verified_world_program.h verified_branch_power_program.h verified_direction.h verified_float.h verified_math.h verified_normal.h verified_bounds.h verified_ranges.h verified_ndf_power_program.h verified_ndf_density_program.h verified_normal_float_program.h
+
+$(BUILD)/verified_single_power.o: verified_single_power.h verified_anisotropic_single_program.h verified_float.h verified_ranges.h verified_normal.h verified_normal_float_program.h
+
+$(BUILD)/verified_local_geometry.o: verified_transmission_horizon_program.h verified_reflection_horizon_program.h verified_world_program.h verified_direction.h verified_single_power.h verified_float.h verified_outgoing_program.h verified_normal_float_program.h verified_ranges.h
+
+$(BUILD)/verified_vndf.o: verified_vndf.h verified_direction.h verified_float.h verified_math.h verified_normal.h

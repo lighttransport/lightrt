@@ -47,7 +47,8 @@ typedef enum lrt_hip_caps {
     LRT_HIP_CAP_WMMA = 1u << 1,    /* gfx11/gfx12 WMMA (matrix cores) usable  */
     LRT_HIP_CAP_FP8 = 1u << 2,     /* fp8 WMMA inputs (gfx12+)                */
     LRT_HIP_CAP_INT8 = 1u << 3,    /* iu8 WMMA inputs                        */
-    LRT_HIP_CAP_INT4 = 1u << 4     /* iu4 WMMA inputs                        */
+    LRT_HIP_CAP_INT4 = 1u << 4,    /* iu4 WMMA inputs                        */
+    LRT_HIP_CAP_POINTS = 1u << 5   /* serialized sphere/disc/ellipse leaves (hiprtc path) */
 } lrt_hip_caps;
 
 typedef struct lrt_hip_engine_options {

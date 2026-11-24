@@ -14,6 +14,9 @@
 #include "obj_load.h"
 #include "mtlx_doc.h"
 #include "mtlx_eval.h"
+#include "verified_math.h"
+#include "passive_film.h"
+#include "bsdf.h"
 #include "material_bind.h"
 #include "texture.h"
 #include "env.h"
@@ -114,6 +117,11 @@ static void usage(const char *prog) {
         "  --spp <int>            samples per pixel (default 64)\n"
         "  --bounces <int>        max path length (default 8)\n"
         "  --threads <int>        worker threads (default: all cores)\n"
+        "  --verified-math        strict modeled sine/cosine for MaterialX graph evaluation\n"
+        "  --ms-dielectric        energy-compensate rough dielectric transmission (Turquin)\n"
+        "  --energy-mode M        reference (default) | conservative (certified glass R/T scale)\n"
+        "  --layering L           physical (default) | graph: OpenPBR graph's layer throughput on\n"
+        "                         transmission (double Fresnel, issues/materialx/02; diagnostic)\n"
         "  --env <file.exr>       lat-long HDRI environment\n"
         "  --env-intensity <f>    env scale (default 1)\n"
         "  --env-rotation <deg>   HDRI azimuth rotation (default 0)\n"
@@ -128,8 +136,9 @@ static void usage(const char *prog) {
         "  --cam-yaw <deg> --cam-pitch <deg> --cam-dist <f>   orbit camera\n"
         "  --cam-eye x,y,z --cam-target x,y,z --cam-fov <deg>  explicit look-at\n"
         "                         camera (overrides orbit; for the verify harness)\n"
+        "  --pixel-filter <box|tent>  camera pixel filter (default box)\n"
         "  --hide-env             black background; env still lights the scene\n"
-        "  --backend <cpu|vk>     cpu = tiled tracer (default); vk = GPU-traced\n"
+        "  --backend <cpu|cpu-wavefront|vk>  tiled CPU, wavefront CPU, or GPU rays\n"
         "                         wavefront (needs a VK build + device)\n"
         "  --gpu-validate         render the wavefront on CPU and GPU, report RMSE\n",
         prog);
@@ -144,6 +153,7 @@ int main(int argc, char **argv) {
     const char *out_path = "chess.exr", *png_path = NULL, *env_path = NULL;
     const char *srgb_path = NULL; /* plain linear->sRGB PNG (no ACES) for verify harness */
     int W = 800, H = 600, spp = 64, bounces = 8, threads = 0, hq = 0, sss_walk = 0, sky = 0;
+    int pixel_filter_tent = 0;
     int hide_env_bg = 0; /* black background, env still lights (for verify harness) */
     float exposure = 1.0f, env_intensity = 1.0f, env_rot = 0.0f;
     float cam_yaw = 35.0f, cam_pitch = 25.0f, cam_dist = 1.6f;
@@ -156,6 +166,7 @@ int main(int argc, char **argv) {
     v3 sun_color = {1.0f, 0.95f, 0.85f};
     const char *backend = "cpu"; /* cpu (tiled) | vk (GPU-traced wavefront) */
     int gpu_validate = 0;
+    int ms_dielectric_on = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -168,10 +179,40 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--w")) W = atoi(NEXT);
         else if (!strcmp(a, "--h")) H = atoi(NEXT);
         else if (!strcmp(a, "--spp")) spp = atoi(NEXT);
+        else if (!strcmp(a, "--pixel-filter")) {
+            const char *filter = NEXT;
+            if (!strcmp(filter, "tent")) pixel_filter_tent = 1;
+            else if (!strcmp(filter, "box")) pixel_filter_tent = 0;
+            else { fprintf(stderr, "invalid pixel filter: %s\n", filter); return 1; }
+        }
         else if (!strcmp(a, "--bounces")) bounces = atoi(NEXT);
         else if (!strcmp(a, "--threads")) threads = atoi(NEXT);
         else if (!strcmp(a, "--env")) env_path = NEXT;
         else if (!strcmp(a, "--env-intensity")) env_intensity = (float)atof(NEXT);
+        else if (!strcmp(a, "--verified-math")) {
+            if (!mtlx_verified_math_enable(1)) {
+                fprintf(stderr, "--verified-math requires binary32, nearest/even and gradual underflow\n");
+                return 1;
+            }
+            fprintf(stderr, "MaterialX graph math: strict binary32 sine/cosine\n");
+        }
+        else if (!strcmp(a, "--ms-dielectric")) { bsdf_set_dielectric_multiscatter(1); ms_dielectric_on = 1; }
+        else if (!strcmp(a, "--energy-mode")) {
+            const char *mode = NEXT;
+            if (!strcmp(mode, "reference")) bsdf_set_energy_mode(0);
+            else if (!strcmp(mode, "conservative")) {
+                bsdf_set_energy_mode(1);
+                /* Proved passive channel model for thin films in this mode only. */
+                bsdf_set_conservative_film_fn(mtlx_passive_film);
+            }
+            else { fprintf(stderr, "invalid --energy-mode: %s\n", mode); return 1; }
+        }
+        else if (!strcmp(a, "--layering")) {
+            const char *mode = NEXT;
+            if (!strcmp(mode, "physical")) bsdf_set_layering_graph(0);
+            else if (!strcmp(mode, "graph")) bsdf_set_layering_graph(1);
+            else { fprintf(stderr, "invalid --layering: %s\n", mode); return 1; }
+        }
         else if (!strcmp(a, "--env-rotation")) env_rot = (float)atof(NEXT);
         else if (!strcmp(a, "--sky")) sky = 1;
         else if (!strcmp(a, "--sun")) sun_on = 1;
@@ -198,6 +239,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
         else { fprintf(stderr, "unknown option '%s'\n", a); usage(argv[0]); return 1; }
         #undef NEXT
+    }
+    if (ms_dielectric_on && bsdf_energy_mode() == 1) {
+        fprintf(stderr, "--ms-dielectric (uncertified diagnostic) cannot be combined with "
+                        "--energy-mode conservative\n");
+        return 1;
+    }
+    if (bsdf_layering_graph() && bsdf_energy_mode() == 1) {
+        fprintf(stderr, "--layering graph (diagnostic) cannot be combined with --energy-mode conservative\n");
+        return 1;
     }
     if ((!gltf_path && !obj_path) || !mtlx_path) { usage(argv[0]); return 1; }
 
@@ -255,6 +305,7 @@ int main(int argc, char **argv) {
     cfg.nthreads = threads > 0 ? threads : (int)cpu_count();
     cfg.sss_walk = sss_walk; cfg.seed = 12345u;
     cfg.hide_env_bg = hide_env_bg;
+    cfg.pixel_filter_tent = pixel_filter_tent;
 
     /* directional sun from azimuth/elevation (degrees) */
     cfg.sun.enabled = sun_on;
@@ -298,6 +349,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "gpu-validate: this binary was built without Vulkan (use VK=1)\n");
         fb_free(&fb); goto teardown;
 #endif
+    } else if (!strcmp(backend, "cpu-wavefront")) {
+        RayTracer *rt = rt_cpu_create(&scene);
+        if (!rt) {
+            fprintf(stderr, "backend cpu-wavefront: could not create CPU ray tracer\n");
+            fb_free(&fb); goto teardown;
+        }
+        render_wavefront(&scene, doc, &bind, tex, env, &cam, &cfg, &fb, rt);
+        rt_destroy(rt);
     } else if (!strcmp(backend, "vk")) {
 #ifdef MTLX_HAVE_VK
         RayTracer *rt = rt_vk_create(&scene);
