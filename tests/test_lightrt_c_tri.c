@@ -1551,7 +1551,7 @@ static void test_serialization(void) {
     float *verts = make_random_soup(NT, 0.15f);
     lrt_tri_layout layouts[3] = {LRT_TRI_LAYOUT_BVH4, LRT_TRI_LAYOUT_BVH8,
                                  LRT_TRI_LAYOUT_BVH8Q};
-    const char *path = "/tmp/lrt_test_scene.lrts";
+    const char *path = "lrt_test_scene.lrts";
     for (int l = 0; l < 3; l++) {
         lrt_tri_build_options o = {.quality = LRT_TRI_BUILD_DEFAULT,
                                    .layout = layouts[l]};
@@ -1597,7 +1597,12 @@ static void test_serialization(void) {
             lrt_tri_scene_free(lf);
         }
         lrt_tri_scene *mm = lrt_tri_scene_open_mmap(path, &err);
+#ifdef _WIN32
+        CHECK(mm == NULL && err == LRT_RESULT_NOT_BUILT,
+              "open_mmap on Windows must report NOT_BUILT (err=%d)", (int)err);
+#else
         CHECK(mm != NULL, "open_mmap failed (err=%d)", (int)err);
+#endif
         if (mm) {
             CHECK(scenes_disagree(s, mm, 8000) == 0, "mmap load differs");
             lrt_tri_scene_free(mm);
@@ -1704,10 +1709,20 @@ static void test_refit(void) {
     /* mmapped scenes are read-only: refit must be rejected, not crash. */
     {
         lrt_tri_scene *s = lrt_tri_scene_build(v0, NT, NULL, NULL);
-        const char *path = "/tmp/lrt_refit_scene.lrts";
-        if (s && lrt_tri_scene_save(s, path) == LRT_RESULT_OK) {
-            lrt_result err = LRT_RESULT_OK;
-            lrt_tri_scene *mm = lrt_tri_scene_open_mmap(path, &err);
+        const char *path = "lrt_refit_scene.lrts";
+        CHECK(s != NULL, "refit mmap: build failed");
+        if (s) {
+            lrt_result err = lrt_tri_scene_save(s, path);
+            CHECK(err == LRT_RESULT_OK, "refit mmap: save failed (err=%d)", (int)err);
+            lrt_tri_scene *mm = err == LRT_RESULT_OK
+                                    ? lrt_tri_scene_open_mmap(path, &err)
+                                    : NULL;
+#ifdef _WIN32
+            CHECK(mm == NULL && err == LRT_RESULT_NOT_BUILT,
+                  "refit mmap: Windows must report NOT_BUILT (err=%d)", (int)err);
+#else
+            CHECK(mm != NULL, "refit mmap: open failed (err=%d)", (int)err);
+#endif
             if (mm) {
                 CHECK(lrt_tri_scene_refit(mm, v0, NT) ==
                           LRT_RESULT_INVALID_ARGUMENT,
@@ -4211,18 +4226,18 @@ static void test_null_inputs(void) {
 
     /* lrt_tri_scene_save(NULL, ...) -> INVALID_ARGUMENT. */
     err = LRT_RESULT_OK;
-    CHECK(lrt_tri_scene_save(NULL, "/tmp/lrt_null_test.lrts") ==
+    CHECK(lrt_tri_scene_save(NULL, "lrt_null_test.lrts") ==
               LRT_RESULT_INVALID_ARGUMENT,
           "save(NULL) returns INVALID_ARGUMENT");
 
     /* lrt_tri_scene_load("/nonexistent", ...) -> NULL. */
     err = LRT_RESULT_OK;
-    CHECK(lrt_tri_scene_load("/tmp/lrt_nonexistent.lrts", &err) == NULL,
+    CHECK(lrt_tri_scene_load("lrt_nonexistent/lrt_scene.lrts", &err) == NULL,
           "load non-existent file returns NULL");
 
     /* lrt_tri_scene_open_mmap("/nonexistent", ...) -> NULL. */
     err = LRT_RESULT_OK;
-    CHECK(lrt_tri_scene_open_mmap("/tmp/lrt_nonexistent.lrts", &err) == NULL,
+    CHECK(lrt_tri_scene_open_mmap("lrt_nonexistent/lrt_scene.lrts", &err) == NULL,
           "open_mmap non-existent file returns NULL");
 
     /* lrt_tri_scene_load_from_memory(NULL, 0, ...) -> NULL. */
