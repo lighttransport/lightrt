@@ -4522,8 +4522,8 @@ static void test_kernel_name(void) {
 #if defined(__AVX2__) && defined(__FMA__)
         if (n8q) CHECK(strstr(n8q, "/avx2") != NULL, "kernel-name: BVH8Q reports avx2");
 #else
-        if (n8) CHECK((strstr(n8, "/sse4") || strstr(n8, "/scalar") ||
-                       strstr(n8, "/sve") || strstr(n8, "/neon")) != NULL,
+        if (n8) CHECK(strstr(n8, "/sse4") || strstr(n8, "/scalar") ||
+                      strstr(n8, "/sve") || strstr(n8, "/neon"),
                       "kernel-name: BVH8 reports a known backend");
 #endif
         if (s8qf8 && s8q4) {

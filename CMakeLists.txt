@@ -17,6 +17,11 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+# MSVC requires an opt-in for the C11 atomics used by the kernels.
+if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+    add_compile_options($<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
+endif()
+
 # Compiler flags: no RTTI, no exceptions
 if(MSVC)
     # Remove default /GR to avoid override warning, keep /EHsc for MSVC

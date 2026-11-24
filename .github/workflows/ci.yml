@@ -31,15 +31,21 @@ jobs:
             runner: windows-2022
           - platform: macOS ARM64
             runner: macos-15
+            cmake-flags: -DCMAKE_CXX_FLAGS=-Wno-error=poison-system-directories
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+      - name: Select the macOS SDK
+        if: runner.os == 'macOS'
+        run: |
+          sdk_root=$(xcrun --sdk macosx --show-sdk-path)
+          echo "SDKROOT=$sdk_root" >> "$GITHUB_ENV"
       - name: Configure CPU build
         run: >
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
           -DNO_SVE=ON -DLIGHTRT_NO_SVE=ON
-          -DLIGHTRT_BUILD_VIEWER_WINDOWS=OFF
+          -DLIGHTRT_BUILD_VIEWER_WINDOWS=OFF ${{ matrix.cmake-flags }}
       - name: Build smoke tests
         run: >
           cmake --build build --config Release --parallel 2 --target
