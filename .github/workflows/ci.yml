@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    name: CPU / ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Linux x86-64
+            runner: ubuntu-24.04
+          - platform: Linux ARM64
+            runner: ubuntu-24.04-arm
+          - platform: Windows x86-64
+            runner: windows-2022
+          - platform: macOS ARM64
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Configure CPU build
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+          -DNO_SVE=ON -DLIGHTRT_NO_SVE=ON
+          -DLIGHTRT_BUILD_VIEWER_WINDOWS=OFF
+      - name: Build smoke tests
+        run: >
+          cmake --build build --config Release --parallel 2 --target
+          lightrt_c_test lightrt_c_tri_test lightrt_spatial_query_test
+      - name: Run smoke tests
+        run: >
+          ctest --test-dir build -C Release --output-on-failure --no-tests=error
+          -R "^(lightrt_c_test|lightrt_c_tri_test|lightrt_spatial_query_test)$"
+
+  wasm:
+    name: WebAssembly
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Build and load the Wasm bindings
+        shell: bash
+        run: |
+          git clone --depth 1 --branch 7.0.0 https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/emsdk"
+          "$RUNNER_TEMP/emsdk/emsdk" install 7.0.0
+          "$RUNNER_TEMP/emsdk/emsdk" activate 7.0.0
+          source "$RUNNER_TEMP/emsdk/emsdk_env.sh"
+          CMAKE_BUILD_PARALLEL_LEVEL=2 npm --prefix wasm run build
+          npm --prefix wasm test
+
+  lean:
+    name: Lean proofs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Check generated Lean and sorry budget
+        run: |
+          python3 formal/tools/c2lean.py --check
+          sh formal/tools/count_sorry.sh --max 0
+      - name: Build BVH spatial-query proofs
+        uses: leanprover/lean-action@fe408643ea7367d8c0404a8be3975bb145f5fb64 # v1.7.0
+        with:
+          lake-package-directory: formal
+          use-github-cache: false
+          use-mathlib-cache: true
+          build: true
+          build-args: LightRT.BVH.Region LightRT.BVH.KNearest
+          test: false
+          lint: false

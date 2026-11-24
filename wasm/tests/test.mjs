@@ -1,13 +1,16 @@
-const mod = await import('../dist/lightrt.js');
-console.log('mod.default callable:', typeof mod.default);
+import assert from 'node:assert/strict';
+import loadLightRT from '../dist/lightrt.js';
 
-if (typeof mod.default === 'function') {
-  console.log('Calling mod.default()...');
-  const lightrt = await mod.default();
-  console.log('TriangleBVH:', typeof lightrt.TriangleBVH);
-  console.log('Ray:', typeof lightrt.Ray);
-  console.log('Vec3:', typeof lightrt.Vec3);
-} else {
-  console.log('mod.default is not a function');
-  console.log('Type:', typeof mod.default);
+const lightrt = await loadLightRT();
+const bvh = new lightrt.TriangleBVH();
+try {
+  const vertices = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+  assert.equal(bvh.build(vertices, null), true);
+  assert.equal(bvh.getNumPrimitives(), 1);
+  const hit = bvh.trace(0.25, 0.25, 1, 0, 0, -1, 0, 10);
+  assert.equal(hit.hit, true);
+  assert.equal(hit.prim_id, 0);
+  assert.equal(hit.t, 1);
+} finally {
+  bvh.delete();
 }

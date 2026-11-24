@@ -1812,8 +1812,9 @@ BVH::SplitResult BVH::findBestSplitBinned(
     // Select centroid array for this axis
     const float* centroid_vals = (axis == 0) ? cx : (axis == 1) ? cy : cz;
 
-    // Put primitives into bins (Parallelizable)
+    // Put primitives into bins. The Wasm task system runs serially.
     float scale = static_cast<float>(nb) / (max_val - min_val);
+#ifndef __EMSCRIPTEN__
     if (config_.use_parallel_build && num_prims > 4096) {
       std::mutex bins_mutex;
       TaskSystem::parallelFor(0, num_prims, [&](uint32_t start, uint32_t end) {
@@ -1832,7 +1833,9 @@ BVH::SplitResult BVH::findBestSplitBinned(
           bins[b].count += local_bins[b].count;
         }
       }, 1024);
-    } else {
+    } else
+#endif
+    {
       for (uint32_t i = 0; i < num_prims; i++) {
         float val = centroid_vals[i];
 

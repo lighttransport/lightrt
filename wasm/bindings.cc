@@ -35,15 +35,13 @@ std::vector<Triangle> verticesToTriangles(const val& vertices) {
   unsigned numTriangles = length / 9;
   triangles.reserve(numTriangles);
 
-  // Get direct pointer to Float32Array buffer
-  val heap = val::module_property("HEAPF32");
-  unsigned byteOffset = vertices["byteOffset"].as<unsigned>();
-
-  const float* data = reinterpret_cast<const float*>(
-      heap["buffer"].as<uintptr_t>() + byteOffset);
+  // The input array can live outside Wasm memory.
+  std::vector<float> coordinates(length);
+  val(emscripten::typed_memory_view(coordinates.size(), coordinates.data()))
+      .call<void>("set", vertices);
 
   for (unsigned i = 0; i < numTriangles; i++) {
-    const float* tri = data + i * 9;
+    const float* tri = coordinates.data() + i * 9;
     Vec3 v0(tri[0], tri[1], tri[2]);
     Vec3 v1(tri[3], tri[4], tri[5]);
     Vec3 v2(tri[6], tri[7], tri[8]);
