@@ -17,6 +17,13 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+# Visual Studio evaluates target-wide language flags as C++ for mixed targets.
+# Apply the C11 atomics opt-in to the C kernel sources directly.
+if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+    set_property(SOURCE lightrt_c.c lightrt_c_tri.c APPEND_STRING
+        PROPERTY COMPILE_FLAGS " /experimental:c11atomics")
+endif()
+
 # Compiler flags: no RTTI, no exceptions
 if(MSVC)
     # Remove default /GR to avoid override warning, keep /EHsc for MSVC

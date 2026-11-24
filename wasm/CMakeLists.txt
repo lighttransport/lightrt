@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.13)
 project(lightrt-wasm)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -12,19 +12,18 @@ set(CMAKE_EXECUTABLE_OUTPUT_PATH ${CMAKE_BINARY_DIR})
 
 add_executable(lightrt-wasm bindings.cc ../lightrt.cc)
 
-set_target_properties(lightrt-wasm PROPERTIES
-    OUTPUT_NAME "lightrt-wasm"
-    LINK_FLAGS
-        "--bind
-         -s ALLOW_MEMORY_GROWTH=1
-         -s EXPORT_ES6=1
-         -s MODULARIZE=1
-         -s EXPORT_NAME=loadLightRT
-         -s ASSERTIONS=0
-         -Oz
-         -s FILESYSTEM=0
-         -s MALLOC=emmalloc
-         -s DISABLE_EXCEPTION_CATCHING=1
-         -s EXPORTED_RUNTIME_METHODS=[]
-         --emit-tsd ${CMAKE_BINARY_DIR}/lightrt.d.ts"
+set_target_properties(lightrt-wasm PROPERTIES OUTPUT_NAME "lightrt")
+target_link_options(lightrt-wasm PRIVATE
+    --bind
+    -sALLOW_MEMORY_GROWTH=1
+    -sEXPORT_ES6=1
+    -sMODULARIZE=1
+    -sEXPORT_NAME=loadLightRT
+    -sASSERTIONS=0
+    -Oz
+    -sFILESYSTEM=0
+    -sMALLOC=emmalloc
+    -sDISABLE_EXCEPTION_CATCHING=1
+    -sEXPORTED_RUNTIME_METHODS=[]
+    --emit-tsd "${CMAKE_BINARY_DIR}/lightrt.d.ts"
 )
